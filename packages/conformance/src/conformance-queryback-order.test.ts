@@ -8,9 +8,15 @@ const schema: Schema = {
   tables: {
     parent: { columns: { id: { type: 'int' }, active: { type: 'bool' } }, primaryKey: 'id' },
     child: {
-      columns: { id: { type: 'int' }, parent_id: { type: 'int' }, payload: { type: 'text' } },
+      columns: {
+        id: { type: 'int' },
+        parent_id: { type: 'int' },
+        group_id: { type: 'int' },
+        payload: { type: 'text' },
+      },
       primaryKey: 'id',
     },
+    grandchild: { columns: { id: { type: 'int' }, group_id: { type: 'int' } }, primaryKey: 'id' },
   },
 }
 
@@ -59,5 +65,46 @@ describe('native: a query-back cannot overwrite a newer outer-row decision', () 
     const rows = await foldStream(shape.streamUrl)
     expect(rows.has('1')).toBe(false)
     expect(rows.size).toBe(99999)
+  }, 90000)
+})
+
+describe('native: a nested query-back cannot overwrite a newer parent-node decision', () => {
+  let h: Harness
+  beforeAll(async () => {
+    h = await bootHarness(schema)
+    await pgQuery(h, 'INSERT INTO parent (id, active) VALUES (1, false), (2, false)')
+    await pgQuery(
+      h,
+      `INSERT INTO child (id, parent_id, group_id, payload)
+       SELECT i, 1, CASE WHEN i = 1 THEN 1 ELSE 2 END, repeat('x', 256)
+         FROM generate_series(1, 100000) AS i`,
+    )
+    await pgQuery(h, 'INSERT INTO grandchild (id, group_id) VALUES (1, 1)')
+    await drainEngine(h, 60000)
+  }, 90000)
+  afterAll(async () => await h?.shutdown())
+
+  it('a child row moved after the parent-node snapshot does not re-enter through that stale snapshot', async () => {
+    const activeChildGroups = {
+      table: 'child',
+      project: 'group_id',
+      where: { col: 'parent_id', in: activeParents },
+    } as const
+    const shape = await createShape(h, {
+      table: 'grandchild',
+      where: { col: 'group_id', in: activeChildGroups },
+    })
+    await drainEngine(h)
+    expect((await foldStream(shape.streamUrl)).size).toBe(0)
+
+    // This query-back updates an intermediate membership node rather than emitting directly to a
+    // shape. Its Postgres snapshot needs the same recency fence as the outer-shape query-back above.
+    await pgQuery(h, 'UPDATE parent SET active = true WHERE id = 1')
+    await waitFor(() => candidateQueryRunning(h), 'the nested membership query-back to establish its snapshot')
+    await pgQuery(h, 'UPDATE child SET parent_id = 2 WHERE id = 1')
+
+    await drainEngine(h, 60000)
+    const rows = await foldStream(shape.streamUrl)
+    expect(rows.has('1')).toBe(false)
   }, 90000)
 })

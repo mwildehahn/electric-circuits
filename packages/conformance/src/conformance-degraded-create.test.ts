@@ -41,11 +41,19 @@ describe('native: degradation closes every membership stream, including an in-fl
     // Its outcome is settled into a value here so the parked request is never an unhandled rejection:
     // a refusal is one of the two answers this test accepts (see the assertion at the end).
     const createLock = await lockTable(h, 'child2')
-    const creating = createShape(h, { table: 'child2', where: { col: 'parent_id', in: activeParents } }).then(
+    const definition = { table: 'child2', where: { col: 'parent_id', in: activeParents } }
+    const creating = createShape(h, definition).then(
       (rec) => ({ ok: true as const, rec }),
       (err: Error) => ({ ok: false as const, err }),
     )
     await waitFor(async () => (await tableLockWaiters(h, 'child2')).length > 0, 'the second create to block')
+
+    // A normal identical request joins the in-flight creator and waits on its public share result.
+    // Start it before the fault schedule so it passes the same active-health gate as the creator.
+    const joining = createShape(h, definition).then(
+      (rec) => ({ ok: true as const, rec }),
+      (err: Error) => ({ ok: false as const, err }),
+    )
 
     const queryBackLock = await lockTable(h, 'child')
     try {
@@ -73,17 +81,22 @@ describe('native: degradation closes every membership stream, including an in-fl
     // reaper has run, then let its empty backfill finish.
     await createLock.release()
     const created = await creating
+    const joined = await joining
 
-    // Either answer honours the contract, and both are answers a normal client already handles:
-    // the create refuses with the typed `Degraded` 503 (it overlapped the mark, so its stream is in
-    // the reaper's snapshot and it rolls itself back), or it returns a handle — in which case the
-    // stream behind that handle must be readable. What must never happen is a successful POST
-    // handing back a stream this same engine has already reaped.
-    if (created.ok) {
-      expect(await streamStatus(created.rec.streamUrl)).not.toBe(404)
-    } else {
+    // Degradation and stream reaping both completed while this create remained parked. It therefore
+    // overlapped the mark and must refuse with the typed public error, not return a handle.
+    expect(created.ok).toBe(false)
+    if (!created.ok) {
       expect(created.err.message).toContain('POST /shapes -> 503')
       expect(created.err.message).toContain('degraded: subquery membership effects were lost')
+    }
+
+    // The joiner overlapped the same degradation and must receive the same typed refusal. A generic
+    // initialization failure maps to 500 and makes identical normal-client requests disagree.
+    expect(joined.ok).toBe(false)
+    if (!joined.ok) {
+      expect(joined.err.message).toContain('POST /shapes -> 503')
+      expect(joined.err.message).toContain('degraded: subquery membership effects were lost')
     }
   }, 60000)
 })
