@@ -44,6 +44,9 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/table/{table}/rows", post(insert_table_row).delete(delete_table_rows))
         .route("/subqueries", get(subquery_stats))
         .route("/replication/lsn", get(replication_lsn))
+        // Operator recovery from a broken epoch under ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false
+        // (ADR-0004): retire every shape, bind a new epoch, resume ingest.
+        .route("/epoch/reset", post(epoch_reset))
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
         .route("/memory", get(get_memory))
@@ -616,7 +619,28 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         // Flip batches abandoned after exhausting their retries; non-zero means the engine is
         // degraded (its membership-bearing routes answer 503) and must be restarted.
         "flipFailures": engine.flip_failures(),
+        // Which replication slot, in which cluster, this engine is bound to (ADR-0004), and whether
+        // that binding still holds. `state: "broken"` is the refuse policy's degraded state: ingest
+        // is stopped, shape routes answer 503, and `POST /epoch/reset` is the way out.
+        "epoch": engine.epoch_json(),
     }))
+}
+
+/// `POST /epoch/reset` — the operator's half of `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false`:
+/// retire every shape, bind a new epoch on a fresh slot, and let ingest resume.
+///
+/// Refused with 409 unless the epoch is actually broken. It is a destructive operation (every shape
+/// stream is closed and deleted), and on a healthy engine there is nothing it could fix — the slot
+/// it would drop is the one the ingestor is streaming from.
+async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(reason) = engine.epoch_broken() else {
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            msg: "the epoch is not broken; nothing to reset".to_string(),
+        });
+    };
+    engine.reset_epoch(reason).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "epoch": engine.epoch_json() })))
 }
 
 async fn get_metrics() -> Json<serde_json::Value> {
@@ -664,9 +688,13 @@ struct AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
-        // A lost-effects degradation is the one engine failure that is not a 500: the request was
-        // fine, the engine is not. Matched by type, never by message text.
-        let status = if e.downcast_ref::<crate::engine::Degraded>().is_some() {
+        // A degradation is the one engine failure that is not a 500: the request was fine, the
+        // engine is not. Matched by type, never by message text — lost membership effects
+        // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
+        let status = if e.downcast_ref::<crate::engine::Degraded>().is_some()
+            || e.downcast_ref::<crate::engine::EpochBroken>().is_some()
+            || e.downcast_ref::<crate::engine::EpochResetting>().is_some()
+        {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::INTERNAL_SERVER_ERROR

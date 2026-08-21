@@ -146,6 +146,23 @@ which has no runtime circuit rebuild and so restarts the process after its retir
 triggering transaction's xid against the boot seed's `SnapshotGate`: a re-delivered transaction the
 fresh seed already reflects does not restart again.
 
+**The slot itself is bound to an epoch** (ADR-0004). The engine records `SlotBound { system_identifier,
+timeline_id, slot }` in the durable catalog when it first creates — or adopts — its slot, and verifies
+the slot against that binding before **every** connection, not only at boot: a slot that is gone, whose
+`wal_status` is `lost`, that carries a different output plugin, or that lives in a cluster with another
+`system_identifier` is an **epoch break**, and the changes it was supposed to carry are simply not
+available anywhere. (A slot merely held by another walsender is not a break — the engine waits for it —
+and a changed `timeline_id` is recorded, not acted on.) The default policy is auto-reset: every shape,
+active and dormant, is retired (closed, then deleted), the slot is recreated and a new `SlotBound` is
+written — that record is the new epoch, and clients re-subscribe.
+`ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false` refuses instead: ingest does not start, shape reads
+degrade fail-closed with a named reason (`GET /replication/lsn` → `epoch.state`/`epoch.reason`), and
+`POST /epoch/reset` is the operator's recovery. Reconnects back off exponentially with jitter
+(1 s → 30 s), reset only by a connection that actually delivered — a rejected `START_REPLICATION`
+climbs the schedule like any other failure — and cut short by an epoch rebind. A durable catalog that
+cannot be READ at boot is fatal rather than treated as an empty one: deciding the epoch from a log the
+engine could not read is how a fresh slot at the WAL head gets created beside shapes nobody dropped.
+
 Unparseable values (e.g. `NaN` floats) still log errors when degraded to NULL.
 
 ---
@@ -510,6 +527,7 @@ absolute membership emission makes them unnecessary for convergence).
 | engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log offset checkpoints) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
 | compiled schema ↔ Postgres | fingerprint compare on every `Relation` + a 60 s catalog reconciler; drift/TRUNCATE/identity regression retires that table's dependents, and a per-table schema generation refuses any create that overlapped it (ADR-0005) | never serves rows over a schema Postgres no longer has; the catalog records `schemaChanged` as the audit trail for the drops |
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
+| engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,

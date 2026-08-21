@@ -732,10 +732,12 @@ fn unauthorized() -> Response {
 }
 
 /// 503 for a degraded engine (see `Engine::ensure_not_degraded`): serving a shape would hand out
-/// membership the engine knows is wrong. Carries the control plane's `error` body — this is the
-/// engine refusing outright, not a protocol-level shape error.
-fn degraded() -> Response {
-    let body = serde_json::json!({ "error": crate::engine::Degraded.to_string() }).to_string();
+/// membership the engine knows is wrong, or rows from an epoch the engine is no longer bound to
+/// (ADR-0004). Carries the control plane's `error` body — this is the engine refusing outright, not
+/// a protocol-level shape error, so the reason travels verbatim from the same typed refusal the
+/// native surface returns.
+fn degraded(why: &anyhow::Error) -> Response {
+    let body = serde_json::json!({ "error": format!("{why:#}") }).to_string();
     let len = body.len() as u64;
     let mut headers = HeaderMap::new();
     headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -764,8 +766,8 @@ pub async fn shape(
         p.api_secret.as_deref(),
     ) {
         unauthorized()
-    } else if engine.degraded() {
-        degraded()
+    } else if let Err(e) = engine.ensure_not_degraded() {
+        degraded(&e)
     } else {
         match shape_inner(engine, p, &raw_pairs).await {
             Ok(resp) => resp,

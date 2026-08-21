@@ -11,7 +11,7 @@ the project is growing toward).
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
@@ -238,6 +238,21 @@ canvas update, screenshot.
   the circuit-tier restart is gated on the trigger's xid against the boot seed, so an at-least-once
   re-delivery cannot become an exit loop. Never serve stale: no additive tolerance, no whole-engine
   reset.
+- **The replication slot is bound to a catalog epoch** (ADR 0004; `engine/epoch.rs`). A `SlotBound
+  { system_identifier, timeline_id, slot }` record in the durable catalog names the epoch every shape
+  belongs to, and the slot is verified against it before **every** connection — boot and each ingestor
+  reconnect. Slot gone, `wal_status = 'lost'`, foreign output plugin, or a different cluster
+  `system_identifier` = **epoch break**: the gap cannot be filled, so either every shape is retired
+  and a new epoch bound (`ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=true`, the default), or the engine
+  fails closed with a named reason until `POST /epoch/reset` (`=false`). A slot held by another
+  walsender is NOT a break (wait for it) and a changed timeline is recorded, not acted on. Never
+  recreate the slot silently: a fresh slot at the WAL head with shapes still being served is the
+  exact failure the ADR exists to prevent — which is also why a durable catalog the engine cannot
+  READ at boot is fatal (an unreadable log is not an epoch-less one), why the reset drains its
+  `Dropped` records to storage BEFORE creating the new slot, and why the break stays latched until
+  the new `SlotBound` is written. A create that overlapped a reset is refused (`resetting`) or rolled
+  back by the epoch component of `SchemaGens` — the whole-engine twin of the per-table schema
+  generation.
 - **Engine-initiated retirement closes the stream, then deletes it** (`ds.retire_stream`; ADR 0007):
   purge, eviction, drop-at-restore, schema drift, the degraded subquery reap. The close releases a tailing
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never

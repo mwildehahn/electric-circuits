@@ -1264,9 +1264,17 @@ impl Engine {
     /// what to retire. So a create either registered before the retirement (and is enumerated and
     /// purged by it) or after (and its captured generation is the post-drift one) — never installed,
     /// unenumerated, against a schema that has already been swapped out from under it.
+    /// It also carries the **epoch** (ADR-0004), re-checked in the same lock hold: an epoch reset
+    /// bumps `EngineState::epoch_gen` in the same critical section in which it enumerates the shapes
+    /// it retires, so a create that registered before that enumeration — and whose backfill snapshot
+    /// therefore predates the new slot's consistent point — is rolled back instead of being left
+    /// serving a window of changes that no slot will ever deliver.
     pub(crate) async fn ensure_schema_unchanged(&self, gens: &SchemaGens) -> Result<()> {
-        let drifted = self.state.lock().await.drifted_since(gens);
-        match drifted {
+        let st = self.state.lock().await;
+        if st.epoch_reset_since(gens) {
+            bail!("the replication epoch was reset during creation; retry");
+        }
+        match st.drifted_since(gens) {
             Some(t) => bail!("schema of '{t}' changed during creation; retry"),
             None => Ok(()),
         }

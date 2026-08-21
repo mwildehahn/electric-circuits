@@ -16,6 +16,21 @@ rebuild. `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false` selects **refuse** instead
 reads degrade fail-closed with a named reason, and the reset is an explicit operator action.
 Reconnects use exponential backoff with jitter.
 
+## Consequences
+
+`ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` (default `true`) selects the policy; `false` makes a break a
+named degraded state (`slot_lost` / `slot_wal_lost` / `system_identifier_mismatch`) in which ingest
+stops, `/v1/health` reports `degraded` and every shape route answers 503, and `POST /epoch/reset` on
+the control plane is the operator's recovery — it runs exactly the same reset the auto policy runs
+and resumes ingest (409 when the epoch is not broken; the operation is destructive and would have
+nothing to fix). `GET /replication/lsn` grows an `epoch` object — `state` (`ok`/`broken`), `reason`,
+`systemIdentifier`, `timelineId`, `slot`, `boundAt` — which is where both policies are observed, and
+`epoch_breaks_total` / `epoch_resets_total` count them. A reset while counts pipelines are running
+exits the process (75) for the same reason schema drift does: the circuit is seeded once at boot and
+cannot be rebuilt across the gap. A durable catalog that cannot be read at boot is boot-fatal — an
+unreadable log is not a log without a binding, and deciding either way from it is how a slot gets
+created at the WAL head beside shapes that were never dropped.
+
 ## Considered options
 
 - Refuse by default (a pathological state is refused; recovery is a deliberate human act): equally

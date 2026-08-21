@@ -15,7 +15,7 @@ pub struct ShapeRecord {
     /// before ADR-0002, and silently resolving it would be worse than refusing: the `sig` stored
     /// beside it keeps the bare spelling, so the restored shape would never share with an identical
     /// post-cutover create and the engine would maintain two streams for one table. See
-    /// [`de_canonical_table`] and `catalog::restore_catalog`.
+    /// [`de_canonical_table`] and `catalog::fold_catalog`.
     #[serde(deserialize_with = "de_canonical_table")]
     pub table: TableRef,
     pub stream_path: String,

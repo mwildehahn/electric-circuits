@@ -20,6 +20,12 @@
 //! renders them with the same type output functions the backfill's `::text` casts use, keeping
 //! backfilled and replicated representations byte-identical (see `pg.rs::row_json_expr`).
 //!
+//! Every connection is gated on the engine's **epoch** check ([`EpochEvents::before_connect`],
+//! ADR-0004): the slot must still be the one the engine bound to, or `START_REPLICATION` would
+//! resume a slot the engine has no history with — silently, at the current WAL head. Refusals and
+//! connection failures alike back off exponentially with jitter (1 s → 30 s); a connection that was
+//! actually established resets the schedule, and an operator's epoch reset cuts the wait short.
+//!
 //! The ingestor is also where **schema drift** is noticed (ADR-0005). Postgres re-sends a
 //! `Relation` message after any DDL that changes a table, so every `R` is compared with the
 //! compiled [`SchemaFingerprint`]; a difference — a column added/dropped/retyped/reordered, or a
@@ -83,6 +89,103 @@ pub trait SchemaEvents: Send + Sync {
     fn on_truncate<'a>(&'a self, tables: Vec<TableRef>, txn: Option<TxnRef>) -> BoxFuture<'a, ()>;
 }
 
+/// Why the engine will not let the ingestor open a replication connection right now.
+///
+/// Every variant is a *wait*, never a give-up: the loop backs off and asks again. They differ only
+/// in what could make the answer change — an operator (`EpochBroken`), another engine going away
+/// (`SlotBusy`), or Postgres coming back (`CheckFailed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The epoch is broken and `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false`: ingest stays stopped
+    /// until an operator posts `/epoch/reset` (ADR-0004).
+    EpochBroken(&'static str),
+    /// Another walsender holds the slot — Postgres allows exactly one, so this is a second engine
+    /// on the same slot (or our own predecessor that Postgres has not yet reaped), not an epoch
+    /// break.
+    SlotBusy(Option<i32>),
+    /// The verification itself could not run (Postgres unreachable). No verdict, so no connect.
+    CheckFailed,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::EpochBroken(reason) => {
+                write!(f, "epoch broken ({reason}); waiting for POST /epoch/reset")
+            }
+            Refused::SlotBusy(Some(pid)) => write!(f, "the slot is held by walsender pid {pid}"),
+            Refused::SlotBusy(None) => f.write_str("the slot is held by another walsender"),
+            Refused::CheckFailed => f.write_str("the slot could not be verified"),
+        }
+    }
+}
+
+/// The engine's gate on the replication connection itself (ADR-0004). Split from [`SchemaEvents`]
+/// because it is about the **slot**, not about any table: the ingestor must never call
+/// `START_REPLICATION` on a slot the engine is not still bound to, or it would silently resume a
+/// fresh slot at the current WAL head and every shape would miss the gap.
+pub trait EpochEvents: Send + Sync {
+    /// Verify the slot before connecting, and apply the configured slot-loss policy. `Ok` = connect
+    /// now; `Err` = keep waiting (the loop backs off and asks again).
+    fn before_connect(&self) -> BoxFuture<'_, std::result::Result<(), Refused>>;
+
+    /// Resolves when the engine (re)binds an epoch — an operator reset, so the answer to
+    /// [`Self::before_connect`] has just changed and the backoff should be cut short.
+    fn epoch_rebound(&self) -> BoxFuture<'_, ()>;
+}
+
+/// Reconnect backoff bounds (ADR-0004). One second is long enough that a flapping server is not
+/// hammered and short enough that an ordinary blip is invisible; 30 s is the ceiling for an outage
+/// that needs an operator anyway.
+const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Un-jittered backoff for the n-th consecutive failed attempt: 1s, 2s, 4s … capped at
+/// [`RECONNECT_MAX`]. Pure, so the schedule is a unit test rather than a stopwatch.
+fn backoff_base(attempt: u32) -> std::time::Duration {
+    RECONNECT_MIN.saturating_mul(1u32 << attempt.min(16)).min(RECONNECT_MAX)
+}
+
+/// Spread `base` by ±25% from `nanos` (the clock's sub-second noise — no RNG dependency, and
+/// precision is irrelevant here). Pure in `nanos` so the bounds are testable.
+fn jitter(base: std::time::Duration, nanos: u32) -> std::time::Duration {
+    let spread = base.as_millis() as u64 / 2; // the full ±25% window
+    if spread == 0 {
+        return base;
+    }
+    base.saturating_sub(std::time::Duration::from_millis(spread / 2))
+        + std::time::Duration::from_millis(u64::from(nanos) % spread)
+}
+
+/// One step of the reconnect schedule: the (un-jittered) delay before the next attempt, and the
+/// attempt counter to carry forward.
+///
+/// `connected` is "this attempt got a message out of the server", not "a socket was opened" — see
+/// [`stream_loop`]. Only that resets the schedule, so a run of auth/`pg_hba`/slot-busy failures
+/// actually climbs 1 s → 30 s instead of retrying at the floor forever. Pure, so the whole schedule
+/// is a unit test.
+fn next_backoff(attempt: u32, connected: bool) -> (std::time::Duration, u32) {
+    let attempt = if connected { 0 } else { attempt };
+    (backoff_base(attempt), attempt.saturating_add(1))
+}
+
+/// The sub-second clock noise the jitter is drawn from.
+fn clock_nanos() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+}
+
+/// Wait out the backoff, cut short by an epoch rebind (so an operator's `/epoch/reset` is followed
+/// by a connect attempt at once rather than up to 30 s later).
+async fn backoff_wait(epoch: &dyn EpochEvents, d: std::time::Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => {}
+        _ = epoch.epoch_rebound() => {}
+    }
+}
+
 /// The drain-barrier bookkeeping table: `public.__el_sync` specifically — a same-named table in
 /// another schema is ordinary data, never the sentinel.
 fn sync_table() -> &'static TableRef {
@@ -92,6 +195,11 @@ fn sync_table() -> &'static TableRef {
 
 /// Long-running ingestor. Reconnects on any connection-level failure; the server resends
 /// everything after the last acknowledged commit.
+///
+/// **Every** connection is gated on [`EpochEvents::before_connect`] (ADR-0004): a slot that vanished
+/// or was recreated under the engine is caught before `START_REPLICATION`, not discovered as a
+/// permanent failure. Failures — refusals and connection errors alike — back off exponentially with
+/// jitter (1 s → 30 s); a connection that was actually established resets the schedule.
 ///
 /// `tables` is the engine's **live** schema view, not a boot-time copy: schema drift swaps an entry
 /// in place and the very next decode uses it (ADR-0005).
@@ -103,23 +211,41 @@ pub async fn run(
     ds: DsClient,
     tables: SharedTables,
     events: Arc<dyn SchemaEvents>,
+    epoch: Arc<dyn EpochEvents>,
     last_lsn: Arc<std::sync::Mutex<String>>,
     sync_seq: Arc<AtomicI64>,
 ) {
+    let mut attempt: u32 = 0;
     loop {
+        // The epoch gate. A refusal is never fatal — it is "not yet", and what could change the
+        // answer differs per reason (see `Refused`).
+        if let Err(refused) = epoch.before_connect().await {
+            tracing::warn!("replicator: not connecting — {refused}");
+            let (base, next) = next_backoff(attempt, false);
+            backoff_wait(epoch.as_ref(), jitter(base, clock_nanos())).await;
+            attempt = next;
+            continue;
+        }
         let cfg = match replication_config(&pg_url, &slot, &publication) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("replicator: bad connection config: {e:#}; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let (base, next) = next_backoff(attempt, false);
+                backoff_wait(epoch.as_ref(), jitter(base, clock_nanos())).await;
+                attempt = next;
                 continue;
             }
         };
-        match stream_loop(cfg, &ds, &tables, events.as_ref(), &last_lsn, &sync_seq).await {
+        let mut connected = false;
+        match stream_loop(cfg, &ds, &tables, events.as_ref(), &last_lsn, &sync_seq, &mut connected).await {
             Ok(()) => tracing::warn!("replicator: stream ended; reconnecting"),
             Err(e) => tracing::error!("replicator: {e:#}; reconnecting"),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // A connection that actually delivered is evidence the far side is healthy: start the next
+        // outage's schedule from the bottom rather than from wherever the last one ended.
+        let (base, next) = next_backoff(attempt, connected);
+        backoff_wait(epoch.as_ref(), jitter(base, clock_nanos())).await;
+        attempt = next;
     }
 }
 
@@ -181,6 +307,7 @@ fn percent_decode(s: &str) -> String {
 /// One replication connection's lifetime: decode pgoutput frames, buffer per transaction, append
 /// at commit, acknowledge. Returns `Err` on any failure so the caller reconnects (the server then
 /// resends from the confirmed position).
+#[allow(clippy::too_many_arguments)]
 async fn stream_loop(
     cfg: ReplicationConfig,
     ds: &DsClient,
@@ -188,12 +315,19 @@ async fn stream_loop(
     events: &dyn SchemaEvents,
     last_lsn: &Arc<std::sync::Mutex<String>>,
     sync_seq: &Arc<AtomicI64>,
+    // Set once the server has actually delivered something, so the caller can tell "the server
+    // never let us in" from "we streamed and then something went wrong" when choosing the next
+    // backoff. NOT set at `connect`: that only spawns the worker task, and TCP, auth, `pg_hba` and
+    // `START_REPLICATION` failures (a slot held by someone else, most of all) all surface on the
+    // first `recv`. Setting it there would peg every one of those at the 1 s floor forever.
+    connected: &mut bool,
 ) -> Result<()> {
     let mut client = ReplicationClient::connect(cfg).await.context("replication connect")?;
     let mut dec = Decoder::new(tables.clone());
     let mut txn: Option<TxnBuf> = None;
     loop {
         let ev = client.recv().await.context("replication stream")?;
+        *connected = true;
         let Some(ev) = ev else { return Ok(()) };
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
@@ -1020,5 +1154,85 @@ mod tests {
         // A truncate that hits ONLY untracked relations reports nothing at all.
         d.on_truncate(&[2, 9], ev.as_ref(), None).await;
         assert_eq!(ev.truncates.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// The reconnect schedule doubles from one second and stops at thirty (ADR-0004). A flat retry
+    /// hammers a server that is down; an uncapped one leaves an engine asleep long after the outage
+    /// ended.
+    #[test]
+    fn the_backoff_schedule_doubles_and_caps() {
+        let secs = |a: u32| backoff_base(a).as_secs();
+        assert_eq!([secs(0), secs(1), secs(2), secs(3), secs(4)], [1, 2, 4, 8, 16]);
+        // 32s would exceed the ceiling, so it and everything after it sit at 30s.
+        assert_eq!(secs(5), 30);
+        assert_eq!(secs(9), 30);
+        // …including attempt counts big enough to overflow a naive `1 << attempt`.
+        assert_eq!(secs(64), 30);
+        assert_eq!(secs(u32::MAX), 30);
+    }
+
+    /// Jitter stays inside ±25% of the base for every possible clock reading — many engines
+    /// reconnecting to the same server must not do it in lockstep, but neither may the delay
+    /// collapse to zero or run away.
+    #[test]
+    fn jitter_stays_within_a_quarter_of_the_base() {
+        for attempt in 0..8u32 {
+            let base = backoff_base(attempt);
+            let lo = base.mul_f64(0.75);
+            let hi = base.mul_f64(1.25);
+            for nanos in [0u32, 1, 12_345, 500_000_000, 999_999_999] {
+                let d = jitter(base, nanos);
+                assert!(d >= lo && d <= hi, "attempt {attempt}, nanos {nanos}: {d:?} outside {lo:?}..{hi:?}");
+            }
+        }
+        // The whole window is actually used: the extremes of the clock reading differ.
+        let base = backoff_base(3);
+        assert_ne!(jitter(base, 0), jitter(base, 999_999_999));
+    }
+
+    /// A sub-millisecond base has no jitter window to speak of; it must be returned untouched
+    /// rather than underflowing.
+    #[test]
+    fn a_tiny_base_is_returned_as_is() {
+        let tiny = std::time::Duration::from_micros(10);
+        assert_eq!(jitter(tiny, 12_345), tiny);
+    }
+
+    /// Drive the schedule the way the ingest loop does, over a sequence of outcomes.
+    fn schedule(outcomes: &[bool]) -> Vec<u64> {
+        let mut attempt = 0u32;
+        outcomes
+            .iter()
+            .map(|&connected| {
+                let (base, next) = next_backoff(attempt, connected);
+                attempt = next;
+                base.as_secs()
+            })
+            .collect()
+    }
+
+    /// A run of failures that never got a message out of the server — a wrong password, a `pg_hba`
+    /// rule, another engine holding the slot — must actually climb to the ceiling. This is the case
+    /// that regressed when `connected` was set at `connect` (which only spawns the worker) instead
+    /// of at the first `recv`: every such failure looked like a healthy connection that ended, and
+    /// the loop retried at the 1 s floor forever.
+    #[test]
+    fn repeated_connection_failures_climb_to_the_ceiling() {
+        assert_eq!(schedule(&[false; 8]), [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
+    /// A connection that delivered resets the schedule: the wait after it drops back to the floor
+    /// and the NEXT outage climbs from the bottom again, rather than resuming wherever the last one
+    /// had escalated to.
+    #[test]
+    fn a_delivering_connection_resets_the_schedule() {
+        assert_eq!(schedule(&[false, false, false, true, false, false]), [1, 2, 4, 1, 2, 4]);
+        // …and an engine that keeps losing a working stream never escalates past the floor at all.
+        assert_eq!(schedule(&[true; 4]), [1, 1, 1, 1]);
     }
 }

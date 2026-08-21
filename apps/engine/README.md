@@ -45,6 +45,7 @@ discover the bound port.
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
 | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval |
 | `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
+| `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` (Electric parity) retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
 | `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before its **handle state** is evicted and its shape subscription released (the shape + stream are retained and follow the retention lifecycle); a late request gets `409 must-refetch` and rejoins the retained shape |
 | `ELECTRIC_LIVE_TIMEOUT_MS` | `20000` | Overall deadline for a `live=true` `/v1/shape` long-poll, then `204` |
 
@@ -115,7 +116,8 @@ unchanged.
 | `GET /tables` | every tracked table + its schema-drift `unresolved` flag |
 | `GET /tables/{name}/offset` · `GET /tables/{name}/families` | tailer position / routing-family stats |
 | `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…` | shared-node stats, pipeline graph, one node's live index |
-| `GET /replication/lsn` | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) |
+| `GET /replication/lsn` | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) + the `epoch` object (slot binding + `state`/`reason`) |
+| `POST /epoch/reset` | operator recovery from a broken epoch under `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false`: retire every shape, bind a new epoch, resume ingest (409 if the epoch is not broken) |
 | `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition |
 | `GET /v1/shape` | Electric protocol: snapshot (`offset=-1`), live long-poll, handles/offsets/`must-refetch` |
 
@@ -183,6 +185,46 @@ schema fingerprint exactly when the publication publishes them. The engine's own
 
 A table that is **dropped** has its dependents retired and is untracked; a table re-created under the
 same name is not synced again until the engine restarts (same as adding a table).
+
+## Replication slot and epochs
+
+The engine records **which slot, in which cluster, it is bound to** (`docs/adr/0004-slot-epoch-and-reset.md`).
+The first time it creates — or adopts — its slot it writes a `slotBound`
+(`system_identifier`, `timeline_id`, `slot`, `bound_at`) to the durable catalog; the last such record
+is the current **epoch**, and every shape in that catalog belongs to it. Before *every* connection —
+at boot and on each ingestor reconnect, not just at boot — the slot is verified against that binding.
+
+A durable catalog the engine cannot **read** at boot is fatal, by design: it is not a catalog with no
+epoch in it, and treating it as one would create a slot at the current WAL head and orphan every shape
+already in the log. The engine refuses to start until storage is healthy.
+
+An **epoch break** is a slot the engine can no longer vouch for: it is gone, `wal_status = 'lost'`,
+it is there under a different output plugin, or `pg_control_system().system_identifier` is not the
+one the binding names. There is no way to fill the resulting gap — the changes between the old slot's
+`confirmed_flush_lsn` and the current WAL head simply are not available — so every shape over it is
+wrong. (Two look-alikes that are **not** breaks: a slot held by another walsender, which is a second
+engine on the same slot and is waited out; and a `timeline_id` that moved, which is logged and
+recorded but not acted on — one primary, no promotion, per the ADR.)
+
+- **`ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=true`** (default, Electric parity): the engine **resets**.
+  Every shape — active and dormant — is retired (stream closed, then deleted; ADR-0007), the slot is
+  dropped and recreated, and a new `slotBound` is written. That record *is* the new epoch. Clients see
+  closed streams and re-subscribe, exactly as for eviction or schema drift. An unattended deployment
+  heals itself, at the cost of an unscheduled backfill storm.
+- **`…=false`**: the engine **refuses**. Ingest does not start, `/v1/health` reports `degraded` (503),
+  every shape route answers 503, and `GET /replication/lsn` names the reason
+  (`epoch.state = "broken"`, `epoch.reason` one of `slot_lost` / `slot_wal_lost` /
+  `system_identifier_mismatch`). Nothing is destroyed while refusing. Recovery is a deliberate act:
+  `POST /epoch/reset` runs exactly the reset above and resumes ingest.
+
+Reconnects (and refusals) back off exponentially with jitter, 1 s → 30 s. The schedule resets only
+when a connection actually **delivered** — a `START_REPLICATION` the server rejected (the slot is held
+by another walsender, say), an auth failure or a `pg_hba` rule all climb to the ceiling rather than
+retrying at the floor. An operator's reset cuts the wait short rather than leaving the engine asleep. `epoch_breaks_total` and `epoch_resets_total`
+count both halves. The slot NAME never changes, so the StatsD slot gauges keep reporting across a
+reset. A reset while a counts pipeline is running exits `75` to be restarted, for the same reason
+schema drift on a circuit-served table does: the circuit is seeded once at boot and has no runtime
+rebuild across the gap.
 
 ## Shape retention lifecycle
 

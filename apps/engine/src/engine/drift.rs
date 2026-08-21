@@ -64,8 +64,9 @@ use crate::replication::TxnRef;
 use crate::schema::{REPLICA_IDENTITY_FULL, SchemaFingerprint, describe_drift};
 
 /// Exit code for the circuit-tier restart. Non-zero so a supervisor treats it as a crash and
-/// restarts; distinct from 1 so it is recognisable in `kubectl describe`.
-const EXIT_CIRCUIT_REBUILD: i32 = 75;
+/// restarts; distinct from 1 so it is recognisable in `kubectl describe`. Shared with the epoch
+/// reset (ADR-0004), which leaves the counts pipelines in the same unrebuildable state.
+pub(crate) const EXIT_CIRCUIT_REBUILD: i32 = 75;
 
 /// How long the inline `ALTER … REPLICA IDENTITY FULL` may wait for its `ACCESS EXCLUSIVE` lock.
 /// The drift handler runs inside the ingestor, so an unbounded wait would stall EVERY table's
@@ -749,6 +750,47 @@ mod tests {
         // on the gate).
         let err = engine.create_shape(&items, None, None, false, true).await.unwrap_err().to_string();
         assert!(!err.contains("being resolved"), "the gate must clear with the lock: {err}");
+    }
+
+    /// A create that overlapped an epoch reset must never be installed (ADR-0004). Two independent
+    /// gates say so, and this exercises both against the reset's real critical section.
+    ///
+    /// A create that arrives while the reset is in flight is refused outright — its backfill would
+    /// take a snapshot at an LSN before the new slot's consistent point and permanently miss the
+    /// window between them. And a create that had already registered before the reset enumerated its
+    /// victims fails its closing check: the reset bumped the epoch generation in that same critical
+    /// section, so the create it did not see is rolled back rather than left serving a gap.
+    #[tokio::test]
+    async fn a_create_overlapping_an_epoch_reset_is_refused_or_rolled_back() {
+        let (engine, items) = engine_with_items().await;
+
+        // Captured as a create does, under the lock, before the reset runs.
+        let gens = engine.state.lock().await.capture_gens(std::slice::from_ref(&items));
+        assert!(engine.ensure_schema_unchanged(&gens).await.is_ok(), "nothing has moved yet");
+
+        let window = engine.force_epoch_reset_window().await;
+        // (a) a create arriving now never registers.
+        let err = engine.create_shape(&items, None, None, false, true).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::engine::EpochResetting>().is_some(),
+            "a create during a reset must get the typed retryable refusal: {err:#}"
+        );
+        assert!(engine.state.lock().await.shapes.is_empty(), "and must leave nothing registered");
+
+        // (b) the create that got in first fails its closing check instead.
+        let err = engine.ensure_schema_unchanged(&gens).await.unwrap_err().to_string();
+        assert!(err.contains("epoch was reset"), "unexpected closing refusal: {err}");
+
+        // The refusal is not sticky: once the reset has bound its new epoch, creates work again
+        // (this one fails later, on the absent DS server, not on the gate).
+        drop(window);
+        let err = engine.create_shape(&items, None, None, false, true).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::engine::EpochResetting>().is_none(),
+            "the gate must clear with the reset: {err:#}"
+        );
+        // …but a create captured in the OLD epoch stays refused — its generation is gone for good.
+        assert!(engine.ensure_schema_unchanged(&gens).await.is_err());
     }
 
     /// The replay guard, as a pure decision. A trigger whose transaction the boot seed already

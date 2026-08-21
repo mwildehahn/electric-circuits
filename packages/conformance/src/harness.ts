@@ -110,6 +110,8 @@ export interface Harness {
   schema: Schema
   /** Postgres connection string for this harness's database (the system of record). */
   pgUrl: string
+  /** This harness's logical replication slot (unique per database — see `bootHarness`). */
+  slot: string
   /** Everything the engine has written to stderr so far — for asserting on/absence of engine log lines. */
   engineStderr(): string
   /**
@@ -117,8 +119,11 @@ export interface Harness {
    * durable streams, Postgres, and slot. Returns once the new process is listening; `engineUrl`
    * is updated in place. The new engine restores its shapes from the durable catalog — nothing
    * re-registers them.
+   *
+   * `whileDown` runs after the old process is gone and before the new one starts — the window for
+   * things only an absent engine allows (dropping its replication slot, applying DDL).
    */
-  restartEngine(): Promise<void>
+  restartEngine(whileDown?: () => Promise<void>): Promise<void>
   shutdown(): Promise<void>
 }
 
@@ -131,6 +136,9 @@ export interface BootOptions {
   ddl?: string
   /** Extra env vars for the engine process (e.g. retention tuning: `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`). */
   engineEnv?: Record<string, string>
+  /** TEST-ONLY: runs after the tables exist and before the engine's FIRST boot — the window for
+   * state the engine is supposed to find already there (e.g. an operator-created replication slot). */
+  beforeEngine?: (info: { pgUrl: string; slot: string }) => Promise<void>
 }
 
 function adminUrl(): string {
@@ -224,6 +232,8 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     await c.query('INSERT INTO __el_sync (id, n) VALUES (1, 0)')
     await c.end()
 
+    await opts.beforeEngine?.({ pgUrl, slot })
+
     // 2. Boot durable-streams + the engine (Postgres mode) + API + client + oracle.
     server = new DurableStreamTestServer({ port: 0 })
     const dsUrl = await server.start()
@@ -245,10 +255,12 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
       oracle,
       schema,
       pgUrl,
+      slot,
       engineStderr: () => spawned.stderr(),
-      restartEngine: async () => {
+      restartEngine: async (whileDown?: () => Promise<void>) => {
         proc?.kill('SIGKILL')
         await new Promise((r) => proc?.once('exit', r))
+        await whileDown?.()
         spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
         proc = spawned.proc
         h.engineUrl = spawned.url

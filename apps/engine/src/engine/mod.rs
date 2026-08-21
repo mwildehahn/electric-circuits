@@ -26,6 +26,7 @@ mod catalog;
 mod circuit_serving;
 mod drift;
 pub(crate) mod emission;
+pub(crate) mod epoch;
 mod executors;
 mod introspection;
 mod lifecycle;
@@ -38,11 +39,13 @@ mod tests;
 
 use catalog::*;
 use circuit_serving::*;
+use epoch::*;
 use executors::*;
 use introspection::*;
 use planning::*;
 use sequencer::*;
 
+pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph,
@@ -181,6 +184,9 @@ pub struct Engine {
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
     /// after a checkpoint restore, where the highwater does the fencing instead).
     arr_gates: Arc<std::sync::RwLock<HashMap<TableRef, crate::pg::SnapshotGate>>>,
+    /// Which replication slot, in which cluster, this engine is bound to — and what to do when that
+    /// stops being true (see [`engine::epoch`], ADR-0004).
+    epoch: Arc<EpochState>,
 }
 
 /// A unit of deferred subquery propagation for the flip propagator (see [`Engine::flip_tx`]).
@@ -333,34 +339,53 @@ struct EngineState {
     /// catalog). Creates on them are refused with a retryable error and the ingestor decodes
     /// nothing for them; a per-table retry task keeps trying. Never a silent stale-serve.
     unresolved: HashSet<TableRef>,
+    /// **Epoch generation**, bumped in the same critical section in which an epoch reset enumerates
+    /// the shapes it is about to retire (`Engine::reset_epoch`, ADR-0004). The per-table
+    /// `schema_gen` closes the create-overtaken-by-a-drift race; this one closes its whole-engine
+    /// twin — a create that registered before the reset's enumeration would otherwise be purged by
+    /// it, or (worse) backfill at a snapshot taken before the NEW slot's consistent point and
+    /// permanently miss the window between them.
+    epoch_gen: u64,
 }
 
-/// The schema generations a create captured for every table it depends on.
+/// The generations a create captured for everything that can invalidate it: the schema of each table
+/// it depends on, and the engine's epoch.
 ///
 /// A create reads several tables (a subquery shape reads its outer table AND every referenced inner
 /// table), and any of them drifting invalidates the whole create — so the whole set travels
-/// together and is re-checked as one.
+/// together and is re-checked as one. The epoch rides along for the same reason and is re-checked in
+/// the same place: one closing check, whatever moved.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SchemaGens(Vec<(TableRef, u64)>);
+pub(crate) struct SchemaGens {
+    tables: Vec<(TableRef, u64)>,
+    /// `EngineState::epoch_gen` as it was when this create registered (ADR-0004).
+    epoch: u64,
+}
 
 impl EngineState {
-    /// Capture the current generation of each table. Call under the state lock, in the same
-    /// critical section that registers the create.
+    /// Capture the current generation of each table, and of the epoch. Call under the state lock, in
+    /// the same critical section that registers the create.
     fn capture_gens(&self, tables: &[TableRef]) -> SchemaGens {
-        SchemaGens(
-            tables
+        SchemaGens {
+            tables: tables
                 .iter()
                 .map(|t| (t.clone(), self.schema_gen.get(t).copied().unwrap_or(0)))
                 .collect(),
-        )
+            epoch: self.epoch_gen,
+        }
     }
 
     /// The first table whose generation moved since [`capture_gens`](Self::capture_gens), if any.
     fn drifted_since(&self, gens: &SchemaGens) -> Option<TableRef> {
-        gens.0
+        gens.tables
             .iter()
             .find(|(t, g)| self.schema_gen.get(t).copied().unwrap_or(0) != *g)
             .map(|(t, _)| t.clone())
+    }
+
+    /// Did an epoch reset run since [`capture_gens`](Self::capture_gens)?
+    fn epoch_reset_since(&self, gens: &SchemaGens) -> bool {
+        self.epoch_gen != gens.epoch
     }
 
     /// The first of `tables` whose schema is unresolved, if any.
@@ -539,6 +564,7 @@ impl Engine {
                 circuit_placement: HashMap::new(),
                 schema_gen: HashMap::new(),
                 unresolved: HashSet::new(),
+                epoch_gen: 0,
             })),
             pg_url,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
@@ -563,6 +589,7 @@ impl Engine {
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            epoch: EpochState::new(),
         }
     }
 
@@ -659,7 +686,23 @@ impl Engine {
 
     /// The guard every membership-bearing create/read path takes: once degraded, refuse rather than
     /// answer with membership the engine knows is wrong.
+    ///
+    /// Two independent degradations reach it, each with its own typed error (both 503): lost
+    /// membership effects ([`Degraded`], latched until restart) and a broken epoch under the refuse
+    /// policy ([`EpochBroken`], cleared by `POST /epoch/reset`). The epoch is checked first — it is
+    /// the more fundamental "this engine is not serving this database right now".
     pub fn ensure_not_degraded(&self) -> Result<()> {
+        // A reset in flight is checked FIRST: it is the transient, actionable one, and while it runs
+        // the epoch is also (correctly) latched broken — "retry in a moment" is the useful answer.
+        // Taken under the engine-state lock by every create, so a create either registered before
+        // the reset's enumeration (and is retired by it, then rolled back by its own closing check)
+        // or is refused here — never installed against a slot that is being replaced.
+        if self.epoch_resetting() {
+            return Err(anyhow::Error::new(EpochResetting));
+        }
+        if let Some(reason) = self.epoch_broken() {
+            return Err(anyhow::Error::new(EpochBroken { reason }));
+        }
         if self.degraded() {
             return Err(anyhow::Error::new(Degraded));
         }
@@ -698,7 +741,7 @@ impl Engine {
     /// engine answers 503, not 404). This destroys nothing a restart would have kept: a restart
     /// re-seeds every node from Postgres but DROPS every subquery shape — their inner-node state
     /// is not persisted, so the catalog restore deliberately does not restore them (see
-    /// `Engine::restore_from_catalog`) — and clients recreate them with `POST /shapes`.
+    /// `Engine::apply_catalog`) — and clients recreate them with `POST /shapes`.
     async fn reap_subquery_streams(&self) {
         let paths: Vec<String> = {
             let st = self.state.lock().await;
@@ -763,9 +806,12 @@ impl Engine {
 
     /// The `/v1/health` status string: `degraded` | `waiting` | `starting` | `active` (exact, no
     /// whitespace). `degraded` outranks every boot phase — an engine that has lost membership
-    /// effects is not healthy however far along its boot got.
+    /// effects, or whose epoch broke under the refuse policy (ADR-0004), is not healthy however far
+    /// along its boot got. The two are one status word on purpose: the fleet healthcheck
+    /// string-compares the body, and `GET /replication/lsn` is where the *reason* lives
+    /// (`flipFailures` vs `epoch.reason`).
     pub fn health_status(&self) -> &'static str {
-        if self.degraded() {
+        if self.degraded() || self.epoch_broken().is_some() {
             return "degraded";
         }
         match self.health.load(std::sync::atomic::Ordering::Relaxed) {
@@ -837,27 +883,71 @@ impl Engine {
             let ts = TableSchema::from_def(t, &def)?;
             compiled.insert(t.clone(), ts);
         }
-        crate::pg::ensure_slot(&client, slot).await?;
         self.ds.ensure_stream(crate::CHANGES_STREAM).await?;
         *self.tables_shared.write().unwrap() = compiled.clone();
         self.state.lock().await.tables = compiled.clone();
         self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
-        // Replay the durable shape catalog (restores shapes + the change-log replay offset), then
-        // start the sequencer from the restored position. Runs before the ingestor so the restored
-        // routing sees every replayed change.
-        // Start (and seed or restore) the dbsp arrangement layer BEFORE the catalog restore:
-        // the restore spawns the sequencer (which captures the handle + seed gates) and may
-        // re-register circuit-served shapes, both of which need the layer up. A failure here
-        // degrades to Postgres query-backs (the engine still runs), it does not abort boot.
+
+        // --- The epoch (ADR-0004) ---
+        //
+        // Read the durable catalog and DECIDE before restoring anything: the epoch the catalog's
+        // shapes belong to is recorded in that same log, and no shape may be resumed until the slot
+        // it depends on has been vouched for. A slot the engine cannot vouch for is not recreated
+        // quietly — every shape over it is missing an unknown span of WAL.
+        self.set_epoch_slot(slot);
+        // A catalog the engine could not READ is not a catalog with no epoch in it. Booting past an
+        // unreadable one would take the `FirstBoot` branch — create a slot at the current WAL head,
+        // append a `SlotBound` on top of whatever is already in the log — and the next boot, with
+        // storage healthy again, would Resume-restore shapes that were never `Dropped` straight over
+        // the gap. So it is fatal, exactly like a catalog written before ADR-0002: nothing may claim
+        // an epoch unless the log was read and demonstrably contained none.
+        let fold = self.fold_catalog().await.map_err(|e| {
+            if e.downcast_ref::<catalog::CatalogPredatesQualification>().is_some() {
+                return e;
+            }
+            e.context(
+                "durable catalog unreadable; refusing to decide the epoch (an unreadable catalog is \
+                 not an empty one — booting on would create a slot at the current WAL head and \
+                 silently orphan every shape already in the log). Fix durable-streams and restart.",
+            )
+        })?;
+        self.adopt_epoch_binding(fold.binding.clone());
+        let restored = match self.verify_epoch_at_boot(&client, slot).await? {
+            // Either the epoch is intact or this boot just started one. Restore as usual.
+            epoch::Verdict::FirstBoot | epoch::Verdict::Ok { .. } | epoch::Verdict::Busy { .. } => {
+                Some(fold)
+            }
+            epoch::Verdict::Break(reason) => {
+                // Park the records (see `RestoreMode::Park`): nothing is resumed, so no old-epoch
+                // shape is ever maintained, and the reset — now, or whenever the operator asks —
+                // still retires each one properly instead of orphaning its stream. Parking BEFORE
+                // the policy runs is what gives the auto reset something to retire.
+                self.apply_catalog(fold, &compiled, catalog::RestoreMode::Park).await?;
+                // The same latch/count/act path the ingestor's pre-connect check uses. A refusal is
+                // the expected outcome under the refuse policy, and boot continues (every route
+                // answers 503); a failed auto-reset leaves the break latched and the ingestor
+                // retries it.
+                if let Err(refused) = self.on_epoch_break(reason, slot).await {
+                    tracing::warn!("boot: ingest will not start — {refused}");
+                }
+                None
+            }
+        };
+        // Start (and seed) the dbsp arrangement layer BEFORE the catalog restore: the restore spawns
+        // the sequencer (which captures the handle + seed gates) and may re-register circuit-served
+        // shapes, both of which need the layer up. It is also after the epoch step, so a reset's new
+        // slot exists before the seed snapshot is taken — otherwise the circuit would miss the
+        // changes between the two. A failure here degrades to Postgres query-backs (the engine still
+        // runs), it does not abort boot.
         if let Err(e) = self.maybe_start_arrangements(&compiled).await {
             tracing::error!("dbsp arrangements failed to start (falling back to Postgres): {e:#}");
         }
-        if let Err(e) = self.restore_catalog(&compiled).await {
-            // A catalog written before ADR-0002 is not a restore failure to shrug off — booting past
-            // it would maintain two shapes for one table (see `CatalogPredatesQualification`).
-            if e.downcast_ref::<catalog::CatalogPredatesQualification>().is_some() {
-                return Err(e);
-            }
+        // Replay the durable shape catalog (restores shapes + the change-log replay offset), then
+        // start the sequencer from the restored position. Runs before the ingestor so the restored
+        // routing sees every replayed change.
+        if let Some(fold) = restored
+            && let Err(e) = self.apply_catalog(fold, &compiled, catalog::RestoreMode::Resume).await
+        {
             tracing::error!("catalog restore failed (continuing empty): {e:#}");
         }
         {
@@ -872,6 +962,9 @@ impl Engine {
         }
         // The ingestor reads the LIVE schema view (not a boot-time copy) and reports schema drift
         // / TRUNCATE back through `SchemaEvents`, which `Engine` implements (see `engine::drift`).
+        // It is spawned even when the epoch is broken and the policy is refuse: `EpochEvents`
+        // refuses every connection until `POST /epoch/reset`, so it parks in its backoff loop and
+        // starts streaming the moment the operator acts — no ingest happens in the meantime.
         tokio::spawn(crate::replication::run(
             url,
             slot.to_string(),
@@ -879,6 +972,7 @@ impl Engine {
             self.ds.clone(),
             self.tables_shared.clone(),
             Arc::new(self.clone()) as Arc<dyn crate::replication::SchemaEvents>,
+            Arc::new(self.clone()) as Arc<dyn crate::replication::EpochEvents>,
             self.repl_lsn.clone(),
             self.repl_sync.clone(),
         ));

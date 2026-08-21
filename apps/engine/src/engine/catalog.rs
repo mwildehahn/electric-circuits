@@ -38,6 +38,11 @@ pub(crate) enum CatalogEvent {
     /// already `Dropped` in the log. It is written so the durable record explains *why* a swathe of
     /// shapes disappeared at a given point.
     SchemaChanged { table: TableRef, fingerprint: crate::schema::SchemaFingerprint },
+    /// The engine created (or first adopted) its replication slot: the **epoch** every shape after
+    /// this point in the log belongs to (ADR-0004). The LAST one wins — a reset appends a new one
+    /// after the `Dropped` records of the epoch it ended, so a fold reads "these shapes, in this
+    /// epoch" straight off the log.
+    SlotBound(crate::engine::epoch::SlotBinding),
 }
 
 /// The catalog writer's ordered channel, plus the count of events sent but not yet appended.
@@ -150,15 +155,98 @@ pub(crate) async fn ensure_catalog(ds: &DsClient) -> bool {
 }
 
 
+/// One shape as the fold reconstructed it: (record, sharing signature, refcount, dormant resume
+/// state). The last `Dormant`/`Reactivated` event wins.
+type Restored = (ShapeRecord, Option<String>, usize, Option<(String, crate::pg::SnapshotGate)>);
+
+/// The durable catalog, folded — everything a boot needs before it decides what to *do* with it.
+///
+/// Reading and deciding are separate because the epoch check has to happen between them (ADR-0004):
+/// the binding to verify against is in the log, and no shape may be resumed before the verdict is
+/// in.
+pub(crate) struct CatalogFold {
+    recs: HashMap<String, Restored>,
+    /// The sequencer's change-log replay start (the last `Offset` checkpoint).
+    start_offset: String,
+    /// The last `SlotBound`: the epoch these shapes belong to. `None` = nothing ever claimed one,
+    /// which is a genuine first boot.
+    pub(crate) binding: Option<crate::engine::epoch::SlotBinding>,
+}
+
+impl Default for CatalogFold {
+    fn default() -> Self {
+        CatalogFold { recs: HashMap::new(), start_offset: "-1".to_string(), binding: None }
+    }
+}
+
+impl CatalogFold {
+    /// Fold one event in. Pure (no engine, no IO), so the log's semantics — last-writer-wins for the
+    /// epoch and the offset, remove-on-drop for the shapes — are unit-testable.
+    fn apply(&mut self, ev: CatalogEvent) {
+        match ev {
+            CatalogEvent::Created { rec, sig } => {
+                self.recs.insert(rec.id.clone(), (rec, sig, 1, None));
+            }
+            CatalogEvent::Joined { id } => {
+                if let Some(e) = self.recs.get_mut(&id) {
+                    e.2 += 1;
+                }
+            }
+            CatalogEvent::Left { id } => {
+                if let Some(e) = self.recs.get_mut(&id) {
+                    e.2 = e.2.saturating_sub(1);
+                }
+            }
+            CatalogEvent::Dormant { id, resume_offset, gate } => {
+                if let Some(e) = self.recs.get_mut(&id) {
+                    e.3 = Some((resume_offset, gate));
+                }
+            }
+            CatalogEvent::Reactivated { id } => {
+                if let Some(e) = self.recs.get_mut(&id) {
+                    e.3 = None;
+                }
+            }
+            CatalogEvent::Dropped { id } => {
+                self.recs.remove(&id);
+            }
+            CatalogEvent::Offset { offset } => self.start_offset = offset,
+            // Audit only (see the variant): the shapes it explains are already `Dropped`,
+            // and the boot's own introspection is the authority on the schema.
+            CatalogEvent::SchemaChanged { .. } => {}
+            // The LAST binding is the epoch in force. A reset appends its new one after the
+            // `Dropped` records of the epoch it ended, so the two always agree.
+            CatalogEvent::SlotBound(binding) => self.binding = Some(binding),
+        }
+    }
+
+    /// Nothing was ever written (or everything was dropped and nothing checkpointed).
+    fn is_empty(&self) -> bool {
+        self.recs.is_empty() && self.start_offset == "-1"
+    }
+}
+
+/// How much of a folded catalog a boot actually installs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreMode {
+    /// The ordinary boot: restore the records and re-register them with the sequencer.
+    Resume,
+    /// The epoch broke (ADR-0004). Restore the shape RECORDS and nothing else — no resume, no
+    /// sequencer registration, no retention lifecycle, and above all no teardown of its own.
+    ///
+    /// The records are what a reset needs in order to retire the shapes *properly* (close the
+    /// stream, then delete it, and write `Dropped`), whether that reset happens immediately (the
+    /// auto policy) or when an operator posts `/epoch/reset`. Nothing is resumed, so no old-epoch
+    /// shape is ever maintained for an instant; nothing is destroyed either, so a refusing engine
+    /// has not thrown anything away before the human said so.
+    Park,
+}
+
 impl Engine {
-    /// Replay the durable shape catalog and re-register every restorable shape with the (not yet
-    /// spawned) sequencer — see [`CATALOG_STREAM`] for the restore semantics per shape kind.
-    pub(crate) async fn restore_catalog(&self, compiled: &HashMap<TableRef, TableSchema>) -> Result<()> {
-        // 1. Fold the event log.
-        // (rec, sig, refcount, dormant resume state). The last Dormant/Reactivated event wins.
-        type Restored = (ShapeRecord, Option<String>, usize, Option<(String, crate::pg::SnapshotGate)>);
-        let mut recs: HashMap<String, Restored> = HashMap::new();
-        let mut start_offset = "-1".to_string();
+    /// Read the durable shape catalog and fold it. No engine state is touched — see
+    /// [`Self::apply_catalog`] for that half.
+    pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
+        let mut fold = CatalogFold::default();
         let mut off = "-1".to_string();
         loop {
             let (events, next, up_to_date) = self.ds.read_json(CATALOG_STREAM, &off).await?;
@@ -176,49 +264,48 @@ impl Engine {
                     }));
                 }
                 let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
-                match ev {
-                    CatalogEvent::Created { rec, sig } => {
-                        recs.insert(rec.id.clone(), (rec, sig, 1, None));
-                    }
-                    CatalogEvent::Joined { id } => {
-                        if let Some(e) = recs.get_mut(&id) {
-                            e.2 += 1;
-                        }
-                    }
-                    CatalogEvent::Left { id } => {
-                        if let Some(e) = recs.get_mut(&id) {
-                            e.2 = e.2.saturating_sub(1);
-                        }
-                    }
-                    CatalogEvent::Dormant { id, resume_offset, gate } => {
-                        if let Some(e) = recs.get_mut(&id) {
-                            e.3 = Some((resume_offset, gate));
-                        }
-                    }
-                    CatalogEvent::Reactivated { id } => {
-                        if let Some(e) = recs.get_mut(&id) {
-                            e.3 = None;
-                        }
-                    }
-                    CatalogEvent::Dropped { id } => {
-                        recs.remove(&id);
-                    }
-                    CatalogEvent::Offset { offset } => start_offset = offset,
-                    // Audit only (see the variant): the shapes it explains are already `Dropped`,
-                    // and the boot's own introspection is the authority on the schema.
-                    CatalogEvent::SchemaChanged { .. } => {}
-                }
+                fold.apply(ev);
             }
             match next {
                 Some(n) if !up_to_date && n != off => off = n,
                 _ => break,
             }
         }
-        if recs.is_empty() && start_offset == "-1" {
+        Ok(fold)
+    }
+
+    /// Install a folded catalog: re-register every restorable shape with the (not yet spawned)
+    /// sequencer — see [`CATALOG_STREAM`] for the restore semantics per shape kind — or, in
+    /// [`RestoreMode::Park`], record them and stop there.
+    pub(crate) async fn apply_catalog(
+        &self,
+        fold: CatalogFold,
+        compiled: &HashMap<TableRef, TableSchema>,
+        mode: RestoreMode,
+    ) -> Result<()> {
+        if fold.is_empty() {
             return Ok(());
         }
+        let CatalogFold { recs, start_offset, .. } = fold;
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_offset}", recs.len());
         *self.seq_start.lock().unwrap() = start_offset;
+
+        if mode == RestoreMode::Park {
+            // The epoch broke: hold the records, touch nothing else (see `RestoreMode::Park`).
+            let mut st = self.state.lock().await;
+            for (id, (rec, _, _, _)) in recs {
+                if let Ok(num) = id.trim_start_matches('s').parse::<u64>() {
+                    st.next_shape_id = st.next_shape_id.max(num + 1);
+                }
+                st.shapes.insert(id, rec);
+            }
+            tracing::warn!(
+                "catalog restore: {} shape(s) parked over a broken epoch — none is resumed or \
+                 maintained; they exist only to be retired by the reset",
+                st.shapes.len()
+            );
+            return Ok(());
+        }
 
         // 2. Restore records + shares; subquery shapes are dropped (see CATALOG_STREAM docs).
         let mut resume: Vec<ShapeRecord> = Vec::new();
@@ -327,7 +414,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Re-register one restored shape with the sequencer (the resume half of `restore_catalog`).
+    /// Re-register one restored shape with the sequencer (the resume half of `apply_catalog`).
     pub(crate) async fn resume_shape(
         &self,
         cmd_tx: &mpsc::UnboundedSender<SequencerCmd>,
@@ -473,6 +560,80 @@ mod tests {
         match ok {
             CatalogEvent::Created { rec, .. } => assert_eq!(rec.table.to_string(), "other.users"),
             other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    fn bound(slot: &str, sysid: &str, at: &str) -> CatalogEvent {
+        CatalogEvent::SlotBound(crate::engine::epoch::SlotBinding {
+            system_identifier: sysid.to_string(),
+            timeline_id: 1,
+            slot: slot.to_string(),
+            bound_at: at.to_string(),
+        })
+    }
+
+    fn fold_of(events: Vec<CatalogEvent>) -> CatalogFold {
+        let mut fold = CatalogFold::default();
+        for ev in events {
+            fold.apply(ev);
+        }
+        fold
+    }
+
+    /// A catalog with no `SlotBound` anywhere is a genuine first boot — the state that licenses the
+    /// engine to create a slot from nothing (ADR-0004).
+    #[test]
+    fn a_catalog_without_a_binding_folds_to_no_epoch() {
+        let fold = fold_of(vec![CatalogEvent::Offset { offset: "42".to_string() }]);
+        assert!(fold.binding.is_none());
+        assert_eq!(fold.start_offset, "42");
+        // Nothing at all folds to the empty catalog, which the restore skips outright.
+        assert!(CatalogFold::default().is_empty());
+    }
+
+    /// The LAST binding is the epoch in force: a reset appends its new one after the `Dropped`
+    /// records of the epoch it ended, so the fold must not stop at the first.
+    #[test]
+    fn the_last_slot_bound_wins() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            bound("s", "7300000000000000001", "2026-08-20T09:00:00.000Z"),
+            created,
+            CatalogEvent::Dropped { id: "s1".to_string() },
+            bound("s", "7300000000000000001", "2026-08-21T11:30:00.000Z"),
+        ]);
+        let b = fold.binding.expect("the epoch is folded out of the log");
+        assert_eq!(b.bound_at, "2026-08-21T11:30:00.000Z", "the newest binding is the epoch in force");
+        assert!(fold.recs.is_empty(), "the epoch it ended took its shapes with it");
+    }
+
+    /// The binding survives everything else in the log — dropping every shape does not drop the
+    /// epoch, and the epoch does not disturb the shapes.
+    #[test]
+    fn shapes_and_the_binding_fold_independently() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            bound("s", "7300000000000000001", "2026-08-21T11:30:00.000Z"),
+            created,
+            CatalogEvent::Joined { id: "s1".to_string() },
+        ]);
+        assert_eq!(fold.binding.map(|b| b.slot), Some("s".to_string()));
+        assert_eq!(fold.recs.get("s1").map(|r| r.2), Some(2), "create + join = refcount 2");
+    }
+
+    /// The event is stored (and restored) as its own `t` case, alongside the shape lifecycle — a
+    /// catalog is one log, and its epoch is part of it.
+    #[test]
+    fn slot_bound_round_trips_on_the_wire() {
+        let json = serde_json::to_value(bound("electric_circuits", "73", "2026-08-21T11:30:00.000Z")).unwrap();
+        assert_eq!(json["t"], "slotBound");
+        assert_eq!(json["slot"], "electric_circuits");
+        assert_eq!(json["system_identifier"], "73");
+        assert_eq!(json["timeline_id"], 1);
+        assert_eq!(json["bound_at"], "2026-08-21T11:30:00.000Z");
+        match serde_json::from_value::<CatalogEvent>(json).unwrap() {
+            CatalogEvent::SlotBound(b) => assert_eq!(b.system_identifier, "73"),
+            other => panic!("expected SlotBound, got {other:?}"),
         }
     }
 }

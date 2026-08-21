@@ -106,6 +106,8 @@ pub struct Metrics {
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
     pub schema_drift: AtomicU64,       // ADR-0005: tables whose dependents were retired (drift / TRUNCATE / identity regression / drop)
     pub schema_unresolved: AtomicU64,  // ADR-0005: drifts that could not be resolved (table parked, retrying)
+    pub epoch_breaks: AtomicU64,       // ADR-0004: slots the engine could no longer vouch for
+    pub epoch_resets: AtomicU64,       // ADR-0004: new epochs bound (every shape retired, fresh slot)
     pub process_envelope: Hist,   // end-to-end fan-out latency per table envelope
     pub family_step: Hist,        // one family circuit transaction
     pub append: Hist,             // one shape-stream append (durable-streams round-trip)
@@ -124,6 +126,8 @@ pub fn metrics() -> &'static Metrics {
         retention_pressure: AtomicU64::new(0),
         schema_drift: AtomicU64::new(0),
         schema_unresolved: AtomicU64::new(0),
+        epoch_breaks: AtomicU64::new(0),
+        epoch_resets: AtomicU64::new(0),
         process_envelope: Hist::new(),
         family_step: Hist::new(),
         append: Hist::new(),
@@ -143,6 +147,8 @@ impl Metrics {
                 "retention_pressure": self.retention_pressure.load(Ordering::Relaxed),
                 "schema_drift_total": self.schema_drift.load(Ordering::Relaxed),
                 "schema_unresolved_total": self.schema_unresolved.load(Ordering::Relaxed),
+                "epoch_breaks_total": self.epoch_breaks.load(Ordering::Relaxed),
+                "epoch_resets_total": self.epoch_resets.load(Ordering::Relaxed),
             },
             "process_envelope_us": self.process_envelope.snapshot(),
             "family_step_us": self.family_step.snapshot(),
@@ -162,6 +168,8 @@ impl Metrics {
         self.retention_pressure.store(0, Ordering::Relaxed);
         self.schema_drift.store(0, Ordering::Relaxed);
         self.schema_unresolved.store(0, Ordering::Relaxed);
+        self.epoch_breaks.store(0, Ordering::Relaxed);
+        self.epoch_resets.store(0, Ordering::Relaxed);
         self.process_envelope.reset();
         self.family_step.reset();
         self.append.reset();

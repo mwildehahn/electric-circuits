@@ -78,6 +78,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_PG_POLL_MS`| no       | —                | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery). |
 | `ELECTRIC_CIRCUITS_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
 | `ELECTRIC_CIRCUITS_LOG`       | no       | `info`           | Log filter (`error`, `warn`, `info`, `debug`). |
+| `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | no | `true`      | Policy when the replication slot can no longer be trusted: `true` retires every shape and starts a new epoch; `false` refuses (fail-closed) until `POST /epoch/reset`. See "Losing the replication slot" below. |
 
 ¹ Omit `ELECTRIC_CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
 
@@ -112,6 +113,32 @@ activeUsers.subscribe((rows) => render(rows))
   retains WAL for it. If you decommission an engine, drop its slot:
   `SELECT pg_drop_replication_slot('<slot>');` Monitor `pg_replication_slots.confirmed_flush_lsn` vs
   `pg_current_wal_lsn()` to watch lag.
+- **Losing the replication slot costs a full resync — and the engine says so.** The engine records
+  which slot, in which cluster (`pg_control_system().system_identifier`), it is bound to, and checks
+  that binding before *every* connection. Things that break it in practice:
+  `max_slot_wal_keep_size` reclaiming the WAL the slot needed (`pg_replication_slots.wal_status`
+  goes to `lost`); restoring the database from a backup or a snapshot (new `system_identifier`,
+  and usually no slot — slots are not part of a `pg_dump` and do not survive a PITR); a **major
+  version upgrade** (`pg_upgrade` does not carry logical slots across); and an operator or cleanup
+  script dropping it. There is no way to recover the changes that happened in the gap, so every
+  shape built on that slot is wrong.
+
+  With the default `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=true` the engine **resets**: it retires
+  every shape (each stream closed, then deleted — clients see the same `stream-closed`/404 they see
+  for an eviction and re-subscribe), creates a fresh slot under the same name, records the new epoch,
+  and resumes. Expect a backfill storm proportional to your live shape count, and note that a table
+  with a counts pipeline additionally restarts the process (exit `75`). With
+  `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false` it **refuses**: ingest stops, `/v1/health` reports
+  `degraded` (503) and every shape route answers 503, `GET /replication/lsn` names the reason
+  (`epoch.state = "broken"`, `epoch.reason` = `slot_lost` | `slot_wal_lost` |
+  `system_identifier_mismatch`), and nothing is torn down until you post `/epoch/reset` — which then
+  performs exactly the reset above. Pick `false` when an unscheduled resync is worse than an outage
+  (and alert on `epoch_breaks_total`); pick the default when an unattended deployment must heal
+  itself. Either way, budget `max_slot_wal_keep_size` for your worst expected engine downtime.
+- **A durable-streams outage at boot stops the engine, deliberately.** The epoch is decided from the
+  durable catalog, so a catalog the engine cannot read is refused rather than guessed at — booting on
+  would look like "no epoch has ever been claimed", create a slot at the current WAL head, and leave
+  every shape already in the log undropped and short of the gap. Restore durable-streams and restart.
 - **Consistency:** on shape registration the engine takes a `REPEATABLE READ` snapshot of the
   matching rows (the backfill) and, atomically with it, captures the snapshot's
   `pg_current_snapshot()` — the **snapshot gate**. Each replicated change is stamped with its
