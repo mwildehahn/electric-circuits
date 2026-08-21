@@ -216,8 +216,18 @@ export interface ChangeEvent {
   row?: Row
 }
 
-/** The single ordered change log every table write rides on (replication and library mode). */
-export const CHANGES_STREAM = 'changes'
+/**
+ * The single ordered change log every table write rides on (replication and library mode). It is
+ * **segmented** (ADR-0006): `changes/0`, `changes/1`, … , rotated by size or age and deleted once
+ * nothing can resume inside them, so there is no un-suffixed `changes` stream — always address a
+ * segment. Which one is current comes from the engine (`GET /replication/lsn` -> `changes.segment`).
+ */
+export const CHANGES_PREFIX = 'changes'
+
+/** Stream path of change-log segment `n`. */
+export function changesSegmentPath(n: number): string {
+  return `${CHANGES_PREFIX}/${n}`
+}
 
 
 export function shapeStreamPath(shapeId: string): string {

@@ -599,7 +599,7 @@ impl Engine {
     }
 
     /// Make sure a shape is active, reactivating it from dormancy if needed ("any touch
-    /// reactivates"): replay the change log from the shape's resume offset through its predicate
+    /// reactivates"): replay the change log from the shape's resume position through its predicate
     /// onto the retained stream — no Postgres backfill — then re-register it for live routing.
     /// Concurrent touches coalesce onto one replay; a touch during deactivation waits for the
     /// transition to settle first. Also refreshes `last_read`.
@@ -621,44 +621,74 @@ impl Engine {
                         match &life.state {
                             LifeState::Active => Step::Done,
                             LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
-                            LifeState::Reactivating { done } => Step::WaitReactivate(done.clone()),
-                            LifeState::Dormant { resume_offset, gate, .. } => {
+                            LifeState::Reactivating { done, .. } => Step::WaitReactivate(done.clone()),
+                            LifeState::Dormant { resume, gate, .. } => {
                                 // Kick off the replay in a DETACHED task: `ensure_active` futures
                                 // are dropped when an HTTP client disconnects, and a cancelled
                                 // in-place replay would strand the shape in `Reactivating`. The
                                 // task always settles the lifecycle state and publishes the
                                 // outcome; this caller then awaits THIS attempt's channel like any
                                 // concurrent toucher.
-                                let resume_offset = resume_offset.clone();
+                                let resume = resume.clone();
                                 let gate = gate.clone();
                                 let (tx, rx) = tokio::sync::watch::channel(None);
-                                life.state = LifeState::Reactivating { done: rx.clone() };
+                                life.state = LifeState::Reactivating { done: rx.clone(), resume: resume.clone() };
                                 let engine = self.clone();
                                 let id = id.to_string();
                                 tokio::spawn(async move {
-                                    let res = engine.resume_dormant(&id, resume_offset.clone(), gate.clone()).await;
-                                    let mut lives = engine.lives.lock().unwrap();
-                                    match res {
+                                    let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
+                                    let err = match res {
                                         Ok(()) => {
+                                            let mut lives = engine.lives.lock().unwrap();
                                             if let Some(life) = lives.get_mut(&id) {
                                                 life.state = LifeState::Active;
                                                 life.last_read = std::time::Instant::now();
                                             }
+                                            drop(lives);
                                             let _ = tx.send(Some(true));
+                                            return;
                                         }
-                                        Err(e) => {
-                                            tracing::warn!("reactivating shape {id} failed: {e:#}");
-                                            // Restore the dormant resume state so a later touch retries.
-                                            if let Some(life) = lives.get_mut(&id) {
-                                                life.state = LifeState::Dormant {
-                                                    since: std::time::Instant::now(),
-                                                    resume_offset,
-                                                    gate,
-                                                };
-                                            }
-                                            let _ = tx.send(Some(false));
+                                        Err(e) => e,
+                                    };
+                                    // The replay's resume SEGMENT is gone (ADR-0006). Nothing can
+                                    // bring this shape up to date — the changes it is missing are
+                                    // not anywhere any more — so it is evicted rather than parked
+                                    // back as dormant with a resume position that will 404 on every
+                                    // future touch. Subscribers get 404 / `stream-closed` and
+                                    // recreate, which backfills them from Postgres.
+                                    if crate::ds::is_stream_gone(&err) {
+                                        tracing::error!(
+                                            "reactivating shape {id}: its change-log resume segment {} is gone \
+                                             ({err:#}); evicting the shape — it can never be brought up to date",
+                                            crate::changelog::segment_path(resume.segment)
+                                        );
+                                        // Put it back as dormant first: `evict_shape` only evicts a
+                                        // settled shape, and this one is still `Reactivating`.
+                                        if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                            life.state = LifeState::Dormant {
+                                                since: std::time::Instant::now(),
+                                                resume: resume.clone(),
+                                                gate: gate.clone(),
+                                            };
                                         }
+                                        if let Err(e) =
+                                            engine.evict_shape(&id, EvictReason::ChangeLogRetention).await
+                                        {
+                                            tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
+                                        }
+                                        let _ = tx.send(Some(false));
+                                        return;
                                     }
+                                    tracing::warn!("reactivating shape {id} failed: {err:#}");
+                                    // Restore the dormant resume state so a later touch retries.
+                                    if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                        life.state = LifeState::Dormant {
+                                            since: std::time::Instant::now(),
+                                            resume,
+                                            gate,
+                                        };
+                                    }
+                                    let _ = tx.send(Some(false));
                                 });
                                 Step::WaitReactivate(rx)
                             }
@@ -693,12 +723,12 @@ impl Engine {
     }
 
     /// The replay half of a reactivation: re-register the shape through the sequencer's two-phase
-    /// pending-buffer handshake, but replay the change log from the dormant resume offset instead
-    /// of taking a Postgres snapshot. Live deltas arriving during the replay buffer in the pending
+    /// pending-buffer handshake, but replay the change log from the dormant resume position instead
+    /// of taking a Postgres snapshot (following rotation pointers across segments, ADR-0006). Live deltas arriving during the replay buffer in the pending
     /// shape and drain through the same gate at activation; any overlap between the replay and the
     /// buffer double-applies only absolute per-pk upserts/deletes — idempotent for stream readers.
     /// Split from [`ensure_active`] so the lifecycle bookkeeping stays in one place.
-    pub(crate) async fn resume_dormant(&self, id: &str, resume_offset: String, gate: crate::pg::SnapshotGate) -> Result<()> {
+    pub(crate) async fn resume_dormant(&self, id: &str, resume: LogPosition, gate: crate::pg::SnapshotGate) -> Result<()> {
         let (rec, ts, pred, out_cols, num_id, cmd_tx, gens) = {
             let mut st = self.state.lock().await;
             let rec =
@@ -737,7 +767,7 @@ impl Engine {
             out_cols.as_ref(),
             &gate,
             &rec.stream_path,
-            &resume_offset,
+            &resume,
         )
         .await
         {
@@ -780,7 +810,7 @@ impl Engine {
     }
 
     /// Move an idle refcount-0 shape from active to dormant: the sequencer unregisters its
-    /// routing and hands back the resume state (fully-processed change-log offset + the shape's
+    /// routing and hands back the resume state (fully-processed change-log position + the shape's
     /// snapshot gate); the stream and record are retained. Rechecks eligibility under the locks —
     /// a touch or rejoin racing the sweep wins.
     ///
@@ -817,14 +847,14 @@ impl Engine {
         let mut lives = self.lives.lock().unwrap();
         let Some(life) = lives.get_mut(id) else { return Ok(()) };
         match resume {
-            Some((resume_offset, gate)) => {
+            Some((resume, gate)) => {
                 life.state = LifeState::Dormant {
                     since: std::time::Instant::now(),
-                    resume_offset: resume_offset.clone(),
+                    resume: resume.clone(),
                     gate: gate.clone(),
                 };
                 drop(lives);
-                self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume_offset, gate });
+                self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume, gate });
                 metrics().shapes_dormanted.fetch_add(1, Ordering::Relaxed);
                 trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDormant { shape: id.to_string() });
                 tracing::debug!("shape {id} went dormant (idle)");
@@ -849,9 +879,11 @@ impl Engine {
     /// shapes (subquery / aggregate — see [`crate::retention`]), which the TTL layer evicts
     /// straight from active with a full teardown. Rechecks eligibility under the locks — a
     /// reactivation or rejoin racing the sweep wins.
-    pub(crate) async fn evict_shape(&self, id: &str, reason: EvictReason) -> Result<()> {
+    pub(crate) async fn evict_shape(&self, id: &str, reason: EvictReason) -> Result<Evicted> {
         let mut st = self.state.lock().await;
-        let Some(rec) = st.shapes.get(id).cloned() else { return Ok(()) };
+        // No record: the shape is already gone, so whatever it held (a change-log segment pin
+        // included) is released — that IS the outcome the caller asked for.
+        let Some(rec) = st.shapes.get(id).cloned() else { return Ok(Evicted::Yes) };
         let parkable = !rec.is_subquery && rec.aggregate.is_none();
         {
             let mut lives = self.lives.lock().unwrap();
@@ -865,10 +897,10 @@ impl Engine {
                 _ => false, // transitioning (or already evicted) since the sweep snapshot
             };
             if !evictable {
-                return Ok(());
+                return Ok(Evicted::Skipped);
             }
             if st.feed_shares.get(id).is_some_and(|s| s.refcount > 0) {
-                return Ok(());
+                return Ok(Evicted::Skipped);
             }
             lives.remove(id);
         }
@@ -903,7 +935,7 @@ impl Engine {
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("evicted shape {id} ({})", reason.as_str());
         }
-        Ok(())
+        Ok(Evicted::Yes)
     }
 
     /// One retention sweep: snapshot every shape's status, run the pure layered policy
@@ -969,6 +1001,149 @@ impl Engine {
                 tracing::warn!("retention: evicting shape {id} failed: {e:#}");
             }
         }
+        // Same tick, second half: the change log's own retention (ADR-0006).
+        self.sweep_change_log().await;
+    }
+
+    /// Delete the change-log segments nothing can resume inside any more, evicting first the
+    /// dormant shapes that would pin one past the retain window (ADR-0006).
+    ///
+    /// The decision itself is [`crate::changelog::plan_segment_deletion`] — pure, so the interlock
+    /// (floor, pins, retain window, never the current segment) is unit-tested without storage. This
+    /// half snapshots the inputs, executes, and enforces three things the pure planner cannot:
+    ///
+    /// - **the floor is the DURABLE checkpoint**, not the sequencer's in-memory position. The
+    ///   sequencer publishes a crossing the instant it happens, but the checkpoint that survives a
+    ///   restart is an async catalog append; deleting on the in-memory position would let a sweep
+    ///   delete segment `n` while a restart would still resume inside it;
+    /// - **the plan is recomputed after the evictions**, from a fresh snapshot and with the retain
+    ///   window switched off, so what is deleted is only what the pins that *actually remain* leave
+    ///   unpinned. An eviction that turned into a no-op (the shape was touched between planning and
+    ///   eviction, and is now reactivating) therefore cannot license deleting its segment;
+    /// - **nothing is deleted while a shape is `Deactivating`**. Its resume position is captured by
+    ///   the sequencer and only lands in `LifeState::Dormant` a moment later; in that window it pins
+    ///   nothing observable, so the sweep simply waits for the next tick.
+    pub(crate) async fn sweep_change_log(&self) {
+        let current = self.changes.state().current();
+        let has_sequencer = self.state.lock().await.sequencer.is_some();
+        // With no sequencer there is no consumer of the log at all — a Postgres-mode engine over
+        // which no shape has ever been created, or one whose restored catalog held none. The log
+        // still grows under the ingestor, so "nothing is deletable" would break the disk bound.
+        // The floor is then the CURRENT segment: nothing can ever need an earlier one, because a
+        // shape created later backfills from Postgres behind its own snapshot gate and starts
+        // reading from wherever the sequencer is spawned. Advance the DURABLE checkpoint to say so
+        // — that is what a later sequencer starts from, and it is also what licenses the delete.
+        if !has_sequencer {
+            let target = LogPosition::start_of(current);
+            if self.catalog_tx.durable_offset().is_none_or(|d| d < target) {
+                // Both halves of "a sequencer spawned later starts here": the durable record (which
+                // is also what licenses the delete, once it lands) and the in-memory start position
+                // `ensure_sequencer` reads.
+                *self.seq_start.lock().unwrap() = target.clone();
+                self.catalog_tx.send(CatalogEvent::Offset { pos: target });
+            }
+        }
+        // The floor. `None` = nothing durable yet (a first boot that has not checkpointed), which
+        // reads as segment 0 — i.e. nothing is deletable, which is the safe answer.
+        let floor = self.catalog_tx.durable_offset().map(|p| p.segment).unwrap_or(0);
+        let segments = self.changes.state().segments();
+        let plan = crate::changelog::plan_segment_deletion(
+            &segments,
+            current,
+            floor,
+            &self.segment_pins(),
+            self.changes.config().retain,
+            crate::changelog::now_secs(),
+        );
+        let mut evicted_all = true;
+        for id in &plan.evict {
+            tracing::info!(
+                "change log: evicting dormant shape {id} — its resume segment was rotated out more than {:?} ago",
+                self.changes.config().retain
+            );
+            match self.evict_shape(id, EvictReason::ChangeLogRetention).await {
+                Ok(Evicted::Yes) => {}
+                Ok(Evicted::Skipped) => {
+                    tracing::info!("change log: shape {id} was touched or re-subscribed; its pin stands");
+                    evicted_all = false;
+                }
+                Err(e) => {
+                    tracing::warn!("change log: evicting shape {id} failed: {e:#}");
+                    evicted_all = false;
+                }
+            }
+        }
+        // Re-snapshot and re-plan with the retain window OFF: every pin that still exists now
+        // counts, however old. This is the step that makes a failed/skipped eviction harmless.
+        let pins = self.segment_pins();
+        let deletable = crate::changelog::plan_segment_deletion(
+            &self.changes.state().segments(),
+            self.changes.state().current(),
+            self.catalog_tx.durable_offset().map(|p| p.segment).unwrap_or(0),
+            &pins,
+            std::time::Duration::ZERO,
+            crate::changelog::now_secs(),
+        );
+        let deactivating = self
+            .lives
+            .lock()
+            .unwrap()
+            .values()
+            .any(|l| matches!(l.state, LifeState::Deactivating { .. }));
+        if !evicted_all || deactivating {
+            if !deletable.delete.is_empty() {
+                tracing::info!(
+                    "change log: deferring {} segment deletion(s) to the next sweep ({})",
+                    deletable.delete.len(),
+                    if deactivating { "a shape is mid-deactivation" } else { "a planned eviction did not happen" }
+                );
+            }
+        } else {
+            for segment in &deletable.delete {
+                let path = crate::changelog::segment_path(*segment);
+                // Retirement (close, then delete): closing a rotated-out segment is a no-op (the
+                // rotation closed it) but keeps every engine-initiated removal on one path.
+                match self.ds.retire_stream(&path).await {
+                    Ok(()) => {
+                        self.changes.state().forget(*segment);
+                        self.catalog_tx.send(CatalogEvent::ChangesSegmentDeleted { segment: *segment });
+                        metrics().changes_segments_deleted.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!("change log: deleted {path} (behind the durable checkpoint, unpinned)");
+                    }
+                    Err(e) => tracing::warn!("change log: deleting {path} failed: {e:#}"),
+                }
+            }
+        }
+        metrics().changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
+    }
+
+    /// Every shape currently holding a change-log segment against deletion (ADR-0006).
+    ///
+    /// A **dormant** shape pins the segment it will resume from, and the sweeper may release that
+    /// pin by evicting it. A **reactivating** one is replaying from that same position right now: it
+    /// pins just as hard, but the pin is not the sweeper's to release (`evict_shape` refuses a shape
+    /// mid-transition, so proposing it would produce a no-op that reads as "unpinned"). Neither an
+    /// active nor a deactivating shape can pin anything below the floor — their resume position is
+    /// captured from the sequencer, which is at or past it.
+    fn segment_pins(&self) -> Vec<crate::changelog::SegmentPin> {
+        self.lives
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, life)| match &life.state {
+                LifeState::Dormant { resume, .. } => Some(crate::changelog::SegmentPin {
+                    shape_id: id.clone(),
+                    segment: resume.segment,
+                    evictable: true,
+                }),
+                LifeState::Reactivating { resume, .. } => Some(crate::changelog::SegmentPin {
+                    shape_id: id.clone(),
+                    segment: resume.segment,
+                    evictable: false,
+                }),
+                LifeState::Active | LifeState::Deactivating { .. } => None,
+            })
+            .collect()
     }
 
     /// Spawn (once) the background retention sweeper. Started lazily from the shape-create paths

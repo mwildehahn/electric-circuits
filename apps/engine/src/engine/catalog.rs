@@ -24,15 +24,26 @@ pub(crate) enum CatalogEvent {
     /// A subscriber left a shared feed (refcount −1). With retention, reaching refcount 0 keeps
     /// the shape (it goes dormant later), so `Left` never implies teardown.
     Left { id: String },
-    /// The shape went dormant: routing state dropped, stream + record retained. `resume_offset`
-    /// is the change-log position its stream is complete up to; `gate` is its original
-    /// backfill-snapshot fence. Restores as dormant (an improvement over the in-memory-only
-    /// lifecycle: a restart no longer forgets dormant shapes).
-    Dormant { id: String, resume_offset: String, gate: crate::pg::SnapshotGate },
+    /// The shape went dormant: routing state dropped, stream + record retained. `resume` is the
+    /// change-log position its stream is complete up to — a `(segment, offset)` pair since
+    /// ADR-0006, because the offset alone is meaningless once the log has rotated; `gate` is its
+    /// original backfill-snapshot fence. Restores as dormant (an improvement over the
+    /// in-memory-only lifecycle: a restart no longer forgets dormant shapes).
+    Dormant { id: String, resume: LogPosition, gate: crate::pg::SnapshotGate },
     /// A dormant shape was reactivated (replayed + re-registered).
     Reactivated { id: String },
     Dropped { id: String },
-    Offset { offset: String },
+    Offset { pos: LogPosition },
+    /// The change log rotated (ADR-0006): `segment` became the CURRENT segment at `at` (unix
+    /// seconds). Written on the first creation of segment 0 too, so every segment's start time is
+    /// in the log — segment `n` was closed when `n+1` began, which is what the retain window that
+    /// governs deletion measures against. The fold's last one is the current segment.
+    ChangesRotated { segment: u32, at: u64 },
+    /// The retention sweeper deleted a rotated-out change-log segment (ADR-0006). Without it the
+    /// fold's segment set would keep every segment the log ever had, so every restart would re-plan
+    /// retiring streams that are long gone (harmless — a delete of an absent stream is a no-op — but
+    /// it would also make the `changes_segments_retained` gauge wrong until the first sweep).
+    ChangesSegmentDeleted { segment: u32 },
     /// **Audit only**: a table's schema drifted and was re-introspected (ADR-0005). The restore
     /// ignores it — every dependent shape of the table was retired by the same handler, so it is
     /// already `Dropped` in the log. It is written so the durable record explains *why* a swathe of
@@ -54,6 +65,15 @@ pub(crate) enum CatalogEvent {
 pub(crate) struct CatalogWriter {
     tx: mpsc::UnboundedSender<CatalogEvent>,
     in_flight: Arc<std::sync::atomic::AtomicI64>,
+    /// The last `Offset` checkpoint that has actually **landed in storage** — what a restart would
+    /// resume from, as opposed to what this process has processed in memory.
+    ///
+    /// It is the floor for change-log segment deletion (ADR-0006), and it has to be: the sequencer
+    /// publishes its in-memory position the instant it crosses a segment boundary, but the
+    /// checkpoint is an async append. Deleting on the in-memory position would let a sweep delete
+    /// segment `n` while the durable checkpoint still says `(n, X)` — and a crash in that window
+    /// leaves a boot resuming inside a stream that no longer exists.
+    durable: Arc<std::sync::Mutex<Option<LogPosition>>>,
 }
 
 impl CatalogWriter {
@@ -63,6 +83,20 @@ impl CatalogWriter {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         if self.tx.send(ev).is_err() {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The last change-log position whose `Offset` checkpoint is durable (see [`Self::durable`]).
+    pub(crate) fn durable_offset(&self) -> Option<LogPosition> {
+        self.durable.lock().unwrap().clone()
+    }
+
+    /// Adopt the checkpoint the boot restored from the catalog: it is by definition already durable,
+    /// and without it nothing could be deleted until this process wrote its first checkpoint.
+    pub(crate) fn seed_durable_offset(&self, pos: LogPosition) {
+        let mut g = self.durable.lock().unwrap();
+        if g.as_ref().is_none_or(|cur| *cur < pos) {
+            *g = Some(pos);
         }
     }
 
@@ -86,21 +120,41 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient) -> CatalogWriter {
     let (tx, mut rx) = mpsc::unbounded_channel::<CatalogEvent>();
     let in_flight = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let counter = in_flight.clone();
+    let durable: Arc<std::sync::Mutex<Option<LogPosition>>> = Arc::new(std::sync::Mutex::new(None));
+    let landed = durable.clone();
     tokio::spawn(async move {
         let mut ensured = false;
         while let Some(ev) = rx.recv().await {
             if !ensured {
                 ensured = self::ensure_catalog(&ds).await;
             }
-            if let Ok(json) = serde_json::to_value(&ev)
-                && let Err(e) = ds.append_json(CATALOG_STREAM, &[json]).await
-            {
-                tracing::error!("catalog append failed (event lost; restart may under-restore): {e:#}");
+            // Published only on a SUCCESSFUL append: an `Offset` whose write failed is not a
+            // position a restart would resume from, and treating it as one would license deleting
+            // the segment underneath it.
+            let checkpoint = match &ev {
+                CatalogEvent::Offset { pos } => Some(pos.clone()),
+                _ => None,
+            };
+            match serde_json::to_value(&ev) {
+                Ok(json) => match ds.append_json(CATALOG_STREAM, &[json]).await {
+                    Ok(()) => {
+                        if let Some(pos) = checkpoint {
+                            let mut g = landed.lock().unwrap();
+                            if g.as_ref().is_none_or(|cur| *cur < pos) {
+                                *g = Some(pos);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("catalog append failed (event lost; restart may under-restore): {e:#}")
+                    }
+                },
+                Err(e) => tracing::error!("catalog event could not be serialized (event lost): {e:#}"),
             }
             counter.fetch_sub(1, Ordering::SeqCst);
         }
     });
-    CatalogWriter { tx, in_flight }
+    CatalogWriter { tx, in_flight, durable }
 }
 
 /// The durable catalog holds a record written **before** ADR-0002 (a bare `rec.table`).
@@ -128,6 +182,51 @@ impl std::fmt::Display for CatalogPredatesQualification {
 }
 
 impl std::error::Error for CatalogPredatesQualification {}
+
+/// The durable catalog holds a change-log position written **before** ADR-0006 (a bare offset
+/// string, from when the log was one un-segmented `changes` stream).
+///
+/// Fatal for the same reason [`CatalogPredatesQualification`] is: the value cannot be repaired, and
+/// guessing would be worse than not booting. A bare offset is a byte position in a stream that no
+/// longer exists under that name; adopting it as "segment 0" would resume the sequencer — or a
+/// dormant shape — at an unrelated point in a different segment's byte space, silently replaying or
+/// silently skipping an arbitrary span of changes. Greenfield: no such catalog can exist except
+/// from a pre-cutover build, and recovery is a deliberate human act (reset the storage).
+#[derive(Debug)]
+pub struct CatalogPredatesSegmentation {
+    detail: String,
+}
+
+impl std::fmt::Display for CatalogPredatesSegmentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "durable catalog predates ADR-0006 ({}); reset the durable-streams data directory",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for CatalogPredatesSegmentation {}
+
+/// Is this raw catalog event a pre-ADR-0006 change-log position? `Some(detail)` names it.
+///
+/// Deliberately positive-checking the OLD spelling rather than trusting the strict deserializer to
+/// fail: an unparseable event is otherwise silently skipped by the fold, which for an `Offset` would
+/// silently restart the sequencer from the beginning of the log.
+fn predates_segmentation(ev: &serde_json::Value) -> Option<String> {
+    match ev.get("t").and_then(serde_json::Value::as_str) {
+        Some("offset") if ev.get("offset").is_some_and(serde_json::Value::is_string) => {
+            Some(format!("bare change-log offset {}", ev["offset"]))
+        }
+        Some("dormant") if ev.get("resume_offset").is_some_and(serde_json::Value::is_string) => Some(format!(
+            "bare dormant resume offset {} for shape {}",
+            ev["resume_offset"],
+            ev.get("id").and_then(serde_json::Value::as_str).unwrap_or("<unknown>")
+        )),
+        _ => None,
+    }
+}
 
 /// Did the shape's table move while the engine was down? `Some(description)` if so.
 ///
@@ -157,7 +256,7 @@ pub(crate) async fn ensure_catalog(ds: &DsClient) -> bool {
 
 /// One shape as the fold reconstructed it: (record, sharing signature, refcount, dormant resume
 /// state). The last `Dormant`/`Reactivated` event wins.
-type Restored = (ShapeRecord, Option<String>, usize, Option<(String, crate::pg::SnapshotGate)>);
+type Restored = (ShapeRecord, Option<String>, usize, Option<(LogPosition, crate::pg::SnapshotGate)>);
 
 /// The durable catalog, folded — everything a boot needs before it decides what to *do* with it.
 ///
@@ -167,7 +266,13 @@ type Restored = (ShapeRecord, Option<String>, usize, Option<(String, crate::pg::
 pub(crate) struct CatalogFold {
     recs: HashMap<String, Restored>,
     /// The sequencer's change-log replay start (the last `Offset` checkpoint).
-    start_offset: String,
+    start_pos: LogPosition,
+    /// The change log's current segment: the last `ChangesRotated`, else 0 (ADR-0006). A lower
+    /// bound — a process can die between closing a segment and recording the rotation — so the
+    /// boot walks forward from here (`changelog::resolve_current`).
+    pub(crate) current_segment: u32,
+    /// Every segment's start time (unix seconds), for the retain window that governs deletion.
+    pub(crate) segment_starts: std::collections::BTreeMap<u32, u64>,
     /// The last `SlotBound`: the epoch these shapes belong to. `None` = nothing ever claimed one,
     /// which is a genuine first boot.
     pub(crate) binding: Option<crate::engine::epoch::SlotBinding>,
@@ -175,7 +280,13 @@ pub(crate) struct CatalogFold {
 
 impl Default for CatalogFold {
     fn default() -> Self {
-        CatalogFold { recs: HashMap::new(), start_offset: "-1".to_string(), binding: None }
+        CatalogFold {
+            recs: HashMap::new(),
+            start_pos: LogPosition::start(),
+            binding: None,
+            current_segment: 0,
+            segment_starts: std::collections::BTreeMap::new(),
+        }
     }
 }
 
@@ -197,9 +308,9 @@ impl CatalogFold {
                     e.2 = e.2.saturating_sub(1);
                 }
             }
-            CatalogEvent::Dormant { id, resume_offset, gate } => {
+            CatalogEvent::Dormant { id, resume, gate } => {
                 if let Some(e) = self.recs.get_mut(&id) {
-                    e.3 = Some((resume_offset, gate));
+                    e.3 = Some((resume, gate));
                 }
             }
             CatalogEvent::Reactivated { id } => {
@@ -210,7 +321,18 @@ impl CatalogFold {
             CatalogEvent::Dropped { id } => {
                 self.recs.remove(&id);
             }
-            CatalogEvent::Offset { offset } => self.start_offset = offset,
+            CatalogEvent::Offset { pos } => self.start_pos = pos,
+            // The LAST rotation is the current segment; every one of them is kept, because the
+            // retain window needs to know when each segment began (see the variant).
+            CatalogEvent::ChangesRotated { segment, at } => {
+                self.current_segment = self.current_segment.max(segment);
+                self.segment_starts.insert(segment, at);
+            }
+            // A deleted segment leaves the set but never moves `current_segment`: the current one
+            // is never deleted, so the last rotation still names it.
+            CatalogEvent::ChangesSegmentDeleted { segment } => {
+                self.segment_starts.remove(&segment);
+            }
             // Audit only (see the variant): the shapes it explains are already `Dropped`,
             // and the boot's own introspection is the authority on the schema.
             CatalogEvent::SchemaChanged { .. } => {}
@@ -220,9 +342,15 @@ impl CatalogFold {
         }
     }
 
+    /// The sequencer's restored change-log position — the segment the boot must vouch for before
+    /// anything resumes (see `Engine::init_change_log`).
+    pub(crate) fn start_pos(&self) -> LogPosition {
+        self.start_pos.clone()
+    }
+
     /// Nothing was ever written (or everything was dropped and nothing checkpointed).
     fn is_empty(&self) -> bool {
-        self.recs.is_empty() && self.start_offset == "-1"
+        self.recs.is_empty() && self.start_pos == LogPosition::start()
     }
 }
 
@@ -263,6 +391,12 @@ impl Engine {
                         detail: format!("bare table name '{raw}' in shape {id}"),
                     }));
                 }
+                // Same stance for a pre-segmentation change-log position (ADR-0006): refuse the
+                // boot naming it, rather than let the strict deserializer turn it into a silently
+                // skipped event.
+                if let Some(detail) = predates_segmentation(&ev) {
+                    return Err(anyhow::Error::new(CatalogPredatesSegmentation { detail }));
+                }
                 let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
                 fold.apply(ev);
             }
@@ -286,9 +420,12 @@ impl Engine {
         if fold.is_empty() {
             return Ok(());
         }
-        let CatalogFold { recs, start_offset, .. } = fold;
-        tracing::info!("catalog restore: {} shape(s), change-log replay from {start_offset}", recs.len());
-        *self.seq_start.lock().unwrap() = start_offset;
+        let CatalogFold { recs, start_pos, .. } = fold;
+        tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
+        // The restored checkpoint IS durable (it was read back out of the log), so it is the
+        // segment-deletion floor from boot rather than from this process's first checkpoint.
+        self.catalog_tx.seed_durable_offset(start_pos.clone());
+        *self.seq_start.lock().unwrap() = start_pos;
 
         if mode == RestoreMode::Park {
             // The epoch broke: hold the records, touch nothing else (see `RestoreMode::Park`).
@@ -354,14 +491,14 @@ impl Engine {
                     // A dormant shape restores AS dormant: record + stream retained, no routing,
                     // no replay at boot — the first touch reactivates it from its own resume
                     // offset. (Dormancy age restarts at boot; the TTL clock is conservative.)
-                    Some((resume_offset, gate)) => {
+                    Some((resume_at, gate)) => {
                         self.lives.lock().unwrap().insert(
                             id.clone(),
                             ShapeLife {
                                 last_read: std::time::Instant::now(),
                                 state: LifeState::Dormant {
                                     since: std::time::Instant::now(),
-                                    resume_offset,
+                                    resume: resume_at,
                                     gate,
                                 },
                             },
@@ -580,15 +717,121 @@ mod tests {
         fold
     }
 
+    fn pos(segment: u32, offset: &str) -> LogPosition {
+        LogPosition { segment, offset: offset.to_string() }
+    }
+
     /// A catalog with no `SlotBound` anywhere is a genuine first boot — the state that licenses the
     /// engine to create a slot from nothing (ADR-0004).
     #[test]
     fn a_catalog_without_a_binding_folds_to_no_epoch() {
-        let fold = fold_of(vec![CatalogEvent::Offset { offset: "42".to_string() }]);
+        let fold = fold_of(vec![CatalogEvent::Offset { pos: pos(0, "42") }]);
         assert!(fold.binding.is_none());
-        assert_eq!(fold.start_offset, "42");
+        assert_eq!(fold.start_pos, pos(0, "42"));
         // Nothing at all folds to the empty catalog, which the restore skips outright.
         assert!(CatalogFold::default().is_empty());
+    }
+
+    /// The change log's segmentation folds out of the same log (ADR-0006): the last rotation is the
+    /// current segment, and EVERY rotation is kept — segment `n` was closed when `n+1` began, which
+    /// is the clock the retain window that governs deletion runs on.
+    #[test]
+    fn rotations_fold_to_the_current_segment_and_every_segments_start() {
+        let fold = fold_of(vec![
+            CatalogEvent::ChangesRotated { segment: 0, at: 100 },
+            CatalogEvent::Offset { pos: pos(0, "9") },
+            CatalogEvent::ChangesRotated { segment: 1, at: 200 },
+            CatalogEvent::ChangesRotated { segment: 2, at: 300 },
+        ]);
+        assert_eq!(fold.current_segment, 2);
+        assert_eq!(fold.segment_starts.get(&0), Some(&100));
+        assert_eq!(fold.segment_starts.get(&1), Some(&200));
+        assert_eq!(fold.segment_starts.get(&2), Some(&300));
+        // A catalog that has only ever rotated has nothing to restore.
+        assert_eq!(fold.start_pos, pos(0, "9"));
+
+        // Nothing rotated = segment 0, which is also what a first boot creates.
+        assert_eq!(CatalogFold::default().current_segment, 0);
+    }
+
+    /// A deleted segment leaves the folded set, so a restart neither re-plans retiring streams that
+    /// are long gone nor reports a `changes_segments_retained` gauge counting them. It never moves
+    /// the current segment — the current one is never deleted.
+    #[test]
+    fn deleted_segments_leave_the_fold() {
+        let fold = fold_of(vec![
+            CatalogEvent::ChangesRotated { segment: 0, at: 100 },
+            CatalogEvent::ChangesRotated { segment: 1, at: 200 },
+            CatalogEvent::ChangesRotated { segment: 2, at: 300 },
+            CatalogEvent::ChangesSegmentDeleted { segment: 0 },
+        ]);
+        assert_eq!(fold.current_segment, 2);
+        assert_eq!(fold.segment_starts.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+
+        let json = serde_json::to_value(CatalogEvent::ChangesSegmentDeleted { segment: 7 }).unwrap();
+        assert_eq!(json["t"], "changesSegmentDeleted");
+        assert_eq!(json["segment"], 7);
+    }
+
+    /// The sequencer's checkpoint and a dormant shape's resume state carry the SEGMENT, so a
+    /// restart after a rotation resumes in the right stream rather than at a byte position in a
+    /// stream that no longer holds those bytes.
+    #[test]
+    fn checkpoints_and_dormant_resumes_carry_their_segment() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let gate = crate::pg::SnapshotGate::passthrough();
+        let fold = fold_of(vec![
+            created,
+            CatalogEvent::Dormant { id: "s1".to_string(), resume: pos(3, "77"), gate },
+            CatalogEvent::Offset { pos: pos(4, "12") },
+        ]);
+        assert_eq!(fold.start_pos, pos(4, "12"));
+        assert_eq!(fold.recs.get("s1").and_then(|r| r.3.as_ref()).map(|(p, _)| p.clone()), Some(pos(3, "77")));
+
+        // Wire form: an object, never a bare string.
+        let json = serde_json::to_value(CatalogEvent::Offset { pos: pos(4, "12") }).unwrap();
+        assert_eq!(json["t"], "offset");
+        assert_eq!(json["pos"]["segment"], 4);
+        assert_eq!(json["pos"]["offset"], "12");
+    }
+
+    /// A catalog written before ADR-0006 carries bare change-log offsets, which cannot be repaired:
+    /// the byte position belongs to a stream that no longer exists under that name. It is named and
+    /// refused at boot, never coerced to "segment 0" (which would resume at an unrelated point) and
+    /// never silently skipped by the strict deserializer (which for an `Offset` would restart the
+    /// sequencer from the beginning of the log).
+    #[test]
+    fn a_pre_segmentation_catalog_is_refused_by_name() {
+        let bare_offset = serde_json::json!({ "t": "offset", "offset": "0000000000000000_0000000000000042" });
+        let detail = predates_segmentation(&bare_offset).expect("a bare offset is recognised");
+        assert!(detail.contains("bare change-log offset"), "{detail}");
+        assert!(
+            CatalogPredatesSegmentation { detail }.to_string().contains("predates ADR-0006"),
+            "the operator is told which cutover the catalog is on the wrong side of"
+        );
+
+        let bare_dormant = serde_json::json!({
+            "t": "dormant",
+            "id": "s7",
+            "resume_offset": "0000000000000000_0000000000000042",
+            "gate": {},
+        });
+        let detail = predates_segmentation(&bare_dormant).expect("a bare dormant resume is recognised");
+        assert!(detail.contains("s7"), "the refusal names the shape: {detail}");
+
+        // The current spellings are not mistaken for the old ones.
+        let now = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9") }).unwrap();
+        assert!(predates_segmentation(&now).is_none());
+        let gate = crate::pg::SnapshotGate::passthrough();
+        let now = serde_json::to_value(CatalogEvent::Dormant {
+            id: "s7".to_string(),
+            resume: pos(2, "9"),
+            gate,
+        })
+        .unwrap();
+        assert!(predates_segmentation(&now).is_none());
+        // ...and neither is an unrelated event.
+        assert!(predates_segmentation(&created_event("public.users")).is_none());
     }
 
     /// The LAST binding is the epoch in force: a reset appends its new one after the `Dropped`

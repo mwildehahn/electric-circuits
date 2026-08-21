@@ -54,7 +54,7 @@ Three ideas carry the whole design:
 ## 1. Components
 
 - **durable-streams** — append-only, offset-addressed JSON streams with long-poll tailing. One
-  `changes` stream for all tables (the write log; the envelope's `type` carries the table's
+  segmented `changes/<n>` change log for all tables (the write log; the envelope's `type` carries the table's
   canonical `schema.name` — always qualified, see ADR-0002),
   one `shape/<id>` stream per distinct shape (the
   result feed). The decoupling boundary between write and read paths.
@@ -97,9 +97,23 @@ Three ideas carry the whole design:
 `replication.rs` **streams** a `pgoutput` slot over the walsender protocol (push delivery — no
 poll floor; the wire client is `pgwire-replication`, the message decoding is our `pgoutput.rs`).
 Each transaction's changes are buffered between `Begin` and `Commit`, stamped with
-`(commit LSN, xid, seq)`, appended to `changes`, and only **then** acknowledged to Postgres
-(`confirmed_flush_lsn`) — a failed append tears the connection down unacknowledged, and the server
-resends from the confirmed position.
+`(commit LSN, xid, seq)`, appended to the change log's **current segment**, and only **then**
+acknowledged to Postgres (`confirmed_flush_lsn`) — a failed append tears the connection down
+unacknowledged, and the server resends from the confirmed position.
+
+**The change log is segmented** (ADR-0006): `changes/0`, `changes/1`, … , never a bare `changes`
+stream, because durable-streams offers whole-stream TTL but no prefix trimming and one ever-growing
+log fills the disk. At a transaction boundary, after the commit is appended and acknowledged, the
+ingestor rotates if the current segment is over its byte or age budget
+(`ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` / `_SECS`): create `changes/<n+1>`, append one **control
+envelope** naming the successor to `changes/<n>`, close `changes/<n>`, record `ChangesRotated` in the
+catalog, continue in `changes/<n+1>`. Nothing ever appends to a closed segment. Control envelopes are
+recognised by TYPE (`__circuits.control`, a reserved schema no tracked table may use) and dropped
+unconditionally by every reader before anything else looks at the batch, so they never reach a table
+executor or a shape stream — never by position, since an abandoned rotation (the close failed) leaves
+a pointer mid-segment. Every position in the log is a `(segment, offset)` pair; a rotated-out segment
+is deleted once the **durable** checkpoint is past it and nothing resumes inside it (§5.1, and the
+retention lifecycle for the evict-before-delete rule).
 
 Delivery to the table streams is therefore **at-least-once** (a partial multi-table append failure,
 or acknowledgements not yet flushed at a crash, re-deliver whole transactions). Deltas are *not*
@@ -209,8 +223,20 @@ ONE tokio task consumes the single ordered change log for all tables — Electri
 trivially correct), and each source transaction's shape appends are flushed **before the next
 transaction is processed** — per-transaction atomic emission, across tables; the only intra-txn
 parallelism is the append flush (bounded-concurrent, CAP=32). After a batch is fully fanned out
-**and every append has landed**, the sequencer publishes its processed offset — the convergence
-barrier used by the conformance harness (`GET /tables/<t>/offset` reports the global offset).
+**and every append has landed**, the sequencer publishes its processed position — the convergence
+barrier used by the conformance harness (`GET /tables/<t>/offset` reports the global position).
+
+That position is a `(segment, offset)` pair, because **the sequencer follows rotation pointers**
+(ADR-0006). A read of the current segment that comes back `closed` means the log rotated: the
+sequencer finishes the batch in hand — crossing only once a read of the closed segment comes back
+empty, so a page delivered alongside the close is never left behind — then continues on the segment
+the batch's control envelope pointed at, from `-1`, and checkpoints the crossing immediately so a
+restart resumes in the right stream. A closed segment whose pointer this process never saw (the
+checkpoint it booted from was already past it) steps to **exactly** the next segment, verified to
+exist; jumping to the first open segment would skip the closed ones in between, which are unread
+changes. A closed segment with **no** successor is refused — logged and backed off, never skipped
+past. `replay_changes_for_shape` — the dormant reactivation path — follows the same pointers, one
+segment at a time, until it reaches the tail of the open segment.
 
 Shape creation is **two-phase** so a Postgres backfill never stalls the pipeline: `BeginShape`
 registers a pending shape that buffers its table's deltas; the creator runs the backfill on a
@@ -524,7 +550,8 @@ absolute membership emission makes them unnecessary for convergence).
 | shared shapes | signature + refcount + ready-watch + atomic rollback | joiners see a live, backfilled stream or an error; last drop tears everything down |
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
-| engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log offset checkpoints) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
+| change log ↔ disk | segment rotation by size/age + delete-when-nothing-can-resume (the DURABLE checkpoint past it AND no shape pinning it; a dormant shape pinning past the retain window is evicted first, a reactivating one is never evicted mid-replay) — ADR-0006 | the log is bounded without prefix trimming; no reader ever loses its place (positions are `(segment, offset)`, the pointer is followed, the current segment is never deleted) |
+| engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log position checkpoints + segment rotations) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
 | compiled schema ↔ Postgres | fingerprint compare on every `Relation` + a 60 s catalog reconciler; drift/TRUNCATE/identity regression retires that table's dependents, and a per-table schema generation refuses any create that overlapped it (ADR-0005) | never serves rows over a schema Postgres no longer has; the catalog records `schemaChanged` as the audit trail for the drops |
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
@@ -631,7 +658,8 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (pushdown) / SQL `WHERE` → predicate (Electric path) |
 | `apps/engine/src/electric.rs` | Electric `/v1/shape` adapter (handles, offsets, TTL eviction) |
-| `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_reliable`, `close_stream`, `retire_stream`, `delete_stream`, reads |
+| `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_checked`, `append_reliable`, `head`, `close_stream`, `retire_stream`, `delete_stream`, reads |
+| `apps/engine/src/changelog.rs` | the segmented change log (ADR-0006): `LogPosition`, the control envelope, the rotation writer + boot walk-forward, the segment-deletion planner |
 | `apps/engine/src/http.rs` | control-plane HTTP |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |

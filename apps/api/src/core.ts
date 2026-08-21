@@ -1,9 +1,10 @@
 // electric-circuits "core": the logic behind the tRPC procedures. Writes append State-Protocol
-// envelopes directly to the durable-streams table stream (decoupled from the engine, which
-// tails it). Schema definition and shape lifecycle are forwarded to the Rust engine.
+// envelopes directly to the current segment of the durable-streams change log (decoupled from the
+// engine, which tails it). Schema definition and shape lifecycle are forwarded to the Rust engine.
 
 import {
   type AggregateDef,
+  changesSegmentPath,
   type Op,
   type Row,
   type Schema,
@@ -64,6 +65,18 @@ export function createCore(opts: CoreOptions): ElectricCore {
   const doFetch = opts.fetch ?? fetch
   const genTxid = () => globalThis.crypto.randomUUID()
 
+  // Which change-log segment is current (ADR-0006). Cached — in library mode nothing rotates it —
+  // and re-resolved whenever an append is refused because the segment was closed.
+  let cachedSegment: number | undefined
+  async function currentChangesSegment(refresh: boolean): Promise<number> {
+    if (cachedSegment !== undefined && !refresh) return cachedSegment
+    const res = await doFetch(`${engineUrl}/replication/lsn`)
+    if (!res.ok) throw new Error(`engine /replication/lsn -> ${res.status}`)
+    const body = (await res.json()) as { changes?: { segment?: number } }
+    cachedSegment = body.changes?.segment ?? 0
+    return cachedSegment
+  }
+
   async function engineJson<T>(path: string, init: RequestInit): Promise<T> {
     const res = await doFetch(`${engineUrl}${path}`, {
       ...init,
@@ -84,14 +97,24 @@ export function createCore(opts: CoreOptions): ElectricCore {
       const txid = input.txid ?? genTxid()
       const env = toTableEnvelope(input.table, input.op, input.pk, input.row, txid)
       // Library-mode writes go on the single ordered change log (the envelope's `type` carries
-      // the table) — same stream the replication ingestor feeds in Postgres mode.
-      const res = await doFetch(`${dsUrl}/changes`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify([env]),
-      })
-      if (!res.ok) throw new Error(`append changes -> ${res.status}: ${await res.text()}`)
-      return { txid }
+      // the table) — same log the replication ingestor feeds in Postgres mode. The log is
+      // segmented (ADR-0006), so the write addresses the CURRENT segment, which the engine
+      // reports; a segment that turns out to be closed (409/404) means it rotated underneath us,
+      // so re-resolve once and retry rather than lose the write.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const segment = await currentChangesSegment(attempt > 0)
+        const res = await doFetch(`${dsUrl}/${changesSegmentPath(segment)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify([env]),
+        })
+        if (res.ok) return { txid }
+        if (res.status !== 404 && res.status !== 409 && res.status !== 410) {
+          throw new Error(`append changes -> ${res.status}: ${await res.text()}`)
+        }
+        cachedSegment = undefined
+      }
+      throw new Error('append changes: the change log kept rotating away from under the write')
     },
 
     async createShape(def) {

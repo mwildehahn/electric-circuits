@@ -12,13 +12,14 @@ use tokio::sync::{Mutex, mpsc};
 
 use std::sync::atomic::Ordering;
 
+use crate::changelog::{ChangeLogWriter, ChangesState, LogPosition, segment_path};
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::heap_size::HeapSize;
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::schema::{Schema, SharedTables, TableSchema, compile_schema};
 use crate::table_ref::{TableRef, TableSelector};
-use crate::retention::{EvictReason, LifeState, RetentionConfig, ShapeLife, SweepShape};
+use crate::retention::{EvictReason, Evicted, LifeState, RetentionConfig, ShapeLife, SweepShape};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::value::{Row, Value};
 
@@ -157,8 +158,12 @@ pub struct Engine {
     tables_shared: SharedTables,
     /// Ordered writer for the durable shape catalog (see [`CATALOG_STREAM`]).
     catalog_tx: CatalogWriter,
-    /// Change-log offset the sequencer starts from (set by catalog restore before the spawn).
-    seq_start: Arc<std::sync::Mutex<String>>,
+    /// The segmented change log (ADR-0006): which segment the ingestor appends to, when each
+    /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
+    /// the retention sweeper deletes segments and the epoch reset rotates one.
+    changes: ChangeLogWriter,
+    /// Change-log position the sequencer starts from (set by catalog restore before the spawn).
+    seq_start: Arc<std::sync::Mutex<LogPosition>>,
     /// Per-shape retention lifecycle + last-read instant. A separate sync mutex (not
     /// `EngineState`) so hot read paths can touch it without the async engine lock. Lock order:
     /// when both are held, `state` first, then `lives`; never across `.await`.
@@ -552,6 +557,17 @@ impl Engine {
             trace_tx.clone(),
         );
         let catalog_tx = spawn_catalog_writer(ds.clone());
+        // The change log's writer records every rotation in the durable catalog, so a restart knows
+        // which segment is current (and when each one began, for the retain window).
+        let changes = ChangeLogWriter::new(
+            ds.clone(),
+            Arc::new(ChangesState::default()),
+            crate::changelog::ChangeLogConfig::from_env(),
+            {
+                let catalog_tx = catalog_tx.clone();
+                Arc::new(move |segment, at| catalog_tx.send(CatalogEvent::ChangesRotated { segment, at }))
+            },
+        );
         Engine {
             ds,
             state: Arc::new(Mutex::new(EngineState {
@@ -579,7 +595,8 @@ impl Engine {
             degrade,
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
-            seq_start: Arc::new(std::sync::Mutex::new("-1".to_string())),
+            changes,
+            seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -883,7 +900,6 @@ impl Engine {
             let ts = TableSchema::from_def(t, &def)?;
             compiled.insert(t.clone(), ts);
         }
-        self.ds.ensure_stream(crate::CHANGES_STREAM).await?;
         *self.tables_shared.write().unwrap() = compiled.clone();
         self.state.lock().await.tables = compiled.clone();
         self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
@@ -912,6 +928,10 @@ impl Engine {
             )
         })?;
         self.adopt_epoch_binding(fold.binding.clone());
+        // The change log is segmented (ADR-0006), and which segment is CURRENT is folded out of the
+        // same catalog — so this necessarily comes after the read, not before it as the old
+        // unqualified `ensure_stream("changes")` did.
+        self.init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos()).await?;
         let restored = match self.verify_epoch_at_boot(&client, slot).await? {
             // Either the epoch is intact or this boot just started one. Restore as usual.
             epoch::Verdict::FirstBoot | epoch::Verdict::Ok { .. } | epoch::Verdict::Busy { .. } => {
@@ -969,7 +989,7 @@ impl Engine {
             url,
             slot.to_string(),
             publication,
-            self.ds.clone(),
+            self.changes.clone(),
             self.tables_shared.clone(),
             Arc::new(self.clone()) as Arc<dyn crate::replication::SchemaEvents>,
             Arc::new(self.clone()) as Arc<dyn crate::replication::EpochEvents>,
@@ -978,8 +998,86 @@ impl Engine {
         ));
         // DDL with no following DML produces no `Relation` message; the reconciler catches it.
         self.ensure_schema_reconciler();
+        // The retention sweeper is lazy elsewhere (a library user that never creates a shape never
+        // needs it), but a Postgres-mode engine always has a change log growing under it: the same
+        // sweep is what deletes the segments nothing can resume inside (ADR-0006), so it must run
+        // whether or not anyone has ever created a shape.
+        self.ensure_retention_sweeper();
         // Introspection + slot + ingest loop are up: report `active` (200 on `/v1/health`).
         self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Adopt the change log's segmentation state at boot and make the CURRENT segment exist
+    /// (ADR-0006).
+    ///
+    /// `from_fold` is the catalog's answer, which is a **lower bound**: a process can die between
+    /// closing a segment and recording its `ChangesRotated`, so the boot walks forward over closed
+    /// segments (`changelog::resolve_current`) and writes the rotation records the crashed
+    /// predecessor missed. On a genuine first boot nothing is in the log at all, and segment 0's
+    /// creation is recorded as `ChangesRotated { segment: 0, at }` so the age criterion has a start
+    /// time to measure from.
+    ///
+    /// It is also where the **sequencer's** start position is vouched for. A segment is deleted only
+    /// once the durable checkpoint is past it, so a checkpoint naming a segment storage no longer
+    /// has is an impossible state — and one the sequencer cannot recover from, since it would spin
+    /// on a 404 forever. It is fatal here, at boot, with a message that names the segment, rather
+    /// than a retry loop inside a spawned task nobody is watching.
+    async fn init_change_log(
+        &self,
+        from_fold: u32,
+        starts: std::collections::BTreeMap<u32, u64>,
+        seq_start: &LogPosition,
+    ) -> Result<()> {
+        // "Recorded" tells a first boot (nothing was ever written) from a segment the engine knows
+        // existed having been deleted — see `resolve_current`.
+        let recorded = starts.contains_key(&from_fold);
+        let resolved = crate::changelog::resolve_current(&self.ds, from_fold, recorded)
+            .await
+            .context("resolving the change log's current segment")?;
+        let mut starts = starts;
+        self.ds
+            .ensure_stream(&segment_path(resolved))
+            .await
+            .with_context(|| format!("creating {}", segment_path(resolved)))?;
+        // Every segment from the fold's answer up to the resolved one began without its record
+        // being written (or, for segment 0 on a first boot, has just been created here).
+        for n in from_fold..=resolved {
+            if starts.contains_key(&n) {
+                continue;
+            }
+            let at = crate::changelog::now_secs();
+            starts.insert(n, at);
+            self.catalog_tx.send(CatalogEvent::ChangesRotated { segment: n, at });
+        }
+        // The sequencer resumes here; if that segment is gone it can never advance (see above).
+        let start_head = self
+            .ds
+            .head(&segment_path(seq_start.segment))
+            .await
+            .with_context(|| format!("checking the sequencer's start segment {}", segment_path(seq_start.segment)))?;
+        if start_head.is_none() {
+            bail!(
+                "durable catalog resumes the change log at {seq_start}, but {} does not exist. A segment is \
+                 deleted only once the durable checkpoint has passed it, so this cannot happen while the \
+                 engine is the only writer — refusing to boot rather than spin on a deleted stream. Reset \
+                 the durable-streams data directory.",
+                segment_path(seq_start.segment)
+            );
+        }
+        // Seed the writer's tail from storage, so the size budget and `force_rotate` are right from
+        // the first commit after a restart instead of from the first append this process makes
+        // (which would read the segment as empty and never rotate on size).
+        let tail = if seq_start.segment == resolved {
+            start_head.and_then(|h| h.next_offset)
+        } else {
+            self.ds.head(&segment_path(resolved)).await.ok().flatten().and_then(|h| h.next_offset)
+        };
+        self.changes.state().adopt(resolved, starts, tail);
+        crate::metrics::metrics()
+            .changes_segments_retained
+            .store(self.changes.state().retained(), Ordering::Relaxed);
+        tracing::info!("change log: current segment is {}", segment_path(resolved));
         Ok(())
     }
 
@@ -999,7 +1097,15 @@ impl Engine {
 
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
         let compiled = compile_schema(schema)?;
-        self.ds.ensure_stream(crate::CHANGES_STREAM).await?;
+        // Library mode has no durable catalog to fold, so the current segment is whatever this
+        // process already resolved (0 on a fresh engine) and nothing rotates it — there is no
+        // ingestor. The CURRENT segment stream is what gets created, never a bare `changes`.
+        self.init_change_log(
+            self.changes.state().current(),
+            self.changes.state().segments(),
+            &self.changes.state().position(),
+        )
+        .await?;
         self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
         *self.tables_shared.write().unwrap() = compiled.clone();
         {
@@ -1392,11 +1498,19 @@ impl Engine {
         self.state.lock().await.shapes.get(id).cloned()
     }
 
-    /// The change-log offset up to which the sequencer has processed (global — all tables share
+    /// The change-log position up to which the sequencer has processed (global — all tables share
     /// the single ordered log), or `None` if the sequencer is not running yet.
-    pub async fn table_offset(&self, _table: &TableRef) -> Option<String> {
+    pub async fn table_offset(&self, _table: &TableRef) -> Option<LogPosition> {
         let st = self.state.lock().await;
         st.sequencer.as_ref().map(|s| s.processed.lock().unwrap().clone())
+    }
+
+    /// The ingestor's own change-log position: the CURRENT segment and the tail offset of its last
+    /// append (`GET /replication/lsn` → `changes`). Additive observability — and the only place a
+    /// consumer can learn which segment is current, which is what a convergence barrier HEADs for
+    /// the tail.
+    pub fn changes_position(&self) -> LogPosition {
+        self.changes.state().position()
     }
 
     /// The table's current circuit topology (shared families + standalone count), or `None` if no

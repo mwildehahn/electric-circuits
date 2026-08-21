@@ -9,10 +9,10 @@ use super::*;
 /// transaction, restoring per-transaction atomic emission across tables.
 pub(crate) struct SequencerHandle {
     pub(crate) cmd_tx: mpsc::UnboundedSender<SequencerCmd>,
-    /// Change-log offset up to which every envelope has been processed AND fanned to every shape
-    /// (appends landed). A harness polls this against the change log's tail as the convergence
-    /// barrier.
-    pub(crate) processed: Arc<std::sync::Mutex<String>>,
+    /// Change-log position up to which every envelope has been processed AND fanned to every shape
+    /// (appends landed) — `(segment, offset)`, since the log is segmented (ADR-0006). A harness
+    /// polls this against the current segment's tail as the convergence barrier.
+    pub(crate) processed: Arc<std::sync::Mutex<LogPosition>>,
     /// Per-table circuit topology (shared families + standalone count), for tests/observability.
     pub(crate) stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     /// Live per-node state summaries, merged across all tables, keyed by graph node id.
@@ -55,13 +55,13 @@ pub(crate) enum SequencerCmd {
     /// Creation failed after `BeginShape`: drop the pending buffer.
     AbortShape { table: TableRef, shape_id: String },
     /// Retention: unregister a plain row shape's routing and hand back its resume state — the
-    /// sequencer's fully-processed change-log offset (the batch preceding this command was fully
+    /// sequencer's fully-processed change-log position (the batch preceding this command was fully
     /// fanned out + flushed, so the shape's stream is complete up to here) and the shape's
     /// backfill-snapshot gate. `None` if the shape is unknown (or an aggregate — not parkable).
     DeactivateShape {
         table: TableRef,
         shape_id: String,
-        resp: tokio::sync::oneshot::Sender<Option<(String, crate::pg::SnapshotGate)>>,
+        resp: tokio::sync::oneshot::Sender<Option<(LogPosition, crate::pg::SnapshotGate)>>,
     },
     RemoveShape { table: TableRef, shape_id: String },
     /// Schema drift (ADR-0005): forget everything the sequencer holds for this table. The executor
@@ -102,7 +102,7 @@ pub(crate) enum CreateKind {
 pub(crate) fn spawn_sequencer(
     ds: DsClient,
     tables: SharedTables,
-    start_offset: String,
+    start: LogPosition,
     catalog_tx: CatalogWriter,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
@@ -110,13 +110,13 @@ pub(crate) fn spawn_sequencer(
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let processed = Arc::new(std::sync::Mutex::new(start_offset.clone()));
+    let processed = Arc::new(std::sync::Mutex::new(start.clone()));
     let stats = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let node_states = Arc::new(std::sync::Mutex::new(HashMap::new()));
     tokio::spawn(sequencer_loop(
         ds,
         tables,
-        start_offset,
+        start,
         catalog_tx,
         cmd_rx,
         processed.clone(),
@@ -259,10 +259,10 @@ pub(crate) fn exec_for<'a>(
 pub(crate) async fn sequencer_loop(
     ds: DsClient,
     tables: SharedTables,
-    start_offset: String,
+    start: LogPosition,
     catalog_tx: CatalogWriter,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
-    processed: Arc<std::sync::Mutex<String>>,
+    processed: Arc<std::sync::Mutex<LogPosition>>,
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subq: SubqueryHandle,
@@ -271,11 +271,16 @@ pub(crate) async fn sequencer_loop(
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
-    let mut offset = start_offset;
+    let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
-    // every ~2s of change.
+    // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
+    // resumes on the segment the log actually moved to.
     let mut last_ckpt = std::time::Instant::now();
-    let mut ckpt_offset = offset.clone();
+    let mut ckpt_pos = pos.clone();
+    // The rotation pointer this segment carried (ADR-0006). It can arrive in a batch that is not
+    // yet flagged `closed` — the pointer append and the close are two requests — so it is
+    // remembered until the close actually lands, and the segment is only left once BOTH are in.
+    let mut rotate_to: Option<u32> = None;
     // Envelopes appended per shape id — the counters behind the per-node state summaries.
     let mut emitted: HashMap<String, u64> = HashMap::new();
     // De-duplication highwater: the ingestor's delivery is at-least-once (unacknowledged commits
@@ -286,7 +291,7 @@ pub(crate) async fn sequencer_loop(
     let mut highwater: Option<(u64, u64)> = None;
 
     loop {
-        let off = offset.clone();
+        let (read_path, read_off) = (pos.path(), pos.offset.clone());
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
@@ -310,7 +315,7 @@ pub(crate) async fn sequencer_loop(
                         tracing::error!("activate_shape failed: {e:#}");
                     }
                     let _ = ready.send(res.map_err(|e| format!("{e:#}")));
-                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::AbortShape { table, shape_id }) => {
                     if let Some(exec) = execs.get_mut(table.as_str()) {
@@ -319,7 +324,7 @@ pub(crate) async fn sequencer_loop(
                 }
                 Some(SequencerCmd::DeactivateShape { table, shape_id, resp }) => {
                     // Capture-and-unregister is atomic w.r.t. envelope processing (commands run
-                    // between fully-flushed transactions), so `offset` is exactly "the shape's
+                    // between fully-flushed transactions), so `pos` is exactly "the shape's
                     // stream is complete up to here".
                     let gate = execs.get_mut(table.as_str()).and_then(|exec| {
                         if let Some(shape) = exec.shapes.remove(&shape_id) {
@@ -348,8 +353,8 @@ pub(crate) async fn sequencer_loop(
                     if gate.is_some() {
                         emitted.remove(&shape_id);
                     }
-                    let _ = resp.send(gate.map(|g| (offset.clone(), g)));
-                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    let _ = resp.send(gate.map(|g| (pos.clone(), g)));
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::RemoveShape { table, shape_id }) => {
                     if let Some(exec) = execs.get_mut(table.as_str()) {
@@ -377,13 +382,13 @@ pub(crate) async fn sequencer_loop(
                         }
                     }
                     emitted.remove(&shape_id);
-                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::ResetTable { table }) => {
                     if execs.remove(table.as_str()).is_some() {
                         tracing::warn!("sequencer: dropped the executor for '{table}' (schema drift)");
                     }
-                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::CreateCircuitAgg { table, shape_id, stream_path, constraints, ready }) => {
                     let res = create_circuit_agg(
@@ -394,11 +399,11 @@ pub(crate) async fn sequencer_loop(
                         emitted.insert(shape_id.clone(), 1);
                     }
                     let _ = ready.send(res.map_err(|e| format!("{e:#}")));
-                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
                     let val =
-                        execs.get(table.as_str()).and_then(|exec| dump_node_json(exec, &offset, &emitted, &node_id));
+                        execs.get(table.as_str()).and_then(|exec| dump_node_json(exec, &pos.to_string(), &emitted, &node_id));
                     let _ = resp.send(val);
                 }
                 Some(SequencerCmd::MemBytes { resp }) => {
@@ -410,15 +415,30 @@ pub(crate) async fn sequencer_loop(
                 }
                 None => break,
             },
-            res = ds.read(crate::CHANGES_STREAM, &off, true) => match res {
+            res = ds.read(&read_path, &read_off, true) => match res {
                 Ok(rr) => {
                     let next = rr.next_offset.clone();
-                    if let Some(n) = rr.next_offset { offset = n; }
+                    // How much this read delivered, BEFORE control envelopes are filtered out: a
+                    // closed segment is only left once a read comes back empty, which is the proof
+                    // that everything in it has been consumed.
+                    let delivered = rr.envelopes.len();
+                    let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
+                    if let Some(n) = rr.next_offset { pos.offset = n; }
+                    // Change-log CONTROL envelopes (the rotation pointer, ADR-0006) are routing
+                    // metadata, not data: they are recognised by TYPE and removed here —
+                    // UNCONDITIONALLY, before anything (transaction splitting, the arrangements
+                    // feed, `exec_for`, `process_envelope`) looks at the batch. Not "only when a
+                    // pointer is present": any control envelope, recognised or not, is ours and
+                    // must never be mistaken for a table's change.
+                    let mut envs = rr.envelopes;
+                    if let Some(n) = crate::changelog::rotation_target_in(&envs) {
+                        rotate_to = Some(n);
+                    }
+                    envs.retain(|e| !crate::changelog::is_control(e));
                     // Split the read batch into transactions (runs of equal (txid, lsn) — the
                     // ingestor appends whole commits contiguously, in commit order) and flush each
                     // transaction's appends before processing the next: atomic per-transaction
                     // emission, across tables.
-                    let envs = rr.envelopes;
                     let mut touched = false;
                     let mut i = 0;
                     while i < envs.len() {
@@ -496,21 +516,80 @@ pub(crate) async fn sequencer_loop(
                         flush_pending(&ds, txn_pending).await;
                         i = j;
                     }
-                    // Publish the processed offset only after the whole batch is fanned out + flushed.
-                    if let Some(n) = next {
-                        *processed.lock().unwrap() = n.clone();
-                        if n != ckpt_offset && last_ckpt.elapsed() >= std::time::Duration::from_secs(2) {
-                            ckpt_offset = n.clone();
-                            last_ckpt = std::time::Instant::now();
-                            catalog_tx.send(CatalogEvent::Offset { offset: n });
+                    // Publish the processed position only after the whole batch is fanned out +
+                    // flushed.
+                    if next.is_some() {
+                        *processed.lock().unwrap() = pos.clone();
+                    }
+                    // The segment ended (ADR-0006). Cross only once a read of it comes back EMPTY
+                    // (or stops advancing): "closed" can arrive alongside a page of data, and
+                    // leaving on that page would skip whatever a partial page left behind. A closed
+                    // stream answers a long-poll instantly, so the confirming read costs one round
+                    // trip per rotation. The crossing is checkpointed immediately — a 2 s-lazy
+                    // checkpoint still naming the closed segment's tail would make a restart
+                    // re-derive it.
+                    let mut crossed = false;
+                    if rr.closed && (delivered == 0 || !advanced) {
+                        match rotate_to.take() {
+                            Some(n) => {
+                                tracing::info!("sequencer: {} closed; continuing on {}", pos.path(), segment_path(n));
+                                pos = LogPosition::start_of(n);
+                                *processed.lock().unwrap() = pos.clone();
+                                crossed = true;
+                            }
+                            None => {
+                                // No pointer in this run: the checkpoint this process resumed from
+                                // was already past it, or storage lost it. Step to EXACTLY the next
+                                // segment, verified to exist — never a walk to the first OPEN one,
+                                // which would skip every closed segment in between and with it a
+                                // whole span of unread changes.
+                                match crate::changelog::next_segment_for_reader(&ds, pos.segment).await {
+                                    Ok(n) => {
+                                        tracing::warn!(
+                                            "sequencer: {} is closed and carried no rotation pointer in this run; \
+                                             stepping to {}",
+                                            pos.path(),
+                                            segment_path(n)
+                                        );
+                                        pos = LogPosition::start_of(n);
+                                        *processed.lock().unwrap() = pos.clone();
+                                        crossed = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "sequencer: cannot leave the closed segment {}: {e:#}. Backing off; \
+                                             nothing is skipped.",
+                                            pos.path()
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    }
+                                }
+                            }
                         }
                     }
+                    if crossed || (next.is_some() && pos != ckpt_pos && last_ckpt.elapsed() >= std::time::Duration::from_secs(2)) {
+                        ckpt_pos = pos.clone();
+                        last_ckpt = std::time::Instant::now();
+                        catalog_tx.send(CatalogEvent::Offset { pos: pos.clone() });
+                    }
                     if touched {
-                        publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                        publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                     }
                 }
+                Err(e) if crate::ds::is_stream_gone(&e) => {
+                    // The segment the sequencer is reading has been DELETED under it. The sweeper
+                    // deletes only below the durable checkpoint, and the boot refuses to start on a
+                    // missing segment, so this is unreachable by design — say so at ERROR and back
+                    // off rather than spin quietly at 5 Hz on a 404.
+                    tracing::error!(
+                        "sequencer: the change-log segment it is reading is GONE ({e:#}). Nothing may delete a \
+                         segment the durable checkpoint has not passed, so storage has lost data or something \
+                         outside the engine deleted it; the sequencer cannot advance. Backing off.",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
                 Err(e) => {
-                    tracing::warn!("sequencer read error on {}: {e:#}; backing off", crate::CHANGES_STREAM);
+                    tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             },
@@ -654,9 +733,15 @@ pub(crate) async fn activate_shape(
 
 /// Replay the global change log from `from` for one dormant shape: apply each of its table's
 /// envelopes through the shape's snapshot gate + predicate + projection and append the matches to
-/// the retained stream. Pages until the log reports up-to-date. Appends are direct (`ds.append`):
-/// a retired stream (404/410/closed) means it vanished (evicted/purged mid-replay) and must fail
-/// the resume.
+/// the retained stream. Pages until the log reports up-to-date on the OPEN segment, following each
+/// closed segment's rotation pointer on the way (ADR-0006) exactly as the live loop does. Appends
+/// are direct (`ds.append`): a retired stream (404/410/closed) means it vanished (evicted/purged
+/// mid-replay) and must fail the resume.
+///
+/// A resume segment that is GONE (the sweeper deleted it — which it only does once nothing can
+/// resume inside it, so this should be unreachable) surfaces as a read error, which fails the
+/// resume and drops the shape. That is the right outcome: a shape whose replay start no longer
+/// exists can never be brought up to date, and its subscribers must recreate it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn replay_changes_for_shape(
     ds: &DsClient,
@@ -666,15 +751,24 @@ pub(crate) async fn replay_changes_for_shape(
     out_cols: Option<&Arc<Vec<usize>>>,
     gate: &crate::pg::SnapshotGate,
     stream_path: &str,
-    from: &str,
+    from: &LogPosition,
 ) -> Result<u64> {
-    let mut off = from.to_string();
+    let mut pos = from.clone();
+    let mut rotate_to: Option<u32> = None;
     let mut emitted = 0u64;
     loop {
-        let rr = ds.read(crate::CHANGES_STREAM, &off, false).await?;
+        let rr = ds
+            .read(&pos.path(), &pos.offset, false)
+            .await
+            .with_context(|| format!("replaying the change log from {pos}"))?;
+        if let Some(n) = crate::changelog::rotation_target_in(&rr.envelopes) {
+            rotate_to = Some(n);
+        }
+        let delivered = rr.envelopes.len();
         let mut outs: Vec<Envelope> = Vec::new();
         for env in &rr.envelopes {
-            // The change log's `type` is the canonical `schema.name`.
+            // The change log's `type` is the canonical `schema.name`; a control envelope's never
+            // is, so it is skipped by TYPE here as everywhere else.
             if env.type_ != table.as_str() {
                 continue;
             }
@@ -697,14 +791,27 @@ pub(crate) async fn replay_changes_for_shape(
             emitted += outs.len() as u64;
             ds.append(stream_path, &outs).await.context("append replay to retained stream")?;
         }
-        match rr.next_offset {
-            Some(n) if n != off => {
-                off = n;
-                if rr.up_to_date {
-                    break;
-                }
-            }
-            _ => break,
+        let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
+        if let Some(n) = rr.next_offset {
+            pos.offset = n;
+        }
+        if rr.closed && (delivered == 0 || !advanced) {
+            // The segment is drained AND closed: follow the pointer, exactly as the live loop does.
+            let next = match rotate_to.take() {
+                Some(n) => n,
+                // No pointer seen on this page: step to EXACTLY the next segment (verified to
+                // exist). A walk to the first open segment would skip the closed ones in between,
+                // and this replay is precisely what has to read them.
+                None => crate::changelog::next_segment_for_reader(ds, pos.segment).await?,
+            };
+            pos = LogPosition::start_of(next);
+            continue;
+        }
+        if !advanced {
+            break; // the segment stopped advancing and is still open: nothing more to replay
+        }
+        if rr.up_to_date && !rr.closed {
+            break;
         }
     }
     Ok(emitted)

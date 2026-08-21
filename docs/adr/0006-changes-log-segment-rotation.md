@@ -17,3 +17,27 @@ pin a segment beyond the retention window is evicted first. The catalog records 
 - Prefix trimming as a durable-streams primitive (upstream issue #12's plan): cleaner offsets, but a
   change to another upstream. The low-watermark computation is the same, so it can replace rotation
   later without touching the policy.
+
+## Consequences
+
+Disk is bounded by the segment budget times the number of segments anything still needs:
+`ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` (default 1 GiB) and
+`ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` (default 86400) decide when to rotate (`0` disables that
+criterion), and `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` (default 604800, the dormancy TTL's default)
+is how long a rotated-out segment may stay pinned by a dormant shape. The rotation pointer is a
+control envelope — `type: "__circuits.control"`; the `__circuits` schema is reserved, so no tracked
+table can produce that spelling — and every reader drops control envelopes **by type,
+unconditionally**, never by position. Position would not be safe: if the close after the pointer
+fails, the rotation is retried at the next commit, so a segment can carry commits *after* a pointer
+and end up with two. Readers cross only on `closed` **and** drained, which makes an abandoned
+pointer inert. Deletion and eviction interlock in one direction only: a dormant shape whose resume segment
+was rotated out longer ago than the retain window is **evicted first** (the ordinary close-then-delete
+path, ADR-0007), and only the segments that eviction unpinned are then deleted — an eviction that
+fails defers its segment to the next sweep rather than deleting a segment something could still
+resume inside. Every change-log position becomes `(segment, offset)`; a catalog holding a bare offset
+predates this ADR and is refused at boot rather than coerced. The deletion floor is the **durable**
+checkpoint (the last `Offset` that reached storage), not the sequencer's in-memory position, so a
+crash can never leave a boot resuming inside a segment a sweep has deleted — and a boot whose
+restored position names a segment storage does not have refuses to start rather than spin on a 404.
+A reader leaving a closed segment steps to exactly the next one, never to the first open one: the
+segments in between are unread changes.

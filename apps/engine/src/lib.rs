@@ -17,6 +17,7 @@
 //! `docs/ivm-engine-internals.md` for the system design.
 
 pub mod arrangements;
+pub mod changelog;
 pub mod config;
 pub mod ds;
 pub mod electric;
@@ -50,7 +51,9 @@ pub mod where_sql;
 
 pub use value::{Row, Value};
 
-/// The single ordered change log: the ingestor appends whole commits here (in commit order), and
-/// the engine's sequencer consumes it — the envelope's `type` field carries the table's canonical
-/// `schema.name` (always qualified; see [`table_ref`] and ADR-0002).
-pub const CHANGES_STREAM: &str = "changes";
+// The single ordered change log lives in [`changelog`]: the ingestor appends whole commits (in
+// commit order) to the CURRENT segment and the engine's sequencer consumes them — the envelope's
+// `type` field carries the table's canonical `schema.name` (always qualified; see `table_ref` and
+// ADR-0002). The log is **segmented** (`changes/0`, `changes/1`, …), rotated by size or age so a
+// long-running deployment's disk stays bounded, and a segment is deleted once nothing can resume
+// inside it (ADR-0006). Every position in it is a `changelog::LogPosition`.

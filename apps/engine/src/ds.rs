@@ -45,11 +45,56 @@ pub struct ReadResult {
     pub envelopes: Vec<Envelope>,
     pub next_offset: Option<String>,
     pub up_to_date: bool,
-    /// The server reported `stream-closed`: the stream is **terminal** — it will never grow again,
-    /// and for a shape stream that means the engine retired the shape (close-then-delete, see
-    /// [`DsClient::retire_stream`]). Readers must stop, not re-poll: a closed stream answers a
-    /// long-poll instantly, so looping on "empty page, same offset" would spin on the server.
+    /// The server reported `stream-closed`: the stream is **terminal** — it will never grow again.
+    /// For a shape stream that means the engine retired the shape (close-then-delete, see
+    /// [`DsClient::retire_stream`]) and readers must stop, not re-poll: a closed stream answers a
+    /// long-poll instantly, so looping on "empty page, same offset" would spin on the server. For a
+    /// `changes/<n>` segment it means the log ROTATED (ADR-0006) and the reader follows the batch's
+    /// rotation pointer onto the next segment.
     pub closed: bool,
+}
+
+/// What a `HEAD` found: the stream's tail offset and whether it is closed. `None` from
+/// [`DsClient::head`] means the stream is not there (404) or soft-deleted (410).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamHead {
+    pub next_offset: Option<String>,
+    pub closed: bool,
+}
+
+/// A read hit a stream that is not there: deleted (404) or soft-deleted (410).
+///
+/// A typed error because callers make very different decisions about it than about a transient read
+/// failure. On the change log (ADR-0006) it is never expected — a segment is deleted only once
+/// nothing can resume inside it — so the sequencer treats it as an error to log loudly and back off
+/// from, the boot treats it as fatal for the position it is about to resume, and a dormant shape's
+/// replay treats it as "this shape can never be brought up to date", which evicts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamGone {
+    pub path: String,
+    pub status: u16,
+}
+
+impl std::fmt::Display for StreamGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream '{}' is gone ({})", self.path, self.status)
+    }
+}
+
+impl std::error::Error for StreamGone {}
+
+/// Does this error (or anything it was contextualised from) mean "the stream is not there"?
+pub fn is_stream_gone(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<StreamGone>().is_some())
+}
+
+/// The outcome of an append that treats retirement as an answer rather than an error (see
+/// [`DsClient::append_checked`]).
+pub enum Appended {
+    /// Landed; `next_offset` is the stream's tail afterwards (`stream-next-offset`).
+    Ok { next_offset: Option<String> },
+    /// The stream is retired — deleted (404), soft-deleted (410) or closed (409 + `stream-closed`).
+    Retired(u16),
 }
 
 /// Why an append failed: the stream is retired — deleted (404), soft-deleted (410) or closed
@@ -174,18 +219,38 @@ impl DsClient {
     }
 
     /// Append envelopes. A retired stream (404/410/closed) is an error here; the live path uses
-    /// [`Self::append_reliable`], which discards instead.
+    /// [`Self::append_reliable`], which discards instead, and the change log uses
+    /// [`Self::append_checked`], which routes around it.
     pub async fn append(&self, path: &str, envelopes: &[Envelope]) -> Result<()> {
         match self.append_once(path, envelopes).await {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(AppendError::Gone(status)) => bail!("POST {path} -> {status} (stream retired)"),
             Err(AppendError::Other(e)) => Err(e),
         }
     }
 
-    async fn append_once(&self, path: &str, envelopes: &[Envelope]) -> std::result::Result<(), AppendError> {
+    /// Append, reporting a retired stream as an outcome instead of an error, and handing back the
+    /// stream's tail offset on success.
+    ///
+    /// The change log's writer needs both (ADR-0006): the tail offset IS the segment's size (the
+    /// rotation decision), and a closed segment is a routing signal — walk forward to the successor
+    /// — not a loss. Transient failures still surface as `Err` so the ingestor can tear its
+    /// connection down unacknowledged rather than lose the commit.
+    pub async fn append_checked(&self, path: &str, envelopes: &[Envelope]) -> Result<Appended> {
+        match self.append_once(path, envelopes).await {
+            Ok(next_offset) => Ok(Appended::Ok { next_offset }),
+            Err(AppendError::Gone(status)) => Ok(Appended::Retired(status)),
+            Err(AppendError::Other(e)) => Err(e),
+        }
+    }
+
+    async fn append_once(
+        &self,
+        path: &str,
+        envelopes: &[Envelope],
+    ) -> std::result::Result<Option<String>, AppendError> {
         if envelopes.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Serialize once ourselves (instead of `.json(...)`) so the successful append's byte size
         // can be recorded for the retention disk-budget accounting.
@@ -205,11 +270,12 @@ impl DsClient {
         // (closed, which retirement does before deleting). Read the header before the body consumes
         // the response; the body text ("stream is closed") is not the contract.
         let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let next_offset = header(&res, "stream-next-offset");
         // Drain the body so the connection can be pooled and reused (avoids a socket leak per append).
         let body = res.text().await.unwrap_or_default();
         if status.is_success() {
             *self.appended.lock().unwrap().entry(path.to_string()).or_insert(0) += payload_len;
-            Ok(())
+            Ok(next_offset)
         } else if status.as_u16() == 404 || status.as_u16() == 410 || (status.as_u16() == 409 && closed) {
             Err(AppendError::Gone(status.as_u16()))
         } else {
@@ -234,7 +300,7 @@ impl DsClient {
         let mut attempt = 0u32;
         loop {
             match self.append_once(path, envelopes).await {
-                Ok(()) => return true,
+                Ok(_) => return true,
                 Err(AppendError::Gone(status)) => {
                     tracing::debug!("append to {path}: stream retired ({status}); discarding {} envelopes", envelopes.len());
                     return false;
@@ -307,6 +373,32 @@ impl DsClient {
         }
     }
 
+    /// `HEAD` a stream: its tail offset and whether it is closed, without reading a byte of it (and
+    /// without resetting its TTL). `Ok(None)` = not there (404) or soft-deleted (410).
+    ///
+    /// The change log's boot walk uses this to step over segments a crashed predecessor closed
+    /// (ADR-0006): a closed segment can be a gigabyte, and durable-streams offers no bounded tail
+    /// read, so the successor is derived and *verified* rather than read back.
+    pub async fn head(&self, path: &str) -> Result<Option<StreamHead>> {
+        let res = self
+            .http
+            .head(self.stream_url(path))
+            .send()
+            .await
+            .with_context(|| format!("HEAD {path}"))?;
+        let status = res.status();
+        if status.as_u16() == 404 || status.as_u16() == 410 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            bail!("HEAD {path} -> {status}");
+        }
+        Ok(Some(StreamHead {
+            next_offset: header(&res, "stream-next-offset"),
+            closed: header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true")),
+        }))
+    }
+
     /// Read from `offset` (use "-1" for the beginning). `live` enables long-poll tailing.
     pub async fn read(&self, path: &str, offset: &str, live: bool) -> Result<ReadResult> {
         let mut url = format!("{}?offset={}", self.stream_url(path), offset);
@@ -324,6 +416,11 @@ impl DsClient {
         // 204 = long-poll timeout / no new data / a close that woke this long-poll.
         if status.as_u16() == 204 {
             return Ok(ReadResult { envelopes: Vec::new(), next_offset, up_to_date, closed });
+        }
+        // A stream that is not there is a TYPED error (see `StreamGone`), never a generic read
+        // failure: on the change log every caller has its own, very different answer to it.
+        if status.as_u16() == 404 || status.as_u16() == 410 {
+            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: status.as_u16() }));
         }
         if !status.is_success() {
             bail!("GET {path} -> {status}");

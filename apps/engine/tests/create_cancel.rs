@@ -46,6 +46,8 @@ async fn ds_handler(State(ds): State<FakeDs>, request: Request) -> Response {
             StatusCode::OK.into_response()
         }
         Method::POST => StatusCode::OK.into_response(),
+        // The change log's boot walk HEADs the current segment (ADR-0006): present, never closed.
+        Method::HEAD => ([("stream-next-offset", "tip")]).into_response(),
         Method::GET => ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }

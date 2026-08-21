@@ -83,7 +83,8 @@ The engine creates a `pgoutput` logical-replication slot (+ a `<slot>_pub` publi
 **streams** it over the walsender protocol (push delivery — no poll interval). It buffers each
 transaction between `Begin` and `Commit` and stamps every change with its transaction's
 **COMMIT LSN** (not the per-change record LSN). It appends the resulting `Envelope`s (with
-`old` + `new`) to the `changes` durable stream, and only **then** acknowledges the commit
+`old` + `new`) to the current segment of the `changes/<n>` durable change log (ADR-0006), and only
+**then** acknowledges the commit
 to Postgres (`confirmed_flush_lsn`). A failed append tears the connection down unacknowledged;
 the server resends from the confirmed position (append-then-acknowledge).
 
@@ -117,7 +118,8 @@ duplicates at the exact boundary; the xid gate decides both cases. Guarded by
 ### 2.3 Tail and fan-out (`engine/sequencer.rs`)
 
 There is **one sequencer task for all tables** (`sequencer_loop`) — the LSN-ordered executor.
-It long-polls the single `changes` log (whole commits, in commit order) and for each change:
+It long-polls the change log's current segment (whole commits, in commit order; on a rotation it
+follows the segment's control-envelope pointer to the next one) and for each change:
 
 1. **de-duplicate**: skip if the envelope's `(commit lsn, seq)` is at/below the sequencer's
    global highwater — the ingestor's delivery is at-least-once (unacknowledged commits

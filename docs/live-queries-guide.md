@@ -66,7 +66,7 @@ identical either way.)
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
 keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
-ensures the `changes` durable stream, and starts the ingestor.
+ensures the current `changes/<n>` change-log segment, and starts the ingestor.
 
 In production you run three processes — the `durable-streams-server`, the engine binary, and the
 API server — pointed at your Postgres, and point the client at the API URL. The demos colocate

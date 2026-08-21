@@ -10,8 +10,11 @@
 //! - **Dormant** — after sitting idle (no engine-visible reads and refcount 0) for
 //!   [`RetentionConfig::idle_timeout`]: the tailer's routing state for the shape is dropped, while
 //!   the durable stream and the shape record are retained at zero engine cost. Any touch
-//!   reactivates by replaying the global `changes` log from the captured resume offset — no
-//!   Postgres backfill (see `Engine::ensure_active`).
+//!   reactivates by replaying the global change log from the captured resume **position** —
+//!   `(segment, offset)`, following rotation pointers across segments (ADR-0006) — with no Postgres
+//!   backfill (see `Engine::ensure_active`). While dormant a shape PINS its resume segment against
+//!   deletion; one that would pin it past `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted
+//!   ([`EvictReason::ChangeLogRetention`]) so the segment can go.
 //! - **Evicted** — stream and record deleted; a returning `/v1/shape` client gets `409
 //!   must-refetch` and re-snapshots, an extended-API client gets `404` and recreates.
 //!
@@ -40,12 +43,13 @@
 //! planner ([`plan_sweep`]); `crate::engine` owns the state and executes plans. Persistence of the
 //! lifecycle (catalog, `last_read` flushes, restart recovery) is the follow-up catalog work (GH
 //! issue #8). Dormancy IS durable: the engine's `meta/catalog` records `Dormant`/`Reactivated`
-//! events (with the resume offset + snapshot gate), so a restart restores dormant shapes as
+//! events (with the resume position + snapshot gate), so a restart restores dormant shapes as
 //! dormant — no re-registration, no backfill. Only the in-memory clocks reset (dormancy age
 //! restarts at boot, so the TTL is conservative across restarts).
 
 use std::time::{Duration, Instant};
 
+use crate::changelog::LogPosition;
 use crate::heap_size::HeapSize;
 use crate::pg::SnapshotGate;
 
@@ -111,23 +115,29 @@ pub enum LifeState {
     /// The active → dormant transition is in flight (the tailer is unregistering the shape and
     /// capturing the resume state). A touch waits for it to finish, then reactivates.
     Deactivating { done: tokio::sync::watch::Receiver<bool> },
-    /// Engine state dropped; stream + record retained. `resume_offset` is the change-log offset
-    /// up to which the shape's stream is complete; `gate` is the shape's original
-    /// backfill-snapshot fence (still needed if the shape went dormant with pre-backfill changes
-    /// in flight).
-    Dormant { since: Instant, resume_offset: String, gate: SnapshotGate },
+    /// Engine state dropped; stream + record retained. `resume` is the change-log position
+    /// (segment + offset — the log is segmented, ADR-0006) up to which the shape's stream is
+    /// complete; `gate` is the shape's original backfill-snapshot fence (still needed if the shape
+    /// went dormant with pre-backfill changes in flight). While dormant the shape **pins** its
+    /// resume segment: the segment is not deleted until the shape is reactivated or evicted.
+    Dormant { since: Instant, resume: LogPosition, gate: SnapshotGate },
     /// A touch is replaying the change log to bring the shape back. Concurrent touches await
     /// the same outcome (`Some(true)` = active again, `Some(false)` = reactivation failed).
-    Reactivating { done: tokio::sync::watch::Receiver<Option<bool>> },
+    /// `resume` is the position the replay is running FROM: it keeps pinning its change-log segment
+    /// for the whole replay, so the sweeper cannot delete the segment out from under a
+    /// reactivation that outlives one sweep tick (ADR-0006).
+    Reactivating { done: tokio::sync::watch::Receiver<Option<bool>>, resume: LogPosition },
 }
 
 impl HeapSize for LifeState {
-    /// Only `Dormant`'s `resume_offset` (a `String`) and `gate` own heap; the `watch::Receiver`
-    /// variants are channel handles (shared with the sender side), not uniquely owned data.
+    /// Only `Dormant`'s `resume` position (its offset `String`) and `gate` own heap; the
+    /// `watch::Receiver` variants are channel handles (shared with the sender side), not uniquely
+    /// owned data.
     fn heap_bytes(&self) -> usize {
         match self {
-            LifeState::Dormant { since: _, resume_offset, gate } => resume_offset.heap_bytes() + gate.heap_bytes(),
-            LifeState::Active | LifeState::Deactivating { .. } | LifeState::Reactivating { .. } => 0,
+            LifeState::Dormant { since: _, resume, gate } => resume.heap_bytes() + gate.heap_bytes(),
+            LifeState::Reactivating { done: _, resume } => resume.heap_bytes(),
+            LifeState::Active | LifeState::Deactivating { .. } => 0,
         }
     }
 }
@@ -172,12 +182,33 @@ pub struct SweepShape {
     pub stream_bytes: u64,
 }
 
+/// Did an eviction actually happen?
+///
+/// The change log's sweeper needs the difference (ADR-0006). It evicts a dormant shape in order to
+/// **unpin** the segment the shape resumes from, and then deletes that segment; a "nothing to do"
+/// answer — the shape was touched between planning and eviction and is now reactivating, or it was
+/// re-subscribed — must not be read as "the pin is released", or the segment would be deleted out
+/// from under a live replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evicted {
+    /// The shape is gone (or was already gone): nothing it held is held any more.
+    Yes,
+    /// Nothing was done — the shape is mid-transition, or has been touched/re-subscribed since the
+    /// sweep's snapshot. Everything it pinned, it still pins.
+    Skipped,
+}
+
 /// Why a shape is being evicted (for logs/metrics).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictReason {
     DormantTtl,
     MaxShapes,
     DiskBudget,
+    /// The shape's dormant resume position sits in a change-log segment that was rotated out more
+    /// than `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` ago (ADR-0006). Evicting it is what unpins the
+    /// segment so it can be deleted — the change log must not be held hostage by a shape nobody has
+    /// touched in a week.
+    ChangeLogRetention,
 }
 
 impl EvictReason {
@@ -186,6 +217,7 @@ impl EvictReason {
             EvictReason::DormantTtl => "dormant-ttl",
             EvictReason::MaxShapes => "max-shapes",
             EvictReason::DiskBudget => "disk-budget",
+            EvictReason::ChangeLogRetention => "change-log-retention",
         }
     }
 }

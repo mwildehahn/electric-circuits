@@ -470,13 +470,23 @@ fn path_table(raw: &str) -> Result<TableRef, AppError> {
     })
 }
 
+/// `GET /tables/{name}/offset` — the sequencer's position in the (segmented) change log.
+///
+/// The change log is a sequence of `changes/<n>` streams (ADR-0006), so a bare offset no longer
+/// identifies a position: the answer carries the `segment`, its `path`, and the offset within it.
+/// A consumer comparing progress must compare `(segment, offset)` — an offset from a later segment
+/// can be lexicographically smaller than one from an earlier segment.
 async fn table_offset(
     State(engine): State<Engine>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let name = path_table(&name)?;
     match engine.table_offset(&name).await {
-        Some(offset) => Ok(Json(serde_json::json!({ "offset": offset }))),
+        Some(pos) => Ok(Json(serde_json::json!({
+            "segment": pos.segment,
+            "path": pos.path(),
+            "offset": pos.offset,
+        }))),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
     }
 }
@@ -609,6 +619,9 @@ async fn subquery_stats(State(engine): State<Engine>) -> Json<serde_json::Value>
 }
 
 async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    // Read the change-log position ONCE: three separate reads could straddle a rotation and report
+    // a segment with an offset that belongs to a different one.
+    let changes = engine.changes_position();
     Json(serde_json::json!({
         "lsn": engine.replication_lsn(),
         "sync": engine.replication_sync(),
@@ -623,6 +636,15 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         // that binding still holds. `state: "broken"` is the refuse policy's degraded state: ingest
         // is stopped, shape routes answer 503, and `POST /epoch/reset` is the way out.
         "epoch": engine.epoch_json(),
+        // The INGESTOR's position in the segmented change log (ADR-0006): which segment it appends
+        // to, and the tail offset of its last append. Additive — the four fields above are
+        // untouched — and it is what a convergence barrier reads to know which `changes/<n>` to
+        // HEAD for the tail (the sequencer's own position is `GET /tables/{name}/offset`).
+        "changes": {
+            "segment": changes.segment,
+            "path": changes.path(),
+            "offset": changes.offset,
+        },
     }))
 }
 

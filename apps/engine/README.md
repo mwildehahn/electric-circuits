@@ -43,7 +43,10 @@ discover the bound port.
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
 | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
-| `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval |
+| `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval (also drives change-log segment deletion) |
+| `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
+| `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Change log: rotate once the current segment is this old. `0` disables the age criterion (both `0` = never rotate, i.e. an unbounded log) |
+| `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | Change log: how long a rotated-out segment may stay pinned by a **dormant** shape before that shape is evicted and the segment deleted. `0` = a dormant shape pins its segment forever |
 | `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` (Electric parity) retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
 | `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before its **handle state** is evicted and its shape subscription released (the shape + stream are retained and follow the retention lifecycle); a late request gets `409 must-refetch` and rejoins the retained shape |
@@ -114,9 +117,9 @@ unchanged.
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
 | `GET /trace` | SSE: per-envelope pipeline traces (hops + outcomes) and `shapeAdded`/`shapeDropped` lifecycle events; lossy by design, zero cost with no subscribers |
 | `GET /tables` | every tracked table + its schema-drift `unresolved` flag |
-| `GET /tables/{name}/offset` · `GET /tables/{name}/families` | tailer position / routing-family stats |
+| `GET /tables/{name}/offset` · `GET /tables/{name}/families` | sequencer position in the change log (`{segment, path, offset}` — compare `(segment, offset)`, never the offset alone) / routing-family stats |
 | `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…` | shared-node stats, pipeline graph, one node's live index |
-| `GET /replication/lsn` | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) + the `epoch` object (slot binding + `state`/`reason`) |
+| `GET /replication/lsn` | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) + the `epoch` object (slot binding + `state`/`reason`) + `changes` (the current change-log segment and the ingestor's tail offset in it) |
 | `POST /epoch/reset` | operator recovery from a broken epoch under `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false`: retire every shape, bind a new epoch, resume ingest (409 if the epoch is not broken) |
 | `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition |
 | `GET /v1/shape` | Electric protocol: snapshot (`offset=-1`), live long-poll, handles/offsets/`must-refetch` |
@@ -132,6 +135,46 @@ a node, walked on down the graph) the moment the seed and the shape are in. The 
 state stays registry-owned across the whole install, so a client disconnect at any point — a
 partly-installed membership seed included — is unwound exactly and the same shape is immediately
 creatable again.
+
+## The change log
+
+Every committed change to every tracked table rides one ordered log, which the ingestor appends to
+and the sequencer consumes. That log is **segmented** (`docs/adr/0006-changes-log-segment-rotation.md`):
+`changes/0`, `changes/1`, … , never a bare `changes` stream.
+
+At a transaction boundary — after the commit's append and its acknowledgement — the ingestor checks
+the current segment against `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` and
+`ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS`. Over either budget it creates `changes/<n+1>`, appends one
+final **control envelope** naming the successor to `changes/<n>`, closes `changes/<n>` (which
+releases every tailing reader at once with `stream-closed`), records the rotation in the durable
+catalog, and continues in the new segment. Nothing ever appends to a closed segment: a writer told
+otherwise walks forward to the open one. Control envelopes carry `type: "__circuits.control"` — the
+`__circuits` schema is reserved, so `ELECTRIC_CIRCUITS_PG_TABLES` refuses to track anything in it —
+and every reader drops them **by type, unconditionally**, so they never reach a table's routing or a
+shape stream. (Not by position: if the close after the pointer fails, the rotation is retried at the
+next commit, so a segment can carry commits after a pointer and end up with two. Readers cross only
+on closed-**and**-drained, so the abandoned one is inert.)
+
+Every position in the log is therefore a `(segment, offset)` pair — the sequencer's checkpoint, a
+dormant shape's resume state, `GET /tables/{name}/offset`. Comparing offsets alone is wrong: an
+offset from a later segment can be lexicographically smaller than one from an earlier segment.
+
+A rotated-out segment is **deleted** by the retention sweeper once the **durable** checkpoint (the
+last position that actually reached the catalog, not the sequencer's in-memory one) is past it and
+no shape resumes inside it. A dormant shape that would pin a segment for longer than
+`ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted first (the ordinary close-then-delete retirement),
+which is what unpins it; a shape whose reactivation is replaying pins just as hard and is never
+evicted out from under the replay. The current segment is never deleted, and neither is one the
+durable checkpoint has not passed. `GET /metrics` reports `changes_rotations_total`,
+`changes_segments_deleted_total` and the `changes_segments_retained` gauge.
+
+If the process dies between closing a segment and recording the rotation, the next boot finds the
+catalog's segment closed and walks forward to the open one, writing the record the crash lost. Only
+the **writer** walks: a reader that finds its segment closed steps to exactly the next one, because
+everything in between is changes it has not read. A closed segment with **no** successor cannot be
+produced by the engine (rotation creates the successor first), so that state is refused loudly rather
+than skipped past — as is a boot whose restored position, or whose recorded current segment, names a
+stream storage no longer has.
 
 ## Schema changes
 
@@ -236,8 +279,10 @@ maintained:
   does not deactivate; brief reconnects rejoin the same warm stream.
 - **Dormant** — after `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` with no reads and no subscribers: engine
   routing state is dropped, the durable stream and shape record are retained at zero engine cost.
-  Any touch (rejoin, `/v1/shape` re-snapshot, rows/log read) reactivates by replaying the
-  `table/<name>` stream from the captured resume offset — no Postgres backfill.
+  Any touch (rejoin, `/v1/shape` re-snapshot, rows/log read) reactivates by replaying the change
+  log from the captured resume position (`(segment, offset)`, following rotation pointers across
+  segments) — no Postgres backfill. A dormant shape **pins** its resume segment against deletion;
+  one that would pin it for longer than `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted instead.
 - **Evicted** — record deleted and the stream **retired**: closed, then deleted (see
   `docs/adr/0007-retirement-closes-before-delete.md`), so a client tailing it is released at once
   with `stream-closed` rather than blocking to the long-poll timeout. `/v1/shape` clients get

@@ -108,6 +108,11 @@ pub struct Metrics {
     pub schema_unresolved: AtomicU64,  // ADR-0005: drifts that could not be resolved (table parked, retrying)
     pub epoch_breaks: AtomicU64,       // ADR-0004: slots the engine could no longer vouch for
     pub epoch_resets: AtomicU64,       // ADR-0004: new epochs bound (every shape retired, fresh slot)
+    pub changes_rotations: AtomicU64,  // ADR-0006: change-log segments closed and succeeded
+    pub changes_segments_deleted: AtomicU64, // ADR-0006: rotated-out segments retired (nothing could resume inside)
+    /// GAUGE, not a counter: how many change-log segments exist right now (republished by every
+    /// retention sweep). `reset()` leaves it alone — a gauge describes the world, not the window.
+    pub changes_segments_retained: AtomicU64,
     pub process_envelope: Hist,   // end-to-end fan-out latency per table envelope
     pub family_step: Hist,        // one family circuit transaction
     pub append: Hist,             // one shape-stream append (durable-streams round-trip)
@@ -128,6 +133,9 @@ pub fn metrics() -> &'static Metrics {
         schema_unresolved: AtomicU64::new(0),
         epoch_breaks: AtomicU64::new(0),
         epoch_resets: AtomicU64::new(0),
+        changes_rotations: AtomicU64::new(0),
+        changes_segments_deleted: AtomicU64::new(0),
+        changes_segments_retained: AtomicU64::new(0),
         process_envelope: Hist::new(),
         family_step: Hist::new(),
         append: Hist::new(),
@@ -149,6 +157,11 @@ impl Metrics {
                 "schema_unresolved_total": self.schema_unresolved.load(Ordering::Relaxed),
                 "epoch_breaks_total": self.epoch_breaks.load(Ordering::Relaxed),
                 "epoch_resets_total": self.epoch_resets.load(Ordering::Relaxed),
+                "changes_rotations_total": self.changes_rotations.load(Ordering::Relaxed),
+                "changes_segments_deleted_total": self.changes_segments_deleted.load(Ordering::Relaxed),
+            },
+            "gauges": {
+                "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
             },
             "process_envelope_us": self.process_envelope.snapshot(),
             "family_step_us": self.family_step.snapshot(),
@@ -170,6 +183,9 @@ impl Metrics {
         self.schema_unresolved.store(0, Ordering::Relaxed);
         self.epoch_breaks.store(0, Ordering::Relaxed);
         self.epoch_resets.store(0, Ordering::Relaxed);
+        self.changes_rotations.store(0, Ordering::Relaxed);
+        self.changes_segments_deleted.store(0, Ordering::Relaxed);
+        // `changes_segments_retained` is deliberately NOT reset: it is a gauge of what exists.
         self.process_envelope.reset();
         self.family_step.reset();
         self.append.reset();

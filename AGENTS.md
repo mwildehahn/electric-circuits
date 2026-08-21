@@ -253,6 +253,23 @@ canvas update, screenshot.
   the new `SlotBound` is written. A create that overlapped a reset is refused (`resetting`) or rolled
   back by the epoch component of `SchemaGens` — the whole-engine twin of the per-table schema
   generation.
+- **The change log is segmented; never append to a closed segment** (ADR 0006; `engine/src/changelog.rs`).
+  The log is `changes/0`, `changes/1`, … — there is no bare `changes` stream. The ingestor rotates at
+  a transaction boundary by bytes or age: create the successor, append ONE control envelope naming
+  it, close the predecessor, record `ChangesRotated`. Control envelopes carry
+  `type: "__circuits.control"` and are skipped **by type, unconditionally** by every reader (never by
+  position — an abandoned rotation leaves a pointer mid-segment; `__circuits` is a reserved schema so
+  no tracked table can spell it), so they can never reach `exec_for`, an arrangement or a shape
+  stream. Every change-log position is a `LogPosition { segment, offset }` — the sequencer's
+  checkpoint, a dormant shape's resume state, `GET /tables/{name}/offset` — and comparing bare
+  offsets across segments is wrong. Readers cross a boundary only on **closed AND drained**, and step
+  to **exactly** the next segment (the writer is the only thing that walks to the first open one). A
+  rotated-out segment is deleted only once the **durable** checkpoint (the last `Offset` that reached
+  the catalog, not the in-memory position) is past it and no shape pins it — a dormant shape pinning
+  past `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted first, a reactivating one is never evicted
+  mid-replay, and the plan is recomputed after the evictions so a skipped one cannot license a
+  delete. The current segment is never deleted, and a boot whose restored position names a missing
+  segment refuses to start.
 - **Engine-initiated retirement closes the stream, then deletes it** (`ds.retire_stream`; ADR 0007):
   purge, eviction, drop-at-restore, schema drift, the degraded subquery reap. The close releases a tailing
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never

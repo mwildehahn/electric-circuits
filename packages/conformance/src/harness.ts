@@ -281,24 +281,58 @@ export async function applyOp(h: Harness, table: string, ev: ChangeEvent): Promi
   await h.oracle.applyChange(table, ev)
 }
 
-async function changesTail(dsUrl: string): Promise<string | null> {
-  const res = await fetch(`${dsUrl}/changes`, { method: 'HEAD' })
-  if (!res.ok) return null
-  const off = res.headers.get('stream-next-offset')
-  // An empty stream has nothing to reach. Servers differ in how they spell "empty": the Node
-  // test server reports -1 (which the engine's initial "-1" trivially satisfies), the Rust
-  // server reports the zero offset (all-zero epoch_byte) — which the engine's "-1" would
-  // lexicographically never reach. Normalize both to "no tail".
-  if (off === null || off === '-1' || /^0+(_0+)?$/.test(off)) return null
-  return off
+/** A position in the segmented change log (ADR-0006): compare `(segment, offset)`, never the offset alone. */
+export interface LogPosition {
+  segment: number
+  offset: string
 }
 
-async function engineChangesOffset(engineUrl: string): Promise<string | null> {
-  // The per-table route reports the sequencer's global change-log offset (same for every table).
+/**
+ * Is `a` at or past `b`? Segment first — an offset from a later segment can be lexicographically
+ * smaller than one from an earlier segment, so comparing offsets alone is wrong. `'-1'` (the start
+ * sentinel) sorts below every real offset, which is exactly what an empty target segment wants.
+ */
+export function positionReached(a: LogPosition, b: LogPosition): boolean {
+  if (a.segment !== b.segment) return a.segment > b.segment
+  return a.offset >= b.offset
+}
+
+/**
+ * The tail of the change log: the CURRENT segment (which the engine reports — the log rotates, so
+ * there is no un-suffixed `changes` stream to HEAD) and that segment's tail offset.
+ */
+export async function changesTail(dsUrl: string, engineUrl: string): Promise<LogPosition | null> {
+  const segment = await engineChangesSegment(engineUrl)
+  if (segment === null) return null
+  const res = await fetch(`${dsUrl}/changes/${segment}`, { method: 'HEAD' })
+  if (!res.ok) return null
+  const off = res.headers.get('stream-next-offset')
+  // A segment the ingestor has not written to yet — the usual state right after a rotation — has
+  // no bytes to reach, but the sequencer must still have GOT to it, so the segment half of the
+  // barrier stands. Servers differ in how they spell "empty": the Node test server reports -1, the
+  // Rust server the zero offset (all-zero epoch_byte). Normalize both to the start sentinel, which
+  // every position inside that segment satisfies — the alternative (waiting for the sequencer to
+  // report the zero offset) waits out a whole 30 s long-poll on an empty segment.
+  const empty = off === null || off === '-1' || /^0+(_0+)?$/.test(off)
+  if (empty && segment === 0) return null // nothing has ever been written at all
+  return { segment, offset: empty ? '-1' : off }
+}
+
+/** The segment the INGESTOR is appending to — the one a tail HEAD must address. */
+export async function engineChangesSegment(engineUrl: string): Promise<number | null> {
+  const res = await fetch(`${engineUrl}/replication/lsn`)
+  if (!res.ok) throw new Error(`engine replication status -> ${res.status}`)
+  const body = (await res.json()) as { changes?: { segment: number } }
+  return body.changes?.segment ?? null
+}
+
+/** The SEQUENCER's position in the change log (the same global position for every table). */
+export async function engineChangesOffset(engineUrl: string): Promise<LogPosition | null> {
   const res = await fetch(`${engineUrl}/tables/_any/offset`)
   if (res.status === 404) return null
   if (!res.ok) throw new Error(`engine change-log offset -> ${res.status}`)
-  return ((await res.json()) as { offset: string }).offset
+  const body = (await res.json()) as { segment: number; offset: string }
+  return { segment: body.segment, offset: body.offset }
 }
 
 async function engineReplicationSync(engineUrl: string): Promise<number> {
@@ -348,21 +382,26 @@ export async function drainEngine(h: Harness, timeoutMs = 20000): Promise<void> 
   if (!synced) {
     throw new Error(`drainEngine: replication did not reach sentinel ${target} within ${timeoutMs}ms`)
   }
-  // Stage 2: the sequencer processed the single ordered change log up to its tail.
+  // Stage 2: the sequencer processed the single ordered change log up to its tail. The log is
+  // segmented (ADR-0006), so the barrier is on `(segment, offset)`: the tail is read from the
+  // segment the ingestor is currently appending to, and the sequencer must have reached that
+  // segment AND that offset within it.
   {
-    const tail = await changesTail(h.dsUrl)
+    const tail = await changesTail(h.dsUrl, h.engineUrl)
     if (tail) {
       let reached = false
       while (Date.now() < deadline) {
-        const off = await engineChangesOffset(h.engineUrl)
-        if (off === null || off >= tail) {
+        const pos = await engineChangesOffset(h.engineUrl)
+        if (pos === null || positionReached(pos, tail)) {
           reached = true
           break
         }
         await sleep(20)
       }
       if (!reached) {
-        throw new Error(`drainEngine: engine did not reach change-log tail ${tail} within ${timeoutMs}ms`)
+        throw new Error(
+          `drainEngine: engine did not reach change-log tail changes/${tail.segment}@${tail.offset} within ${timeoutMs}ms`,
+        )
       }
     }
   }

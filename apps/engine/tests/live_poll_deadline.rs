@@ -30,6 +30,8 @@ async fn ds_handler(req: Request) -> Response {
     let is_long_poll = req.uri().query().unwrap_or("").split('&').any(|kv| kv == "live=long-poll");
     match *req.method() {
         Method::PUT | Method::POST | Method::DELETE => StatusCode::OK.into_response(),
+        // The change log's boot walk HEADs the current segment (ADR-0006): present, never closed.
+        Method::HEAD => ([("stream-next-offset", "tip")]).into_response(),
         Method::GET if !is_long_poll => {
             // Catch-up read (materialize / key-set rebuild): empty and up-to-date.
             ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response()

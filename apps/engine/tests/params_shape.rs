@@ -18,6 +18,8 @@ use tower::ServiceExt;
 async fn ds_handler(req: Request) -> Response {
     match *req.method() {
         Method::PUT | Method::POST | Method::DELETE => StatusCode::OK.into_response(),
+        // The change log's boot walk HEADs the current segment (ADR-0006): present, never closed.
+        Method::HEAD => ([("stream-next-offset", "tip")]).into_response(),
         Method::GET => ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }

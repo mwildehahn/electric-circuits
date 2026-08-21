@@ -28,6 +28,12 @@ use anyhow::{Result, bail};
 /// The schema a bare table name resolves to.
 pub const PUBLIC_SCHEMA: &str = "public";
 
+/// The engine's own reserved schema. **No table identity may live here**, so no envelope the
+/// ingestor produces can ever collide with the engine's own control envelopes on the change log
+/// (`__circuits.control`, ADR-0006) — the ADR's "a spelling no tracked table can produce" is
+/// enforced at the one place table identities are built, rather than assumed.
+pub const RESERVED_SCHEMA: &str = "__circuits";
+
 /// A schema-qualified table identity. `Display`/[`as_str`](TableRef::as_str) render the canonical
 /// `schema.name` (unquoted, exactly one dot); [`quote_qualified`](TableRef::quote_qualified) renders
 /// the SQL form `"schema"."name"`.
@@ -37,6 +43,19 @@ pub struct TableRef {
     canon: String,
     /// Byte offset of the separating `.` within `canon`.
     dot: usize,
+}
+
+/// Reject a schema the engine reserves for itself (see [`RESERVED_SCHEMA`]) as well as everything
+/// [`check_part`] rejects. Every path that names a schema goes through here.
+fn check_schema(schema: &str) -> Result<()> {
+    check_part("schema", schema)?;
+    if schema == RESERVED_SCHEMA {
+        bail!(
+            "'{RESERVED_SCHEMA}' is reserved by the engine (its change-log control envelopes are typed \
+             '{RESERVED_SCHEMA}.*'); no table may be tracked in it"
+        );
+    }
+    Ok(())
 }
 
 /// Reject anything that would make the canonical `schema.name` form ambiguous or need quoting: an
@@ -68,7 +87,7 @@ fn check_part(what: &str, part: &str) -> Result<()> {
 impl TableRef {
     /// Build from an explicit schema + name. Errors on an empty/dotted/quoted part.
     pub fn new(schema: &str, name: &str) -> Result<Self> {
-        check_part("schema", schema)?;
+        check_schema(schema)?;
         check_part("name", name)?;
         Ok(TableRef { canon: format!("{schema}.{name}"), dot: schema.len() })
     }
@@ -202,7 +221,7 @@ impl TableSelector {
             return Ok(TableSelector::AllIn(PUBLIC_SCHEMA.to_string()));
         }
         if let Some(schema) = s.strip_suffix(".*") {
-            check_part("schema", schema)?;
+            check_schema(schema)?;
             return Ok(TableSelector::AllIn(schema.to_string()));
         }
         Ok(TableSelector::One(TableRef::parse(s)?))
@@ -221,6 +240,24 @@ impl fmt::Display for TableSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's control envelopes on the change log are typed `__circuits.control` (ADR-0006),
+    /// and every reader skips them BY TYPE. That is only sound if no tracked table can ever carry
+    /// that type — so the schema is refused wherever a table identity or selector is built, not
+    /// merely assumed to be unused.
+    #[test]
+    fn the_reserved_schema_can_never_name_a_table() {
+        let err = TableRef::parse("__circuits.control").expect_err("the control type is not a table");
+        assert!(err.to_string().contains("reserved"), "{err}");
+        assert!(TableRef::new("__circuits", "anything").is_err());
+        // ...including through the config surface, table-by-table or wholesale.
+        assert!(TableSelector::parse("__circuits.items").is_err());
+        let err = TableSelector::parse("__circuits.*").expect_err("nor a wildcard over it");
+        assert!(err.to_string().contains("reserved"), "{err}");
+        // A table merely NAMED like it, in a real schema, is ordinary data.
+        assert!(TableRef::parse("public.__circuits").is_ok());
+        assert!(TableRef::parse("__circuits_archive.items").is_ok());
+    }
 
     #[test]
     fn bare_name_is_public_sugar() {

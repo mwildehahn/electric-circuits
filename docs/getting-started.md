@@ -109,7 +109,7 @@ DS_URL=http://127.0.0.1:8791 ENGINE_URL=http://127.0.0.1:7010 API_PORT=8790 \
 `ELECTRIC_CIRCUITS_PG_TABLES="*"` (or empty) means *introspect every `public` table that has a
 primary key* — never every schema. List entries individually as `schema.name` or a bare `name`
 (= `public.<name>`), or opt a whole schema in with `schema.*`. On boot, per table, the engine: introspects columns/types/pk, sets
-`REPLICA IDENTITY FULL`, ensures the `changes` durable stream, creates the logical
+`REPLICA IDENTITY FULL`, ensures the current `changes/<n>` change-log segment, creates the logical
 replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_CIRCUITS_PG_SLOT`,
 default `electric_circuits`),
 and starts the ingestor. Nothing else to migrate or install in the database.

@@ -1,8 +1,12 @@
 //! Logical-replication ingestor: streams a Postgres `pgoutput` slot (walsender protocol, push
 //! delivery — no poll floor) and turns each row change into a State-Protocol envelope (carrying
 //! old + new and the change's COMMIT LSN), appended — whole commits, in commit order — to the
-//! single durable-streams `changes` stream (the envelope's `type` carries the table). The
-//! engine's sequencer consumes that stream, so global transaction order survives end to end.
+//! single durable-streams change log (the envelope's `type` carries the table). The engine's
+//! sequencer consumes that log, so global transaction order survives end to end. The log is
+//! **segmented** (ADR-0006): the ingestor appends to the current `changes/<n>` through a
+//! [`ChangeLogWriter`], which also decides — at a transaction boundary, after the commit is
+//! appended and acknowledged — whether the segment is over its size/age budget and must be
+//! rotated. The ingestor itself knows nothing about segments, the catalog or shapes.
 //!
 //! Delivery is append-then-acknowledge: a transaction's changes are buffered between `Begin` and
 //! `Commit`, appended to durable-streams as ONE batch, and only then acknowledged to Postgres
@@ -44,7 +48,8 @@ use anyhow::{Context, Result};
 use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
 use serde_json::{Map, Value as Json};
 
-use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
+use crate::changelog::ChangeLogWriter;
+use crate::ds::{Envelope, EnvelopeHeaders};
 use crate::pgoutput::{self, Cell, Message, OldTuple, RelColumn, Tuple};
 use crate::schema::{ColumnType, SchemaFingerprint, SharedTables, TableSchema};
 use crate::table_ref::TableRef;
@@ -208,7 +213,7 @@ pub async fn run(
     pg_url: String,
     slot: String,
     publication: String,
-    ds: DsClient,
+    log: ChangeLogWriter,
     tables: SharedTables,
     events: Arc<dyn SchemaEvents>,
     epoch: Arc<dyn EpochEvents>,
@@ -237,7 +242,7 @@ pub async fn run(
             }
         };
         let mut connected = false;
-        match stream_loop(cfg, &ds, &tables, events.as_ref(), &last_lsn, &sync_seq, &mut connected).await {
+        match stream_loop(cfg, &log, &tables, events.as_ref(), &last_lsn, &sync_seq, &mut connected).await {
             Ok(()) => tracing::warn!("replicator: stream ended; reconnecting"),
             Err(e) => tracing::error!("replicator: {e:#}; reconnecting"),
         }
@@ -310,7 +315,7 @@ fn percent_decode(s: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn stream_loop(
     cfg: ReplicationConfig,
-    ds: &DsClient,
+    log: &ChangeLogWriter,
     tables: &SharedTables,
     events: &dyn SchemaEvents,
     last_lsn: &Arc<std::sync::Mutex<String>>,
@@ -372,11 +377,11 @@ async fn stream_loop(
                     env.headers.txid = Some(t.xid.to_string());
                     env.headers.seq = Some(i as u64);
                 }
-                // The whole commit is ONE append to the single ordered log; acknowledge only on
-                // success. A failure tears the connection down (re-delivery; the sequencer
-                // de-duplicates).
+                // The whole commit is ONE append to the single ordered log's CURRENT segment;
+                // acknowledge only on success. A failure tears the connection down (re-delivery;
+                // the sequencer de-duplicates).
                 if !envs.is_empty() {
-                    ds.append(crate::CHANGES_STREAM, &envs).await.context("append changes")?;
+                    log.append_commit(&envs).await.context("append changes")?;
                 }
                 client.update_applied_lsn(end_lsn);
                 *last_lsn.lock().unwrap() = commit_lsn;
@@ -391,6 +396,11 @@ async fn stream_loop(
                     let lag_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     crate::statsd::replication_txn(ops, t.bytes, lag_ms);
                 }
+                // Rotation is a TRANSACTION-BOUNDARY decision, taken after the commit is on the log
+                // and acknowledged: a segment never splits a transaction, and a rotation that fails
+                // (storage hiccup) is logged and retried at the next commit rather than failing —
+                // or duplicating — a commit that already landed (ADR-0006).
+                log.maybe_rotate().await;
             }
             ReplicationEvent::KeepAlive { .. }
             | ReplicationEvent::Message { .. }

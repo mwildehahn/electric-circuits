@@ -79,6 +79,9 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
 | `ELECTRIC_CIRCUITS_LOG`       | no       | `info`           | Log filter (`error`, `warn`, `info`, `debug`). |
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | no | `true`      | Policy when the replication slot can no longer be trusted: `true` retires every shape and starts a new epoch; `false` refuses (fail-closed) until `POST /epoch/reset`. See "Losing the replication slot" below. |
+| `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | no | `1073741824` | Change-log segment size before rotation (`0` disables the size criterion). See "Change-log disk" below. |
+| `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | no | `86400` | Change-log segment age before rotation (`0` disables the age criterion). |
+| `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | no | `604800` | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted and the segment deleted (`0` = pin forever). |
 
 ¹ Omit `ELECTRIC_CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
 
@@ -109,6 +112,18 @@ activeUsers.subscribe((rows) => render(rows))
 
 - **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
   replica identity on the new table and introspect it at startup.
+- **Change-log disk is bounded by segment size/age and the retain window.** Every committed change
+  rides one ordered log on the durable-streams server, which the engine rotates into segments
+  (`changes/0`, `changes/1`, …) by `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` (1 GiB) or
+  `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` (1 day), whichever comes first, and deletes once the
+  engine has consumed past them. Steady-state usage is therefore roughly **one segment budget plus
+  whatever a dormant shape still pins**: a shape that went dormant a while ago holds every segment
+  from its resume point on, which is capped by `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` (7 days) —
+  past that the shape is evicted (clients re-subscribe and backfill) and the segments go. Size the
+  durable-streams volume for `segment budget × (retain window ÷ rotation interval)` in the worst
+  case, plus your shape streams. Setting both rotation criteria to `0` disables rotation entirely and
+  the log grows without bound. `GET /metrics` reports `changes_rotations_total`,
+  `changes_segments_deleted_total` and the `changes_segments_retained` gauge.
 - **Replication slot lag:** an engine that is stopped for a long time holds its slot, and Postgres
   retains WAL for it. If you decommission an engine, drop its slot:
   `SELECT pg_drop_replication_slot('<slot>');` Monitor `pg_replication_slots.confirmed_flush_lsn` vs

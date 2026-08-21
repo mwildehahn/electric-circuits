@@ -473,6 +473,12 @@ impl Engine {
             }
         }
 
+        // 1b. Rotate the change log (ADR-0006). Every segment written under the epoch that just
+        //     ended holds changes no shape will ever consume again — the shapes are gone — so
+        //     closing the current one makes the whole old-epoch span deletable at the next sweep
+        //     instead of waiting for the size/age budget to expire on its own.
+        self.changes.force_rotate().await;
+
         // 2. The barrier. Nothing may create the new slot until every `Dropped` is durable.
         if !self.catalog_tx.drain(CATALOG_DRAIN_TIMEOUT).await {
             bail!(
