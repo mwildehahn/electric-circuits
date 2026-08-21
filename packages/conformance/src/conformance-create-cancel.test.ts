@@ -66,3 +66,43 @@ describe('native: an aborted create does not poison later creates of the same sh
     expect(keys).toEqual(['1', '2', '3'])
   }, 60000)
 })
+
+describe('native: cancellation while installing a large membership seed rolls back', () => {
+  let h: Harness
+  beforeAll(async () => {
+    h = await bootHarness(schema)
+    await pgQuery(h, 'INSERT INTO parent (id, active) SELECT i, true FROM generate_series(1, 250000) AS i')
+    await pgQuery(h, 'INSERT INTO child (id, parent_id) VALUES (1, 1)')
+    await drainEngine(h, 60000)
+  }, 90000)
+  afterAll(async () => await h?.shutdown())
+
+  it('an identical create succeeds after the in-flight request is aborted', async () => {
+    const def = { table: 'child', where: { col: 'parent_id', in: activeParents } }
+    const lock = await lockTable(h, 'child')
+    const controller = new AbortController()
+    const first = createShape(h, def, controller.signal).then(
+      () => 'completed' as const,
+      () => 'aborted' as const,
+    )
+
+    try {
+      await waitForLockWaiter(h, 'the outer backfill to block after the membership seed')
+    } finally {
+      await lock.release()
+    }
+
+    // The released backfill has one row; the large node seed makes installation long enough for a
+    // normal client disconnect to cancel the request after phase B without any engine-side hook.
+    await sleep(500)
+    controller.abort()
+    expect(await first).toBe('aborted')
+    // Rollback is detached from the disconnected handler. Give it ample time to remove the public
+    // share entry; a later conflict is then persistent leaked registration, not a joiner racing cleanup.
+    await sleep(3000)
+
+    const again = await createShape(h, def)
+    await drainEngine(h, 60000)
+    expect(await streamKeys(again.streamUrl)).toEqual(['1'])
+  }, 120000)
+})

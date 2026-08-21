@@ -105,6 +105,20 @@ export async function lockWaiters(h: Harness): Promise<number[]> {
   return rows.map((r) => Number(r.pid))
 }
 
+/** Backends waiting to acquire a relation lock on one specific table. */
+export async function tableLockWaiters(h: Harness, table: string): Promise<number[]> {
+  const rows = await pgQuery(
+    h,
+    `SELECT DISTINCT a.pid
+       FROM pg_stat_activity AS a
+       JOIN pg_locks AS l ON l.pid = a.pid AND NOT l.granted
+       JOIN pg_class AS c ON c.oid = l.relation
+      WHERE a.datname = current_database() AND c.relname = $1 AND a.pid <> pg_backend_pid()`,
+    [table],
+  )
+  return rows.map((r) => Number(r.pid))
+}
+
 export async function waitForLockWaiter(h: Harness, what: string): Promise<void> {
   await waitFor(async () => (await lockWaiters(h)).length > 0, what)
 }
