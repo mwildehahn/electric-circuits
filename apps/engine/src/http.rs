@@ -33,6 +33,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/shapes/{id}/rows", get(get_shape_rows))
         .route("/shapes/{id}/log", get(get_shape_log))
         .route("/query", post(query_subset))
+        .route("/tables", get(list_tables))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
         // Table schema (columns + pk), a parameterized single-row INSERT (the visualizer's add-row
@@ -200,6 +201,32 @@ impl ShapeResp {
         let stream_url = engine.stream_url(&rec.stream_path);
         ShapeResp { shape_id: rec.id, table: rec.table, stream_path: rec.stream_path, stream_url, state: None }
     }
+}
+
+#[derive(serde::Serialize)]
+struct TableInfo {
+    table: TableRef,
+    /// True when the table's schema drifted and the engine could not settle it: its shapes have
+    /// been retired, its changes are dropped and creates on it are refused until a retry succeeds
+    /// (ADR-0005). Watch this rather than guessing from a create failure.
+    unresolved: bool,
+}
+
+#[derive(serde::Serialize)]
+struct TablesResp {
+    tables: Vec<TableInfo>,
+}
+
+/// Every table the engine tracks, with its schema-drift status.
+async fn list_tables(State(engine): State<Engine>) -> Json<TablesResp> {
+    let unresolved = engine.unresolved_tables().await;
+    let tables = engine
+        .tracked_tables()
+        .await
+        .into_iter()
+        .map(|table| TableInfo { unresolved: unresolved.contains(&table), table })
+        .collect();
+    Json(TablesResp { tables })
 }
 
 async fn create_shape(

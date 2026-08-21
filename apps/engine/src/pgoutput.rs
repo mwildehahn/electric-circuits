@@ -34,12 +34,30 @@ pub enum OldTuple {
     Key(Tuple),
 }
 
+/// One column of a `Relation` message: everything Postgres tells us about the relation's shape.
+///
+/// Upstream decoded and discarded the flags, type OID and typmod, keeping only the name — which is
+/// exactly what made post-DDL drift undetectable on the wire. They are the observed half of
+/// [`crate::schema::SchemaFingerprint`] (ADR-0005).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelColumn {
+    pub name: String,
+    /// `pg_attribute.atttypid`.
+    pub type_oid: u32,
+    /// `pg_attribute.atttypmod`.
+    pub typmod: i32,
+    /// Flag bit 1: the column is part of the relation's replica identity key.
+    pub key: bool,
+}
+
 /// A decoded pgoutput message the ingestor cares about.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    /// `R` — relation metadata; sent before the first DML for a relation on each connection (and
-    /// again after schema changes). Maps `rel_id` to a table name + column names.
-    Relation { rel_id: u32, namespace: String, name: String, columns: Vec<String> },
+    /// `R` — relation metadata; sent before the first DML for a relation on each connection **and
+    /// again after any DDL that changes it** (Postgres invalidates the relation cache entry). The
+    /// full message is kept — identity + per-column type OID/typmod — so the ingestor can compare
+    /// it with the compiled schema instead of only learning the column names (ADR-0005).
+    Relation { rel_id: u32, namespace: String, name: String, replident: u8, columns: Vec<RelColumn> },
     /// `I`
     Insert { rel_id: u32, new: Tuple },
     /// `U` — `old` is present only when the replica identity provides it.
@@ -61,16 +79,17 @@ pub fn decode(data: &[u8]) -> Result<Message> {
             let rel_id = r.u32()?;
             let namespace = r.cstr()?;
             let name = r.cstr()?;
-            let _replident = r.u8()?;
+            let replident = r.u8()?;
             let ncols = r.i16()?;
             let mut columns = Vec::with_capacity(ncols.max(0) as usize);
             for _ in 0..ncols {
-                let _flags = r.u8()?;
-                columns.push(r.cstr()?);
-                let _typoid = r.u32()?;
-                let _typmod = r.i32()?;
+                let flags = r.u8()?;
+                let name = r.cstr()?;
+                let type_oid = r.u32()?;
+                let typmod = r.i32()?;
+                columns.push(RelColumn { name, type_oid, typmod, key: flags & 1 != 0 });
             }
-            Message::Relation { rel_id, namespace, name, columns }
+            Message::Relation { rel_id, namespace, name, replident, columns }
         }
         b'I' => {
             let rel_id = r.u32()?;
@@ -198,33 +217,61 @@ mod tests {
         v
     }
 
-    fn relation_msg() -> Vec<u8> {
+    /// Encode an `R` message the way Postgres does — the inverse of the `b'R'` decode arm, so the
+    /// round-trip test actually exercises the wire layout (flags/typoid/typmod included).
+    fn encode_relation(rel_id: u32, namespace: &str, name: &str, replident: u8, columns: &[RelColumn]) -> Vec<u8> {
         let mut m = vec![b'R'];
-        m.extend(42u32.to_be_bytes());
-        m.extend(cstr("public"));
-        m.extend(cstr("users"));
-        m.push(b'f'); // replident
-        m.extend(2i16.to_be_bytes());
-        // col id: flags, name, typoid, typmod
-        m.push(0);
-        m.extend(cstr("id"));
-        m.extend(23u32.to_be_bytes());
-        m.extend((-1i32).to_be_bytes());
-        m.push(0);
-        m.extend(cstr("name"));
-        m.extend(25u32.to_be_bytes());
-        m.extend((-1i32).to_be_bytes());
+        m.extend(rel_id.to_be_bytes());
+        m.extend(cstr(namespace));
+        m.extend(cstr(name));
+        m.push(replident);
+        m.extend((columns.len() as i16).to_be_bytes());
+        for c in columns {
+            m.push(if c.key { 1 } else { 0 });
+            m.extend(cstr(&c.name));
+            m.extend(c.type_oid.to_be_bytes());
+            m.extend(c.typmod.to_be_bytes());
+        }
         m
     }
 
+    fn rel_col(name: &str, type_oid: u32, typmod: i32, key: bool) -> RelColumn {
+        RelColumn { name: name.into(), type_oid, typmod, key }
+    }
+
+    fn relation_msg() -> Vec<u8> {
+        encode_relation(42, "public", "users", b'f', &[
+            rel_col("id", 23, -1, true),
+            rel_col("name", 25, -1, false),
+        ])
+    }
+
+    /// The decode keeps everything drift detection needs: the replica identity and, per column, the
+    /// type OID, the typmod and the key flag (upstream read and discarded all four).
     #[test]
-    fn decodes_relation() {
+    fn decodes_relation_with_replident_and_column_types() {
         let msg = decode(&relation_msg()).unwrap();
         assert_eq!(msg, Message::Relation {
             rel_id: 42,
             namespace: "public".into(),
             name: "users".into(),
-            columns: vec!["id".into(), "name".into()],
+            replident: b'f',
+            columns: vec![rel_col("id", 23, -1, true), rel_col("name", 25, -1, false)],
+        });
+
+        // A relation whose identity is no longer FULL decodes as such (not silently normalized),
+        // and a length-qualified type carries its typmod.
+        let msg = decode(&encode_relation(7, "other", "items", b'd', &[
+            rel_col("id", 23, -1, true),
+            rel_col("label", 1043, 14, false),
+        ]))
+        .unwrap();
+        assert_eq!(msg, Message::Relation {
+            rel_id: 7,
+            namespace: "other".into(),
+            name: "items".into(),
+            replident: b'd',
+            columns: vec![rel_col("id", 23, -1, true), rel_col("label", 1043, 14, false)],
         });
     }
 

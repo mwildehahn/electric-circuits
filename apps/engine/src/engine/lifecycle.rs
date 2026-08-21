@@ -43,9 +43,19 @@ impl Engine {
         if let Some(sig) = &feed_sig {
             if let Some(existing_id) = st.feed_by_sig.get(sig).cloned() {
                 if let Some(rec) = st.shapes.get(&existing_id).cloned() {
+                    // Refuse BEFORE taking the refcount: a join that is going to be turned away must
+                    // not leave a `Joined` in the durable catalog or a refcount for the caller to
+                    // give back. A joiner takes the same schema-generation snapshot a creator does —
+                    // the shape it ref-counts can be retired by a drift while it waits.
+                    let mut joined = vec![table.clone()];
+                    if let Some(w) = &where_ {
+                        joined.extend(referenced_tables(w));
+                    }
+                    self.ensure_schema_resolved(&st, &joined)?;
+                    let gens = st.capture_gens(&joined);
                     let share = st.feed_shares.get_mut(&existing_id).expect("share entry for live feed");
                     share.refcount += 1;
-                let _ = self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
+                    self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
                     let ready = share.ready.clone();
                     // Release the lock, then wait for the creator's backfill to land: a joiner must not
                     // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
@@ -71,6 +81,10 @@ impl Engine {
                     // left, reactivate it (change-log replay) before handing out the stream.
                     if let Err(e) = self.ensure_active(&existing_id).await {
                         // Roll the failed join back so the dead subscription doesn't pin the shape.
+                        self.release_shape(&existing_id).await;
+                        return Err(e);
+                    }
+                    if let Err(e) = self.ensure_schema_unchanged(&gens).await {
                         self.release_shape(&existing_id).await;
                         return Err(e);
                     }
@@ -100,6 +114,10 @@ impl Engine {
                     bail!("unknown table '{t}' referenced by subquery");
                 }
             }
+            self.ensure_schema_resolved(&st, &tables)?;
+            // Captured under the same lock hold that registers the shape below: outer + every inner
+            // table, all re-checked before this create returns a handle.
+            let gens = st.capture_gens(&tables);
             // The sequencer feeds every table's deltas to the registry; just make sure it runs.
             self.ensure_sequencer(&mut st);
             let rec = ShapeRecord {
@@ -112,6 +130,7 @@ impl Engine {
                 family_key: None,
                 is_subquery: true,
                 aggregate: None,
+                fingerprint: ts.fingerprint.clone(),
             };
             // The load-bearing degrade check: taken under the state lock, in the same critical
             // section as the registration below. The degradation reaper snapshots every registered
@@ -120,7 +139,7 @@ impl Engine {
             // `ensure_create_not_degraded`) or observes `degraded` here and never registers at all.
             self.ensure_not_degraded()?;
             st.shapes.insert(id.clone(), rec.clone());
-            let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+            self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
             self.ensure_retention_sweeper();
             // First subquery shape: from here on a lost flip is possible, so the stream reaper that
@@ -157,6 +176,14 @@ impl Engine {
                         creating.rollback().await;
                         return Err(e);
                     }
+                    // ...or a schema drift on the outer table or ANY table its subquery reads. This
+                    // is also what unwinds a create the drift handler purged mid-phase-B: the
+                    // registry install would otherwise land on a deleted stream.
+                    if let Err(e) = self.ensure_schema_unchanged(&gens).await {
+                        let _ = ready_tx.send(ShareOutcome::Failed);
+                        creating.rollback().await;
+                        return Err(e);
+                    }
                     creating.complete();
                     let _ = ready_tx.send(ShareOutcome::Ready);
                     trace_lifecycle(
@@ -176,6 +203,8 @@ impl Engine {
             }
         }
 
+        self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+        let gens = st.capture_gens(std::slice::from_ref(table));
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
         // Family placement (for graph introspection): an equality template routes by these key columns
         // via a shared family; otherwise it's a standalone filter.
@@ -208,12 +237,13 @@ impl Engine {
             family_key,
             is_subquery: false,
             aggregate: None,
+            fingerprint: ts.fingerprint.clone(),
         };
         // Under the state lock, immediately before registering — see `ensure_create_not_degraded`
         // for why this check and the one after the create's work are together sufficient.
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
-        let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+        self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
         // Register the (first) shared feed so later identical subset feeds join it. Joiners wait on
@@ -243,6 +273,12 @@ impl Engine {
                 // answering success (see `ensure_create_not_degraded`).
                 if let Err(e) = self.ensure_create_not_degraded() {
                     let _ = share_tx.send(ShareOutcome::Degraded);
+                    creating.rollback().await;
+                    return Err(e);
+                }
+                // ...and the table must still have the schema this backfill was read through.
+                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
+                    let _ = share_tx.send(ShareOutcome::Failed);
                     creating.rollback().await;
                     return Err(e);
                 }
@@ -280,6 +316,8 @@ impl Engine {
         self.ensure_not_degraded()?;
         let mut st = self.state.lock().await;
         let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
+        self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+        let gens = st.capture_gens(std::slice::from_ref(table));
         if where_.as_ref().is_some_and(predicate_has_subquery) {
             bail!("aggregations over subquery predicates are not supported");
         }
@@ -297,12 +335,19 @@ impl Engine {
         let agg_sig = agg_signature(table, &where_, &func, col_idx);
         if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned() {
             if let Some(rec) = st.shapes.get(&existing_id).cloned() {
+                // Refuse before taking the refcount — see the row-shape join path.
+                self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+                let join_gens = st.capture_gens(std::slice::from_ref(table));
                 let share = st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate");
                 share.refcount += 1;
-                let _ = self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
+                self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
                 let ready = share.ready.clone();
                 drop(st);
                 await_share_ready(ready, &existing_id).await?;
+                if let Err(e) = self.ensure_schema_unchanged(&join_gens).await {
+                    self.release_shape(&existing_id).await;
+                    return Err(e);
+                }
                 self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
                 return Ok(rec);
             }
@@ -344,6 +389,7 @@ impl Engine {
                             family_key: None,
                             is_subquery: false,
                             aggregate: Some(AggInfo { func, col }),
+                            fingerprint: ts.fingerprint.clone(),
                         };
                         // Under the state lock, immediately before registering — see
                         // `ensure_create_not_degraded` for why this check and the one after the
@@ -354,8 +400,7 @@ impl Engine {
                             id.clone(),
                             CircuitPlacement { label: "counts".into(), col: None, counts: true },
                         );
-                        let _ = self
-                            .catalog_tx
+                        self.catalog_tx
                             .send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
                         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
                         self.ensure_retention_sweeper();
@@ -375,6 +420,11 @@ impl Engine {
                                 // answering success (see `ensure_create_not_degraded`).
                                 if let Err(e) = self.ensure_create_not_degraded() {
                                     let _ = share_tx.send(ShareOutcome::Degraded);
+                                    creating.rollback().await;
+                                    return Err(e);
+                                }
+                                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
+                                    let _ = share_tx.send(ShareOutcome::Failed);
                                     creating.rollback().await;
                                     return Err(e);
                                 }
@@ -426,12 +476,13 @@ impl Engine {
             family_key: None,
             is_subquery: false,
             aggregate: Some(AggInfo { func, col }),
+            fingerprint: ts.fingerprint.clone(),
         };
         // Under the state lock, immediately before registering — see `ensure_create_not_degraded`
         // for why this check and the one after the create's work are together sufficient.
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
-        let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
+        self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
         // Register this (first) aggregate so later identical ones join it by ref-count.
@@ -452,6 +503,11 @@ impl Engine {
                 // answering success (see `ensure_create_not_degraded`).
                 if let Err(e) = self.ensure_create_not_degraded() {
                     let _ = share_tx.send(ShareOutcome::Degraded);
+                    creating.rollback().await;
+                    return Err(e);
+                }
+                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
+                    let _ = share_tx.send(ShareOutcome::Failed);
                     creating.rollback().await;
                     return Err(e);
                 }
@@ -480,7 +536,7 @@ impl Engine {
         let mut st = self.state.lock().await;
         if let Some(share) = st.feed_shares.get_mut(id) {
             share.refcount = share.refcount.saturating_sub(1);
-            let _ = self.catalog_tx.send(CatalogEvent::Left { id: id.to_string() });
+            self.catalog_tx.send(CatalogEvent::Left { id: id.to_string() });
         }
         drop(st);
         self.touch_shape(id);
@@ -502,7 +558,7 @@ impl Engine {
         let removed = st.shapes.remove(id);
         st.circuit_placement.remove(id);
         if removed.is_some() {
-            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
+            self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
         }
         if let Some(rec) = &removed {
             if let Some(seq) = st.sequencer.as_ref() {
@@ -643,10 +699,12 @@ impl Engine {
     /// buffer double-applies only absolute per-pk upserts/deletes — idempotent for stream readers.
     /// Split from [`ensure_active`] so the lifecycle bookkeeping stays in one place.
     pub(crate) async fn resume_dormant(&self, id: &str, resume_offset: String, gate: crate::pg::SnapshotGate) -> Result<()> {
-        let (rec, ts, pred, out_cols, num_id, cmd_tx) = {
+        let (rec, ts, pred, out_cols, num_id, cmd_tx, gens) = {
             let mut st = self.state.lock().await;
             let rec =
                 st.shapes.get(id).cloned().with_context(|| format!("shape '{id}' vanished during reactivation"))?;
+            self.ensure_schema_resolved(&st, std::slice::from_ref(&rec.table))?;
+            let gens = st.capture_gens(std::slice::from_ref(&rec.table));
             let ts =
                 st.tables.get(&rec.table).cloned().with_context(|| format!("unknown table '{}'", rec.table))?;
             let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), &ts)?);
@@ -654,7 +712,7 @@ impl Engine {
             let num_id: u64 =
                 id.strip_prefix('s').and_then(|n| n.parse().ok()).context("unparseable shape id")?;
             let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
-            (rec, ts, pred, out_cols, num_id, cmd_tx)
+            (rec, ts, pred, out_cols, num_id, cmd_tx, gens)
         };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         cmd_tx
@@ -705,7 +763,13 @@ impl Engine {
             .await
             .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
             .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e}"))?;
-        let _ = self.catalog_tx.send(CatalogEvent::Reactivated { id: id.to_string() });
+        // The replay read the change log through the schema captured above; if the table drifted
+        // meanwhile the shape has been retired underneath us and must not be reported live.
+        if let Err(e) = self.ensure_schema_unchanged(&gens).await {
+            let _ = cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
+            return Err(e.context(format!("shape '{id}' reactivation")));
+        }
+        self.catalog_tx.send(CatalogEvent::Reactivated { id: id.to_string() });
         metrics().shapes_reactivated.fetch_add(1, Ordering::Relaxed);
         trace_lifecycle(
             &self.trace_tx,
@@ -760,7 +824,7 @@ impl Engine {
                     gate: gate.clone(),
                 };
                 drop(lives);
-                let _ = self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume_offset, gate });
+                self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume_offset, gate });
                 metrics().shapes_dormanted.fetch_add(1, Ordering::Relaxed);
                 trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDormant { shape: id.to_string() });
                 tracing::debug!("shape {id} went dormant (idle)");
@@ -814,7 +878,7 @@ impl Engine {
         let removed = st.shapes.remove(id);
         st.circuit_placement.remove(id);
         if removed.is_some() {
-            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
+            self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
         }
         // A dormant shape is already unregistered from the sequencer; a non-parkable one is still
         // live and needs the full teardown (sequencer routing for aggregates, registry for subqueries).
@@ -1170,6 +1234,44 @@ impl Engine {
         self.ensure_not_degraded()
     }
 
+    /// Refuse work on a table the engine cannot currently vouch for (ADR-0005). Both cases are
+    /// retryable errors rather than "unknown table" — the table exists and the engine intends to
+    /// serve it again:
+    ///
+    /// - **unresolved**: a drift that could not be settled; a retry task is working on it;
+    /// - **being resolved right now**: a drift resolution holds the table's lock. Registering here
+    ///   would be worse than losing the race — the retirement has already enumerated its victims, so
+    ///   this create would NOT be purged, would pass its own closing generation check (the bump
+    ///   happened before it captured), and would then be orphaned by the `ResetTable` that ends the
+    ///   swap.
+    ///
+    /// Evaluated under the engine-state lock, in the same critical section that registers the create.
+    fn ensure_schema_resolved(&self, st: &EngineState, tables: &[TableRef]) -> Result<()> {
+        if let Some(t) = st.first_unresolved(tables) {
+            bail!("schema of '{t}' is unresolved after a change; retry later");
+        }
+        if let Some(t) = tables.iter().find(|t| self.resolving.is_active(t)) {
+            bail!("schema of '{t}' is being resolved after a change; retry");
+        }
+        Ok(())
+    }
+
+    /// The create's closing check, the schema counterpart of [`Self::ensure_create_not_degraded`]:
+    /// did any table this create read drift while it was reading it?
+    ///
+    /// A create captures every dependency's schema generation under the state lock as it registers;
+    /// `retire_dependents` bumps that generation in the same critical section in which it enumerates
+    /// what to retire. So a create either registered before the retirement (and is enumerated and
+    /// purged by it) or after (and its captured generation is the post-drift one) — never installed,
+    /// unenumerated, against a schema that has already been swapped out from under it.
+    pub(crate) async fn ensure_schema_unchanged(&self, gens: &SchemaGens) -> Result<()> {
+        let drifted = self.state.lock().await.drifted_since(gens);
+        match drifted {
+            Some(t) => bail!("schema of '{t}' changed during creation; retry"),
+            None => Ok(()),
+        }
+    }
+
     /// Undo a create: the one implementation of "this shape was never made", shared by the explicit
     /// error paths and by [`CreateGuard`]'s cancelled path.
     ///
@@ -1201,7 +1303,7 @@ impl Engine {
         drop(st);
         self.lives.lock().unwrap().remove(id);
         if existed {
-            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
+            self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
         }
         if registration == Registration::Registry {
             self.subqueries.lock().await.abort_create(id).await;
@@ -1252,6 +1354,7 @@ mod cancellation_tests {
             family_key: None,
             is_subquery: true,
             aggregate: None,
+            fingerprint: None,
         });
         let (_ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Pending);
         st.feed_by_sig.insert("sig".into(), id.to_string());
@@ -1378,6 +1481,7 @@ mod cancellation_tests {
             family_key: None,
             is_subquery: true,
             aggregate: None,
+            fingerprint: None,
         });
         st.feed_by_sig.insert(sig.clone(), id.to_string());
         st.feed_shares.insert(id.to_string(), FeedShare { sig, refcount: 1, ready: rx });

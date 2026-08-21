@@ -23,4 +23,12 @@ deletes). A replica-identity regression re-asserts `REPLICA IDENTITY FULL`, then
 ## Consequences
 
 A migration that touches a synced table costs one resync of that table's shapes — the "clients resync
-at cutovers" rule, enforced rather than hoped for.
+at cutovers" rule, enforced rather than hoped for. One exception to per-table granularity: a table
+with a **counts pipeline** has no runtime circuit rebuild, so a drift or `TRUNCATE` on it additionally
+**exits the process** once its retirements have landed — gated on the triggering transaction's xid
+against the boot seed's snapshot, so the at-least-once re-delivery of that transaction does not
+restart again. The publication must deliver whole rows: a per-table column list is refused at boot,
+and generated-column publishing is folded into the fingerprint, so the wire and the catalog agree by
+construction rather than being reconciled at runtime. The reconciler's period is
+`ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` (default 60; `0` disables it, leaving primary-key changes
+and DDL-without-DML undetected until a restart).

@@ -20,10 +20,6 @@ pub(crate) struct SequencerHandle {
     pub(crate) node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
 }
 
-/// The tables the sequencer can decode, shared with the `Engine` (which updates it on
-/// `setup_postgres` / `define_schema`). A std lock: reads are brief and never held across awaits.
-pub(crate) type SharedTables = Arc<std::sync::RwLock<HashMap<TableRef, TableSchema>>>;
-
 pub(crate) enum SequencerCmd {
     /// Phase 1 of shape creation: register a PENDING shape that buffers this table's deltas while
     /// the creator runs the Postgres backfill concurrently — the sequencer itself never blocks on
@@ -68,6 +64,12 @@ pub(crate) enum SequencerCmd {
         resp: tokio::sync::oneshot::Sender<Option<(String, crate::pg::SnapshotGate)>>,
     },
     RemoveShape { table: TableRef, shape_id: String },
+    /// Schema drift (ADR-0005): forget everything the sequencer holds for this table. The executor
+    /// is keyed by the OLD `TableSchema`, so it is dropped outright rather than patched; the next
+    /// envelope for the table lazily rebuilds it from the (already swapped) shared schema view.
+    /// Every shape it was routing has been retired by the same handler, so there is nothing to
+    /// preserve.
+    ResetTable { table: TableRef },
     /// Create a **circuit-served** COUNT aggregate over the table's counts pipeline: seeded by
     /// summing matching groups, then updated from the pipeline's per-transaction group deltas.
     CreateCircuitAgg {
@@ -101,7 +103,7 @@ pub(crate) fn spawn_sequencer(
     ds: DsClient,
     tables: SharedTables,
     start_offset: String,
-    catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
+    catalog_tx: CatalogWriter,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
@@ -258,7 +260,7 @@ pub(crate) async fn sequencer_loop(
     ds: DsClient,
     tables: SharedTables,
     start_offset: String,
-    catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
+    catalog_tx: CatalogWriter,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
@@ -375,6 +377,12 @@ pub(crate) async fn sequencer_loop(
                         }
                     }
                     emitted.remove(&shape_id);
+                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
+                Some(SequencerCmd::ResetTable { table }) => {
+                    if execs.remove(table.as_str()).is_some() {
+                        tracing::warn!("sequencer: dropped the executor for '{table}' (schema drift)");
+                    }
                     publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::CreateCircuitAgg { table, shape_id, stream_path, constraints, ready }) => {
@@ -494,7 +502,7 @@ pub(crate) async fn sequencer_loop(
                         if n != ckpt_offset && last_ckpt.elapsed() >= std::time::Duration::from_secs(2) {
                             ckpt_offset = n.clone();
                             last_ckpt = std::time::Instant::now();
-                            let _ = catalog_tx.send(CatalogEvent::Offset { offset: n });
+                            catalog_tx.send(CatalogEvent::Offset { offset: n });
                         }
                     }
                     if touched {

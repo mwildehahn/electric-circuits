@@ -34,6 +34,15 @@ pub struct ShapeRecord {
     /// Present iff this shape is a scalar **aggregation** (maintains a running COUNT/SUM/… over `where`,
     /// not the rows). Streams a single value that updates as rows enter/leave the predicate.
     pub aggregate: Option<AggInfo>,
+    /// The table's [`SchemaFingerprint`] when this shape was created (ADR-0005) — the only way a
+    /// restart can tell that the table was migrated **while the engine was down**, which no
+    /// `Relation` message and no reconciler tick ever saw. The catalog restore retires any record
+    /// whose fingerprint no longer matches the boot-introspected one.
+    ///
+    /// `None` means the record cannot be vouched for (library mode, or a catalog written before
+    /// this field existed) and is treated as a mismatch by the restore.
+    #[serde(default)]
+    pub fingerprint: Option<crate::schema::SchemaFingerprint>,
 }
 
 /// Strict table deserializer for the durable catalog: the stored string must ALREADY be the
@@ -946,6 +955,7 @@ mod tests {
             family_key: None,
             is_subquery: false,
             aggregate: None,
+            fingerprint: None,
         };
         assert_eq!(
             empty.heap_bytes(),
@@ -963,6 +973,7 @@ mod tests {
             family_key: Some(vec!["a".to_string()]),
             is_subquery: false,
             aggregate: Some(AggInfo { func: AggFn::Count, col: Some("qty".to_string()) }),
+            fingerprint: None,
         };
         assert!(populated.heap_bytes() > 0, "a populated ShapeRecord should report non-zero owned heap");
     }

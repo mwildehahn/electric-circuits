@@ -11,7 +11,7 @@ the project is growing toward).
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
@@ -223,8 +223,23 @@ canvas update, screenshot.
   = shape retired, discard). The sequencer's processed offset is published only after the whole batch
   landed, and each source transaction's appends are flushed before the next transaction is processed
   (per-transaction atomic emission).
+- **Schema drift, `TRUNCATE` and a replica-identity regression retire that table's dependents**
+  (ADR 0005; `engine/drift.rs`). The compiled schema carries a fingerprint (`attnum`-ordered
+  `(name, type oid, typmod)` + `relreplident`); a pgoutput `Relation` that disagrees with it, a
+  `TRUNCATE`, or the `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` reconciler retires every shape on the
+  table and every subquery shape referencing it. Drift also re-introspects and swaps the schema in
+  all holders (TRUNCATE does not — nothing changed); the ingestor awaits the handling inline, so
+  post-DDL DML decodes against the new schema. A create that overlapped a retirement is refused by
+  the per-table **schema generation** (bumped in the retirement's own enumeration critical section,
+  captured + re-checked by every create/join/reactivation) plus the per-table **resolve lock** (a
+  create registering mid-resolution is refused outright). An unsettleable drift parks the table
+  **unresolved** (creates refused, changes dropped, retry task running until a re-introspection
+  succeeds); the catalog restore retires any shape whose table moved while the engine was down; and
+  the circuit-tier restart is gated on the trigger's xid against the boot seed, so an at-least-once
+  re-delivery cannot become an exit loop. Never serve stale: no additive tolerance, no whole-engine
+  reset.
 - **Engine-initiated retirement closes the stream, then deletes it** (`ds.retire_stream`; ADR 0007):
-  purge, eviction, drop-at-restore, the degraded subquery reap. The close releases a tailing
+  purge, eviction, drop-at-restore, schema drift, the degraded subquery reap. The close releases a tailing
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
   close — a parked dormant shape's stream must stay appendable, and a rolled-back create's stream
   had no subscriber (plain `delete_stream`).

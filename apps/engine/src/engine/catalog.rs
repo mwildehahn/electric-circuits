@@ -33,23 +33,69 @@ pub(crate) enum CatalogEvent {
     Reactivated { id: String },
     Dropped { id: String },
     Offset { offset: String },
+    /// **Audit only**: a table's schema drifted and was re-introspected (ADR-0005). The restore
+    /// ignores it — every dependent shape of the table was retired by the same handler, so it is
+    /// already `Dropped` in the log. It is written so the durable record explains *why* a swathe of
+    /// shapes disappeared at a given point.
+    SchemaChanged { table: TableRef, fingerprint: crate::schema::SchemaFingerprint },
+}
+
+/// The catalog writer's ordered channel, plus the count of events sent but not yet appended.
+///
+/// The counter exists for one caller: the circuit-tier drift path exits the process, and it must
+/// not do so with its own `Dropped`/`SchemaChanged` events still in the queue — a restart would
+/// then restore shapes whose streams it had just deleted (see [`CatalogWriter::drain`]).
+#[derive(Clone)]
+pub(crate) struct CatalogWriter {
+    tx: mpsc::UnboundedSender<CatalogEvent>,
+    in_flight: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl CatalogWriter {
+    /// Enqueue an event. Infallible by design: a dead writer means the process is going away, and
+    /// no caller has a better answer than continuing (the previous code spelled this `let _ =`).
+    pub(crate) fn send(&self, ev: CatalogEvent) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.tx.send(ev).is_err() {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Wait until every event sent so far has been appended (or `timeout` elapses — reported, never
+    /// hung on). Returns whether the queue actually drained.
+    pub(crate) async fn drain(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.in_flight.load(Ordering::SeqCst) > 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
 }
 
 /// Spawn the single catalog writer: events are appended strictly in send order (senders enqueue
 /// while holding the engine-state lock, so the log order matches the state-mutation order).
-pub(crate) fn spawn_catalog_writer(ds: DsClient, mut rx: mpsc::UnboundedReceiver<CatalogEvent>) {
+pub(crate) fn spawn_catalog_writer(ds: DsClient) -> CatalogWriter {
+    let (tx, mut rx) = mpsc::unbounded_channel::<CatalogEvent>();
+    let in_flight = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let counter = in_flight.clone();
     tokio::spawn(async move {
         let mut ensured = false;
         while let Some(ev) = rx.recv().await {
             if !ensured {
                 ensured = self::ensure_catalog(&ds).await;
             }
-            let Ok(json) = serde_json::to_value(&ev) else { continue };
-            if let Err(e) = ds.append_json(CATALOG_STREAM, &[json]) .await {
+            if let Ok(json) = serde_json::to_value(&ev)
+                && let Err(e) = ds.append_json(CATALOG_STREAM, &[json]).await
+            {
                 tracing::error!("catalog append failed (event lost; restart may under-restore): {e:#}");
             }
+            counter.fetch_sub(1, Ordering::SeqCst);
         }
     });
+    CatalogWriter { tx, in_flight }
 }
 
 /// The durable catalog holds a record written **before** ADR-0002 (a bare `rec.table`).
@@ -77,6 +123,21 @@ impl std::fmt::Display for CatalogPredatesQualification {
 }
 
 impl std::error::Error for CatalogPredatesQualification {}
+
+/// Did the shape's table move while the engine was down? `Some(description)` if so.
+///
+/// Only Postgres-mode tables can answer: a library-mode table has no fingerprint on either side and
+/// is restored as before. A record with no fingerprint of its own, over a table that HAS one, cannot
+/// be vouched for and is retired — greenfield, so that is a catalog written before the field
+/// existed, not a format to keep compatibility with.
+fn schema_moved_while_down(rec: &ShapeRecord, compiled: &HashMap<TableRef, TableSchema>) -> Option<String> {
+    let now = compiled.get(&rec.table)?.fingerprint.as_ref()?;
+    match &rec.fingerprint {
+        Some(then) if then.still_serves(now) => None,
+        Some(then) => Some(crate::schema::describe_drift(then, now).join("; ")),
+        None => Some("the record predates schema fingerprinting".to_string()),
+    }
+}
 
 pub(crate) async fn ensure_catalog(ds: &DsClient) -> bool {
     match ds.ensure_stream(CATALOG_STREAM).await {
@@ -143,6 +204,9 @@ impl Engine {
                         recs.remove(&id);
                     }
                     CatalogEvent::Offset { offset } => start_offset = offset,
+                    // Audit only (see the variant): the shapes it explains are already `Dropped`,
+                    // and the boot's own introspection is the authority on the schema.
+                    CatalogEvent::SchemaChanged { .. } => {}
                 }
             }
             match next {
@@ -165,6 +229,20 @@ impl Engine {
                 if let Ok(num) = id.trim_start_matches('s').parse::<u64>() {
                     st.next_shape_id = st.next_shape_id.max(num + 1);
                 }
+                // DDL while the engine was DOWN is seen by nothing on the live path: no `Relation`
+                // message, no reconciler tick. The record's own fingerprint is the only witness —
+                // if it no longer matches what boot introspected, the retained stream holds rows
+                // shaped by the old schema and can never be brought up to date (ADR-0005).
+                if let Some(what) = schema_moved_while_down(&rec, compiled) {
+                    tracing::warn!(
+                        "restore: retiring shape {id} on {} — its schema changed while the engine was \
+                         down ({what}); subscribers observe the closed stream and recreate",
+                        rec.table
+                    );
+                    self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                    dead_streams.push(rec.stream_path.clone());
+                    continue;
+                }
                 if rec.is_subquery {
                     // Subquery shapes are registry-served and their inner-node contributor
                     // state is not persisted: a fresh-seeded node cannot detect flips that
@@ -173,7 +251,7 @@ impl Engine {
                     tracing::warn!(
                         "restore: dropping subquery shape {id} (inner-node state is not persisted); subscribers observe the deleted stream and recreate"
                     );
-                    let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                    self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
                     dead_streams.push(rec.stream_path.clone());
                     continue;
                 }
@@ -232,7 +310,7 @@ impl Engine {
                 tracing::error!("restore: shape {} failed to resume ({e:#}); dropping it", rec.id);
                 let mut st = self.state.lock().await;
                 st.shapes.remove(&rec.id);
-                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: rec.id.clone() });
+                self.catalog_tx.send(CatalogEvent::Dropped { id: rec.id.clone() });
                 if let Some(share) = st.feed_shares.remove(&rec.id) {
                     st.feed_by_sig.remove(&share.sig);
                 }
@@ -362,6 +440,7 @@ mod tests {
                 "family_key": null,
                 "is_subquery": false,
                 "aggregate": null,
+                "fingerprint": null,
             },
             "sig": null,
         })

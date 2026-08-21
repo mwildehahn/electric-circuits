@@ -1,14 +1,155 @@
 //! Schema types (deserialized from the control-plane JSON, mirroring `@electric-circuits/protocol`)
-//! and their compiled, positional runtime form.
+//! and their compiled, positional runtime form, plus the **schema fingerprint** the engine compares
+//! against what Postgres now reports for a table (ADR-0005).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::table_ref::TableRef;
 use crate::value::{Row, Value};
+
+/// The compiled table schemas, shared (and atomically swappable) between the `Engine`, the
+/// sequencer and the replication ingestor. A std lock: reads are brief and never held across an
+/// await. Schema drift replaces one entry in place, so every holder sees the new schema at once
+/// (ADR-0005) — nobody keeps a private immutable copy.
+pub type SharedTables = Arc<std::sync::RwLock<HashMap<TableRef, TableSchema>>>;
+
+/// `pg_class.relreplident` for `REPLICA IDENTITY FULL` — the only value the engine can serve: an
+/// UPDATE/DELETE must carry the full old row for the delta algebra to retract it.
+pub const REPLICA_IDENTITY_FULL: u8 = b'f';
+
+/// One column exactly as Postgres reports it — `pg_attribute` at introspection, the pgoutput
+/// `Relation` message on the wire. `name`/`type_oid`/`typmod` are what decides whether a compiled
+/// schema still *describes* the relation; the position in [`SchemaFingerprint::columns`] is the
+/// `attnum` order, which is also the order pgoutput tuples arrive in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FingerprintColumn {
+    pub name: String,
+    /// `pg_attribute.atttypid`.
+    pub type_oid: u32,
+    /// `pg_attribute.atttypmod` (`varchar(n)` length, `numeric(p,s)`, …; `-1` when unqualified).
+    pub typmod: i32,
+}
+
+/// What Postgres says a table looks like *right now*: live columns in `attnum` order, the
+/// relation's replica identity, and its primary key. Compared against the compiled copy on every
+/// `Relation` message and on the reconciler's tick; a difference is schema drift and retires the
+/// table's dependents.
+///
+/// Deliberately independent of [`TableSchema::columns`] (which is sorted, coarse-typed and carries
+/// the engine's own positional order): the fingerprint is Postgres's view, not the engine's.
+///
+/// **`pk` is only known to the catalog half.** A fingerprint read from `pg_index` carries
+/// `Some(cols)`; one derived from a pgoutput `Relation` message carries `None`, because under
+/// `REPLICA IDENTITY FULL` every column is flagged as part of the identity key, so the wire says
+/// nothing about the primary key. [`still_serves`](Self::still_serves) therefore compares `pk` only
+/// when BOTH sides have it — which means a primary-key change is caught by the reconciler (and by
+/// any re-introspection), not by the `R` compare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaFingerprint {
+    pub columns: Vec<FingerprintColumn>,
+    /// `pg_class.relreplident` (`f` = FULL, `d` = default/pk, `n` = nothing, `i` = index).
+    #[serde(with = "replident_serde")]
+    pub replident: u8,
+    /// Primary-key column names in key order (`pg_index.indkey`), or `None` when the source cannot
+    /// know them — see the type docs.
+    #[serde(default)]
+    pub pk: Option<Vec<String>>,
+}
+
+/// Render `relreplident` as the one-character string Postgres spells it with, so a durable audit
+/// record reads `"f"` rather than `102`.
+mod replident_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u8, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&(*v as char).to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(s.as_bytes().first().copied().unwrap_or(b'?'))
+    }
+}
+
+impl SchemaFingerprint {
+    /// True iff the compiled schema still describes `observed` **and** the replica identity is
+    /// still FULL. Both halves matter: identical columns with a regressed identity means updates
+    /// and deletes in between were mis-applied, which is drift just as much as a new column is.
+    ///
+    /// The primary key is compared only when both sides know it (see the type docs).
+    pub fn still_serves(&self, observed: &SchemaFingerprint) -> bool {
+        self.columns == observed.columns
+            && observed.replident == REPLICA_IDENTITY_FULL
+            && self.pk_matches(observed)
+    }
+
+    /// The primary keys agree, or one of the two sides does not know its own.
+    fn pk_matches(&self, observed: &SchemaFingerprint) -> bool {
+        match (&self.pk, &observed.pk) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+
+    /// Column names in `attnum` order (what a pgoutput tuple's cells zip against).
+    pub fn column_names(&self) -> Vec<String> {
+        self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+}
+
+/// Name what changed between the compiled fingerprint and the observed one, for the drift log.
+/// Empty iff nothing did — so it is also the pure "are these the same table?" predicate
+/// [`SchemaFingerprint::still_serves`] is built on (this one additionally reports a non-FULL
+/// replica identity, which is drift even when the columns match).
+pub fn describe_drift(compiled: &SchemaFingerprint, observed: &SchemaFingerprint) -> Vec<String> {
+    let mut out = Vec::new();
+    let old: BTreeMap<&str, &FingerprintColumn> =
+        compiled.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    let new: BTreeMap<&str, &FingerprintColumn> =
+        observed.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    for name in new.keys().filter(|n| !old.contains_key(*n)) {
+        out.push(format!("column '{name}' added"));
+    }
+    for name in old.keys().filter(|n| !new.contains_key(*n)) {
+        out.push(format!("column '{name}' dropped"));
+    }
+    for (name, c) in &new {
+        let Some(o) = old.get(name) else { continue };
+        if o.type_oid != c.type_oid || o.typmod != c.typmod {
+            out.push(format!(
+                "column '{name}' retyped (oid {}/typmod {} -> oid {}/typmod {})",
+                o.type_oid, o.typmod, c.type_oid, c.typmod
+            ));
+        }
+    }
+    // Same columns, different attnum order (a drop+add cycle): the tuple cells no longer line up
+    // with the names the decoder zips them against, so it is drift even though nothing was gained
+    // or lost.
+    if out.is_empty() && compiled.column_names() != observed.column_names() {
+        out.push(format!(
+            "columns reordered ({} -> {})",
+            compiled.column_names().join(","),
+            observed.column_names().join(",")
+        ));
+    }
+    if let (Some(before), Some(after)) = (&compiled.pk, &observed.pk)
+        && before != after
+    {
+        out.push(format!("primary key changed ({} -> {})", before.join(","), after.join(",")));
+    }
+    if observed.replident != REPLICA_IDENTITY_FULL {
+        out.push(format!(
+            "replica identity '{}' (expected 'f' = FULL)",
+            observed.replident as char
+        ));
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,6 +185,11 @@ pub struct TableDef {
     // Accepts a single column name (`"id"`) or an ordered list (`["a","b"]`) for composite keys.
     #[serde(rename = "primaryKey", deserialize_with = "de_primary_key")]
     pub primary_key: Vec<String>,
+    /// What Postgres reported for the table at introspection (ADR-0005). `None` in **library
+    /// mode** — the JSON schema carries no catalog detail, there is no Postgres to compare
+    /// against, and drift checking is therefore off for that table.
+    #[serde(default, skip)]
+    pub fingerprint: Option<SchemaFingerprint>,
 }
 
 fn de_primary_key<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
@@ -88,6 +234,10 @@ pub struct TableSchema {
     /// all `false` in library mode. Surfaced by `GET /table/{name}/schema` so the add-row form can
     /// treat these columns as optional.
     pub has_defaults: Vec<bool>,
+    /// Postgres's own view of the table when this schema was compiled (ADR-0005). Compared with
+    /// every pgoutput `Relation` message and with the reconciler's catalog read; a difference
+    /// retires the table's dependents. `None` in library mode ⇒ no drift checking.
+    pub fingerprint: Option<SchemaFingerprint>,
 }
 
 /// Separator joining composite-key column values into the durable-stream `key` string. Chosen to not
@@ -122,6 +272,7 @@ impl TableSchema {
             pk_cols,
             pg_types,
             has_defaults,
+            fingerprint: def.fingerprint.clone(),
         })
     }
 
@@ -235,5 +386,125 @@ mod tests {
         assert_eq!(ts.pk_of(&row).unwrap(), &Value::Int(7));
         let back = ts.row_to_json(&row);
         assert_eq!(back, obj);
+    }
+
+    /// A library-mode schema (JSON, no Postgres) carries no fingerprint, so nothing drift-checks it.
+    #[test]
+    fn library_mode_schema_has_no_fingerprint() {
+        assert!(users().fingerprint.is_none());
+    }
+
+    fn col(name: &str, type_oid: u32, typmod: i32) -> FingerprintColumn {
+        FingerprintColumn { name: name.into(), type_oid, typmod }
+    }
+
+    /// A catalog-read fingerprint: it knows its primary key.
+    fn fp(columns: Vec<FingerprintColumn>) -> SchemaFingerprint {
+        SchemaFingerprint { columns, replident: REPLICA_IDENTITY_FULL, pk: Some(vec!["id".into()]) }
+    }
+
+    /// A wire (`Relation`-derived) fingerprint: it does not.
+    fn wire(columns: Vec<FingerprintColumn>) -> SchemaFingerprint {
+        SchemaFingerprint { columns, replident: REPLICA_IDENTITY_FULL, pk: None }
+    }
+
+    fn base() -> SchemaFingerprint {
+        fp(vec![col("id", 23, -1), col("name", 25, -1)])
+    }
+
+    #[test]
+    fn identical_fingerprints_are_not_drift() {
+        assert!(base().still_serves(&base()));
+        assert!(describe_drift(&base(), &base()).is_empty());
+    }
+
+    #[test]
+    fn an_added_column_is_drift() {
+        let observed = fp(vec![col("id", 23, -1), col("name", 25, -1), col("extra", 25, -1)]);
+        assert!(!base().still_serves(&observed));
+        assert_eq!(describe_drift(&base(), &observed), ["column 'extra' added"]);
+    }
+
+    #[test]
+    fn a_dropped_column_is_drift() {
+        let observed = fp(vec![col("id", 23, -1)]);
+        assert!(!base().still_serves(&observed));
+        assert_eq!(describe_drift(&base(), &observed), ["column 'name' dropped"]);
+    }
+
+    #[test]
+    fn a_retyped_column_is_drift() {
+        // text -> varchar(10): both the oid and the typmod move.
+        let observed = fp(vec![col("id", 23, -1), col("name", 1043, 14)]);
+        assert!(!base().still_serves(&observed));
+        assert_eq!(describe_drift(&base(), &observed), [
+            "column 'name' retyped (oid 25/typmod -1 -> oid 1043/typmod 14)"
+        ]);
+        // A typmod-only change (varchar(10) -> varchar(20)) is drift too.
+        let a = fp(vec![col("name", 1043, 14)]);
+        let b = fp(vec![col("name", 1043, 24)]);
+        assert!(!a.still_serves(&b));
+        assert_eq!(describe_drift(&a, &b).len(), 1);
+    }
+
+    /// Same names and types, different `attnum` order (drop + re-add): the tuple cells no longer
+    /// line up with the names they are zipped against, so it must not compare equal.
+    #[test]
+    fn reordered_columns_are_drift() {
+        let observed = fp(vec![col("name", 25, -1), col("id", 23, -1)]);
+        assert!(!base().still_serves(&observed));
+        assert_eq!(describe_drift(&base(), &observed), ["columns reordered (id,name -> name,id)"]);
+    }
+
+    /// Identical columns but a regressed replica identity is drift: the updates and deletes since
+    /// the regression were mis-applied.
+    /// A primary-key change is drift when both sides know their key (the reconciler's compare, and
+    /// any re-introspection) — and is invisible to the `R` compare, which cannot know it.
+    #[test]
+    fn a_primary_key_change_is_drift_only_where_the_key_is_known() {
+        let cols = base().columns;
+        let repk = SchemaFingerprint {
+            columns: cols.clone(),
+            replident: REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["name".into()]),
+        };
+        assert!(!base().still_serves(&repk));
+        assert_eq!(describe_drift(&base(), &repk), ["primary key changed (id -> name)"]);
+
+        // The same columns off the wire carry no pk, so the `R` compare passes them.
+        assert!(base().still_serves(&wire(cols)));
+        assert!(describe_drift(&base(), &wire(base().columns)).is_empty());
+    }
+
+    #[test]
+    fn a_replica_identity_regression_is_drift() {
+        let observed =
+            SchemaFingerprint { columns: base().columns, replident: b'd', pk: base().pk };
+        assert!(!base().still_serves(&observed));
+        assert_eq!(describe_drift(&base(), &observed), [
+            "replica identity 'd' (expected 'f' = FULL)"
+        ]);
+    }
+
+    /// Why a publication that does not deliver whole rows is refused at BOOT rather than handled at
+    /// runtime (`pg::inspect_publication`): its `Relation` message describes a narrower table than
+    /// the catalog holds, on every message, and no re-introspection can ever reconcile the two.
+    #[test]
+    fn a_catalog_the_wire_does_not_deliver_never_compares_equal() {
+        let catalog = fp(vec![col("id", 23, -1), col("name", 25, -1), col("secret", 25, -1)]);
+        let wire = wire(vec![col("id", 23, -1), col("name", 25, -1)]);
+        assert!(!catalog.still_serves(&wire));
+        assert_eq!(describe_drift(&catalog, &wire), ["column 'secret' dropped"]);
+        // Stable: re-reading the catalog changes nothing.
+        assert!(!catalog.still_serves(&wire));
+    }
+
+    /// The durable audit record spells the identity as Postgres does.
+    #[test]
+    fn fingerprint_json_round_trips_with_a_readable_replident() {
+        let json = serde_json::to_value(base()).unwrap();
+        assert_eq!(json["replident"], "f");
+        assert_eq!(json["pk"], serde_json::json!(["id"]));
+        assert_eq!(serde_json::from_value::<SchemaFingerprint>(json).unwrap(), base());
     }
 }

@@ -295,6 +295,7 @@ async fn graph_includes_counts_pipeline_and_consumers() {
             family_key: None,
             is_subquery: false,
             aggregate: Some(AggInfo { func: AggFn::Count, col: None }),
+            fingerprint: None,
         },
     );
 
@@ -1064,6 +1065,7 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
             family_key: None,
             is_subquery: false,
             aggregate: None,
+            fingerprint: None,
         },
     );
 

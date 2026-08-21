@@ -63,7 +63,7 @@ export ELECTRIC_CIRCUITS_BIND="0.0.0.0:9000"
 ./electric-circuits-engine
 ```
 
-On startup the engine introspects each table, sets `REPLICA IDENTITY FULL`, ensures the slot, starts
+On startup the engine sets `REPLICA IDENTITY FULL` on each table, introspects it, ensures the slot, starts
 the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUITS_BIND`. It prints
 `ENGINE_LISTENING <addr>` once ready.
 
@@ -106,8 +106,8 @@ activeUsers.subscribe((rows) => render(rows))
 
 ## Operating notes
 
-- **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will introspect
-  and set replica identity on the new table at startup.
+- **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
+  replica identity on the new table and introspect it at startup.
 - **Replication slot lag:** an engine that is stopped for a long time holds its slot, and Postgres
   retains WAL for it. If you decommission an engine, drop its slot:
   `SELECT pg_drop_replication_slot('<slot>');` Monitor `pg_replication_slots.confirmed_flush_lsn` vs
@@ -123,10 +123,41 @@ activeUsers.subscribe((rows) => render(rows))
   de-duplicates by `(commit LSN, position)`, so each change takes effect exactly once. This assumes a
   single ingestor per database (the model above). Running multiple ingestors over the same tables is
   not supported.
-- **Degraded forms are loud:** if a table's `REPLICA IDENTITY` is reset from `FULL` (e.g. a migration
-  recreated it), updates lose their old image and deletes their tuple — the engine logs errors and
-  tells you to restore identity + recreate shapes. `TRUNCATE` is not propagated (also logged);
-  recreate shapes after one.
+- **Migrations cost one resync of that table's shapes.** The engine compares every table's compiled
+  schema with what Postgres reports — on each pgoutput `Relation` message (which Postgres re-sends
+  after DDL) and on a background reconciler tick (`ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS`, default
+  60 s, for DDL that no write follows, and for primary-key changes, which the replication stream
+  cannot describe). On any difference — a column added, dropped, retyped or reordered, a changed
+  primary key, or a `REPLICA IDENTITY` reset from `FULL` (which the engine re-asserts) — it
+  re-introspects the table and **retires every shape that depends on it**: the streams are closed and
+  deleted, and clients re-subscribe and backfill through the new schema. Rows already on a stream can
+  never gain a new column, so this is enforced rather than hoped for. `TRUNCATE` retires the same
+  shapes (the engine holds no row copy from which to synthesise the deletes). Other tables' shapes
+  are untouched. A shape creation that overlapped the migration is refused with
+  `schema of <t> changed during creation; retry` rather than being served over the old schema.
+  One exception: a table with a counts pipeline (`ELECTRIC_CIRCUITS_DBSP_COUNTS`) has no runtime
+  circuit rebuild, so the engine additionally exits (code `75`) to be restarted once the retirements
+  have landed — plan migrations *and truncates* on those tables like a rolling restart.
+- **Migrating while the engine is stopped works too.** Every shape record stores the fingerprint its
+  table had when the shape was created; at boot the engine re-introspects and retires any shape whose
+  table moved while it was down, so a restart after a migration is a resync of the affected tables,
+  never a silent resume over the old schema.
+- **When a migration cannot be settled, the table is parked, not guessed at.** If the engine cannot
+  re-introspect (Postgres unreachable) or cannot get the `ACCESS EXCLUSIVE` lock to restore
+  `REPLICA IDENTITY FULL` within 5 s, the table becomes **unresolved**: its shapes are retired, its
+  changes are dropped, and creates on it are refused with
+  `schema of <t> is unresolved after a change; retry later`. A per-table retry task keeps working on
+  it (2 s → 30 s backoff) and un-parks it on the first successful re-introspection. Watch
+  `GET /tables` (each table's `unresolved` flag) and the `schema_unresolved_total` counter.
+- **The publication must deliver whole rows.** A `Relation` message that describes fewer columns than
+  the table has can never be reconciled with its schema, so the engine **refuses to boot** if its
+  publication has a per-table column list, naming the tables. Stored generated columns follow
+  `pg_publication.pubgencols` (PG18+): the engine includes them in a table's schema fingerprint
+  exactly when the publication publishes them. The engine's own `<slot>_pub` is `FOR ALL TABLES` and
+  satisfies both; point it at a hand-made publication only if it does too.
+- **Dropping a table is one-way until a restart.** A table dropped from Postgres has its shapes
+  retired and is untracked; re-creating it under the same name does not resume syncing — restart the
+  engine, exactly as when adding a table.
 - **Permissions:** the engine's Postgres role needs `SELECT` on the watched tables, ownership (for
   `ALTER TABLE … REPLICA IDENTITY`), and the `REPLICATION` attribute (to create/read the slot).
 - **Introspection surface:** the engine's control port also serves the pipeline-visualizer backend —

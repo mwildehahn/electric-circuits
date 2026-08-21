@@ -44,6 +44,7 @@ discover the bound port.
 | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
 | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval |
+| `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
 | `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before its **handle state** is evicted and its shape subscription released (the shape + stream are retained and follow the retention lifecycle); a late request gets `409 must-refetch` and rejoins the retained shape |
 | `ELECTRIC_LIVE_TIMEOUT_MS` | `20000` | Overall deadline for a `live=true` `/v1/shape` long-poll, then `204` |
 
@@ -111,6 +112,7 @@ unchanged.
 | `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
 | `GET /trace` | SSE: per-envelope pipeline traces (hops + outcomes) and `shapeAdded`/`shapeDropped` lifecycle events; lossy by design, zero cost with no subscribers |
+| `GET /tables` | every tracked table + its schema-drift `unresolved` flag |
 | `GET /tables/{name}/offset` · `GET /tables/{name}/families` | tailer position / routing-family stats |
 | `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…` | shared-node stats, pipeline graph, one node's live index |
 | `GET /replication/lsn` | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) |
@@ -128,6 +130,59 @@ a node, walked on down the graph) the moment the seed and the shape are in. The 
 state stays registry-owned across the whole install, so a client disconnect at any point — a
 partly-installed membership seed included — is unwound exactly and the same shape is immediately
 creatable again.
+
+## Schema changes
+
+The engine never keeps serving rows over a schema Postgres no longer has (`docs/adr/0005-schema-drift-retires-per-table.md`).
+The compiled schema of each table carries a fingerprint — its live columns in `attnum` order with
+`(name, type OID, typmod)`, plus `relreplident` and the primary key — and four things are compared
+against it: the pgoutput `Relation` message Postgres re-sends after any DDL, that message's replica
+identity, `TRUNCATE`, and the background reconciler (`ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS`, for
+DDL that no write follows). (The `Relation` message cannot describe a primary key — under
+`REPLICA IDENTITY FULL` every column is flagged as part of the identity — so a PK change is caught by
+the reconciler, not on the wire.)
+
+**Schema drift** (a column added, dropped, retyped or reordered; a PK change; an identity that
+regressed from `FULL`, which is re-asserted first) re-introspects the table, **retires every
+dependent shape** — including aggregates and any subquery shape whose predicate references it — by
+closing then deleting their streams, swaps the compiled schema everywhere, and records
+`schemaChanged` in the durable catalog. **`TRUNCATE`** retires the same dependents and stops there:
+nothing about the schema changed, so there is nothing to re-introspect, swap or record. Clients treat
+the closed stream exactly as they treat eviction: re-subscribe, and the new shape backfills through
+the new schema. A create that was already in flight when a drift retired its table is refused
+(`schema of <t> changed during creation; retry`) and rolled back rather than installed against a
+schema that is gone.
+
+Granularity is per table: a migration on one table never resyncs another. The one exception is a
+table with a counts pipeline (`ELECTRIC_CIRCUITS_DBSP_COUNTS`) — the circuit is built and seeded once
+at boot with no runtime rebuild, so once the retirements and catalog records have landed the process
+exits `75` to be restarted; boot re-seeds the circuit and the catalog restores every other table's
+shapes. This applies to `TRUNCATE` as much as to drift (a truncate emits no per-row envelopes, so the
+pipeline would otherwise keep its pre-truncate groups).
+
+**Migrations applied while the engine is down** are seen by nothing on the live path. Each shape
+record carries the fingerprint its table had when the shape was created, and the catalog restore
+retires any shape whose table no longer matches — its retained stream holds rows shaped by the old
+schema and can never be brought up to date.
+
+**Unresolved tables.** If the drift cannot be settled — Postgres unreachable, a catalog read that
+errored, or an `ALTER … REPLICA IDENTITY FULL` that could not get its `ACCESS EXCLUSIVE` lock within
+5 s (the wait is bounded so one long reader cannot stall *all* ingest) — the table is parked as
+**unresolved**: dependents retired, its changes dropped, and `POST /shapes` / `POST /aggregate` on it
+refused with `schema of <t> is unresolved after a change; retry later`. A per-table retry task keeps
+attempting the resolution (2 s → 30 s backoff) regardless of the reconciler setting, and the first
+successful re-introspection un-parks it. `GET /tables` lists every tracked table with its
+`unresolved` flag, and `schema_unresolved_total` counts the parkings.
+
+**Publication requirements.** The engine needs **whole rows** on the wire: a `Relation` message that
+describes fewer columns than the catalog holds can never be reconciled with the table's schema. At
+boot the engine therefore refuses to start if its publication carries a per-table **column list**, and
+reads `pg_publication.pubgencols` (PG18+) so that **stored generated columns** are included in the
+schema fingerprint exactly when the publication publishes them. The engine's own `<slot>_pub` is
+`FOR ALL TABLES`, which satisfies both.
+
+A table that is **dropped** has its dependents retired and is untracked; a table re-created under the
+same name is not synced again until the engine restarts (same as adding a table).
 
 ## Shape retention lifecycle
 

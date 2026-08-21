@@ -16,7 +16,7 @@ use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::heap_size::HeapSize;
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
-use crate::schema::{Schema, TableSchema, compile_schema};
+use crate::schema::{Schema, SharedTables, TableSchema, compile_schema};
 use crate::table_ref::{TableRef, TableSelector};
 use crate::retention::{EvictReason, LifeState, RetentionConfig, ShapeLife, SweepShape};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
@@ -24,6 +24,7 @@ use crate::value::{Row, Value};
 
 mod catalog;
 mod circuit_serving;
+mod drift;
 pub(crate) mod emission;
 mod executors;
 mod introspection;
@@ -48,6 +49,7 @@ pub use introspection::{
     FamilyStat, GraphEdge, GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue,
     OpEdge, OpNode, ShapeRecord, StateSnapshot, TableColumnInfo, TableSchemaInfo, TableStats,
 };
+pub use drift::ResolveLock;
 pub use planning::CircuitPlacement;
 pub(crate) use output::{apply_envelope, delete_envelopes, translate_output};
 
@@ -140,10 +142,18 @@ pub struct Engine {
     pending_flips: Arc<std::sync::atomic::AtomicI64>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
-    /// Table schemas shared with the sequencer task (updated on `setup_postgres`/`define_schema`).
+    /// Table schemas shared with the sequencer task and the replication ingestor — the set of
+    /// tables the engine can **currently decode and route**, and the single place a drift swaps a
+    /// schema (ADR-0005).
+    ///
+    /// It is a subset of `EngineState::tables` (which is what the engine *knows about*, and what
+    /// the reconciler reconciles): a table whose drift is unresolved is removed from here, so its
+    /// changes are dropped at the decoder rather than decoded against a schema the engine knows is
+    /// stale, while staying in `tables` so it is still reconciled and still gives API callers the
+    /// specific "unresolved, retry" refusal rather than "unknown table".
     tables_shared: SharedTables,
     /// Ordered writer for the durable shape catalog (see [`CATALOG_STREAM`]).
-    catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
+    catalog_tx: CatalogWriter,
     /// Change-log offset the sequencer starts from (set by catalog restore before the spawn).
     seq_start: Arc<std::sync::Mutex<String>>,
     /// Per-shape retention lifecycle + last-read instant. A separate sync mutex (not
@@ -154,6 +164,16 @@ pub struct Engine {
     retention: Arc<RetentionConfig>,
     /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the background schema reconciler has been spawned (see `engine::drift`).
+    reconciler_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-table serialisation of drift resolutions, plus the set currently running (see
+    /// [`drift::Resolving`]). Every trigger runs its own resolution, one at a time per table, and a
+    /// shape create on a table being resolved is refused rather than allowed to install against a
+    /// schema that is mid-swap.
+    resolving: Arc<drift::Resolving>,
+    /// Tables with an unresolved-retry task running (coalescing — one task per table). A std lock
+    /// so the task's drop guard can clear it without an await.
+    retrying: Arc<std::sync::Mutex<HashSet<TableRef>>>,
     /// dbsp arrangement settings (`ELECTRIC_CIRCUITS_DBSP*`), set before `setup_postgres`.
     dbsp_cfg: Arc<std::sync::Mutex<Option<crate::config::DbspConfig>>>,
     /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
@@ -301,6 +321,52 @@ struct EngineState {
     /// graph payload so the visualizer can draw pipeline→shape edges.
     circuit_placement: HashMap<String, CircuitPlacement>,
     feed_shares: HashMap<String, FeedShare>,
+    /// Per-table **schema generation**, bumped in the same critical section that enumerates a
+    /// table's dependents for retirement (`Engine::retire_dependents`). A shape create captures the
+    /// generation of every table it touches when it registers and re-checks it before returning
+    /// success, so a create that overlapped a drift is rolled back instead of being installed
+    /// against a schema that is already gone (ADR-0005) — the same shape as the degradation latch's
+    /// two-check pattern (see [`Engine::ensure_create_not_degraded`]).
+    schema_gen: HashMap<TableRef, u64>,
+    /// Tables whose drift could not be resolved (Postgres unreachable, the catalog read failed, the
+    /// `REPLICA IDENTITY FULL` re-assert timed out, or the wire keeps disagreeing with the
+    /// catalog). Creates on them are refused with a retryable error and the ingestor decodes
+    /// nothing for them; a per-table retry task keeps trying. Never a silent stale-serve.
+    unresolved: HashSet<TableRef>,
+}
+
+/// The schema generations a create captured for every table it depends on.
+///
+/// A create reads several tables (a subquery shape reads its outer table AND every referenced inner
+/// table), and any of them drifting invalidates the whole create — so the whole set travels
+/// together and is re-checked as one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SchemaGens(Vec<(TableRef, u64)>);
+
+impl EngineState {
+    /// Capture the current generation of each table. Call under the state lock, in the same
+    /// critical section that registers the create.
+    fn capture_gens(&self, tables: &[TableRef]) -> SchemaGens {
+        SchemaGens(
+            tables
+                .iter()
+                .map(|t| (t.clone(), self.schema_gen.get(t).copied().unwrap_or(0)))
+                .collect(),
+        )
+    }
+
+    /// The first table whose generation moved since [`capture_gens`](Self::capture_gens), if any.
+    fn drifted_since(&self, gens: &SchemaGens) -> Option<TableRef> {
+        gens.0
+            .iter()
+            .find(|(t, g)| self.schema_gen.get(t).copied().unwrap_or(0) != *g)
+            .map(|(t, _)| t.clone())
+    }
+
+    /// The first of `tables` whose schema is unresolved, if any.
+    fn first_unresolved(&self, tables: &[TableRef]) -> Option<TableRef> {
+        tables.iter().find(|t| self.unresolved.contains(*t)).cloned()
+    }
 }
 
 struct FeedShare {
@@ -460,8 +526,7 @@ impl Engine {
             degrade.clone(),
             trace_tx.clone(),
         );
-        let (catalog_tx, catalog_rx) = mpsc::unbounded_channel();
-        spawn_catalog_writer(ds.clone(), catalog_rx);
+        let catalog_tx = spawn_catalog_writer(ds.clone());
         Engine {
             ds,
             state: Arc::new(Mutex::new(EngineState {
@@ -472,6 +537,8 @@ impl Engine {
                 feed_by_sig: HashMap::new(),
                 feed_shares: HashMap::new(),
                 circuit_placement: HashMap::new(),
+                schema_gen: HashMap::new(),
+                unresolved: HashSet::new(),
             })),
             pg_url,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
@@ -490,6 +557,9 @@ impl Engine {
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reconciler_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resolving: Arc::new(drift::Resolving::default()),
+            retrying: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -684,6 +754,13 @@ impl Engine {
         self.state.lock().await.tables.len()
     }
 
+    /// Every table the engine tracks, canonically sorted (`GET /tables`).
+    pub async fn tracked_tables(&self) -> Vec<TableRef> {
+        let mut v: Vec<TableRef> = self.state.lock().await.tables.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// The `/v1/health` status string: `degraded` | `waiting` | `starting` | `active` (exact, no
     /// whitespace). `degraded` outranks every boot phase — an engine that has lost membership
     /// effects is not healthy however far along its boot got.
@@ -738,16 +815,29 @@ impl Engine {
         }
         tables.sort();
         tables.dedup();
+        // The publication is inspected BEFORE the first introspection, because it decides what a
+        // fingerprint even contains: pgoutput publishes stored generated columns only when
+        // `pubgencols = 's'`, and a column list means the wire can never deliver the row the
+        // catalog describes — a boot-fatal misconfiguration rather than runtime drift (ADR-0005).
+        let publication = format!("{slot}_pub");
+        crate::pg::ensure_publication(&client, &publication).await?;
+        let pubinfo = crate::pg::inspect_publication(&client, &publication, &tables).await?;
+        crate::pg::set_publish_generated(pubinfo.publish_generated);
+        if pubinfo.publish_generated {
+            tracing::info!("publication '{publication}' publishes stored generated columns");
+        }
         let mut compiled = HashMap::new();
         for t in &tables {
+            // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
+            // includes `relreplident`, and reading it before the ALTER would record the pre-boot
+            // identity — which the ingestor's first `Relation` message would then report as drift
+            // on every single boot (ADR-0005).
+            crate::pg::ensure_replica_identity_full(&client, t).await?;
             let def = crate::pg::introspect(&client, t).await?;
             let ts = TableSchema::from_def(t, &def)?;
-            crate::pg::ensure_replica_identity_full(&client, t).await?;
             compiled.insert(t.clone(), ts);
         }
         crate::pg::ensure_slot(&client, slot).await?;
-        let publication = format!("{slot}_pub");
-        crate::pg::ensure_publication(&client, &publication).await?;
         self.ds.ensure_stream(crate::CHANGES_STREAM).await?;
         *self.tables_shared.write().unwrap() = compiled.clone();
         self.state.lock().await.tables = compiled.clone();
@@ -780,15 +870,20 @@ impl Engine {
             self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
+        // The ingestor reads the LIVE schema view (not a boot-time copy) and reports schema drift
+        // / TRUNCATE back through `SchemaEvents`, which `Engine` implements (see `engine::drift`).
         tokio::spawn(crate::replication::run(
             url,
             slot.to_string(),
             publication,
             self.ds.clone(),
-            Arc::new(compiled),
+            self.tables_shared.clone(),
+            Arc::new(self.clone()) as Arc<dyn crate::replication::SchemaEvents>,
             self.repl_lsn.clone(),
             self.repl_sync.clone(),
         ));
+        // DDL with no following DML produces no `Relation` message; the reconciler catches it.
+        self.ensure_schema_reconciler();
         // Introspection + slot + ingest loop are up: report `active` (200 on `/v1/health`).
         self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
         Ok(())

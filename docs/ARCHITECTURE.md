@@ -112,9 +112,41 @@ exactly-once **effect**:
 - The drain-barrier sentinel (`__el_sync`) is published only after its whole commit landed on the
   streams, so the barrier can never claim "drained" while a transaction is still due for re-append.
 
-Degraded/unsupported forms are **loud, never silent**: an `UPDATE` without an old image or a `DELETE`
-without tuple data (REPLICA IDENTITY no longer FULL) and `TRUNCATE` log errors describing the staleness
-they cause; unparseable values (e.g. `NaN` floats) log errors when degraded to NULL.
+**Schema drift retires, it does not degrade** (ADR-0005). The compiled schema carries a *fingerprint*
+— live columns in `attnum` order with `(name, type OID, typmod)`, plus `relreplident` and the primary
+key — and Postgres re-sends a `Relation` message after any DDL that changes a table, so every `R` is
+compared with it. Four triggers reach one **retirement**: a fingerprint difference, a replica identity
+that is no longer FULL, a `TRUNCATE`, and the reconciler (`ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS`,
+default 60 s — for DDL with no following DML, and for the primary key, which the wire cannot describe).
+Every dependent of the table — shapes, aggregates, subquery shapes whose predicate references it — is
+purged by closing then deleting its stream.
+
+Drift additionally **re-introspects** the table, swaps the compiled schema in every holder (the shared
+view, the engine registry, the subquery registry), drops the sequencer's executor for it, and records
+`schemaChanged` in the catalog; an identity regression re-asserts `REPLICA IDENTITY FULL` first (with a
+bounded lock wait, so one long reader cannot stall all ingest). `TRUNCATE` does none of that — nothing
+about the schema changed. The ingestor **awaits** the handling before decoding further messages, so the
+post-DDL DML is decoded against the new schema and no dependent is still being maintained when it lands.
+
+Retire-then-swap leaves one race — a create already out at Postgres when the retirement enumerates its
+victims. Two things close it: a per-table **schema generation** bumped inside that same critical
+section (a create captures the generation of every table it reads and re-checks it before returning a
+handle), and a per-table **resolve lock** held across the whole resolution (a create registering while
+it is held is refused, since one arriving *after* the enumeration would pass its own generation check
+and then be orphaned by the `ResetTable`). A drift that cannot be settled — Postgres unreachable, the
+identity ALTER blocked on its lock — parks the table as **unresolved**: dependents retired, changes
+dropped, creates refused with a retryable error, and a per-table retry task working on it until a
+re-introspection succeeds. A publication that cannot deliver whole rows is *not* a runtime concern: a
+column list is refused at boot and generated-column publishing is folded into the fingerprint, so wire
+and catalog agree by construction.
+
+Granularity is per table, never whole-engine; the one exception is a table with a counts pipeline,
+which has no runtime circuit rebuild and so restarts the process after its retirements land (for
+`TRUNCATE` as much as for drift). Because delivery is at-least-once, the restart is gated on the
+triggering transaction's xid against the boot seed's `SnapshotGate`: a re-delivered transaction the
+fresh seed already reflects does not restart again.
+
+Unparseable values (e.g. `NaN` floats) still log errors when degraded to NULL.
 
 ---
 
@@ -476,6 +508,8 @@ absolute membership emission makes them unnecessary for convergence).
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
 | engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log offset checkpoints) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
+| compiled schema ↔ Postgres | fingerprint compare on every `Relation` + a 60 s catalog reconciler; drift/TRUNCATE/identity regression retires that table's dependents, and a per-table schema generation refuses any create that overlapped it (ADR-0005) | never serves rows over a schema Postgres no longer has; the catalog records `schemaChanged` as the audit trail for the drops |
+| shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,
@@ -570,12 +604,12 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 
 | path | role |
 |------|------|
-| `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, pooled Postgres query-backs), `emission.rs` (per-stream ordered emission lanes), `output.rs` (envelope ⇄ delta codec) |
+| `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `drift.rs` (schema drift / TRUNCATE retirement + the reconciler), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, pooled Postgres query-backs), `emission.rs` (per-stream ordered emission lanes), `output.rs` (envelope ⇄ delta codec) |
 | `apps/engine/src/subquery.rs` | subquery registry: shared nodes + templates, edges, absolute emission, atomic create/rollback |
 | `apps/engine/src/subq_circuit.rs` | the membership circuit: inner-set state + flip detection (dbsp distinct) |
 | `apps/engine/src/arrangements.rs` | the circuit: in-memory dbsp counts pipelines, group-aggregated boot seeding (§6b) |
-| `apps/engine/src/replication.rs` | ingestor: streaming pgoutput (decoder: `pgoutput.rs`), per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge |
-| `apps/engine/src/pg.rs` | connect/introspect, slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
+| `apps/engine/src/replication.rs` | ingestor: streaming pgoutput (decoder: `pgoutput.rs`), per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge, schema-drift/TRUNCATE reporting (`SchemaEvents`) |
+| `apps/engine/src/pg.rs` | connect/introspect (+ schema fingerprints), slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (pushdown) / SQL `WHERE` → predicate (Electric path) |
 | `apps/engine/src/electric.rs` | Electric `/v1/shape` adapter (handles, offsets, TTL eviction) |

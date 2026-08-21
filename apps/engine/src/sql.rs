@@ -206,7 +206,7 @@ mod tests {
         columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
         columns.insert("score".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
         columns.insert("active".to_string(), ColumnDef { ty: ColumnType::Bool, pg_type: None, has_default: false });
-        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
+        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
         TableSchema::from_def(&"users".into(), &def).unwrap()
     }
 
@@ -258,7 +258,7 @@ mod tests {
         for (c, ty, pg) in cols {
             columns.insert(c.to_string(), ColumnDef { ty: *ty, pg_type: Some(pg.to_string()), has_default: false });
         }
-        let def = TableDef { columns, primary_key: vec![cols[0].0.to_string()] };
+        let def = TableDef { columns, primary_key: vec![cols[0].0.to_string()], fingerprint: None };
         TableSchema::from_def(&TableRef::parse(name).unwrap(), &def).unwrap()
     }
 

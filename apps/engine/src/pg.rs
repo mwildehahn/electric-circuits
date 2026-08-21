@@ -11,7 +11,7 @@ use tokio_postgres::{Client, NoTls};
 
 use crate::heap_size::HeapSize;
 use crate::predicate::CompiledPredicate;
-use crate::schema::{ColumnDef, ColumnType, TableDef, TableSchema};
+use crate::schema::{ColumnDef, ColumnType, FingerprintColumn, SchemaFingerprint, TableDef, TableSchema};
 use crate::table_ref::TableRef;
 use crate::value::Row;
 
@@ -34,6 +34,24 @@ static POOL_SIZE: OnceLock<usize> = OnceLock::new();
 
 /// One shared pool per distinct URL for the process lifetime.
 static POOLS: OnceLock<std::sync::Mutex<HashMap<String, Pool>>> = OnceLock::new();
+
+/// Whether the publication publishes stored generated columns (PG18 `pg_publication.pubgencols`),
+/// resolved once at boot by [`inspect_publication`]. Default `false` — every server before 18, and
+/// PG18's own default.
+static PUBLISH_GENERATED: OnceLock<bool> = OnceLock::new();
+
+/// Record what the publication does with stored generated columns. Call once at boot, before the
+/// first [`fingerprints`].
+pub fn set_publish_generated(v: bool) {
+    let _ = PUBLISH_GENERATED.set(v);
+}
+
+/// Does the publication deliver stored generated columns? Decides whether the schema fingerprint
+/// includes them, so that the catalog's view and the wire's `Relation` message agree by
+/// construction (ADR-0005).
+pub fn publish_generated() -> bool {
+    *PUBLISH_GENERATED.get_or_init(|| false)
+}
 
 /// Set the per-URL pool capacity. Call once at boot, before the first [`pool_for`].
 pub fn set_pool_size(size: usize) {
@@ -176,11 +194,106 @@ pub async fn list_tables(client: &Client, schema: &str) -> Result<Vec<TableRef>>
         .collect())
 }
 
-/// Introspect a table's columns (+ types) and single-column primary key from the catalog. Both the
-/// column lookup and the primary-key lookup are qualified by `(table_schema, table_name)` / the
-/// quoted qualified `to_regclass`, so same-named tables in different schemas never cross.
+/// Read the live **schema fingerprint** of every given table in ONE round trip: `pg_class` ⨝
+/// `pg_attribute`, live columns only (`attnum > 0 and not attisdropped`) in `attnum` order, plus
+/// `pg_class.relreplident` (ADR-0005).
+///
+/// A table the query finds no row for is simply **absent** from the result — that is exactly how a
+/// DROPped table is detected, by the reconciler and by the drift handler alike. The wanted set is
+/// two bound `text[]` params joined through `unnest`, so neither an odd schema name nor a large
+/// table set turns into interpolated SQL.
+pub async fn fingerprints(
+    client: &Client,
+    tables: &[TableRef],
+) -> Result<HashMap<TableRef, SchemaFingerprint>> {
+    if tables.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let schemas: Vec<String> = tables.iter().map(|t| t.schema().to_string()).collect();
+    let names: Vec<String> = tables.iter().map(|t| t.name().to_string()).collect();
+    // Stored generated columns are included **iff the publication publishes them** ($3): pgoutput
+    // omits them unless `pubgencols = 's'`, and a fingerprint that disagrees with the wire on this
+    // would report drift on every single `Relation` message, forever (ADR-0005).
+    let with_generated = publish_generated();
+    let rows = client
+        .query(
+            "select n.nspname, c.relname, c.relreplident::text, \
+                    a.attname, a.atttypid::int8, a.atttypmod \
+             from pg_class c \
+             join pg_namespace n on n.oid = c.relnamespace \
+             join unnest($1::text[], $2::text[]) as w(s, t) on w.s = n.nspname and w.t = c.relname \
+             left join pg_attribute a \
+               on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped \
+                  and (a.attgenerated = '' or $3::bool) \
+             order by n.nspname, c.relname, a.attnum",
+            &[&schemas, &names, &with_generated],
+        )
+        .await
+        .context("read schema fingerprints")?;
+    let mut out: HashMap<TableRef, SchemaFingerprint> = HashMap::new();
+    for r in &rows {
+        let schema: String = r.get(0);
+        let name: String = r.get(1);
+        let Ok(table) = TableRef::new(&schema, &name) else { continue };
+        let replident: String = r.get(2);
+        let entry = out.entry(table).or_insert_with(|| SchemaFingerprint {
+            columns: Vec::new(),
+            replident: replident.as_bytes().first().copied().unwrap_or(b'?'),
+            // Filled by the primary-key pass below; a table without one keeps `Some(vec![])`, which
+            // is still a KNOWN key (and different from any real one), not "unknown".
+            pk: Some(Vec::new()),
+        });
+        // `CREATE TABLE t ()` is legal: the LEFT JOIN then yields one all-NULL column row.
+        let Some(attname) = r.get::<_, Option<String>>(3) else { continue };
+        let type_oid: i64 = r.get(4);
+        let typmod: i32 = r.get(5);
+        entry.columns.push(FingerprintColumn { name: attname, type_oid: type_oid as u32, typmod });
+    }
+    // Second pass: the primary key, in `indkey` order. A separate query rather than another join —
+    // joining it into the column query would multiply every column row by the key width.
+    let pk_rows = client
+        .query(
+            "select n.nspname, c.relname, a.attname \
+             from pg_class c \
+             join pg_namespace n on n.oid = c.relnamespace \
+             join unnest($1::text[], $2::text[]) as w(s, t) on w.s = n.nspname and w.t = c.relname \
+             join pg_index i on i.indrelid = c.oid and i.indisprimary \
+             join pg_attribute a on a.attrelid = c.oid and a.attnum = any(i.indkey) \
+             order by n.nspname, c.relname, array_position(i.indkey, a.attnum)",
+            &[&schemas, &names],
+        )
+        .await
+        .context("read primary keys")?;
+    for r in &pk_rows {
+        let schema: String = r.get(0);
+        let name: String = r.get(1);
+        let Ok(table) = TableRef::new(&schema, &name) else { continue };
+        if let Some(fp) = out.get_mut(&table) {
+            fp.pk.get_or_insert_with(Vec::new).push(r.get(2));
+        }
+    }
+    Ok(out)
+}
+
+/// Introspect a table's columns (+ types), its primary key and its [`SchemaFingerprint`] from the
+/// catalog. Both the column lookup and the primary-key lookup are qualified by `(table_schema,
+/// table_name)` / the quoted qualified `to_regclass`, so same-named tables in different schemas
+/// never cross. Errors when the table does not exist — see [`introspect_opt`] for the caller that
+/// treats "gone" as an outcome rather than a failure.
 pub async fn introspect(client: &Client, table: &TableRef) -> Result<TableDef> {
+    introspect_opt(client, table)
+        .await?
+        .with_context(|| format!("table '{table}' not found in postgres"))
+}
+
+/// [`introspect`], but a table Postgres no longer has yields `Ok(None)` instead of an error: the
+/// schema-drift handler must tell "this table was ALTERed" from "this table was DROPped", and
+/// re-introspecting is where it finds out (ADR-0005).
+pub async fn introspect_opt(client: &Client, table: &TableRef) -> Result<Option<TableDef>> {
     let (schema, name) = (table.schema(), table.name());
+    let Some(fingerprint) = fingerprints(client, std::slice::from_ref(table)).await?.remove(table) else {
+        return Ok(None);
+    };
     let col_rows = client
         .query(
             "select column_name, data_type, udt_name, \
@@ -192,7 +305,10 @@ pub async fn introspect(client: &Client, table: &TableRef) -> Result<TableDef> {
         .await
         .context("introspect columns")?;
     if col_rows.is_empty() {
-        bail!("table '{table}' not found in postgres");
+        // `pg_class` had the relation but `information_schema` has no columns for it: a
+        // zero-column table, or the table was dropped between the two queries. Either way there is
+        // nothing to compile — same answer as "not found".
+        return Ok(None);
     }
     let mut columns = BTreeMap::new();
     for r in &col_rows {
@@ -223,15 +339,39 @@ pub async fn introspect(client: &Client, table: &TableRef) -> Result<TableDef> {
         bail!("table '{table}' must have a primary key");
     }
     let primary_key: Vec<String> = pk_rows.iter().map(|r| r.get(0)).collect();
-    Ok(TableDef { columns, primary_key })
+    Ok(Some(TableDef { columns, primary_key, fingerprint: Some(fingerprint) }))
 }
 
-/// `ALTER TABLE … REPLICA IDENTITY FULL` so logical decoding carries the full old row.
+/// `ALTER TABLE … REPLICA IDENTITY FULL` so logical decoding carries the full old row. Used at
+/// boot, where waiting for the lock is the right thing to do.
 pub async fn ensure_replica_identity_full(client: &Client, table: &TableRef) -> Result<()> {
     client
         .batch_execute(&format!("ALTER TABLE {} REPLICA IDENTITY FULL", table.quote_qualified()))
         .await
         .with_context(|| format!("set REPLICA IDENTITY FULL on {table}"))
+}
+
+/// [`ensure_replica_identity_full`] with a bounded wait for the `ACCESS EXCLUSIVE` lock.
+///
+/// The drift handler runs INLINE in the ingestor: an unbounded lock wait there would stall the
+/// whole replication stream — every table's — behind one long-running reader of this one. With
+/// `lock_timeout` the statement gives up instead, the caller marks the table unresolved, and its
+/// retry task tries again later while ingest keeps flowing.
+pub async fn ensure_replica_identity_full_bounded(
+    client: &Client,
+    table: &TableRef,
+    lock_timeout: std::time::Duration,
+) -> Result<()> {
+    // `SET LOCAL` needs a transaction to be local to; a failed statement leaves it aborted, which
+    // `PooledClient::drop` clears with its `ROLLBACK` before the connection is reused.
+    client
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
+            lock_timeout.as_millis().max(1),
+            table.quote_qualified()
+        ))
+        .await
+        .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"))
 }
 
 /// Create the logical replication slot (`pgoutput`) if it does not exist. A leftover slot with a
@@ -275,6 +415,71 @@ pub async fn ensure_publication(client: &Client, publication: &str) -> Result<()
             .context("create publication")?;
     }
     Ok(())
+}
+
+/// The two things about the publication that decide whether the wire can ever agree with the
+/// catalog (ADR-0005).
+///
+/// A `Relation` message describes what the publication will DELIVER. If that is not the whole row,
+/// no re-introspection can make the engine's compiled schema match it, and the engine would report
+/// drift on every message forever — so a column list is refused at boot rather than discovered at
+/// runtime, and generated-column publishing is folded into the fingerprint instead.
+pub struct PublicationInfo {
+    /// `pg_publication.pubgencols = 's'` (PG18+; absent ⇒ false).
+    pub publish_generated: bool,
+}
+
+/// Check that the publication can deliver whole rows for every tracked table, and learn whether it
+/// publishes stored generated columns. Errors — fatally, at boot — on a per-table column list.
+pub async fn inspect_publication(
+    client: &Client,
+    publication: &str,
+    tables: &[TableRef],
+) -> Result<PublicationInfo> {
+    // One row-to-jsonb read rather than a version-guarded column list: `pubgencols` exists only on
+    // PG18+, and asking jsonb for a missing key is simply `None`.
+    let row = client
+        .query_opt("select to_jsonb(p) from pg_publication p where p.pubname = $1", &[&publication])
+        .await
+        .context("read publication")?
+        .with_context(|| format!("publication '{publication}' does not exist"))?;
+    let pubrow: serde_json::Value = row.get(0);
+    let all_tables = pubrow.get("puballtables").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let publish_generated =
+        pubrow.get("pubgencols").and_then(serde_json::Value::as_str) == Some("s");
+
+    // A `FOR ALL TABLES` publication cannot carry a column list at all, so only a hand-made one is
+    // worth the second query.
+    if !all_tables {
+        let schemas: Vec<String> = tables.iter().map(|t| t.schema().to_string()).collect();
+        let names: Vec<String> = tables.iter().map(|t| t.name().to_string()).collect();
+        let listed = client
+            .query(
+                "select n.nspname, c.relname from pg_publication_rel pr \
+                 join pg_publication p on p.oid = pr.prpubid \
+                 join pg_class c on c.oid = pr.prrelid \
+                 join pg_namespace n on n.oid = c.relnamespace \
+                 join unnest($2::text[], $3::text[]) as w(s, t) on w.s = n.nspname and w.t = c.relname \
+                 where p.pubname = $1 and pr.prattrs is not null \
+                 order by n.nspname, c.relname",
+                &[&publication, &schemas, &names],
+            )
+            .await
+            .context("check publication column lists")?;
+        if !listed.is_empty() {
+            let which: Vec<String> = listed
+                .iter()
+                .map(|r| format!("{}.{}", r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect();
+            bail!(
+                "publication '{publication}' has a column list on {}; the engine requires whole rows \
+                 (a partial row can never be reconciled with the table's schema). Drop the column \
+                 list, or stop syncing that table.",
+                which.join(", ")
+            );
+        }
+    }
+    Ok(PublicationInfo { publish_generated })
 }
 
 pub struct Backfill {

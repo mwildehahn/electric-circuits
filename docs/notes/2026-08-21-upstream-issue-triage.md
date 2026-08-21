@@ -70,3 +70,22 @@ and would require forking the replication client. See ADR-0003.
   has no v2 support.
 - #12: the `table/*` framing predates the single `changes` log.
 - `electric.rs:761` strips a non-`public` schema qualifier and answers with the `public` table's rows.
+
+## Follow-ups surfaced while implementing slices 1–2
+
+Recorded here so they are not lost; none blocks the order of work above.
+
+- **TRUNCATE replay window (ADR-0005).** A crash between a `TRUNCATE`'s append and its slot
+  acknowledgement (≤ 1 s) re-retires that table's shapes at the next boot, including shapes created
+  after boot that already reflect the truncation. Exact handling needs the shape's `SnapshotGate` on
+  its catalog record (or a sequencer round-trip during retirement). Cost today: one spurious resync.
+- **Circuit-tier drift exit has no end-to-end test.** `circuit_needs_rebuild` is unit-tested; no lane
+  boots with `ELECTRIC_CIRCUITS_DBSP_COUNTS`, triggers drift, and asserts exit 75 → restart → recover.
+- **Publication column-list refusal is untested** (`pg::inspect_publication`): the harness always
+  derives `<slot>_pub` itself. `prattrs` is PG15+; it is only queried for a hand-made publication.
+- **Stale `/v1/shape` handle after the delete lands** still answers 500 (the closed-stream case now
+  answers `409 must-refetch`); needs a typed "stream gone" read error in `ds.rs`.
+- **`packages/client` does not yet re-subscribe on `stream-closed` / 404 / 410** (ADR-0007 states
+  the contract as *must*); the engine side is done.
+- **A table dropped and re-created** is untracked until restart (documented in
+  `docs/deployment-postgres.md`).

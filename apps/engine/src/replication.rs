@@ -19,8 +19,18 @@
 //! Values are pgoutput **text-mode** tuples (the `binary` option is never enabled): Postgres
 //! renders them with the same type output functions the backfill's `::text` casts use, keeping
 //! backfilled and replicated representations byte-identical (see `pg.rs::row_json_expr`).
+//!
+//! The ingestor is also where **schema drift** is noticed (ADR-0005). Postgres re-sends a
+//! `Relation` message after any DDL that changes a table, so every `R` is compared with the
+//! compiled [`SchemaFingerprint`]; a difference — a column added/dropped/retyped/reordered, or a
+//! replica identity that is no longer FULL — and `TRUNCATE` are reported to the engine through
+//! [`SchemaEvents`] and **awaited inline** before the next message is decoded. DDL is rare, so the
+//! brief ingest pause buys two things nothing else can: the table's dependents are already retired
+//! before any post-DDL DML for it is decoded, and that DML decodes against the NEW schema.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -29,9 +39,49 @@ use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationE
 use serde_json::{Map, Value as Json};
 
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
-use crate::pgoutput::{self, Cell, Message, OldTuple, Tuple};
-use crate::schema::{ColumnType, TableSchema};
+use crate::pgoutput::{self, Cell, Message, OldTuple, RelColumn, Tuple};
+use crate::schema::{ColumnType, SchemaFingerprint, SharedTables, TableSchema};
 use crate::table_ref::TableRef;
+
+/// A boxed future — the trait-object-safe form of the two `async fn`s on [`SchemaEvents`] (the
+/// engine implements it, so a native `async fn` in trait would make it non-dyn-safe).
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The replication transaction a schema event was observed inside.
+///
+/// It matters for one decision: whether the engine may restart the process over the event.
+/// Delivery is at-least-once (a commit is acknowledged only after its append lands, and
+/// acknowledgements are flushed on an interval), so a restart re-delivers the very transaction that
+/// caused it. Carrying the xid lets the engine ask "does the state I would rebuild already reflect
+/// this transaction?" and decline to restart again — otherwise a `TRUNCATE` on a circuit-served
+/// table is an exit loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxnRef {
+    pub xid: u32,
+}
+
+/// What the ingestor reports to the engine when Postgres tells it a table moved underneath the
+/// compiled schema (ADR-0005). One narrow trait rather than an `Engine` dependency, so the
+/// ingestor keeps knowing nothing about shapes, streams or the catalog.
+///
+/// Both calls are **awaited** by the ingestor before it decodes the next message, and neither
+/// returns anything: the ingestor's view of what it may decode is [`SharedTables`], which the
+/// engine has already updated by the time the call returns.
+pub trait SchemaEvents: Send + Sync {
+    /// The observed fingerprint of `table` differs from the compiled one (or its replica identity
+    /// is no longer FULL). The engine re-introspects, retires every dependent, and swaps the
+    /// compiled schema.
+    fn on_schema_drift<'a>(
+        &'a self,
+        table: &'a TableRef,
+        observed: SchemaFingerprint,
+        txn: Option<TxnRef>,
+    ) -> BoxFuture<'a, ()>;
+
+    /// `TRUNCATE` landed on these tables. There is no row copy in the engine from which to
+    /// synthesise the deletes, so every dependent is retired; the schema does not change.
+    fn on_truncate<'a>(&'a self, tables: Vec<TableRef>, txn: Option<TxnRef>) -> BoxFuture<'a, ()>;
+}
 
 /// The drain-barrier bookkeeping table: `public.__el_sync` specifically — a same-named table in
 /// another schema is ordinary data, never the sentinel.
@@ -42,12 +92,17 @@ fn sync_table() -> &'static TableRef {
 
 /// Long-running ingestor. Reconnects on any connection-level failure; the server resends
 /// everything after the last acknowledged commit.
+///
+/// `tables` is the engine's **live** schema view, not a boot-time copy: schema drift swaps an entry
+/// in place and the very next decode uses it (ADR-0005).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     pg_url: String,
     slot: String,
     publication: String,
     ds: DsClient,
-    tables: Arc<HashMap<TableRef, TableSchema>>,
+    tables: SharedTables,
+    events: Arc<dyn SchemaEvents>,
     last_lsn: Arc<std::sync::Mutex<String>>,
     sync_seq: Arc<AtomicI64>,
 ) {
@@ -60,7 +115,7 @@ pub async fn run(
                 continue;
             }
         };
-        match stream_loop(cfg, &ds, &tables, &last_lsn, &sync_seq).await {
+        match stream_loop(cfg, &ds, &tables, events.as_ref(), &last_lsn, &sync_seq).await {
             Ok(()) => tracing::warn!("replicator: stream ended; reconnecting"),
             Err(e) => tracing::error!("replicator: {e:#}; reconnecting"),
         }
@@ -129,12 +184,13 @@ fn percent_decode(s: &str) -> String {
 async fn stream_loop(
     cfg: ReplicationConfig,
     ds: &DsClient,
-    tables: &HashMap<TableRef, TableSchema>,
+    tables: &SharedTables,
+    events: &dyn SchemaEvents,
     last_lsn: &Arc<std::sync::Mutex<String>>,
     sync_seq: &Arc<AtomicI64>,
 ) -> Result<()> {
     let mut client = ReplicationClient::connect(cfg).await.context("replication connect")?;
-    let mut dec = Decoder::new(tables);
+    let mut dec = Decoder::new(tables.clone());
     let mut txn: Option<TxnBuf> = None;
     loop {
         let ev = client.recv().await.context("replication stream")?;
@@ -145,8 +201,17 @@ async fn stream_loop(
             }
             ReplicationEvent::XLogData { data, .. } => {
                 let msg = pgoutput::decode(&data)?;
+                // Schema-bearing messages are handled — and the engine's handling AWAITED — before
+                // anything else is decoded, so the dependents of a drifted/truncated table are
+                // already retired and its compiled schema already swapped by the time the next
+                // change for it arrives (ADR-0005).
+                let txn_ref = txn.as_ref().map(|t: &TxnBuf| TxnRef { xid: t.xid });
                 if let Message::Relation { .. } = msg {
-                    dec.on_relation(msg);
+                    dec.on_relation(msg, events, txn_ref).await;
+                    continue;
+                }
+                if let Message::Truncate { rel_ids } = &msg {
+                    dec.on_truncate(rel_ids, events, txn_ref).await;
                     continue;
                 }
                 let Some(t) = txn.as_mut() else { continue };
@@ -226,48 +291,100 @@ struct RelMeta {
     /// are dropped), which matches introspection: `pg::list_tables` skips it too, so no shape over
     /// it can exist to go stale.
     table: Option<TableRef>,
+    /// Column names in `attnum` order — what a tuple's cells are zipped against.
     columns: Vec<String>,
+}
+
+/// Build the observed fingerprint from a decoded `Relation` message.
+///
+/// `pk: None` — deliberately. Under `REPLICA IDENTITY FULL` pgoutput flags EVERY column as part of
+/// the identity key, so the wire cannot tell us the primary key; claiming one here would make every
+/// `R` look like a primary-key change. A real PK change is caught by the reconciler's catalog read
+/// instead (see [`SchemaFingerprint`]).
+fn observed_fingerprint(replident: u8, columns: &[RelColumn]) -> SchemaFingerprint {
+    SchemaFingerprint {
+        columns: columns
+            .iter()
+            .map(|c| crate::schema::FingerprintColumn {
+                name: c.name.clone(),
+                type_oid: c.type_oid,
+                typmod: c.typmod,
+            })
+            .collect(),
+        replident,
+        pk: None,
+    }
 }
 
 /// Stateful pgoutput→envelope decoder: tracks relation metadata and builds envelopes for tracked
 /// tables (and sync counters for the `__el_sync` bookkeeping table).
-struct Decoder<'a> {
-    tables: &'a HashMap<TableRef, TableSchema>,
+///
+/// `tables` is the engine's live, swappable schema view — never a private copy — so a schema the
+/// drift handler swapped is in effect for the very next change decoded (ADR-0005).
+struct Decoder {
+    tables: SharedTables,
     rels: HashMap<u32, RelMeta>,
 }
 
-impl<'a> Decoder<'a> {
-    fn new(tables: &'a HashMap<TableRef, TableSchema>) -> Self {
+impl Decoder {
+    fn new(tables: SharedTables) -> Self {
         Decoder { tables, rels: HashMap::new() }
     }
 
-    fn on_relation(&mut self, msg: Message) {
-        if let Message::Relation { rel_id, namespace, name, columns } = msg {
-            let table = TableRef::new(&namespace, &name)
-                .map_err(|e| tracing::error!("replicator: unusable relation '{namespace}.{name}': {e:#}"))
-                .ok();
-            self.rels.insert(rel_id, RelMeta { table, columns });
+    /// Record a relation and, if what Postgres now reports differs from the compiled schema, report
+    /// the drift to the engine and **wait** for it to be handled.
+    async fn on_relation(&mut self, msg: Message, events: &dyn SchemaEvents, txn: Option<TxnRef>) {
+        let Message::Relation { rel_id, namespace, name, replident, columns } = msg else { return };
+        let table = TableRef::new(&namespace, &name)
+            .map_err(|e| tracing::error!("replicator: unusable relation '{namespace}.{name}': {e:#}"))
+            .ok();
+        let observed = observed_fingerprint(replident, &columns);
+        self.rels.insert(rel_id, RelMeta { table: table.clone(), columns: observed.column_names() });
+        // Only a TRACKED table can drift into something the engine is serving wrongly. An unknown
+        // relation (never introspected, or the sentinel) and a library-mode table (no compiled
+        // fingerprint) are recorded and left alone.
+        //
+        // There is deliberately no "this relation is dead" latch here: what the ingestor may decode
+        // is `tables` and only `tables`, which the engine updates as it resolves. A latch would
+        // survive the resolution (a fresh `R` arrives only after more DDL or a reconnect) and
+        // silently drop — and acknowledge — every change for a table that is working again.
+        if let Some(table) = table {
+            let compiled = self.tables.read().unwrap().get(&table).and_then(|ts| ts.fingerprint.clone());
+            if let Some(compiled) = compiled
+                && !compiled.still_serves(&observed)
+            {
+                events.on_schema_drift(&table, observed, txn).await;
+            }
         }
     }
 
-    fn on_change(&mut self, msg: Message) -> Decoded {
+    /// `TRUNCATE`: the engine holds no row copy from which to synthesise the deletes, so every
+    /// dependent of every truncated table is retired (ADR-0005). Awaited, like drift.
+    ///
+    /// Only **tracked** tables are reported. The publication is `FOR ALL TABLES`, so a truncate of
+    /// any application table in the database reaches us; reporting one the engine does not sync
+    /// would log a retirement and bump the drift metric over nothing.
+    async fn on_truncate(&self, rel_ids: &[u32], events: &dyn SchemaEvents, txn: Option<TxnRef>) {
+        // Scoped so the (non-`Send`) read guard cannot be held across the await below.
+        let tables: Vec<TableRef> = {
+            let tracked = self.tables.read().unwrap();
+            rel_ids
+                .iter()
+                .filter_map(|id| self.rels.get(id))
+                .filter_map(|r| r.table.clone())
+                .filter(|t| t != sync_table() && tracked.contains_key(t))
+                .collect()
+        };
+        if !tables.is_empty() {
+            events.on_truncate(tables, txn).await;
+        }
+    }
+
+    fn on_change(&self, msg: Message) -> Decoded {
         let rel_id = match &msg {
             Message::Insert { rel_id, .. }
             | Message::Update { rel_id, .. }
             | Message::Delete { rel_id, .. } => *rel_id,
-            Message::Truncate { rel_ids } => {
-                for id in rel_ids {
-                    if let Some(Some(table)) = self.rels.get(id).map(|r| r.table.as_ref()) {
-                        // Not supported: shapes/aggregates/subquery nodes would retain every
-                        // truncated row. Degraded and loud.
-                        tracing::error!(
-                            "replicator: TRUNCATE on {table} is not supported — shapes over this table \
-                             are now stale and must be recreated"
-                        );
-                    }
-                }
-                return Decoded::None;
-            }
             _ => return Decoded::None,
         };
         let Some(rel) = self.rels.get(&rel_id) else {
@@ -283,7 +400,8 @@ impl<'a> Decoder<'a> {
             }
             return Decoded::None;
         }
-        let Some(ts) = self.tables.get(table) else { return Decoded::None };
+        let tables = self.tables.read().unwrap();
+        let Some(ts) = tables.get(table) else { return Decoded::None };
         match build_envelope(table, ts, &rel.columns, msg) {
             Some(env) => Decoded::Env(env),
             None => Decoded::None,
@@ -319,13 +437,14 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
             let old_map = match old {
                 Some(OldTuple::Full(t)) => Some(tuple_to_map(&t, columns, ts)),
                 Some(OldTuple::Key(_)) | None => {
-                    // No full old image: the table's REPLICA IDENTITY is no longer FULL (e.g. a
-                    // migration recreated it). The engine can't retract the prior row, so a change
-                    // that moves a row OUT of a shape leaves it stale. Degraded and loud.
-                    tracing::error!(
-                        "replicator: UPDATE on {table} carries no full old image — REPLICA IDENTITY \
-                         is no longer FULL; move-outs will be missed until it is restored and shapes \
-                         recreated"
+                    // No full old image: this change was written while the table's REPLICA IDENTITY
+                    // was not FULL. The preceding `R` reported that identity, so the engine has
+                    // already re-asserted FULL and retired every dependent of the table (ADR-0005)
+                    // — nothing is being served from this row any more. Forward the new image
+                    // without an old one, and say why.
+                    tracing::warn!(
+                        "replicator: UPDATE on {table} carries no full old image (REPLICA IDENTITY was \
+                         not FULL when it was written); the table's dependents have been retired"
                     );
                     None
                 }
@@ -343,11 +462,12 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
         }
         Message::Delete { old, .. } => {
             let OldTuple::Full(t) = old else {
-                // Key-only image (REPLICA IDENTITY reset): retracting a phantom mostly-NULL row
-                // would be wrong either way — skip it, loudly.
-                tracing::error!(
-                    "replicator: DELETE on {table} carries no full old image — REPLICA IDENTITY is \
-                     no longer FULL; the delete cannot be propagated and shapes will retain the row"
+                // Key-only image: written while REPLICA IDENTITY was not FULL. Retracting a phantom
+                // mostly-NULL row would be wrong, and there is nothing left to retract from — the
+                // identity regression already retired the table's dependents (ADR-0005).
+                tracing::warn!(
+                    "replicator: DELETE on {table} carries no full old image (REPLICA IDENTITY was not \
+                     FULL when it was written); the table's dependents have been retired"
                 );
                 return None;
             };
@@ -433,36 +553,137 @@ fn text_to_json(text: &str, ty: ColumnType) -> Json {
 mod tests {
     use super::*;
     use crate::pgoutput::{Cell, Message, OldTuple};
-    use crate::schema::{ColumnDef, TableDef};
+    use crate::schema::{ColumnDef, FingerprintColumn, TableDef};
     use std::collections::BTreeMap;
 
-    fn users() -> HashMap<TableRef, TableSchema> {
+    /// A recording [`SchemaEvents`] sink standing in for the engine: it records what the decoder
+    /// reported and, like the real handler, updates the shared schema view — which is the ONLY
+    /// thing the decoder consults about what it may decode.
+    #[derive(Default)]
+    struct RecordingEvents {
+        drifts: std::sync::Mutex<Vec<(TableRef, SchemaFingerprint, Option<TxnRef>)>>,
+        truncates: std::sync::Mutex<Vec<Vec<TableRef>>>,
+        /// The shared view the "engine" resolves into: `Some(schema)` installs it, `None` drops the
+        /// table (the dropped/unresolved outcome).
+        tables: std::sync::Mutex<Option<SharedTables>>,
+        resolves_to: std::sync::Mutex<Option<TableSchema>>,
+    }
+
+    impl RecordingEvents {
+        fn drifted(&self) -> Vec<TableRef> {
+            self.drifts.lock().unwrap().iter().map(|(t, ..)| t.clone()).collect()
+        }
+    }
+
+    impl SchemaEvents for RecordingEvents {
+        fn on_schema_drift<'a>(
+            &'a self,
+            table: &'a TableRef,
+            observed: SchemaFingerprint,
+            txn: Option<TxnRef>,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.drifts.lock().unwrap().push((table.clone(), observed, txn));
+                if let Some(shared) = self.tables.lock().unwrap().as_ref() {
+                    let mut w = shared.write().unwrap();
+                    match self.resolves_to.lock().unwrap().clone() {
+                        Some(ts) => {
+                            w.insert(table.clone(), ts);
+                        }
+                        None => {
+                            w.remove(table);
+                        }
+                    }
+                }
+            })
+        }
+
+        fn on_truncate<'a>(&'a self, tables: Vec<TableRef>, _txn: Option<TxnRef>) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.truncates.lock().unwrap().push(tables);
+            })
+        }
+    }
+
+    fn shared(tables: HashMap<TableRef, TableSchema>) -> SharedTables {
+        Arc::new(std::sync::RwLock::new(tables))
+    }
+
+    fn fp_col(name: &str, type_oid: u32) -> FingerprintColumn {
+        FingerprintColumn { name: name.into(), type_oid, typmod: -1 }
+    }
+
+    /// The `id/tenant/name` fingerprint in `attnum` order (which is NOT the compiled schema's
+    /// alphabetical order — the two are deliberately independent).
+    fn users_fingerprint() -> SchemaFingerprint {
+        SchemaFingerprint {
+            columns: vec![fp_col("id", 23), fp_col("tenant", 23), fp_col("name", 25)],
+            replident: crate::schema::REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        }
+    }
+
+    fn users_def(fingerprint: Option<SchemaFingerprint>) -> TableDef {
         let mut columns = BTreeMap::new();
         columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
         columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
         columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
-        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
-        let mut m = HashMap::new();
-        let t = TableRef::parse("users").unwrap();
-        m.insert(t.clone(), TableSchema::from_def(&t, &def).unwrap());
-        m
+        TableDef { columns, primary_key: vec!["id".to_string()], fingerprint }
     }
 
-    fn decoder(tables: &HashMap<TableRef, TableSchema>) -> Decoder<'_> {
-        let mut d = Decoder::new(tables);
-        d.on_relation(Message::Relation {
-            rel_id: 1,
-            namespace: "public".into(),
-            name: "users".into(),
-            columns: vec!["id".into(), "tenant".into(), "name".into()],
-        });
-        d.on_relation(Message::Relation {
-            rel_id: 2,
-            namespace: "public".into(),
-            name: sync_table().name().into(),
-            columns: vec!["id".into(), "n".into()],
-        });
-        d
+    /// A `users` schema for an arbitrary reference, so a test can track the same table NAME in two
+    /// different schemas. No fingerprint: these tests exercise envelope building, not drift.
+    fn users_in(refs: &[&str]) -> HashMap<TableRef, TableSchema> {
+        let def = users_def(None);
+        refs.iter()
+            .map(|r| {
+                let t = TableRef::parse(r).unwrap();
+                (t.clone(), TableSchema::from_def(&t, &def).unwrap())
+            })
+            .collect()
+    }
+
+    fn users() -> HashMap<TableRef, TableSchema> {
+        users_in(&["users"])
+    }
+
+    /// A `public.users` tracked WITH a fingerprint — the Postgres-mode shape, where drift applies.
+    fn fingerprinted_users() -> HashMap<TableRef, TableSchema> {
+        let t = TableRef::parse("users").unwrap();
+        let ts = TableSchema::from_def(&t, &users_def(Some(users_fingerprint()))).unwrap();
+        HashMap::from([(t, ts)])
+    }
+
+    fn rel_col(name: &str, type_oid: u32) -> crate::pgoutput::RelColumn {
+        crate::pgoutput::RelColumn { name: name.into(), type_oid, typmod: -1, key: name == "id" }
+    }
+
+    /// An `R` message with `REPLICA IDENTITY FULL` and the given `(name, type oid)` columns.
+    fn rel_msg(rel_id: u32, namespace: &str, name: &str, cols: &[(&str, u32)]) -> Message {
+        Message::Relation {
+            rel_id,
+            namespace: namespace.into(),
+            name: name.into(),
+            replident: crate::schema::REPLICA_IDENTITY_FULL,
+            columns: cols.iter().map(|(n, o)| rel_col(n, *o)).collect(),
+        }
+    }
+
+    fn users_rel(rel_id: u32, namespace: &str) -> Message {
+        rel_msg(rel_id, namespace, "users", &[("id", 23), ("tenant", 23), ("name", 25)])
+    }
+
+    async fn decoder(tables: &SharedTables) -> (Decoder, Arc<RecordingEvents>) {
+        let ev = Arc::new(RecordingEvents::default());
+        let mut d = Decoder::new(tables.clone());
+        d.on_relation(users_rel(1, "public"), ev.as_ref(), None).await;
+        d.on_relation(
+            rel_msg(2, "public", sync_table().name(), &[("id", 23), ("n", 20)]),
+            ev.as_ref(),
+            None,
+        )
+        .await;
+        (d, ev)
     }
 
     fn t(s: &str) -> Cell {
@@ -476,43 +697,23 @@ mod tests {
         }
     }
 
-    /// A `users` schema for an arbitrary reference, so a test can track the same table NAME in two
-    /// different schemas.
-    fn users_in(refs: &[&str]) -> HashMap<TableRef, TableSchema> {
-        let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
-        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
-        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
-        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
-        refs.iter()
-            .map(|r| {
-                let t = TableRef::parse(r).unwrap();
-                (t.clone(), TableSchema::from_def(&t, &def).unwrap())
-            })
-            .collect()
-    }
-
     /// Register `public.users` as rel 1 and `other.users` as rel 2 — the SAME relname in two
     /// namespaces, which upstream's namespace-discarding decoder collapsed into one relation.
-    fn two_schema_decoder(tables: &HashMap<TableRef, TableSchema>) -> Decoder<'_> {
-        let mut d = Decoder::new(tables);
+    async fn two_schema_decoder(tables: &SharedTables) -> Decoder {
+        let ev = RecordingEvents::default();
+        let mut d = Decoder::new(tables.clone());
         for (rel_id, namespace) in [(1u32, "public"), (2, "other")] {
-            d.on_relation(Message::Relation {
-                rel_id,
-                namespace: namespace.into(),
-                name: "users".into(),
-                columns: vec!["id".into(), "tenant".into(), "name".into()],
-            });
+            d.on_relation(users_rel(rel_id, namespace), &ev, None).await;
         }
         d
     }
 
     /// Tracking `public.users` must NOT make `other.users` a tracked table: its changes are dropped,
     /// not decoded onto the public table's shapes.
-    #[test]
-    fn a_same_named_table_in_another_schema_is_not_tracked() {
-        let tables = users_in(&["public.users"]);
-        let mut d = two_schema_decoder(&tables);
+    #[tokio::test]
+    async fn a_same_named_table_in_another_schema_is_not_tracked() {
+        let tables = shared(users_in(&["public.users"]));
+        let d = two_schema_decoder(&tables).await;
 
         let pubs = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a")] }));
         assert_eq!(pubs.type_, "public.users");
@@ -526,10 +727,10 @@ mod tests {
 
     /// With BOTH tracked, the two relations decode to distinct identities: the envelope `type` is the
     /// canonical `schema.name`, so the sequencer routes each to its own table's shapes.
-    #[test]
-    fn both_schemas_tracked_decode_to_distinct_envelope_types() {
-        let tables = users_in(&["public.users", "other.users"]);
-        let mut d = two_schema_decoder(&tables);
+    #[tokio::test]
+    async fn both_schemas_tracked_decode_to_distinct_envelope_types() {
+        let tables = shared(users_in(&["public.users", "other.users"]));
+        let d = two_schema_decoder(&tables).await;
 
         let a = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("pub")] }));
         let b = env_of(d.on_change(Message::Insert { rel_id: 2, new: vec![t("1"), t("7"), t("oth")] }));
@@ -544,33 +745,35 @@ mod tests {
     /// A relation whose name has no canonical `schema.name` spelling (a quoted identifier carrying a
     /// dot or a quote) is recorded as `table: None` and simply not tracked — never split into a
     /// schema + name that would address a different relation, and never a panic.
-    #[test]
-    fn unspellable_relation_names_are_untracked_not_split() {
-        let tables = users_in(&["public.users"]);
-        let mut d = Decoder::new(&tables);
+    #[tokio::test]
+    async fn unspellable_relation_names_are_untracked_not_split() {
+        let tables = shared(users_in(&["public.users"]));
+        let ev = RecordingEvents::default();
+        let mut d = Decoder::new(tables.clone());
         for (rel_id, name) in [(10u32, "odd.users"), (11, "od\"d")] {
-            d.on_relation(Message::Relation {
-                rel_id,
-                namespace: "public".into(),
-                name: name.into(),
-                columns: vec!["id".into(), "tenant".into(), "name".into()],
-            });
+            d.on_relation(
+                rel_msg(rel_id, "public", name, &[("id", 23), ("tenant", 23), ("name", 25)]),
+                &ev,
+                None,
+            )
+            .await;
             assert!(d.rels[&rel_id].table.is_none(), "{name} must not resolve to a table identity");
             assert!(matches!(
                 d.on_change(Message::Insert { rel_id, new: vec![t("1"), t("7"), t("a")] }),
                 Decoded::None
             ));
-            // TRUNCATE on it must not panic either (it logs nothing, there is no identity to name).
-            assert!(matches!(d.on_change(Message::Truncate { rel_ids: vec![rel_id] }), Decoded::None));
+            // TRUNCATE on it must not panic either (there is no identity to retire).
+            d.on_truncate(&[rel_id], &ev, None).await;
         }
+        assert!(ev.truncates.lock().unwrap().is_empty());
         // In particular `public`.`odd.users` did NOT become the schema `odd`, table `users`.
-        assert!(!tables.contains_key(&TableRef::parse("odd.users").unwrap()));
+        assert!(!tables.read().unwrap().contains_key(&TableRef::parse("odd.users").unwrap()));
     }
 
-    #[test]
-    fn builds_insert_update_delete_with_old() {
-        let tables = users();
-        let mut d = decoder(&tables);
+    #[tokio::test]
+    async fn builds_insert_update_delete_with_old() {
+        let tables = shared(users());
+        let (d, _ev) = decoder(&tables).await;
 
         let ins = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a")] }));
         assert_eq!(ins.headers.operation, "insert");
@@ -598,10 +801,10 @@ mod tests {
         assert!(del.value.is_none());
     }
 
-    #[test]
-    fn handles_null_and_utf8() {
-        let tables = users();
-        let mut d = decoder(&tables);
+    #[tokio::test]
+    async fn handles_null_and_utf8() {
+        let tables = shared(users());
+        let (d, _ev) = decoder(&tables).await;
         let e = env_of(d.on_change(Message::Insert {
             rel_id: 1,
             new: vec![t("5"), Cell::Null, t("a b 'c' café ☃ 北京")],
@@ -610,10 +813,10 @@ mod tests {
         assert_eq!(e.value.as_ref().unwrap()["name"], "a b 'c' café ☃ 北京");
     }
 
-    #[test]
-    fn toast_unchanged_value_filled_from_old() {
-        let tables = users();
-        let mut d = decoder(&tables);
+    #[tokio::test]
+    async fn toast_unchanged_value_filled_from_old() {
+        let tables = shared(users());
+        let (d, _ev) = decoder(&tables).await;
         let upd = env_of(d.on_change(Message::Update {
             rel_id: 1,
             old: Some(OldTuple::Full(vec![t("1"), t("7"), t("big original")])),
@@ -623,17 +826,16 @@ mod tests {
         assert_eq!(upd.value.as_ref().unwrap()["name"], "big original"); // unchanged toast from old
     }
 
-    /// A DELETE / UPDATE without the full old image (REPLICA IDENTITY no longer FULL) must degrade
-    /// loudly, not fabricate retractions; TRUNCATE produces no envelope.
-    #[test]
-    fn degraded_forms_are_skipped() {
-        let tables = users();
-        let mut d = decoder(&tables);
+    /// A DELETE / UPDATE without the full old image (the change was written while REPLICA IDENTITY
+    /// was not FULL) must not fabricate retractions.
+    #[tokio::test]
+    async fn degraded_forms_are_skipped() {
+        let tables = shared(users());
+        let (d, _ev) = decoder(&tables).await;
         assert!(matches!(
             d.on_change(Message::Delete { rel_id: 1, old: OldTuple::Key(vec![t("1")]) }),
             Decoded::None
         ));
-        assert!(matches!(d.on_change(Message::Truncate { rel_ids: vec![1] }), Decoded::None));
         // Update with key-only old image still emits (new row is valid) but without `old`.
         let upd = env_of(d.on_change(Message::Update {
             rel_id: 1,
@@ -643,10 +845,10 @@ mod tests {
         assert!(upd.old.is_none());
     }
 
-    #[test]
-    fn sync_counter_from_sentinel_table_only() {
-        let tables = users();
-        let mut d = decoder(&tables);
+    #[tokio::test]
+    async fn sync_counter_from_sentinel_table_only() {
+        let tables = shared(users());
+        let (mut d, ev) = decoder(&tables).await;
         // A users row whose TEXT value mentions the sentinel is just data.
         let e = d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("__el_sync n:999")] });
         assert!(matches!(e, Decoded::Env(_)));
@@ -656,46 +858,167 @@ mod tests {
 
         // The sentinel is `public.__el_sync` SPECIFICALLY: a same-named table in another schema is
         // ordinary (here untracked) data, never a drain-barrier counter.
-        d.on_relation(Message::Relation {
-            rel_id: 3,
-            namespace: "other".into(),
-            name: sync_table().name().into(),
-            columns: vec!["id".into(), "n".into()],
-        });
+        d.on_relation(
+            rel_msg(3, "other", sync_table().name(), &[("id", 23), ("n", 20)]),
+            ev.as_ref(),
+            None,
+        )
+        .await;
         let s = d.on_change(Message::Update { rel_id: 3, old: None, new: vec![t("1"), t("999")] });
         assert!(matches!(s, Decoded::None), "other.__el_sync must not bump the drain barrier");
     }
 
     /// Changes for relations that are not tracked (and not the sentinel) are ignored.
-    #[test]
-    fn untracked_relations_are_ignored() {
-        let tables = users();
-        let mut d = decoder(&tables);
-        d.on_relation(Message::Relation {
-            rel_id: 9,
-            namespace: "public".into(),
-            name: "not_tracked".into(),
-            columns: vec!["id".into()],
-        });
+    #[tokio::test]
+    async fn untracked_relations_are_ignored() {
+        let tables = shared(users());
+        let (mut d, ev) = decoder(&tables).await;
+        d.on_relation(rel_msg(9, "public", "not_tracked", &[("id", 23)]), ev.as_ref(), None).await;
         assert!(matches!(d.on_change(Message::Insert { rel_id: 9, new: vec![t("1")] }), Decoded::None));
+        assert!(ev.drifted().is_empty(), "an unknown relation is not drift");
     }
 
-    #[test]
-    fn float_pk_key_is_canonicalized() {
+    #[tokio::test]
+    async fn float_pk_key_is_canonicalized() {
         let mut columns = BTreeMap::new();
         columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
-        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
-        let mut tables = HashMap::new();
+        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
         let f = TableRef::parse("f").unwrap();
-        tables.insert(f.clone(), TableSchema::from_def(&f, &def).unwrap());
-        let mut d = Decoder::new(&tables);
-        d.on_relation(Message::Relation {
-            rel_id: 3,
-            namespace: "public".into(),
-            name: "f".into(),
-            columns: vec!["id".into()],
-        });
+        let tables = shared(HashMap::from([(f.clone(), TableSchema::from_def(&f, &def).unwrap())]));
+        let ev = RecordingEvents::default();
+        let mut d = Decoder::new(tables);
+        d.on_relation(rel_msg(3, "public", "f", &[("id", 701)]), &ev, None).await;
         let e = env_of(d.on_change(Message::Insert { rel_id: 3, new: vec![t("1")] }));
         assert_eq!(e.key, "1"); // f64 canonical form, not "1.0"
+    }
+
+    // ---- schema drift (ADR-0005) ----
+
+    /// Every connection re-sends an `R` for each relation before its first change. A fingerprint
+    /// that MATCHES the compiled one is a no-op — the engine is never told about it.
+    #[tokio::test]
+    async fn an_identical_relation_resend_is_not_drift() {
+        let tables = shared(fingerprinted_users());
+        let ev = RecordingEvents::default();
+        let mut d = Decoder::new(tables);
+        for _ in 0..3 {
+            d.on_relation(users_rel(1, "public"), &ev, None).await;
+        }
+        assert!(ev.drifted().is_empty());
+        // ...and the relation is still decodable.
+        assert!(matches!(
+            d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a")] }),
+            Decoded::Env(_)
+        ));
+    }
+
+    /// A changed relation reports EXACTLY ONCE per change: the drift, then silence while the new
+    /// shape keeps being re-sent.
+    #[tokio::test]
+    async fn a_changed_relation_reports_once_per_change() {
+        let tables = shared(fingerprinted_users());
+        let ev = Arc::new(RecordingEvents::default());
+        // The "engine" swaps in a schema whose fingerprint is the new one, as the real handler does.
+        let t_ref = TableRef::parse("users").unwrap();
+        let altered = SchemaFingerprint {
+            columns: vec![fp_col("id", 23), fp_col("tenant", 23), fp_col("name", 25), fp_col("extra", 25)],
+            replident: crate::schema::REPLICA_IDENTITY_FULL,
+            pk: None, // as observed off the wire
+        };
+        let mut def = users_def(Some(altered.clone()));
+        def.columns
+            .insert("extra".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
+        *ev.resolves_to.lock().unwrap() = Some(TableSchema::from_def(&t_ref, &def).unwrap());
+        *ev.tables.lock().unwrap() = Some(tables.clone());
+
+        let mut d = Decoder::new(tables.clone());
+        let altered_msg = rel_msg(1, "public", "users", &[
+            ("id", 23),
+            ("tenant", 23),
+            ("name", 25),
+            ("extra", 25),
+        ]);
+        d.on_relation(altered_msg.clone(), ev.as_ref(), Some(TxnRef { xid: 7 })).await;
+        assert_eq!(ev.drifted(), [t_ref.clone()]);
+        assert_eq!(ev.drifts.lock().unwrap()[0].1, altered);
+        // The enclosing transaction travels with the report — it is what lets the engine tell a
+        // first delivery from a replay.
+        assert_eq!(ev.drifts.lock().unwrap()[0].2, Some(TxnRef { xid: 7 }));
+
+        // The handler swapped the compiled schema, so the re-sent `R` now matches and reports
+        // nothing more.
+        d.on_relation(altered_msg, ev.as_ref(), None).await;
+        assert_eq!(ev.drifted().len(), 1, "an identical re-send after the swap is not drift again");
+
+        // The next change decodes against the NEW schema: the added column is in the envelope.
+        let e = env_of(d.on_change(Message::Insert {
+            rel_id: 1,
+            new: vec![t("1"), t("7"), t("a"), t("x")],
+        }));
+        assert_eq!(e.value.as_ref().unwrap()["extra"], "x");
+    }
+
+    /// Identical columns with a regressed replica identity is drift too.
+    #[tokio::test]
+    async fn a_replica_identity_regression_reports_drift() {
+        let tables = shared(fingerprinted_users());
+        let ev = RecordingEvents::default();
+        let mut d = Decoder::new(tables);
+        let mut msg = users_rel(1, "public");
+        if let Message::Relation { replident, .. } = &mut msg {
+            *replident = b'd';
+        }
+        d.on_relation(msg, &ev, None).await;
+        assert_eq!(ev.drifted(), [TableRef::parse("users").unwrap()]);
+        assert_eq!(ev.drifts.lock().unwrap()[0].1.replident, b'd');
+    }
+
+    /// A library-mode table (no compiled fingerprint) is never drift-checked, whatever `R` says.
+    #[tokio::test]
+    async fn library_mode_tables_are_never_drift_checked() {
+        let tables = shared(users()); // no fingerprint
+        let ev = RecordingEvents::default();
+        let mut d = Decoder::new(tables);
+        d.on_relation(rel_msg(1, "public", "users", &[("id", 23), ("gone", 25)]), &ev, None).await;
+        assert!(ev.drifted().is_empty());
+    }
+
+    /// A table the engine drops (or parks) leaves the shared view, and THAT is what stops the
+    /// decoder — there is no separate latch to go stale. The relation resumes decoding the moment
+    /// the engine puts the table back, with no new `R` needed (which is exactly what a retry that
+    /// resolves an unresolved table does).
+    #[tokio::test]
+    async fn the_shared_view_alone_decides_what_is_decoded() {
+        let tables = shared(fingerprinted_users());
+        let ev = RecordingEvents::default(); // `resolves_to` stays None = the table goes away
+        *ev.tables.lock().unwrap() = Some(tables.clone());
+        let mut d = Decoder::new(tables.clone());
+        d.on_relation(rel_msg(1, "public", "users", &[("id", 23)]), &ev, None).await;
+        assert_eq!(ev.drifted(), [TableRef::parse("users").unwrap()]);
+        assert!(matches!(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1")] }), Decoded::None));
+        // ...and it is not reported as a truncate target while it is out of the view.
+        d.on_truncate(&[1], &ev, None).await;
+        assert!(ev.truncates.lock().unwrap().is_empty());
+
+        // Put it back — as a resolution does — and the SAME relation decodes again immediately.
+        tables.write().unwrap().extend(fingerprinted_users());
+        let e = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1")] }));
+        assert_eq!(e.type_, "public.users");
+    }
+
+    /// TRUNCATE reports every truncated TRACKED table in one call; the sentinel is not one, and
+    /// neither is an application table the engine does not sync (the publication is FOR ALL TABLES,
+    /// so those reach the ingestor too).
+    #[tokio::test]
+    async fn truncate_reports_only_the_tracked_tables_it_hit() {
+        let tables = shared(users());
+        let (mut d, ev) = decoder(&tables).await;
+        d.on_relation(rel_msg(9, "public", "not_tracked", &[("id", 23)]), ev.as_ref(), None).await;
+        d.on_truncate(&[1, 2, 9], ev.as_ref(), None).await;
+        assert_eq!(ev.truncates.lock().unwrap().as_slice(), [vec![TableRef::parse("users").unwrap()]]);
+
+        // A truncate that hits ONLY untracked relations reports nothing at all.
+        d.on_truncate(&[2, 9], ev.as_ref(), None).await;
+        assert_eq!(ev.truncates.lock().unwrap().len(), 1);
     }
 }
