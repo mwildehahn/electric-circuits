@@ -61,7 +61,7 @@ what makes this query live: `/graph` reports it directly —
 curl -s http://localhost:7010/graph | jq '.subqueryNodes, .subqueryEdges'
 ```
 
-— one entry in `subqueryNodes` (`innerTable: "list_members"`, `projCol: "list_id"`,
+— one entry in `subqueryNodes` (`innerTable: "public.list_members"`, `projCol: "list_id"`,
 `distinctValues: 2`), and one entry in `subqueryEdges` connecting it to your live query on
 `list_id`. The node holds two values (alice's two list ids), **not five rows of `todos`** — the
 todos themselves stay in Postgres until something changes for them.

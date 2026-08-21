@@ -22,7 +22,8 @@ COPY --from=build /repo/target/release/electric-circuits-engine /usr/local/bin/e
 #   ELECTRIC_CIRCUITS_DS_URL   durable-streams base URL (e.g. http://ds:8791)
 #   ELECTRIC_CIRCUITS_PG_URL   Postgres URL (wal_level=logical; the engine creates its slot)
 # Optional:
-#   ELECTRIC_CIRCUITS_PG_TABLES  comma list, or `*` (default here) to introspect every public table
+#   ELECTRIC_CIRCUITS_PG_TABLES  comma list of `schema.name` / bare `name` (= public.<name>) /
+#                           `schema.*`; `*` (the default here) = every `public` table with a PK
 #   ELECTRIC_CIRCUITS_PG_SLOT    slot name (default electric_circuits)
 #   ELECTRIC_CIRCUITS_BIND       bind address (default here 0.0.0.0:7010)
 #   ELECTRIC_CIRCUITS_LOG        tracing filter (default info)

@@ -37,12 +37,13 @@ curl -s http://localhost:7010/graph | jq '.arrangements.counts'
 ```
 
 ```json
-[{"id":"arr:counts:todos","input":"arr:input:todos","table":"todos",
+[{"id":"arr:counts:public.todos","input":"arr:input:public.todos","table":"public.todos",
   "groupCols":["list_id","done"],"seeded":true}]
 ```
 
 `seeded: true` means the initial `SELECT list_id, done, count(*) FROM todos GROUP BY list_id, done`
-has already loaded. Open the pipeline explorer: the `todos` source card now carries a small badge —
+has already loaded. Open the pipeline explorer: the `public.todos` source card now carries a small
+badge —
 `⧉ 0 idx · 1 cnt`. Ignore the `idx` half; it's a leftover field from a row-indexing layer the engine
 no longer has, and it's always zero today. The `1 cnt` half is the real thing: one live counts
 pipeline, folded onto the table it counts.
@@ -66,7 +67,7 @@ printf '%s\n' "$AGG"
 ```
 
 ```json
-{"result":{"data":{"shapeId":"<id>","table":"todos",
+{"result":{"data":{"shapeId":"<id>","table":"public.todos",
   "streamPath":"shape/<id>","streamUrl":"http://ds:8791/shape/<id>"}}}
 ```
 
@@ -79,7 +80,7 @@ curl -s "http://localhost:8791/shape/$SHAPE_ID?offset=-1"
 ```
 
 ```json
-[{"type":"todos","key":"agg","value":{"n":2,"value":2},"headers":{"operation":"upsert"}}]
+[{"type":"public.todos","key":"agg","value":{"n":2,"value":2},"headers":{"operation":"upsert"}}]
 ```
 
 Groceries (list 1) has two open todos — *buy milk*, *buy eggs* — so the count is `2` over `n=2`
@@ -104,13 +105,13 @@ curl -s "http://localhost:7010/shapes/$AGG_ID/rows"
 ```
 
 ```json
-{"id":"<id>","table":"todos","changesOnly":false,"count":1,"truncated":false,
+{"id":"<id>","table":"public.todos","changesOnly":false,"count":1,"truncated":false,
  "rows":[{"key":"agg","value":{"n":2,"value":2}}]}
 ```
 
 On the pipeline explorer, this aggregate's row in the sidebar wears a **`circuit · counts`** badge,
-and a `serves` edge runs from the `todos` source straight into its fold — no `σ` runs for this one at
-all. Its value lives in the counts pipeline itself.
+and a `serves` edge runs from the `public.todos` source straight into its fold — no `σ` runs for this
+one at all. Its value lives in the counts pipeline itself.
 
 ## 4. Watch it move, live
 

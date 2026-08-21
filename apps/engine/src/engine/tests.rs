@@ -13,7 +13,7 @@ fn standalone_index_candidates() {
         "primaryKey": "id"
     }))
     .unwrap();
-    let ts = TableSchema::from_def("users", &def).unwrap();
+    let ts = TableSchema::from_def(&"users".into(), &def).unwrap();
     let compile = |j: serde_json::Value| {
         Arc::new(
             CompiledPredicate::compile_opt(Some(&serde_json::from_value(j).unwrap()), &ts).unwrap(),
@@ -143,12 +143,12 @@ fn node_states_cover_every_node_kind() {
     );
 
     assert_eq!(
-        m["table:users"],
+        m["table:public.users"],
         NodeStateSummary::Table { processed_offset: "12".into(), envelopes: 42 }
     );
     assert_eq!(m["filter:s1"], NodeStateSummary::Filter { emitted: 4 });
     assert_eq!(m["shape:s1"], NodeStateSummary::Shape { emitted: 4 });
-    assert_eq!(m["family:users:active"], NodeStateSummary::Family { keys: 1, shapes: 1 });
+    assert_eq!(m["family:public.users:active"], NodeStateSummary::Family { keys: 1, shapes: 1 });
     assert_eq!(m["shape:s2"], NodeStateSummary::Shape { emitted: 7 });
     match &m["shape:s3"] {
         NodeStateSummary::Aggregate { value, count, .. } => {
@@ -178,7 +178,7 @@ fn circuit_ops_decompose_every_strategy() {
         aggregate: agg.map(|func| AggInfo { func, col: None }),
         state: Some("active"),
     };
-    let tables = vec!["users".to_string(), "orders".to_string()];
+    let tables: Vec<TableRef> = vec!["users".into(), "orders".into()];
     let mut counts_agg = gs("s6", "users", None, false, Some(AggFn::Count)); // counts-served aggregate
     counts_agg.circuit = Some(CircuitPlacement { label: "counts".into(), col: None, counts: true });
     let shapes = vec![
@@ -190,14 +190,14 @@ fn circuit_ops_decompose_every_strategy() {
         counts_agg,
     ];
     let nodes = vec![GraphNode {
-        sig: "orders|user_id|".into(),
+        sig: "public.orders|user_id|".into(),
         inner_table: "orders".into(),
         proj_col: "user_id".into(),
         distinct_values: 0,
         refcount: 1,
     }];
     let sq_edges = vec![GraphEdge {
-        node_sig: "orders|user_id|".into(),
+        node_sig: "public.orders|user_id|".into(),
         dependent_kind: "shape".into(),
         dependent_id: "s4".into(),
         connecting_col: "id".into(),
@@ -213,13 +213,13 @@ fn circuit_ops_decompose_every_strategy() {
     }
     // Strategy decompositions.
     for want in [
-        "src:users", "d:users", // table
+        "src:public.users", "d:public.users", // table
         "sigma:s1", "pi:s1", "snk:s1", // standalone
-        "key:users:active", "arr:users:active", "rjoin:users:active", "snk:s2", "snk:s3", // family
+        "key:public.users:active", "arr:public.users:active", "rjoin:public.users:active", "snk:s2", "snk:s3", // family
         "sj:s4", "feed:s4", "snk:s4", // subquery shape (feed set gates the deletes)
         "sigma:s5", "fold:s5", "snk:s5", // aggregate
         "fold:s6", "snk:s6", // counts-served aggregate (no σ — the circuit serves the fold)
-        "sqf:orders|user_id|", "dist:orders|user_id|", // inner set
+        "sqf:public.orders|user_id|", "dist:public.orders|user_id|", // inner set
     ] {
         assert!(ids.contains(want), "missing operator {want}");
     }
@@ -232,22 +232,22 @@ fn circuit_ops_decompose_every_strategy() {
     assert!(edges.iter().any(|e| e.source == "pi:s4" && e.target == "feed:s4" && e.kind == "flow"));
     assert!(edges.iter().any(|e| e.source == "feed:s4" && e.target == "snk:s4" && e.kind == "flow"));
     // Shared family ops emitted once despite two members.
-    assert_eq!(ops.iter().filter(|o| o.id == "arr:users:active").count(), 1);
+    assert_eq!(ops.iter().filter(|o| o.id == "arr:public.users:active").count(), 1);
     // Hop ids use the trace namespace; state ids point at real summaries.
-    let arr = ops.iter().find(|o| o.id == "arr:users:active").unwrap();
-    assert_eq!(arr.hop, "family:users:active");
-    assert_eq!(arr.state.as_deref(), Some("family:users:active"));
+    let arr = ops.iter().find(|o| o.id == "arr:public.users:active").unwrap();
+    assert_eq!(arr.hop, "family:public.users:active");
+    assert_eq!(arr.state.as_deref(), Some("family:public.users:active"));
     let fold = ops.iter().find(|o| o.id == "fold:s5").unwrap();
     assert_eq!(fold.hop, "shape:s5");
     assert_eq!(fold.state.as_deref(), Some("shape:s5"));
     let sigma1 = ops.iter().find(|o| o.id == "sigma:s1").unwrap();
     assert_eq!(sigma1.hop, "filter:s1");
     // The membership edge lands on the dependent's semijoin, dashed as a subquery stream.
-    let dep = edges.iter().find(|e| e.source == "dist:orders|user_id|").unwrap();
+    let dep = edges.iter().find(|e| e.source == "dist:public.orders|user_id|").unwrap();
     assert_eq!(dep.target, "sj:s4");
     assert_eq!(dep.kind, "subquery");
     // The params arrangement feeds the route join as a state edge.
-    assert!(edges.iter().any(|e| e.source == "arr:users:active" && e.target == "rjoin:users:active" && e.kind == "state"));
+    assert!(edges.iter().any(|e| e.source == "arr:public.users:active" && e.target == "rjoin:public.users:active" && e.kind == "state"));
 }
 
 /// With the dbsp layer off, `/graph` omits the `arrangements` section entirely: no arr nodes
@@ -301,25 +301,25 @@ async fn graph_includes_counts_pipeline_and_consumers() {
     let g = engine.graph().await;
     let a = g.arrangements.as_ref().expect("arrangements section present");
     assert_eq!(a.inputs.len(), 1);
-    assert_eq!(a.inputs[0].id, "arr:input:users");
+    assert_eq!(a.inputs[0].id, "arr:input:public.users");
     assert!(!a.inputs[0].seeded, "unseeded until finish_seed");
     assert!(a.indexes.is_empty(), "row arrangements no longer exist");
     assert_eq!(a.counts.len(), 1);
-    assert_eq!(a.counts[0].id, "arr:counts:users");
+    assert_eq!(a.counts[0].id, "arr:counts:public.users");
     assert_eq!(a.counts[0].group_cols, vec!["active".to_string()]);
     assert_eq!(a.consumers.len(), 1);
-    assert_eq!(a.consumers[0].index, "arr:counts:users");
+    assert_eq!(a.consumers[0].index, "arr:counts:public.users");
     assert_eq!(a.consumers[0].dependent_kind, "circuit-agg");
     assert_eq!(a.consumers[0].dependent_id, "s9");
     // Wire format: camelCase keys under the `arrangements` section.
     let v = serde_json::to_value(&g).unwrap();
-    assert_eq!(v["arrangements"]["counts"][0]["id"], "arr:counts:users");
+    assert_eq!(v["arrangements"]["counts"][0]["id"], "arr:counts:public.users");
     assert_eq!(v["arrangements"]["consumers"][0]["dependentKind"], "circuit-agg");
 
     // Seed the counts: the next snapshot reports seeded.
-    arr.seed_groups("users", vec![(Row(vec![Value::Bool(true)]), 3)]).await.unwrap();
-    arr.finish_seed("users");
-    assert_eq!(arr.count_groups("users"), Some(vec![(Row(vec![Value::Bool(true)]), 3)]));
+    arr.seed_groups(&"users".into(), vec![(Row(vec![Value::Bool(true)]), 3)]).await.unwrap();
+    arr.finish_seed(&"users".into());
+    assert_eq!(arr.count_groups(&"users".into()), Some(vec![(Row(vec![Value::Bool(true)]), 3)]));
     let g2 = engine.graph().await;
     let a2 = g2.arrangements.as_ref().unwrap();
     assert!(a2.inputs[0].seeded && a2.counts[0].seeded);
@@ -368,7 +368,7 @@ fn dump_node_family_and_aggregate() {
     let router = KeyRouter { key_cols: vec![ts.column_index("active").unwrap()], index };
     let v = dump_family_json(&ts, &router);
     assert_eq!(v["kind"], "family");
-    assert_eq!(v["node"], "family:users:active");
+    assert_eq!(v["node"], "family:public.users:active");
     assert_eq!(v["keyCols"][0], "active");
     assert_eq!(v["entries"][0]["key"][0], true);
     assert_eq!(v["entries"][0]["shapes"][0], "s5");
@@ -431,7 +431,7 @@ fn users() -> TableSchema {
         "primaryKey": "id"
     }))
     .unwrap();
-    TableSchema::from_def("users", &def).unwrap()
+    TableSchema::from_def(&"users".into(), &def).unwrap()
 }
 
 fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_json::Value>) -> Envelope {
@@ -565,12 +565,12 @@ async fn trace_family_route_and_filter_drop() {
     .await
     .unwrap();
     let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
-    assert_eq!(ev["table"], "users");
+    assert_eq!(ev["table"], "public.users");
     let hops = ev["hops"].as_array().unwrap();
     let hop = |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
-    assert_eq!(hop("table:users")["outcome"], "passed");
-    assert_eq!(hop("family:users:name")["outcome"], "routed");
-    assert_eq!(hop("family:users:name")["key"][0], "a");
+    assert_eq!(hop("table:public.users")["outcome"], "passed");
+    assert_eq!(hop("family:public.users:name")["outcome"], "routed");
+    assert_eq!(hop("family:public.users:name")["key"][0], "a");
     assert_eq!(hop("shape:s7")["outcome"], "passed");
     assert_eq!(hop("filter:s9")["outcome"], "dropped");
     assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s7")]);
@@ -588,7 +588,7 @@ async fn trace_family_route_and_filter_drop() {
     let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
     let hops = ev["hops"].as_array().unwrap();
     let hop = |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
-    assert_eq!(hop("family:users:name")["outcome"], "dropped");
+    assert_eq!(hop("family:public.users:name")["outcome"], "dropped");
     assert_eq!(hop("filter:s9")["outcome"], "dropped");
     assert!(ev["shapes"].as_array().unwrap().is_empty());
 
@@ -655,7 +655,7 @@ fn count_delta_emits_fold_trace() {
     // COUNT(*) over the whole table: one unconstrained group dimension matches every group.
     exec.circuit_aggs
         .insert("s4".into(), CircuitAgg { stream_path: "shape/s4".into(), constraints: vec![None], value: 0 });
-    execs.insert("users".into(), exec);
+    execs.insert("public.users".into(), exec);
 
     let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
     let group = |g: &str| Row(vec![Value::Text(g.into())]);
@@ -670,11 +670,11 @@ fn count_delta_emits_fold_trace() {
         vec![CountDelta { table: "users".into(), group: group("open"), delta: 1 }],
         Some("7".into()), None, &mut pending, &trace_tx,
     );
-    assert_eq!(execs["users"].circuit_aggs["s4"].value, 1);
+    assert_eq!(execs["public.users"].circuit_aggs["s4"].value, 1);
     assert!(pending.contains_key("shape/s4"), "aggregate envelope emitted");
     let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
-    assert_eq!(ev["table"], "users");
-    assert_eq!(hop_outcome(&ev, "table:users"), Some(serde_json::json!("passed")));
+    assert_eq!(ev["table"], "public.users");
+    assert_eq!(hop_outcome(&ev, "table:public.users"), Some(serde_json::json!("passed")));
     assert_eq!(hop_outcome(&ev, "shape:s4"), Some(serde_json::json!("folded")));
     assert_eq!(ev["delta"][0]["w"], 1);
     assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s4")]);
@@ -686,7 +686,7 @@ fn count_delta_emits_fold_trace() {
         vec![CountDelta { table: "users".into(), group: group("open"), delta: -1 }],
         None, None, &mut pending, &trace_tx,
     );
-    assert_eq!(execs["users"].circuit_aggs["s4"].value, 0);
+    assert_eq!(execs["public.users"].circuit_aggs["s4"].value, 0);
     let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
     assert_eq!(ev["delta"][0]["w"], -1);
     assert_eq!(hop_outcome(&ev, "shape:s4"), Some(serde_json::json!("folded")));
@@ -701,7 +701,7 @@ fn count_delta_emits_fold_trace() {
         ],
         None, None, &mut pending, &trace_tx,
     );
-    assert_eq!(execs["users"].circuit_aggs["s4"].value, 0);
+    assert_eq!(execs["public.users"].circuit_aggs["s4"].value, 0);
     assert!(trace_rx.try_recv().is_err(), "net-zero change emits no fold trace");
 }
 
@@ -930,7 +930,7 @@ fn agg_envelope_shared_wire_format() {
     a.apply(&vec![Tup2(active(1), 1), Tup2(active(2), 1)]);
     let fold_env = a.envelope(&ts, Some("t1".into()), Some("0/1".into()));
     let circuit = CircuitAgg { stream_path: "shape/x".into(), constraints: vec![None], value: 2 };
-    let circuit_env = circuit.envelope("users", Some("t1".into()), Some("0/1".into()));
+    let circuit_env = circuit.envelope(&"users".into(), Some("t1".into()), Some("0/1".into()));
     for env in [&fold_env, &circuit_env] {
         assert_eq!(env.key, "agg");
         assert_eq!(env.headers.operation, "upsert");
@@ -1121,7 +1121,7 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
     }))
     .unwrap();
     let compiled = compile_schema(&schema).unwrap();
-    let inner_ts = compiled.get("inner_t").cloned().unwrap();
+    let inner_ts = compiled.get(&"inner_t".into()).cloned().unwrap();
     engine.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
     engine.state.lock().await.tables = compiled;
     let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
@@ -1133,7 +1133,7 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
     // (the seed's own flips are discarded, so the shape is quiet until a live delta moves it).
     let begin = {
         let mut reg = engine.subqueries.lock().await;
-        reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, true).unwrap()
+        reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, true).unwrap()
     };
     let seeds: Vec<_> = begin
         .seeds
@@ -1179,7 +1179,7 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
     assert_eq!(engine.health_status(), "degraded", "degraded outranks the boot phase");
     assert!(engine.ensure_not_degraded().is_err(), "every membership-bearing path must now refuse");
     assert!(
-        engine.create_shape("outer_t", None, None, false, true).await.is_err(),
+        engine.create_shape(&"outer_t".into(), None, None, false, true).await.is_err(),
         "a degraded engine must not create shapes"
     );
 }

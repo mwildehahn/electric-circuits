@@ -22,6 +22,8 @@ const schema: Schema = {
 
 const activeParents = { table: 'parent', project: 'id', where: { col: 'active', op: 'eq', value: true } } as const
 
+// Every engine FROM is schema-qualified (ADR-0002), so the running query-back reads
+// `from "public"."child" t` — the probe below matches that exact text.
 async function candidateQueryRunning(h: Harness): Promise<boolean> {
   const rows = await pgQuery(
     h,
@@ -29,7 +31,7 @@ async function candidateQueryRunning(h: Harness): Promise<boolean> {
        FROM pg_stat_activity
       WHERE datname = current_database()
         AND state = 'active'
-        AND query ILIKE '%from "child" t%'
+        AND query ILIKE '%from "public"."child" t%'
         AND pid <> pg_backend_pid()
       LIMIT 1`,
   )

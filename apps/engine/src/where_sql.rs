@@ -345,7 +345,21 @@ impl Parser<'_> {
                     self.next(); // SELECT
                     let project = self.parse_ident()?;
                     self.eat(&Tok::From)?;
-                    let table = self.parse_ident()?;
+                    // Qualified inner tables are not supported in SQL-text `where` clauses — the
+                    // compat adapter is maintained for parity, not developed (ADR-0001). An
+                    // UNQUOTED `a.b` is already a lex error; a QUOTED `"a.b"` lexes to one
+                    // identifier whose text contains a dot, and letting that through to
+                    // `TableRef::parse` would split a single (quoted) relation name into
+                    // schema + name — a different table. Reject it here; a bare identifier
+                    // resolves through the one parse rule as everything else does (⇒ `public.<name>`).
+                    let raw = self.parse_ident()?;
+                    if raw.contains('.') {
+                        bail!(
+                            "qualified inner table '{raw}' is not supported in a SQL where clause; \
+                             use the native predicate API for a non-public subquery table"
+                        );
+                    }
+                    let table = crate::table_ref::TableRef::parse(&raw)?;
                     let where_ = if matches!(self.peek(), Some(Tok::Where)) {
                         self.next();
                         Some(Box::new(self.parse_or()?))
@@ -472,13 +486,42 @@ mod tests {
         let _ = sig("(active = true OR value = 'x') AND NOT active = false");
     }
 
+    /// The compat lexer has no qualified-table form, and the two ways a dot can reach the inner
+    /// table must BOTH be errors — not a silent re-interpretation of one relation as another.
+    #[test]
+    fn qualified_inner_tables_are_rejected_both_ways() {
+        // Unquoted: `a.b` never lexes as one identifier.
+        let e = parse_where("pid IN (SELECT id FROM other.items)").unwrap_err();
+        assert!(!format!("{e:#}").is_empty());
+
+        // Quoted: `"other.items"` DOES lex to one identifier whose text has a dot. Splitting it
+        // would silently address `other`.`items` instead of the single relation `other.items`.
+        let e = parse_where(r#"pid IN (SELECT id FROM "other.items")"#).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("qualified inner table"), "{msg}");
+        assert!(msg.contains("other.items"), "{msg}");
+
+        // A bare inner table still resolves through the one parse rule (⇒ `public.<name>`).
+        let p = parse_where("pid IN (SELECT id FROM items)").unwrap().unwrap();
+        match p {
+            PredicateJson::In { subquery, .. } => assert_eq!(subquery.table.to_string(), "public.items"),
+            other => panic!("expected a subquery leaf, got {other:?}"),
+        }
+        // ...as does a quoted bare one.
+        let p = parse_where(r#"pid IN (SELECT id FROM "items")"#).unwrap().unwrap();
+        match p {
+            PredicateJson::In { subquery, .. } => assert_eq!(subquery.table.to_string(), "public.items"),
+            other => panic!("expected a subquery leaf, got {other:?}"),
+        }
+    }
+
     fn users() -> TableSchema {
         let json = serde_json::json!({
             "columns": { "id": {"type":"int"}, "name": {"type":"text"}, "score": {"type":"float"}, "active": {"type":"bool"} },
             "primaryKey": "id"
         });
         let def: crate::schema::TableDef = serde_json::from_value(json).unwrap();
-        TableSchema::from_def("users", &def).unwrap()
+        TableSchema::from_def(&crate::table_ref::TableRef::parse("users").unwrap(), &def).unwrap()
     }
 
     fn lit(sql: &str) -> serde_json::Value {

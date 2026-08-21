@@ -43,6 +43,7 @@ pub mod subq_circuit;
 mod subq_feed;
 mod subq_index;
 pub mod subquery;
+pub mod table_ref;
 pub mod trace;
 pub mod value;
 pub mod where_sql;
@@ -50,5 +51,6 @@ pub mod where_sql;
 pub use value::{Row, Value};
 
 /// The single ordered change log: the ingestor appends whole commits here (in commit order), and
-/// the engine's sequencer consumes it — the envelope's `type` field carries the table name.
+/// the engine's sequencer consumes it — the envelope's `type` field carries the table's canonical
+/// `schema.name` (always qualified; see [`table_ref`] and ADR-0002).
 pub const CHANGES_STREAM: &str = "changes";

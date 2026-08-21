@@ -51,8 +51,8 @@ describe('conformance: subquery node sharing', () => {
     const byRef = [...nodes].sort((a, b) => b.refcount - a.refcount)
     expect(byRef[0]!.refcount).toBe(3)
     expect(byRef[1]!.refcount).toBe(1)
-    // Both nodes are over the parent table.
-    expect(nodes.every((n) => n.inner_table === 'parent')).toBe(true)
+    // Both nodes are over the parent table, reported with its canonical `schema.name` (ADR-0002).
+    expect(nodes.every((n) => n.inner_table === 'public.parent')).toBe(true)
     // The two nodes have distinct signatures (active vs inactive).
     expect(new Set(nodes.map((n) => n.sig)).size).toBe(2)
   }, 60000)

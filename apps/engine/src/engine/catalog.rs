@@ -52,6 +52,32 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, mut rx: mpsc::UnboundedReceiver
     });
 }
 
+/// The durable catalog holds a record written **before** ADR-0002 (a bare `rec.table`).
+///
+/// A typed error because the boot path treats it differently from every other restore failure: an
+/// ordinary failure is logged and the engine continues with an empty registry (the clients recreate
+/// their shapes), but this one **refuses to boot**. Half-restoring a pre-qualification catalog is
+/// the one outcome worse than not booting: the record's `sig` still carries the bare spelling, so an
+/// identical post-cutover create would not share with it and the engine would quietly maintain two
+/// streams for one table, forever. Recovery is a deliberate human act (reset the storage), not
+/// something the engine gets to paper over.
+#[derive(Debug)]
+pub struct CatalogPredatesQualification {
+    detail: String,
+}
+
+impl std::fmt::Display for CatalogPredatesQualification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "durable catalog predates ADR-0002 ({}); reset the durable-streams data directory",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for CatalogPredatesQualification {}
+
 pub(crate) async fn ensure_catalog(ds: &DsClient) -> bool {
     match ds.ensure_stream(CATALOG_STREAM).await {
         Ok(()) => true,
@@ -66,7 +92,7 @@ pub(crate) async fn ensure_catalog(ds: &DsClient) -> bool {
 impl Engine {
     /// Replay the durable shape catalog and re-register every restorable shape with the (not yet
     /// spawned) sequencer — see [`CATALOG_STREAM`] for the restore semantics per shape kind.
-    pub(crate) async fn restore_catalog(&self, compiled: &HashMap<String, TableSchema>) -> Result<()> {
+    pub(crate) async fn restore_catalog(&self, compiled: &HashMap<TableRef, TableSchema>) -> Result<()> {
         // 1. Fold the event log.
         // (rec, sig, refcount, dormant resume state). The last Dormant/Reactivated event wins.
         type Restored = (ShapeRecord, Option<String>, usize, Option<(String, crate::pg::SnapshotGate)>);
@@ -76,6 +102,18 @@ impl Engine {
         loop {
             let (events, next, up_to_date) = self.ds.read_json(CATALOG_STREAM, &off).await?;
             for ev in events {
+                // The catalog is engine-written, so `rec.table` is ALWAYS the canonical
+                // `schema.name` (`ShapeRecord`'s strict deserializer enforces it). A bare one can
+                // only be a catalog written before ADR-0002: refuse the boot naming the record,
+                // rather than let the strict deserializer turn it into a silently skipped event.
+                if let Some(raw) = ev.pointer("/rec/table").and_then(serde_json::Value::as_str)
+                    && crate::table_ref::TableRef::parse(raw).is_ok_and(|t| t.as_str() != raw)
+                {
+                    let id = ev.pointer("/rec/id").and_then(serde_json::Value::as_str).unwrap_or("<unknown>");
+                    return Err(anyhow::Error::new(CatalogPredatesQualification {
+                        detail: format!("bare table name '{raw}' in shape {id}"),
+                    }));
+                }
                 let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
                 match ev {
                     CatalogEvent::Created { rec, sig } => {
@@ -216,7 +254,7 @@ impl Engine {
         &self,
         cmd_tx: &mpsc::UnboundedSender<SequencerCmd>,
         rec: &ShapeRecord,
-        compiled: &HashMap<String, TableSchema>,
+        compiled: &HashMap<TableRef, TableSchema>,
     ) -> Result<()> {
         let ts = compiled
             .get(&rec.table)
@@ -305,4 +343,57 @@ impl Engine {
         .map_err(|e| anyhow::anyhow!(e))
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn created_event(table: &str) -> serde_json::Value {
+        serde_json::json!({
+            "t": "created",
+            "rec": {
+                "id": "s1",
+                "table": table,
+                "stream_path": "shape/s1",
+                "changes_only": false,
+                "where_json": null,
+                "columns": null,
+                "family_key": null,
+                "is_subquery": false,
+                "aggregate": null,
+            },
+            "sig": null,
+        })
+    }
+
+    /// The catalog is strict where API ingress is lenient: a record must already carry the
+    /// canonical `schema.name`. A bare one can only be a catalog written before ADR-0002, and
+    /// resolving it would leave its (bare-spelled) sharing signature unable to match an identical
+    /// post-cutover create — two maintained streams for one table.
+    #[test]
+    fn catalog_records_must_be_canonically_spelled() {
+        let ok = serde_json::from_value::<CatalogEvent>(created_event("public.users"))
+            .expect("a canonical record restores");
+        match ok {
+            CatalogEvent::Created { rec, .. } => {
+                assert_eq!(rec.table.to_string(), "public.users");
+                assert_eq!(rec.table.schema(), "public");
+            }
+            other => panic!("expected Created, got {other:?}"),
+        }
+
+        let err = serde_json::from_value::<CatalogEvent>(created_event("users"))
+            .expect_err("a bare record is refused, not resolved to public.users");
+        assert!(err.to_string().contains("canonical"), "{err}");
+
+        // The same rule applies to a non-public bare-impossible spelling: `a.b.c` is not a table.
+        assert!(serde_json::from_value::<CatalogEvent>(created_event("a.b.c")).is_err());
+        // ...and an explicitly qualified non-public table restores untouched.
+        let ok = serde_json::from_value::<CatalogEvent>(created_event("other.users")).unwrap();
+        match ok {
+            CatalogEvent::Created { rec, .. } => assert_eq!(rec.table.to_string(), "other.users"),
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
 }

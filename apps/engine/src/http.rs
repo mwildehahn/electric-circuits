@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::{Engine, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
+use crate::table_ref::TableRef;
 
 pub fn router(engine: Engine) -> Router {
     router_with_introspection(engine, true)
@@ -127,7 +128,9 @@ struct SubsetOrderByReq {
 /// A one-shot subset query (the non-materialized counterpart to `/shapes`).
 #[derive(Deserialize)]
 struct QueryReq {
-    table: String,
+    /// Bare names are accepted as `public.<name>` sugar and canonicalised by `TableRef`'s
+    /// `Deserialize`; `a.b.c` is a deserialization error (4xx), not a bad lookup.
+    table: TableRef,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
     #[serde(default)]
@@ -167,7 +170,7 @@ async fn define_schema(
 
 #[derive(Deserialize)]
 struct CreateShapeReq {
-    table: String,
+    table: TableRef,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
     /// Optional output projection: column names to sync. Omitted = the full row.
@@ -183,7 +186,7 @@ struct CreateShapeReq {
 #[serde(rename_all = "camelCase")]
 struct ShapeResp {
     shape_id: String,
-    table: String,
+    table: TableRef,
     stream_path: String,
     stream_url: String,
     /// Retention lifecycle: `active` | `deactivating` | `dormant` | `reactivating` (see
@@ -210,7 +213,7 @@ async fn create_shape(
 
 #[derive(Deserialize)]
 struct AggregateReq {
-    table: String,
+    table: TableRef,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
     #[serde(rename = "fn")]
@@ -258,7 +261,7 @@ struct ShapeRowEntry {
 #[serde(rename_all = "camelCase")]
 struct ShapeRowsResp {
     id: String,
-    table: String,
+    table: TableRef,
     changes_only: bool,
     /// Total materialized rows (before the display cap).
     count: usize,
@@ -284,7 +287,7 @@ struct ShapeLogEntry {
 #[serde(rename_all = "camelCase")]
 struct ShapeLogResp {
     id: String,
-    table: String,
+    table: TableRef,
     changes_only: bool,
     /// Total envelopes on the stream (before the tail cap).
     total: usize,
@@ -427,10 +430,21 @@ async fn release_shape(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// Resolve a `{table}`/`{name}` path segment to a table identity: a bare segment is the
+/// `public.<name>` sugar, `schema.name` is taken as given, anything else is a 400 (never a
+/// mis-resolved lookup).
+fn path_table(raw: &str) -> Result<TableRef, AppError> {
+    TableRef::parse(raw).map_err(|e| AppError {
+        status: StatusCode::BAD_REQUEST,
+        msg: format!("invalid table '{raw}': {e:#}"),
+    })
+}
+
 async fn table_offset(
     State(engine): State<Engine>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let name = path_table(&name)?;
     match engine.table_offset(&name).await {
         Some(offset) => Ok(Json(serde_json::json!({ "offset": offset }))),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
@@ -441,6 +455,7 @@ async fn table_families(
     State(engine): State<Engine>,
     Path(name): Path<String>,
 ) -> Result<Json<TableStats>, AppError> {
+    let name = path_table(&name)?;
     match engine.table_stats(&name).await {
         Some(stats) => Ok(Json(stats)),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
@@ -453,6 +468,7 @@ async fn get_table_schema(
     State(engine): State<Engine>,
     Path(table): Path<String>,
 ) -> Result<Json<TableSchemaInfo>, AppError> {
+    let table = path_table(&table)?;
     match engine.table_schema_info(&table).await {
         Ok(info) => Ok(Json(info)),
         Err(e) => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("{e:#}") }),
@@ -477,6 +493,7 @@ async fn insert_table_row(
     Path(table): Path<String>,
     Json(req): Json<InsertRowReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let table = path_table(&table)?;
     let values = req.columns.or(req.values).unwrap_or_default();
     match engine.insert_row(&table, &values).await {
         Ok(v) => Ok(Json(v)),
@@ -500,6 +517,7 @@ async fn delete_table_rows(
     Path(table): Path<String>,
     Json(req): Json<DeleteRowsReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let table = path_table(&table)?;
     match engine.delete_rows(&table, &req.keys).await {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),

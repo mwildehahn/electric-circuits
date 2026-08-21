@@ -60,7 +60,7 @@ identical either way.)
 | env var | meaning |
 |---|---|
 | `ELECTRIC_CIRCUITS_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
-| `ELECTRIC_CIRCUITS_PG_TABLES` | comma-separated table list, or `*`/empty to **introspect every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table). |
+| `ELECTRIC_CIRCUITS_PG_TABLES` | comma-separated table list — `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*`/empty means `public.*`: **every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table), never every schema. |
 | `ELECTRIC_CIRCUITS_PG_SLOT` | replication slot name (default `electric_circuits`; the slot uses the `pgoutput` plugin). |
 | `ELECTRIC_CIRCUITS_PG_POLL_MS` | slot poll interval. |
 
@@ -122,7 +122,8 @@ Electric clients/tools work:
 
 - **Snapshot:** `GET /v1/shape?table=todos&where=<SQL WHERE>` (or `offset=-1`) → the current rows
   as `insert` messages + an `up-to-date` control message. Response carries `electric-handle` and
-  `electric-offset` headers. (Schema-qualified names like `public.todos` are accepted.)
+  `electric-offset` headers. The `table` param is **resolved**, not stripped: `public.todos` and
+  `reporting.todos` are different tables, and a bare `todos` means `public.todos`.
 - **Live:** `GET /v1/shape?...&handle=<h>&offset=<o>&live=true` long-polls for `insert`/`update`/
   `delete` from that offset. An unknown handle returns `must-refetch`.
 

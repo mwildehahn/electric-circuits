@@ -33,7 +33,7 @@ discover the bound port.
 |---|---|---|
 | `ELECTRIC_CIRCUITS_DS_URL` | *(required)* | Durable-streams server base URL (the change log) |
 | `ELECTRIC_CIRCUITS_PG_URL` | *(unset)* | Enables **Postgres mode**: ingest via logical replication, backfill by query-back. Unset = library mode (writes arrive on table streams) |
-| `ELECTRIC_CIRCUITS_PG_TABLES` | *(empty)* | Comma list of tables to replicate; `*` (or empty) introspects every `public` table with a primary key |
+| `ELECTRIC_CIRCUITS_PG_TABLES` | *(empty)* | Comma list of tables to replicate: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*` (or empty) = `public.*` — never every schema (introspect-all sets `REPLICA IDENTITY FULL`, which must not touch managed system schemas) |
 | `ELECTRIC_CIRCUITS_PG_SLOT` | `electric_circuits` | Logical replication slot name |
 | `ELECTRIC_CIRCUITS_PG_POLL_MS` | `50` | Replication-slot poll interval |
 | `ELECTRIC_CIRCUITS_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |

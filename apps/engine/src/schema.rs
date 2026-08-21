@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
+use crate::table_ref::TableRef;
 use crate::value::{Row, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -60,13 +61,17 @@ fn de_primary_key<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Schema {
-    pub tables: BTreeMap<String, TableDef>,
+    /// Keyed by table reference: a bare key is the `public.<name>` sugar, canonicalised by
+    /// [`TableRef`]'s `Deserialize` (the single parse rule) as the library-mode `POST /schema` body
+    /// is read.
+    pub tables: BTreeMap<TableRef, TableDef>,
 }
 
 /// Compiled, positional view of one table: sorted columns, a name->index map, and the pk index.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
-    pub name: String,
+    /// The table's identity; its canonical `schema.name` `Display` is what goes on the wire.
+    pub table: TableRef,
     pub columns: Vec<(String, ColumnType)>,
     pub index: HashMap<String, usize>,
     /// First primary-key column index/name/type. For single-PK tables this IS the pk; for composite-PK
@@ -90,7 +95,7 @@ pub struct TableSchema {
 const PK_SEP: char = '\u{1f}';
 
 impl TableSchema {
-    pub fn from_def(name: &str, def: &TableDef) -> Result<Self> {
+    pub fn from_def(table: &TableRef, def: &TableDef) -> Result<Self> {
         let columns: Vec<(String, ColumnType)> =
             def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
         let pg_types: Vec<Option<String>> = def.columns.values().map(|d| d.pg_type.clone()).collect();
@@ -98,7 +103,7 @@ impl TableSchema {
         let index: HashMap<String, usize> =
             columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
         if def.primary_key.is_empty() {
-            anyhow::bail!("table '{name}' has no primary key");
+            anyhow::bail!("table '{table}' has no primary key");
         }
         let pk_cols: Vec<usize> = def
             .primary_key
@@ -108,7 +113,7 @@ impl TableSchema {
         let pk_index = pk_cols[0];
         let pk_type = columns[pk_index].1;
         Ok(TableSchema {
-            name: name.to_string(),
+            table: table.clone(),
             columns,
             index,
             pk_index,
@@ -189,13 +194,13 @@ impl TableSchema {
 }
 
 /// Compile a full schema into per-table `TableSchema`s.
-pub fn compile_schema(schema: &Schema) -> Result<HashMap<String, TableSchema>> {
+pub fn compile_schema(schema: &Schema) -> Result<HashMap<TableRef, TableSchema>> {
     let mut out = HashMap::new();
-    for (name, def) in &schema.tables {
+    for (table, def) in &schema.tables {
         if def.columns.is_empty() {
-            bail!("table '{name}' has no columns");
+            bail!("table '{table}' has no columns");
         }
-        out.insert(name.clone(), TableSchema::from_def(name, def)?);
+        out.insert(table.clone(), TableSchema::from_def(table, def)?);
     }
     Ok(out)
 }
@@ -210,7 +215,7 @@ mod tests {
             "primaryKey": "id"
         });
         let def: TableDef = serde_json::from_value(json).unwrap();
-        TableSchema::from_def("users", &def).unwrap()
+        TableSchema::from_def(&TableRef::parse("users").unwrap(), &def).unwrap()
     }
 
     #[test]

@@ -12,6 +12,10 @@
 
 use std::time::Duration;
 
+use anyhow::{Result, bail};
+
+use crate::table_ref::{TableRef, TableSelector};
+
 /// A StatsD destination (`host[:port]`, default port 8125).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatsdTarget {
@@ -38,8 +42,11 @@ pub struct Config {
     pub log_filter: String,
     /// Logical-replication slot name.
     pub slot: String,
-    /// Tables to replicate (`ELECTRIC_CIRCUITS_PG_TABLES`); empty / `["*"]` = introspect all.
-    pub tables: Vec<String>,
+    /// Tables to replicate (`ELECTRIC_CIRCUITS_PG_TABLES`): `schema.name`, a bare name (=
+    /// `public.<name>`), or `schema.*` / `*` for "every table with a primary key in that schema"
+    /// (`*` and an empty setting both mean `public.*` — see [`TableSelector`]). Malformed entries
+    /// are dropped with a warning rather than crashing the boot.
+    pub tables: Vec<TableSelector>,
     /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
     /// delivery); still parsed so existing `ELECTRIC_CIRCUITS_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
@@ -89,12 +96,13 @@ pub struct DbspConfig {
     /// at shutdown).
     pub checkpoint_every: Option<Duration>,
     /// Extra lookup indexes beyond the per-table primary key: `table.column[,table.column…]`
-    /// (`ELECTRIC_CIRCUITS_DBSP_INDEXES`). Lookups against undeclared indexes fall back to Postgres.
-    pub indexes: Vec<(String, String)>,
+    /// (`ELECTRIC_CIRCUITS_DBSP_INDEXES`). Deprecated and ignored. The table part may itself be
+    /// qualified (`schema.name.column`), so the COLUMN is split off the END.
+    pub indexes: Vec<(TableRef, String)>,
     /// Counts pipelines: `table:col+col[,table:col…]` (`ELECTRIC_CIRCUITS_DBSP_COUNTS`). The circuit
     /// maintains a live COUNT per distinct group projection; COUNT aggregates whose predicate
     /// decomposes over these columns are served from the groups.
-    pub counts: Vec<(String, Vec<String>)>,
+    pub counts: Vec<(TableRef, Vec<String>)>,
 }
 
 /// `ELECTRIC_*` vars the engine actually reads and acts on. Anything else matching `^ELECTRIC_`
@@ -152,8 +160,10 @@ pub fn parse_human_duration(s: &str) -> Option<Duration> {
 }
 
 impl Config {
-    /// Resolve configuration from an env getter. Pure (no process-env access) so precedence is testable.
-    pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Config {
+    /// Resolve configuration from an env getter. Pure (no process-env access) so precedence is
+    /// testable. `Err` is a boot-fatal misconfiguration (today: an unparseable
+    /// `ELECTRIC_CIRCUITS_PG_TABLES` entry).
+    pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
         let g = |k: &str| nonempty(get(k));
 
         // Postgres URL: our internal var wins, then the fleet's DATABASE_URL.
@@ -188,12 +198,32 @@ impl Config {
             None => "electric_circuits".to_string(),
         });
 
-        let tables: Vec<String> = g("ELECTRIC_CIRCUITS_PG_TABLES")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // `schema.name` / bare name (= `public.<name>`) / `schema.*` / `*`. An empty setting leaves
+        // the list empty, which `setup_postgres` reads as `public.*` (introspect all).
+        //
+        // A malformed entry is FATAL, never skipped: skipping it would silently leave a table out of
+        // replication — every shape on it refused, every change to it invisible — for a typo, while
+        // the neighbouring failure mode (a well-formed name for a table that does not exist) already
+        // aborts the boot at introspection. Loud and symmetric beats quietly half-configured.
+        let raw_tables = g("ELECTRIC_CIRCUITS_PG_TABLES").unwrap_or_default();
+        let mut tables: Vec<TableSelector> = Vec::new();
+        let mut table_errors: Vec<String> = Vec::new();
+        for entry in raw_tables.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match TableSelector::parse(entry) {
+                Ok(sel) => tables.push(sel),
+                Err(e) => table_errors.push(format!("'{entry}': {e:#}")),
+            }
+        }
+        if !table_errors.is_empty() {
+            bail!(
+                "ELECTRIC_CIRCUITS_PG_TABLES has {} unusable entr{} ({}). Each entry must be \
+                 `schema.name`, a bare `name` (meaning `public.<name>`), `schema.*` (every table with \
+                 a primary key in that schema), or `*` (= `public.*`).",
+                table_errors.len(),
+                if table_errors.len() == 1 { "y" } else { "ies" },
+                table_errors.join("; "),
+            );
+        }
 
         let poll_ms = g("ELECTRIC_CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
 
@@ -263,8 +293,10 @@ impl Config {
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|s| {
-                    let (t, c) = s.trim().split_once('.')?;
-                    Some((t.trim().to_string(), c.trim().to_string()))
+                    // `table.column`, where `table` may itself be `schema.name` — the COLUMN is the
+                    // last dotted part, so split from the right.
+                    let (t, c) = s.trim().rsplit_once('.')?;
+                    Some((TableRef::parse(t.trim()).ok()?, c.trim().to_string()))
                 })
                 .collect(),
             counts: g("ELECTRIC_CIRCUITS_DBSP_COUNTS")
@@ -277,12 +309,12 @@ impl Config {
                         .map(|c| c.trim().to_string())
                         .filter(|c| !c.is_empty())
                         .collect();
-                    if cols.is_empty() { None } else { Some((t.trim().to_string(), cols)) }
+                    if cols.is_empty() { None } else { Some((TableRef::parse(t.trim()).ok()?, cols)) }
                 })
                 .collect(),
         };
 
-        Config {
+        Ok(Config {
             pg_url,
             ds_url,
             bind,
@@ -301,18 +333,18 @@ impl Config {
             trace,
             dbsp,
             noop_vars: Vec::new(),
-        }
+        })
     }
 
     /// Resolve from the real process environment, then scan it for accepted-no-op `ELECTRIC_*` vars.
-    pub fn from_env() -> Config {
-        let mut cfg = Config::resolve(|k| std::env::var(k).ok());
+    pub fn from_env() -> Result<Config> {
+        let mut cfg = Config::resolve(|k| std::env::var(k).ok())?;
         cfg.noop_vars = std::env::vars()
             .map(|(k, _)| k)
             .filter(|k| is_noop_var(k))
             .collect();
         cfg.noop_vars.sort();
-        cfg
+        Ok(cfg)
     }
 
     /// The bind host:port with the `DATABASE_URL`/`ELECTRIC_SECRET` credentials redacted — safe to log.
@@ -398,6 +430,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn cfg(pairs: &[(&str, &str)]) -> Config {
+        try_cfg(pairs).expect("valid test config")
+    }
+
+    fn try_cfg(pairs: &[(&str, &str)]) -> Result<Config> {
         let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         Config::resolve(move |k| map.get(k).cloned())
     }
@@ -550,11 +586,43 @@ mod tests {
         assert_eq!(c.dbsp.dir, std::path::PathBuf::from("/tmp/dbsp"));
         assert_eq!(
             c.dbsp.indexes,
-            vec![("todos".to_string(), "list_id".to_string()), ("list_members".to_string(), "user_id".to_string())]
+            vec![
+                (TableRef::parse("public.todos").unwrap(), "list_id".to_string()),
+                (TableRef::parse("public.list_members").unwrap(), "user_id".to_string()),
+            ]
         );
-        assert_eq!(c.dbsp.counts, vec![("todos".to_string(), vec!["list_id".to_string(), "done".to_string()])]);
+        assert_eq!(
+            c.dbsp.counts,
+            vec![(TableRef::parse("public.todos").unwrap(), vec!["list_id".to_string(), "done".to_string()])]
+        );
         assert_eq!(c.dbsp.checkpoint_every, None, "0 means checkpoint only at shutdown");
         assert_eq!(c.dbsp.min_storage_bytes, Some(2048 * 1024));
+    }
+
+    /// The selector grammar, and the fact that a typo is FATAL rather than quietly dropped — a
+    /// skipped entry would leave that table out of replication with nothing but a log line to say so.
+    #[test]
+    fn pg_tables_selectors_parse_and_typos_are_fatal() {
+        use crate::table_ref::TableRef;
+        let c = cfg(&[("ELECTRIC_CIRCUITS_PG_TABLES", "items, other.items , reporting.*, *")]);
+        assert_eq!(
+            c.tables,
+            vec![
+                TableSelector::One(TableRef::parse("public.items").unwrap()),
+                TableSelector::One(TableRef::parse("other.items").unwrap()),
+                TableSelector::AllIn("reporting".into()),
+                TableSelector::AllIn("public".into()),
+            ]
+        );
+        assert!(cfg(&[]).tables.is_empty(), "empty setting stays empty (setup_postgres reads it as public.*)");
+
+        for bad in ["a.b.c", "items, a.b.c", "*.*", "foo.*bar", "."] {
+            let err = try_cfg(&[("ELECTRIC_CIRCUITS_PG_TABLES", bad)])
+                .expect_err(&format!("{bad:?} must abort the boot, not be skipped"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains("ELECTRIC_CIRCUITS_PG_TABLES"), "{msg}");
+            assert!(msg.contains("schema.*"), "the message must state the rule: {msg}");
+        }
     }
 
     #[test]

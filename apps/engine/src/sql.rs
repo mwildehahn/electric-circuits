@@ -11,8 +11,10 @@
 
 use std::collections::HashMap;
 
+use crate::pg::quote_ident;
 use crate::predicate::{CompiledPredicate, LeafOp, PredicateJson};
 use crate::schema::TableSchema;
+use crate::table_ref::TableRef;
 use crate::value::Value;
 
 /// Compare a text-bound param `$n` to column `name` (already quoted). When the column's native Postgres
@@ -49,10 +51,6 @@ fn op_sql(op: LeafOp) -> &'static str {
         LeafOp::Gte => ">=",
         LeafOp::Like => "LIKE",
     }
-}
-
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn build(p: &CompiledPredicate, ts: &TableSchema, params: &mut Vec<String>) -> String {
@@ -115,8 +113,8 @@ fn build(p: &CompiledPredicate, ts: &TableSchema, params: &mut Vec<String>) -> S
 pub fn predicate_json_to_sql(
     pred: &PredicateJson,
     start_param: usize,
-    schemas: &HashMap<String, TableSchema>,
-    table: &str,
+    schemas: &HashMap<TableRef, TableSchema>,
+    table: &TableRef,
 ) -> (String, Vec<String>) {
     let mut params: Vec<String> = Vec::new();
     let text = build_json(pred, start_param, &mut params, schemas, table);
@@ -129,8 +127,8 @@ fn build_json(
     p: &PredicateJson,
     start: usize,
     params: &mut Vec<String>,
-    schemas: &HashMap<String, TableSchema>,
-    table: &str,
+    schemas: &HashMap<TableRef, TableSchema>,
+    table: &TableRef,
 ) -> String {
     let pg_type = |col: &str| schemas.get(table).and_then(|ts| ts.pg_type_of(col)).map(str::to_string);
     match p {
@@ -188,7 +186,8 @@ fn build_json(
                 "{} {op} (SELECT {} FROM {}{inner})",
                 quote_ident(col),
                 quote_ident(&subquery.project),
-                quote_ident(&subquery.table),
+                // The inner table is schema-qualified like every other FROM (`"schema"."name"`).
+                subquery.table.quote_qualified(),
             )
         }
     }
@@ -208,7 +207,7 @@ mod tests {
         columns.insert("score".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
         columns.insert("active".to_string(), ColumnDef { ty: ColumnType::Bool, pg_type: None, has_default: false });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
-        TableSchema::from_def("users", &def).unwrap()
+        TableSchema::from_def(&"users".into(), &def).unwrap()
     }
 
     fn sql(json: serde_json::Value) -> (String, Vec<String>) {
@@ -250,7 +249,7 @@ mod tests {
     // No schemas -> pg_type unknown -> the `col::text` fallback form (exercised by these tests).
     fn jsql(json: serde_json::Value) -> (String, Vec<String>) {
         let pj: PredicateJson = serde_json::from_value(json).unwrap();
-        predicate_json_to_sql(&pj, 1, &HashMap::new(), "t")
+        predicate_json_to_sql(&pj, 1, &HashMap::new(), &"t".into())
     }
 
     /// A table with a real Postgres type per column (as introspection would produce).
@@ -260,7 +259,7 @@ mod tests {
             columns.insert(c.to_string(), ColumnDef { ty: *ty, pg_type: Some(pg.to_string()), has_default: false });
         }
         let def = TableDef { columns, primary_key: vec![cols[0].0.to_string()] };
-        TableSchema::from_def(name, &def).unwrap()
+        TableSchema::from_def(&TableRef::parse(name).unwrap(), &def).unwrap()
     }
 
     #[test]
@@ -275,9 +274,9 @@ mod tests {
 
         // Same via the JSON/subquery emitter, casting the INNER table's column to its native type.
         let mut schemas = HashMap::new();
-        schemas.insert("projects".to_string(), ts);
+        schemas.insert(TableRef::parse("projects").unwrap(), ts);
         schemas.insert(
-            "issues".to_string(),
+            TableRef::parse("issues").unwrap(),
             typed_schema("issues", &[("id", ColumnType::Text, "uuid"), ("project_id", ColumnType::Text, "uuid")]),
         );
         let outer: PredicateJson = serde_json::from_value(serde_json::json!({
@@ -285,8 +284,11 @@ mod tests {
             "in": { "table": "projects", "project": "id", "where": { "col": "owner_id", "op": "eq", "value": "u1" } }
         }))
         .unwrap();
-        let (w, p) = predicate_json_to_sql(&outer, 1, &schemas, "issues");
-        assert_eq!(w, r#""project_id" IN (SELECT "id" FROM "projects" WHERE "owner_id" = $1::text::"uuid")"#);
+        let (w, p) = predicate_json_to_sql(&outer, 1, &schemas, &"issues".into());
+        assert_eq!(
+            w,
+            r#""project_id" IN (SELECT "id" FROM "public"."projects" WHERE "owner_id" = $1::text::"uuid")"#
+        );
         assert_eq!(p, vec!["u1".to_string()]);
     }
 
@@ -296,7 +298,7 @@ mod tests {
             "col": "parent_id",
             "in": { "table": "parent", "project": "id", "where": { "col": "active", "op": "eq", "value": true } }
         }));
-        assert_eq!(w, r#""parent_id" IN (SELECT "id" FROM "parent" WHERE "active" = true)"#);
+        assert_eq!(w, r#""parent_id" IN (SELECT "id" FROM "public"."parent" WHERE "active" = true)"#);
         assert!(p.is_empty());
     }
 
@@ -306,7 +308,7 @@ mod tests {
             "col": "pid", "negated": true,
             "in": { "table": "p", "project": "id", "where": { "col": "name", "op": "eq", "value": "x" } }
         }));
-        assert_eq!(w, r#""pid" NOT IN (SELECT "id" FROM "p" WHERE "name"::text = $1)"#);
+        assert_eq!(w, r#""pid" NOT IN (SELECT "id" FROM "public"."p" WHERE "name"::text = $1)"#);
         assert_eq!(p, vec!["x".to_string()]);
     }
 
@@ -321,7 +323,7 @@ mod tests {
         }));
         assert_eq!(
             w,
-            r#"("tag"::text = $1 AND "l3" IN (SELECT "id" FROM "level_3" WHERE "l2" IN (SELECT "id" FROM "level_2" WHERE "name"::text = $2)))"#
+            r#"("tag"::text = $1 AND "l3" IN (SELECT "id" FROM "public"."level_3" WHERE "l2" IN (SELECT "id" FROM "public"."level_2" WHERE "name"::text = $2)))"#
         );
         assert_eq!(p, vec!["a".to_string(), "b".to_string()]);
     }

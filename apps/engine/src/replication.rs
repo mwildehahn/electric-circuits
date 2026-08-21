@@ -31,8 +31,14 @@ use serde_json::{Map, Value as Json};
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::pgoutput::{self, Cell, Message, OldTuple, Tuple};
 use crate::schema::{ColumnType, TableSchema};
+use crate::table_ref::TableRef;
 
-const SYNC_TABLE: &str = "__el_sync";
+/// The drain-barrier bookkeeping table: `public.__el_sync` specifically — a same-named table in
+/// another schema is ordinary data, never the sentinel.
+fn sync_table() -> &'static TableRef {
+    static T: std::sync::OnceLock<TableRef> = std::sync::OnceLock::new();
+    T.get_or_init(|| TableRef::public("__el_sync").expect("valid sentinel table ref"))
+}
 
 /// Long-running ingestor. Reconnects on any connection-level failure; the server resends
 /// everything after the last acknowledged commit.
@@ -41,7 +47,7 @@ pub async fn run(
     slot: String,
     publication: String,
     ds: DsClient,
-    tables: Arc<HashMap<String, TableSchema>>,
+    tables: Arc<HashMap<TableRef, TableSchema>>,
     last_lsn: Arc<std::sync::Mutex<String>>,
     sync_seq: Arc<AtomicI64>,
 ) {
@@ -123,7 +129,7 @@ fn percent_decode(s: &str) -> String {
 async fn stream_loop(
     cfg: ReplicationConfig,
     ds: &DsClient,
-    tables: &HashMap<String, TableSchema>,
+    tables: &HashMap<TableRef, TableSchema>,
     last_lsn: &Arc<std::sync::Mutex<String>>,
     sync_seq: &Arc<AtomicI64>,
 ) -> Result<()> {
@@ -211,27 +217,36 @@ enum Decoded {
     None,
 }
 
-/// Relation metadata learned from `R` messages on this connection.
+/// Relation metadata learned from `R` messages on this connection. The `R` message's namespace is
+/// KEPT (upstream decoded and discarded it), so two same-named tables in different schemas decode
+/// to distinct identities instead of colliding.
 struct RelMeta {
-    table: String,
+    /// `None` when `(namespace, name)` has no canonical `schema.name` spelling — a quoted
+    /// identifier containing a dot or a quote (ADR-0002). Such a relation is untracked (its changes
+    /// are dropped), which matches introspection: `pg::list_tables` skips it too, so no shape over
+    /// it can exist to go stale.
+    table: Option<TableRef>,
     columns: Vec<String>,
 }
 
 /// Stateful pgoutput→envelope decoder: tracks relation metadata and builds envelopes for tracked
 /// tables (and sync counters for the `__el_sync` bookkeeping table).
 struct Decoder<'a> {
-    tables: &'a HashMap<String, TableSchema>,
+    tables: &'a HashMap<TableRef, TableSchema>,
     rels: HashMap<u32, RelMeta>,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(tables: &'a HashMap<String, TableSchema>) -> Self {
+    fn new(tables: &'a HashMap<TableRef, TableSchema>) -> Self {
         Decoder { tables, rels: HashMap::new() }
     }
 
     fn on_relation(&mut self, msg: Message) {
-        if let Message::Relation { rel_id, name, columns, .. } = msg {
-            self.rels.insert(rel_id, RelMeta { table: name, columns });
+        if let Message::Relation { rel_id, namespace, name, columns } = msg {
+            let table = TableRef::new(&namespace, &name)
+                .map_err(|e| tracing::error!("replicator: unusable relation '{namespace}.{name}': {e:#}"))
+                .ok();
+            self.rels.insert(rel_id, RelMeta { table, columns });
         }
     }
 
@@ -242,13 +257,12 @@ impl<'a> Decoder<'a> {
             | Message::Delete { rel_id, .. } => *rel_id,
             Message::Truncate { rel_ids } => {
                 for id in rel_ids {
-                    if let Some(rel) = self.rels.get(id) {
+                    if let Some(Some(table)) = self.rels.get(id).map(|r| r.table.as_ref()) {
                         // Not supported: shapes/aggregates/subquery nodes would retain every
                         // truncated row. Degraded and loud.
                         tracing::error!(
-                            "replicator: TRUNCATE on {} is not supported — shapes over this table \
-                             are now stale and must be recreated",
-                            rel.table
+                            "replicator: TRUNCATE on {table} is not supported — shapes over this table \
+                             are now stale and must be recreated"
                         );
                     }
                 }
@@ -260,7 +274,8 @@ impl<'a> Decoder<'a> {
             tracing::error!("replicator: change for unknown relation id {rel_id} (no R message seen)");
             return Decoded::None;
         };
-        if rel.table == SYNC_TABLE {
+        let Some(table) = rel.table.as_ref() else { return Decoded::None };
+        if table == sync_table() {
             if let Message::Insert { new, .. } | Message::Update { new, .. } = &msg {
                 if let Some(n) = sync_counter(rel, new) {
                     return Decoded::Sync(n);
@@ -268,8 +283,8 @@ impl<'a> Decoder<'a> {
             }
             return Decoded::None;
         }
-        let Some(ts) = self.tables.get(&rel.table) else { return Decoded::None };
-        match build_envelope(&rel.table, ts, &rel.columns, msg) {
+        let Some(ts) = self.tables.get(table) else { return Decoded::None };
+        match build_envelope(table, ts, &rel.columns, msg) {
             Some(env) => Decoded::Env(env),
             None => Decoded::None,
         }
@@ -286,8 +301,9 @@ fn sync_counter(rel: &RelMeta, tuple: &Tuple) -> Option<i64> {
 }
 
 /// Build an envelope from a decoded pgoutput DML message; LSN/xid/seq are stamped at `Commit`.
-fn build_envelope(table: &str, ts: &TableSchema, columns: &[String], msg: Message) -> Option<Envelope> {
+fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: Message) -> Option<Envelope> {
     let make = |operation: &str, value: Option<Json>, old: Option<Json>, key_src: &Json| Envelope {
+        // The wire `type` is the canonical `schema.name` — always qualified, never bare.
         type_: table.to_string(),
         key: key_from_obj(key_src, ts),
         value,
@@ -420,18 +436,19 @@ mod tests {
     use crate::schema::{ColumnDef, TableDef};
     use std::collections::BTreeMap;
 
-    fn users() -> HashMap<String, TableSchema> {
+    fn users() -> HashMap<TableRef, TableSchema> {
         let mut columns = BTreeMap::new();
         columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
         columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
         columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
-        m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
+        let t = TableRef::parse("users").unwrap();
+        m.insert(t.clone(), TableSchema::from_def(&t, &def).unwrap());
         m
     }
 
-    fn decoder(tables: &HashMap<String, TableSchema>) -> Decoder<'_> {
+    fn decoder(tables: &HashMap<TableRef, TableSchema>) -> Decoder<'_> {
         let mut d = Decoder::new(tables);
         d.on_relation(Message::Relation {
             rel_id: 1,
@@ -442,7 +459,7 @@ mod tests {
         d.on_relation(Message::Relation {
             rel_id: 2,
             namespace: "public".into(),
-            name: SYNC_TABLE.into(),
+            name: sync_table().name().into(),
             columns: vec!["id".into(), "n".into()],
         });
         d
@@ -457,6 +474,97 @@ mod tests {
             Decoded::Env(e) => e,
             _ => panic!("expected an envelope"),
         }
+    }
+
+    /// A `users` schema for an arbitrary reference, so a test can track the same table NAME in two
+    /// different schemas.
+    fn users_in(refs: &[&str]) -> HashMap<TableRef, TableSchema> {
+        let mut columns = BTreeMap::new();
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
+        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
+        refs.iter()
+            .map(|r| {
+                let t = TableRef::parse(r).unwrap();
+                (t.clone(), TableSchema::from_def(&t, &def).unwrap())
+            })
+            .collect()
+    }
+
+    /// Register `public.users` as rel 1 and `other.users` as rel 2 — the SAME relname in two
+    /// namespaces, which upstream's namespace-discarding decoder collapsed into one relation.
+    fn two_schema_decoder(tables: &HashMap<TableRef, TableSchema>) -> Decoder<'_> {
+        let mut d = Decoder::new(tables);
+        for (rel_id, namespace) in [(1u32, "public"), (2, "other")] {
+            d.on_relation(Message::Relation {
+                rel_id,
+                namespace: namespace.into(),
+                name: "users".into(),
+                columns: vec!["id".into(), "tenant".into(), "name".into()],
+            });
+        }
+        d
+    }
+
+    /// Tracking `public.users` must NOT make `other.users` a tracked table: its changes are dropped,
+    /// not decoded onto the public table's shapes.
+    #[test]
+    fn a_same_named_table_in_another_schema_is_not_tracked() {
+        let tables = users_in(&["public.users"]);
+        let mut d = two_schema_decoder(&tables);
+
+        let pubs = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a")] }));
+        assert_eq!(pubs.type_, "public.users");
+
+        // rel 2 is `other.users` — untracked, so nothing is decoded for it.
+        assert!(matches!(
+            d.on_change(Message::Insert { rel_id: 2, new: vec![t("1"), t("7"), t("a")] }),
+            Decoded::None
+        ));
+    }
+
+    /// With BOTH tracked, the two relations decode to distinct identities: the envelope `type` is the
+    /// canonical `schema.name`, so the sequencer routes each to its own table's shapes.
+    #[test]
+    fn both_schemas_tracked_decode_to_distinct_envelope_types() {
+        let tables = users_in(&["public.users", "other.users"]);
+        let mut d = two_schema_decoder(&tables);
+
+        let a = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("pub")] }));
+        let b = env_of(d.on_change(Message::Insert { rel_id: 2, new: vec![t("1"), t("7"), t("oth")] }));
+        assert_eq!(a.type_, "public.users");
+        assert_eq!(b.type_, "other.users");
+        // Same pk, same relname — only the `type` tells them apart.
+        assert_eq!(a.key, b.key);
+        assert_eq!(a.value.as_ref().unwrap()["name"], "pub");
+        assert_eq!(b.value.as_ref().unwrap()["name"], "oth");
+    }
+
+    /// A relation whose name has no canonical `schema.name` spelling (a quoted identifier carrying a
+    /// dot or a quote) is recorded as `table: None` and simply not tracked — never split into a
+    /// schema + name that would address a different relation, and never a panic.
+    #[test]
+    fn unspellable_relation_names_are_untracked_not_split() {
+        let tables = users_in(&["public.users"]);
+        let mut d = Decoder::new(&tables);
+        for (rel_id, name) in [(10u32, "odd.users"), (11, "od\"d")] {
+            d.on_relation(Message::Relation {
+                rel_id,
+                namespace: "public".into(),
+                name: name.into(),
+                columns: vec!["id".into(), "tenant".into(), "name".into()],
+            });
+            assert!(d.rels[&rel_id].table.is_none(), "{name} must not resolve to a table identity");
+            assert!(matches!(
+                d.on_change(Message::Insert { rel_id, new: vec![t("1"), t("7"), t("a")] }),
+                Decoded::None
+            ));
+            // TRUNCATE on it must not panic either (it logs nothing, there is no identity to name).
+            assert!(matches!(d.on_change(Message::Truncate { rel_ids: vec![rel_id] }), Decoded::None));
+        }
+        // In particular `public`.`odd.users` did NOT become the schema `odd`, table `users`.
+        assert!(!tables.contains_key(&TableRef::parse("odd.users").unwrap()));
     }
 
     #[test]
@@ -545,6 +653,17 @@ mod tests {
         // The real sentinel update yields a sync counter, not an envelope.
         let s = d.on_change(Message::Update { rel_id: 2, old: None, new: vec![t("1"), t("5")] });
         assert!(matches!(s, Decoded::Sync(5)));
+
+        // The sentinel is `public.__el_sync` SPECIFICALLY: a same-named table in another schema is
+        // ordinary (here untracked) data, never a drain-barrier counter.
+        d.on_relation(Message::Relation {
+            rel_id: 3,
+            namespace: "other".into(),
+            name: sync_table().name().into(),
+            columns: vec!["id".into(), "n".into()],
+        });
+        let s = d.on_change(Message::Update { rel_id: 3, old: None, new: vec![t("1"), t("999")] });
+        assert!(matches!(s, Decoded::None), "other.__el_sync must not bump the drain barrier");
     }
 
     /// Changes for relations that are not tracked (and not the sentinel) are ignored.
@@ -567,7 +686,8 @@ mod tests {
         columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut tables = HashMap::new();
-        tables.insert("f".to_string(), TableSchema::from_def("f", &def).unwrap());
+        let f = TableRef::parse("f").unwrap();
+        tables.insert(f.clone(), TableSchema::from_def(&f, &def).unwrap());
         let mut d = Decoder::new(&tables);
         d.on_relation(Message::Relation {
             rel_id: 3,

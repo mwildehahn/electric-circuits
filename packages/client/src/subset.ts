@@ -6,6 +6,7 @@
 // non-materialized query-back, plus a single-range live tail.
 
 import type { AppRouter } from '@electric-circuits/api'
+import { canonicalTable } from '@electric-circuits/protocol'
 import type { Predicate, Row, Schema, StreamEnvelope, SubsetDef, SubsetResult, Value } from '@electric-circuits/protocol'
 import { stream } from '@durable-streams/client'
 import { createCollection, type Collection } from '@tanstack/db'
@@ -195,6 +196,9 @@ export async function createSubset<T extends Row = Row>(
 ): Promise<SubsetSubscription<T>> {
   const tableDef = deps.schema.tables[def.table]
   if (!tableDef) throw new Error(`client: unknown table "${def.table}"`)
+  // Feed envelopes spell the table canonically (`schema.name`, ADR-0002) whatever spelling the
+  // caller used, so the envelope filter below must compare against the canonical form.
+  const feedType = canonicalTable(def.table)
   const pk = tableDef.primaryKey
   const cmp = makeCmp(pk, def.orderBy)
   const limit = def.limit ?? 100
@@ -255,7 +259,7 @@ export async function createSubset<T extends Row = Row>(
 
     const view: SubsetView = { snapshotLsn, present, applied, inView }
     const applyEnvelope = (env: StreamEnvelope): void => {
-      if (!ctl || env.type !== def.table) return
+      if (!ctl || env.type !== feedType) return
       const action = mergeFeedDelta(view, env)
       if (!action) return
       ctl.begin()

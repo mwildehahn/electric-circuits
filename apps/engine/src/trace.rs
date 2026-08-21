@@ -27,7 +27,7 @@ pub struct TraceEvent {
     pub lsn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txid: Option<String>,
-    pub table: String,
+    pub table: crate::table_ref::TableRef,
     /// Weighted rows of this envelope's delta (capped at [`DELTA_CAP`]).
     pub delta: Vec<TraceDelta>,
     /// Pipeline nodes visited, in fan-out order, with the outcome at each.
@@ -50,7 +50,7 @@ pub struct TraceDelta {
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum GraphLifecycle {
     #[serde(rename_all = "camelCase")]
-    ShapeAdded { shape: String, table: String },
+    ShapeAdded { shape: String, table: crate::table_ref::TableRef },
     #[serde(rename_all = "camelCase")]
     ShapeDropped { shape: String },
     /// The shape went dormant (retention idle timer): engine state dropped, stream retained.
@@ -58,7 +58,7 @@ pub enum GraphLifecycle {
     ShapeDormant { shape: String },
     /// A touch reactivated a dormant shape (table-stream replay, no Postgres backfill).
     #[serde(rename_all = "camelCase")]
-    ShapeReactivated { shape: String, table: String },
+    ShapeReactivated { shape: String, table: crate::table_ref::TableRef },
 }
 
 /// Live per-node state update, broadcast on the same channel as [`TraceEvent`] after a tailer
@@ -111,7 +111,7 @@ mod tests {
         let ev = TraceEvent {
             lsn: Some("0/1A2B3C".into()),
             txid: None,
-            table: "orders".into(),
+            table: crate::table_ref::TableRef::parse("orders").unwrap(),
             delta: vec![TraceDelta { row: serde_json::json!({"id": 1}), w: -1 }],
             hops: vec![
                 TraceHop::routed("family:orders:status,workspace_id".into(), serde_json::json!(["cooking", "w1"])),
@@ -122,7 +122,7 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["lsn"], "0/1A2B3C");
         assert!(v.get("txid").is_none(), "None fields are skipped");
-        assert_eq!(v["table"], "orders");
+        assert_eq!(v["table"], "public.orders");
         assert_eq!(v["delta"][0]["w"], -1);
         assert_eq!(v["hops"][0]["outcome"], "routed");
         assert_eq!(v["hops"][0]["key"][0], "cooking");

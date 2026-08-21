@@ -56,10 +56,15 @@ use crate::ds::{Envelope, ReadResult};
 use crate::engine::Engine;
 use crate::heap_size::HeapSize;
 use crate::schema::{ColumnType, TableSchema};
+use crate::table_ref::TableRef;
 
 #[derive(Debug, Deserialize)]
 pub struct ShapeParams {
-    table: String,
+    /// The requested table. Electric clients send `public.users`; a bare `users` is the same
+    /// `public.users` (the ingress sugar). RESOLVED, not stripped: `private.users` is
+    /// `private.users`, and if that table is not served the request is a 400 — the prefix-stripping
+    /// this replaced answered it with `public.users`' rows.
+    table: TableRef,
     #[serde(default)]
     offset: Option<String>,
     #[serde(default)]
@@ -92,7 +97,7 @@ struct HandleEntry {
     /// so per-handle cursor state is never contended across clients — and each live handle holds
     /// exactly one shape subscription, released when the handle is evicted.
     shape_id: String,
-    table: String,
+    table: TableRef,
     pk_name: String,
     /// When this handle was last touched by a request — drives idle-TTL eviction.
     last_access: std::sync::Mutex<Instant>,
@@ -514,7 +519,7 @@ struct ValidateOnly;
 impl crate::predicate::SubqueryCollector for ValidateOnly {
     fn collect(
         &mut self,
-        table: &str,
+        table: &TableRef,
         project: &str,
         where_: Option<&crate::predicate::PredicateJson>,
     ) -> anyhow::Result<crate::predicate::SubquerySig> {
@@ -748,8 +753,10 @@ pub async fn shape(
     ensure_evictor(&engine);
     let start = Instant::now();
     let live = p.live.as_deref() == Some("true");
-    // root_table tag: the bare table name (strip any schema prefix), computed before shape_inner moves p.
-    let root_table = p.table.rsplit_once('.').map(|(_, b)| b.to_string()).unwrap_or_else(|| p.table.clone());
+    // `root_table` tag: the canonical `schema.name`, computed before shape_inner moves p. Qualified,
+    // like every other spelling of a table — two same-named tables in different schemas are two
+    // series, not one.
+    let root_table = p.table.to_string();
 
     let resp = if !crate::config::secret_ok(
         crate::config::secret(),
@@ -777,14 +784,9 @@ pub async fn shape(
 
 async fn shape_inner(
     engine: Engine,
-    mut p: ShapeParams,
+    p: ShapeParams,
     raw_pairs: &[(String, String)],
 ) -> Result<Response, ApiError> {
-    // Electric clients send schema-qualified table names (`public.users`); our engine keys by the bare
-    // table name. Strip any schema prefix.
-    if let Some((_schema, bare)) = p.table.rsplit_once('.') {
-        p.table = bare.to_string();
-    }
     let offset = p.offset.clone().unwrap_or_else(|| "-1".into());
     let live = p.live.as_deref() == Some("true");
     let columns = col_csv(&p.columns);

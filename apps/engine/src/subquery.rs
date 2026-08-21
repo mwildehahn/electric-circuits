@@ -29,6 +29,7 @@ use crate::predicate::{
     CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
 };
 use crate::schema::TableSchema;
+use crate::table_ref::TableRef;
 use crate::value::{Row, Value};
 
 /// Direction of a value-membership change on a node.
@@ -57,7 +58,7 @@ pub struct Flip {
 /// row and exact retraction needs the remembered old value.
 pub struct SubqueryNode {
     pub sig: SubquerySig,
-    pub inner_table: String,
+    pub inner_table: TableRef,
     /// Column index (in `inner_table`) of the projected value.
     pub proj_col: usize,
     /// Column index (in `inner_table`) of the primary key — used to key contributors.
@@ -138,7 +139,7 @@ impl HeapSize for SubqueryNode {
 impl SubqueryNode {
     pub fn new(
         sig: SubquerySig,
-        inner_table: String,
+        inner_table: TableRef,
         proj_col: usize,
         pk_col: usize,
         pred: Arc<CompiledPredicate>,
@@ -170,7 +171,7 @@ impl SubqueryNode {
 /// projection), then routed to the single affected bind by hash lookup, instead of one full
 /// predicate eval per literal-keyed node.
 pub(crate) struct TemplateGroup {
-    pub(crate) inner_table: String,
+    pub(crate) inner_table: TableRef,
     /// Column index (in `inner_table`) of the projected value (same for every bind).
     proj_col: usize,
     /// The compiled residual (lifted equalities removed, other literals baked in). May contain
@@ -245,7 +246,7 @@ impl HeapSize for Edge {
 /// changes (from outer-row deltas and from inner-set flips).
 pub struct SubqueryShape {
     pub shape_id: String,
-    pub outer_table: String,
+    pub outer_table: TableRef,
     pub stream_path: String,
     /// The outer predicate (with `InSubquery` leaves resolving against this registry's nodes).
     pub pred: Arc<CompiledPredicate>,
@@ -347,7 +348,7 @@ impl HeapSize for BufferedDelta {
 }
 
 /// A `TableSchema` lookup shared with the engine's compiled schema.
-pub type SchemaMap = Arc<HashMap<String, TableSchema>>;
+pub type SchemaMap = Arc<HashMap<TableRef, TableSchema>>;
 
 /// Cheap, sampler-safe registry cardinalities (see [`SubqueryRegistry::mem_totals`]).
 pub struct MemTotals {
@@ -365,7 +366,7 @@ pub struct MemTotals {
 #[derive(Clone, serde::Serialize)]
 pub struct NodeStat {
     pub sig: SubquerySig,
-    pub inner_table: String,
+    pub inner_table: TableRef,
     pub distinct_values: usize,
     pub refcount: usize,
     /// The template this node is a bind of — equal across nodes that differ only in lifted
@@ -418,7 +419,7 @@ impl HeapSize for DeferredNodeWork {
 /// outside the registry lock.
 pub struct PendingSubqueryShape {
     pub shape_id: String,
-    pub outer_table: String,
+    pub outer_table: TableRef,
     pub stream_path: String,
     pub pred: Arc<CompiledPredicate>,
     pub out_cols: Option<Arc<Vec<usize>>>,
@@ -453,7 +454,7 @@ impl HeapSize for PendingSubqueryShape {
 /// What phase B (Postgres I/O, run WITHOUT the registry lock) needs from `begin_create`.
 pub struct BeginCreate {
     /// Fresh nodes this create must seed: `(sig, inner_table, inner where-JSON)`.
-    pub seeds: Vec<(SubquerySig, String, Option<PredicateJson>)>,
+    pub seeds: Vec<(SubquerySig, TableRef, Option<PredicateJson>)>,
     /// Schema map snapshot for SQL emission.
     pub schemas: SchemaMap,
 }
@@ -711,15 +712,15 @@ impl SubqueryRegistry {
 
     /// Does any node's inner table or any shape's outer table equal `table`? (Fast skip for tailers of
     /// tables not involved in any subquery.)
-    pub fn touches(&self, table: &str) -> bool {
+    pub fn touches(&self, table: &TableRef) -> bool {
         // Called once per replicated envelope, so the shape half is answered by the conjunct
         // index's table buckets in O(1) rather than a scan over every registered shape — the same
         // reason step 2 of `on_table_delta` is indexed. Nodes are shared (one per distinct inner
         // query, orders of magnitude fewer than shapes) and `pending_shapes` holds only in-flight
         // creates, so those two stay linear.
-        self.shape_index.has_table(table)
-            || self.nodes.values().any(|n| n.inner_table == table)
-            || self.pending_shapes.iter().any(|p| p.outer_table == table)
+        self.shape_index.has_table(table.as_str())
+            || self.nodes.values().any(|n| &n.inner_table == table)
+            || self.pending_shapes.iter().any(|p| &p.outer_table == table)
     }
 
     /// Number of maintained nodes (shared inner sets).
@@ -906,7 +907,7 @@ impl SubqueryRegistry {
     pub fn begin_create(
         &mut self,
         shape_id: &str,
-        outer_table: &str,
+        outer_table: &TableRef,
         stream_path: &str,
         where_json: &PredicateJson,
         out_cols: Option<Arc<Vec<usize>>>,
@@ -963,7 +964,7 @@ impl SubqueryRegistry {
         // Pending shape: outer-table deltas buffer from HERE (before the phase-B snapshot).
         self.pending_shapes.push(PendingSubqueryShape {
             shape_id: shape_id.to_string(),
-            outer_table: outer_table.to_string(),
+            outer_table: outer_table.clone(),
             stream_path: stream_path.to_string(),
             pred,
             out_cols,
@@ -1205,7 +1206,7 @@ impl SubqueryRegistry {
     /// [`drop_subquery_shape`](Self::drop_subquery_shape).
     fn install_shape(&mut self, shape: SubqueryShape) {
         self.feed_by_id.insert(shape.feed_id, shape.shape_id.clone());
-        self.shape_index.insert(&shape.shape_id, &shape.outer_table, &shape.pred);
+        self.shape_index.insert(&shape.shape_id, shape.outer_table.as_str(), &shape.pred);
         self.shapes.insert(shape.shape_id.clone(), shape);
     }
 
@@ -1216,8 +1217,8 @@ impl SubqueryRegistry {
     /// `delta` must be the RAW Z-set delta (old `-1` images included), not the per-pk latest fold:
     /// the candidate set is the union over old ∪ new images, which is what keeps a move-out's
     /// absolute delete alive. See [`crate::subq_index`].
-    pub(crate) fn outer_candidates(&self, table: &str, delta: &[Tup2<Row, ZWeight>]) -> Vec<String> {
-        self.shape_index.candidates(table, delta)
+    pub(crate) fn outer_candidates(&self, table: &TableRef, delta: &[Tup2<Row, ZWeight>]) -> Vec<String> {
+        self.shape_index.candidates(table.as_str(), delta)
     }
 
     /// Abort a create in whichever phase it died in. Before the atomic tail of `finish_create` that
@@ -1402,7 +1403,7 @@ impl SubqueryRegistry {
         txid: Option<String>,
         mut trace: Option<&mut Vec<crate::trace::TraceHop>>,
     ) -> Result<VecDeque<(SubquerySig, Flip)>> {
-        let table = ts.name.clone();
+        let table = ts.table.clone();
         // Work queue of (node sig, flip) pairs to propagate (BFS up the dependency DAG).
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         // Trace helper: record a hop once per node id (a shape reached via several flips is one hop).
@@ -1782,7 +1783,7 @@ impl SubqueryRegistry {
 
     /// Deferred-propagation helper: snapshot what a query-back needs (brief lock scope at the
     /// call site — see the free functions below).
-    fn snapshot_for_table(&self, table: &str) -> Result<TableSchema> {
+    fn snapshot_for_table(&self, table: &TableRef) -> Result<TableSchema> {
         self.schemas.get(table).cloned().with_context(|| format!("unknown table '{table}'"))
     }
 
@@ -2209,7 +2210,7 @@ async fn propagate_one(
                     move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
                 // Light the whole path only when the shape actually moved rows: source
                 // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
-                if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
+                if let (Some((outer, net)), Some(src)) = (moved, source_table.as_ref()) {
                     emit_flip_trace(
                         trace_tx,
                         &outer,
@@ -2233,7 +2234,7 @@ async fn propagate_one(
                     // A nested `IN`: connect the flipped child `node:<sig>` to the parent
                     // `node:<parent_sig>` it re-derived, so the propagation reads through. The
                     // parent's own downstream shape lights when its flips reach a shape edge.
-                    if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
+                    if let (false, Some(src)) = (flips.is_empty(), source_table.as_ref()) {
                         emit_flip_trace(
                             trace_tx,
                             src,
@@ -2267,7 +2268,7 @@ async fn move_shape_for_value(
     connecting_col: usize,
     value: &Value,
     txid: Option<String>,
-) -> Result<Option<(String, i64)>> {
+) -> Result<Option<(TableRef, i64)>> {
     // Brief lock: snapshot what the query-back needs.
     let (ts, pg_url) = {
         let mut reg = registry.lock().await;
@@ -2316,7 +2317,7 @@ async fn move_shape_for_value(
         .await;
     reg.end_queryback(shape_id);
     Ok(match emitted?.first() {
-        Some((_, true, net)) => Some((ts.name.clone(), *net)),
+        Some((_, true, net)) => Some((ts.table.clone(), *net)),
         _ => None,
     })
 }
@@ -2330,7 +2331,7 @@ async fn requery_and_reconcile_parent(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     parent_sig: &SubquerySig,
     filter: Option<(usize, &Value)>,
-) -> Result<Option<(String, Vec<Flip>)>> {
+) -> Result<Option<(TableRef, Vec<Flip>)>> {
     let (ts, pg_url) = {
         let mut reg = registry.lock().await;
         // Same as `move_shape_for_value`'s pending-shape check, one tier down: a parent node whose
@@ -2376,7 +2377,7 @@ async fn requery_and_reconcile_parent(
     };
     let flips = reg.apply_node_evals(parent_sig, evals).await;
     reg.end_node_queryback(parent_sig);
-    Ok(Some((ts.name.clone(), flips)))
+    Ok(Some((ts.table.clone(), flips)))
 }
 
 /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
@@ -2481,8 +2482,8 @@ fn flip_net(flips: &[Flip]) -> i64 {
 /// (they differ: a `project_members` change moves an `issues` shape).
 fn emit_flip_trace(
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
-    event_table: &str,
-    source_table: &str,
+    event_table: &TableRef,
+    source_table: &TableRef,
     node_sig: &SubquerySig,
     dependent: String,
     shapes: Vec<String>,
@@ -2496,7 +2497,7 @@ fn emit_flip_trace(
     let ev = crate::trace::TraceEvent {
         lsn,
         txid,
-        table: event_table.to_string(),
+        table: event_table.clone(),
         // One synthetic weighted row carrying the net change: a single flip can move many outer
         // rows, so the payload is not one table row — left empty, weighted by the net.
         delta: vec![crate::trace::TraceDelta { row: serde_json::json!({}), w: net }],
@@ -2515,7 +2516,7 @@ fn emit_flip_trace(
 impl SubqueryCollector for SubqueryRegistry {
     /// Discover (or dedupe) a subquery node: compile its inner predicate (recursively collecting deeper
     /// nodes), record its child edges, and queue it for seeding. Returns the canonical signature.
-    fn collect(&mut self, table: &str, project: &str, where_: Option<&PredicateJson>) -> Result<SubquerySig> {
+    fn collect(&mut self, table: &TableRef, project: &str, where_: Option<&PredicateJson>) -> Result<SubquerySig> {
         let sig = subquery_sig(table, project, where_);
         if let Some(n) = self.nodes.get_mut(&sig) {
             n.refcount += 1;
@@ -2558,7 +2559,7 @@ impl SubqueryCollector for SubqueryRegistry {
             // again would double-count.
             struct SigOnly;
             impl SubqueryCollector for SigOnly {
-                fn collect(&mut self, t: &str, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
+                fn collect(&mut self, t: &TableRef, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
                     Ok(subquery_sig(t, p, w))
                 }
             }
@@ -2574,7 +2575,7 @@ impl SubqueryCollector for SubqueryRegistry {
             self.templates.insert(
                 tkey.clone(),
                 TemplateGroup {
-                    inner_table: table.to_string(),
+                    inner_table: table.clone(),
                     proj_col,
                     residual: Arc::new(residual),
                     param_cols: param_cols.clone(),
@@ -2587,7 +2588,7 @@ impl SubqueryCollector for SubqueryRegistry {
             tpl.binds.insert(bind.clone(), sig.clone());
         }
         let mut node = SubqueryNode::new(
-            sig.clone(), table.to_string(), proj_col, inner_ts.pk_index, Arc::new(inner_pred), node_id,
+            sig.clone(), table.clone(), proj_col, inner_ts.pk_index, Arc::new(inner_pred), node_id,
         );
         node.where_json = where_.cloned();
         node.template_key = tkey;
@@ -2656,9 +2657,9 @@ pub fn predicate_has_subquery(p: &PredicateJson) -> bool {
 }
 
 /// Every table referenced by a JSON predicate's subqueries (inner tables, recursively).
-pub fn referenced_tables(p: &PredicateJson) -> Vec<String> {
+pub fn referenced_tables(p: &PredicateJson) -> Vec<TableRef> {
     let mut out = Vec::new();
-    fn go(p: &PredicateJson, out: &mut Vec<String>) {
+    fn go(p: &PredicateJson, out: &mut Vec<TableRef>) {
         match p {
             PredicateJson::In { subquery, .. } => {
                 if !out.contains(&subquery.table) {
@@ -2725,7 +2726,7 @@ mod tests {
                 "columns": { "id": {"type":"int"} }, "primaryKey": "id"
             }))
             .unwrap();
-            crate::schema::TableSchema::from_def("t", &def).unwrap()
+            crate::schema::TableSchema::from_def(&"t".into(), &def).unwrap()
         };
         let mut reg = SubqueryRegistry::new(crate::ds::DsClient::new("http://127.0.0.1:1"), None);
         insert_test_node(&mut reg, "sig1");
@@ -2759,8 +2760,8 @@ mod tests {
         let sig = "project_members|project_id|L(user_id,Eq,1)".to_string();
         emit_flip_trace(
             &trace_tx,
-            "issues",
-            "project_members",
+            &"issues".into(),
+            &"project_members".into(),
             &sig,
             "shape:s1".into(),
             vec!["s1".into()],
@@ -2771,7 +2772,7 @@ mod tests {
 
         let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
         // The event is about the dependent shape's table; the path still heads at the source.
-        assert_eq!(ev["table"], "issues");
+        assert_eq!(ev["table"], "public.issues");
         // Carries the originating write's lsn/txid, so the activity log can group this deferred
         // flip event together with the direct-change event that triggered it (same commit).
         assert_eq!(ev["lsn"], "0/1A2B3C");
@@ -2779,7 +2780,7 @@ mod tests {
         let outcome = |node: &str| {
             ev["hops"].as_array().unwrap().iter().find(|h| h["node"] == node).map(|h| h["outcome"].clone())
         };
-        assert_eq!(outcome("table:project_members"), Some(serde_json::json!("passed")), "source lit");
+        assert_eq!(outcome("table:public.project_members"), Some(serde_json::json!("passed")), "source lit");
         assert_eq!(outcome(&format!("node:{sig}")), Some(serde_json::json!("passed")), "subquery node lit");
         assert_eq!(outcome("shape:s1"), Some(serde_json::json!("passed")), "dependent shape lit");
         assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s1")]);
@@ -2810,7 +2811,7 @@ mod tests {
             negated: false,
             null_sensitive: false,
         });
-        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), ts)].into_iter().collect()));
         let registry = tokio::sync::Mutex::new(reg);
         let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
 
@@ -2844,7 +2845,7 @@ mod tests {
             negated: false,
             null_sensitive: false,
         });
-        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), ts)].into_iter().collect()));
         let registry = tokio::sync::Mutex::new(reg);
         let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
 
@@ -2858,17 +2859,18 @@ mod tests {
 
     /// `outer_t(gid, id)` + `inner_t(gid, id)`: enough for `begin_create` to compile
     /// `gid IN (SELECT gid FROM inner_t)` and register a pending shape.
-    fn creating_schemas() -> HashMap<String, TableSchema> {
+    fn creating_schemas() -> HashMap<TableRef, TableSchema> {
         use crate::schema::TableDef;
         let mk = |name: &str| {
             let def: TableDef = serde_json::from_value(serde_json::json!({
                 "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
             }))
             .unwrap();
-            TableSchema::from_def(name, &def).unwrap()
+            TableSchema::from_def(&TableRef::parse(name).unwrap(), &def).unwrap()
         };
-        [("outer_t".to_string(), mk("outer_t")), ("inner_t".to_string(), mk("inner_t"))]
+        [("outer_t", mk("outer_t")), ("inner_t", mk("inner_t"))]
             .into_iter()
+            .map(|(t, ts)| (TableRef::parse(t).unwrap(), ts))
             .collect()
     }
 
@@ -2883,7 +2885,7 @@ mod tests {
     fn registry_mid_create() -> (SubqueryRegistry, BeginCreate) {
         let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
         reg.set_schemas(Arc::new(creating_schemas()));
-        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &in_inner_t(), None, false).unwrap();
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, false).unwrap();
         (reg, begin)
     }
 
@@ -2950,16 +2952,16 @@ mod tests {
     /// `outer_t(gid, id)` + `mid_t(gid, id)` + `deep_t(gid, id)`: enough to compile the NESTED
     /// `gid IN (SELECT gid FROM mid_t WHERE gid IN (SELECT gid FROM deep_t))`, which registers two
     /// fresh nodes — a deepest one and a PARENT node depending on it.
-    fn nested_schemas() -> HashMap<String, TableSchema> {
+    fn nested_schemas() -> HashMap<TableRef, TableSchema> {
         use crate::schema::TableDef;
         let mk = |name: &str| {
             let def: TableDef = serde_json::from_value(serde_json::json!({
                 "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
             }))
             .unwrap();
-            TableSchema::from_def(name, &def).unwrap()
+            TableSchema::from_def(&TableRef::parse(name).unwrap(), &def).unwrap()
         };
-        ["outer_t", "mid_t", "deep_t"].into_iter().map(|t| (t.to_string(), mk(t))).collect()
+        ["outer_t", "mid_t", "deep_t"].into_iter().map(|t| (TableRef::parse(t).unwrap(), mk(t))).collect()
     }
 
     /// A registry parked in a NESTED create's phase B: both fresh nodes seeding (deepest first),
@@ -2977,7 +2979,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
         assert_eq!(begin.seeds.len(), 2, "two fresh nodes, deepest first");
         let (deep, mid) = (begin.seeds[0].0.clone(), begin.seeds[1].0.clone());
         (reg, deep, mid)
@@ -3084,7 +3086,7 @@ mod tests {
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         insert_membership_shape(&mut reg, "s1", &sig, 1);
-        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), ts)].into_iter().collect()));
         let registry = tokio::sync::Mutex::new(reg);
 
         let mut work: VecDeque<DeferredShapeWork> = [
@@ -3205,11 +3207,11 @@ mod tests {
                 "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
             }))
             .unwrap();
-            crate::schema::TableSchema::from_def("outer_t", &def).unwrap()
+            crate::schema::TableSchema::from_def(&"outer_t".into(), &def).unwrap()
         };
         struct Rec;
         impl crate::predicate::SubqueryCollector for Rec {
-            fn collect(&mut self, t: &str, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
+            fn collect(&mut self, t: &TableRef, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
                 Ok(crate::predicate::subquery_sig(t, p, w))
             }
         }
@@ -3250,11 +3252,11 @@ mod tests {
                 "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
             }))
             .unwrap();
-            crate::schema::TableSchema::from_def(name, &def).unwrap()
+            crate::schema::TableSchema::from_def(&TableRef::parse(name).unwrap(), &def).unwrap()
         };
         let mut schemas = HashMap::new();
-        schemas.insert("outer_t".to_string(), mk("outer_t"));
-        schemas.insert("inner_t".to_string(), mk("inner_t"));
+        schemas.insert(TableRef::parse("outer_t").unwrap(), mk("outer_t"));
+        schemas.insert(TableRef::parse("inner_t").unwrap(), mk("inner_t"));
         // No pg_url: node seeding must fail after collect() has already registered the node.
         let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
         reg.set_schemas(Arc::new(schemas));
@@ -3264,11 +3266,11 @@ mod tests {
         .unwrap();
         // Three-phase: begin registers (nodes buffering, edges, pending shape); a phase-B
         // failure is rolled back exactly by abort_create.
-        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
         assert_eq!(begin.seeds.len(), 1, "one fresh node to seed");
         assert_eq!(reg.nodes.len(), 1);
         assert!(reg.nodes.values().all(|n| n.seed_buffer.is_some()), "fresh node buffers");
-        assert!(reg.touches("outer_t"), "pending shape routes its outer table");
+        assert!(reg.touches(&"outer_t".into()), "pending shape routes its outer table");
         reg.abort_create("s1").await;
         assert_eq!(reg.nodes.len(), 0, "aborted create left an orphaned node");
         assert_eq!(reg.edges_count(), 0, "aborted create left orphaned edges");
@@ -3292,7 +3294,7 @@ mod tests {
             "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
         }))
         .unwrap();
-        let ts = crate::schema::TableSchema::from_def("t", &def).unwrap();
+        let ts = crate::schema::TableSchema::from_def(&"t".into(), &def).unwrap();
         let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
         // A shape whose predicate never matches (Not(MatchAll)): every candidate verdict is
         // "not a member".
@@ -3349,7 +3351,7 @@ mod tests {
             "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
         }))
         .unwrap();
-        let ts = crate::schema::TableSchema::from_def("t", &def).unwrap();
+        let ts = crate::schema::TableSchema::from_def(&"t".into(), &def).unwrap();
         // A real (fake) DS server: the final phase genuinely emits an upsert, which would retry
         // forever against an unreachable URL.
         let (ds_url, _store) = spawn_fake_ds().await;
@@ -3462,7 +3464,7 @@ mod tests {
             "primaryKey": "id"
         }))
         .unwrap();
-        TableSchema::from_def("issues", &def).unwrap()
+        TableSchema::from_def(&"issues".into(), &def).unwrap()
     }
 
     fn issue(id: i64, project_id: i64) -> Row {
@@ -3552,7 +3554,7 @@ mod tests {
         // through the old image.
         let delta = vec![Tup2(issue(1, 100), -1), Tup2(issue(1, 200), 1)];
         assert!(
-            reg.outer_candidates("issues", &delta).contains(&"s100".to_string()),
+            reg.outer_candidates(&"issues".into(), &delta).contains(&"s100".to_string()),
             "the shape the row LEFT must be a candidate — via the delta's old image"
         );
         reg.on_table_delta(&ts, &delta, 2, None, None, None).await.unwrap();
@@ -3585,7 +3587,7 @@ mod tests {
         insert_outer_shape(&mut reg, "other", "comments", keyed_membership_pred(7, &sig));
         assert_eq!(reg.shapes.len(), N as usize + 1);
 
-        let cands = reg.outer_candidates("issues", &[Tup2(issue(1, 7), 1)]);
+        let cands = reg.outer_candidates(&"issues".into(), &[Tup2(issue(1, 7), 1)]);
         assert_eq!(cands, vec!["s7".to_string()], "1 of {N} shapes visited, not {N}");
 
         // Un-indexable predicates must stay unconditional candidates.
@@ -3601,7 +3603,7 @@ mod tests {
             "issues",
             CompiledPredicate::Not(Box::new(keyed_membership_pred(7, &sig))),
         );
-        let mut cands = reg.outer_candidates("issues", &[Tup2(issue(1, 4242), 1)]);
+        let mut cands = reg.outer_candidates(&"issues".into(), &[Tup2(issue(1, 4242), 1)]);
         cands.sort();
         assert_eq!(
             cands,
@@ -3612,7 +3614,7 @@ mod tests {
         // Dropping a shape un-files it: no stale candidate, and the freed id is safe to re-mint.
         reg.drop_subquery_shape("s7").await;
         assert!(
-            reg.outer_candidates("issues", &[Tup2(issue(1, 7), 1)]).iter().all(|s| s != "s7"),
+            reg.outer_candidates(&"issues".into(), &[Tup2(issue(1, 7), 1)]).iter().all(|s| s != "s7"),
             "a dropped shape must leave no index entry behind"
         );
     }
@@ -3894,7 +3896,7 @@ mod tests {
             "primaryKey": "id"
         }))
         .unwrap();
-        TableSchema::from_def("t", &def).unwrap()
+        TableSchema::from_def(&"t".into(), &def).unwrap()
     }
 
     fn inner_row(gid: i64, id: i64) -> Row {

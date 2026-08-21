@@ -106,8 +106,9 @@ DS_URL=http://127.0.0.1:8791 ENGINE_URL=http://127.0.0.1:7010 API_PORT=8790 \
   node docker/api-server.ts
 ```
 
-`ELECTRIC_CIRCUITS_PG_TABLES="*"` (or empty) means *introspect every public table that has a primary
-key*. On boot, per table, the engine: introspects columns/types/pk, sets
+`ELECTRIC_CIRCUITS_PG_TABLES="*"` (or empty) means *introspect every `public` table that has a
+primary key* — never every schema. List entries individually as `schema.name` or a bare `name`
+(= `public.<name>`), or opt a whole schema in with `schema.*`. On boot, per table, the engine: introspects columns/types/pk, sets
 `REPLICA IDENTITY FULL`, ensures the `changes` durable stream, creates the logical
 replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_CIRCUITS_PG_SLOT`,
 default `electric_circuits`),
@@ -291,7 +292,7 @@ curl -s -X POST http://localhost:8790/shapes.create \
 ```json
 {"result":{"data":{
   "shapeId": "<id>",
-  "table": "issues",
+  "table": "public.issues",
   "streamPath": "shape/<id>",
   "streamUrl": "http://localhost:8791/shape/<id>"
 }}}
@@ -345,9 +346,9 @@ membership, just two operations:
 
 ```json
 [
-  {"type":"issues","key":"1000","value":{"id":1000,"title":"fix the tailer","status":"todo","priority":4},
+  {"type":"public.issues","key":"1000","value":{"id":1000,"title":"fix the tailer","status":"todo","priority":4},
    "headers":{"operation":"upsert"}},
-  {"type":"issues","key":"1000","headers":{"operation":"delete","lsn":"0/1A2B3C4"}}
+  {"type":"public.issues","key":"1000","headers":{"operation":"delete","lsn":"0/1A2B3C4"}}
 ]
 ```
 
@@ -398,7 +399,7 @@ same way (`GET http://localhost:8791/shape/$SHAPE_ID?offset=-1…`); the running
 envelope keyed `"agg"`, re-emitted on every change that moves it:
 
 ```json
-{"type":"issues","key":"agg","value":{"value":4,"n":3},"headers":{"operation":"upsert"}}
+{"type":"public.issues","key":"agg","value":{"value":4,"n":3},"headers":{"operation":"upsert"}}
 ```
 
 `value` is the aggregate (`null` when `sum`/`avg`/`min`/`max` has no non-null input rows);

@@ -17,6 +17,7 @@ use crate::heap_size::HeapSize;
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::schema::{Schema, TableSchema, compile_schema};
+use crate::table_ref::{TableRef, TableSelector};
 use crate::retention::{EvictReason, LifeState, RetentionConfig, ShapeLife, SweepShape};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::value::{Row, Value};
@@ -159,7 +160,7 @@ pub struct Engine {
     arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
     /// after a checkpoint restore, where the highwater does the fencing instead).
-    arr_gates: Arc<std::sync::RwLock<HashMap<String, crate::pg::SnapshotGate>>>,
+    arr_gates: Arc<std::sync::RwLock<HashMap<TableRef, crate::pg::SnapshotGate>>>,
 }
 
 /// A unit of deferred subquery propagation for the flip propagator (see [`Engine::flip_tx`]).
@@ -283,7 +284,7 @@ fn spawn_flip_propagator(
 }
 
 struct EngineState {
-    tables: HashMap<String, TableSchema>,
+    tables: HashMap<TableRef, TableSchema>,
     sequencer: Option<SequencerHandle>,
     shapes: HashMap<String, ShapeRecord>,
     next_shape_id: u64,
@@ -382,7 +383,7 @@ fn canon_cols(out_cols: &Option<Arc<Vec<usize>>>) -> String {
 /// is part of the key: a backfilled shape and a no-backfill feed over the same rows are NOT the same
 /// stream.
 fn shape_signature(
-    table: &str,
+    table: &TableRef,
     where_: &Option<PredicateJson>,
     out_cols: &Option<Arc<Vec<usize>>>,
     changes_only: bool,
@@ -392,7 +393,7 @@ fn shape_signature(
 
 /// The sharing key for an **aggregation shape**: table + predicate + function + column. Namespaced so it
 /// never collides with a row shape's key.
-fn agg_signature(table: &str, where_: &Option<PredicateJson>, func: &AggFn, col_idx: Option<usize>) -> String {
+fn agg_signature(table: &TableRef, where_: &Option<PredicateJson>, func: &AggFn, col_idx: Option<usize>) -> String {
     format!("agg\u{1f}{table}\u{1f}{}\u{1f}{:?}\u{1f}{:?}", canon_where(where_), func, col_idx)
 }
 
@@ -406,7 +407,8 @@ fn trace_lifecycle(tx: &tokio::sync::broadcast::Sender<Arc<String>>, ev: crate::
     }
 }
 
-/// The graph/trace node id of a family router: `family:<table>:<col,col>` (column NAMES, matching
+/// The graph/trace node id of a family router: `family:<table>:<col,col>` (canonical `schema.name`
+/// table + column NAMES, matching
 /// the hop ids `process_envelope` emits and the ids the visualizer renders).
 fn family_node_id(ts: &TableSchema, key_cols: &[usize]) -> String {
     let cols = key_cols
@@ -414,7 +416,7 @@ fn family_node_id(ts: &TableSchema, key_cols: &[usize]) -> String {
         .map(|i| ts.columns.get(*i).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("col{i}")))
         .collect::<Vec<_>>()
         .join(",");
-    format!("family:{}:{cols}", ts.name)
+    format!("family:{}:{cols}", ts.table)
 }
 
 /// Shape id (`s<N>`) from its stream path (`shape/s<N>`) — the key `emitted` counters are kept by.
@@ -503,7 +505,7 @@ impl Engine {
     /// Start the dbsp counts layer and seed it, when configured. Seeds each counts pipeline
     /// from one group-aggregated Postgres snapshot per table (capturing the gate that fences the live
     /// feed); restored state skips seeding — the sequencer replays the change-log gap instead.
-    async fn maybe_start_arrangements(&self, schemas: &HashMap<String, TableSchema>) -> Result<()> {
+    async fn maybe_start_arrangements(&self, schemas: &HashMap<TableRef, TableSchema>) -> Result<()> {
         let Some(cfg) = self.dbsp_cfg.lock().unwrap().clone() else { return Ok(()) };
         if !cfg.indexes.is_empty() {
             tracing::warn!(
@@ -699,23 +701,45 @@ impl Engine {
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
     /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
     /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
-    pub async fn setup_postgres(&self, tables: &[String], slot: &str) -> Result<()> {
+    pub async fn setup_postgres(&self, selectors: &[TableSelector], slot: &str) -> Result<()> {
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         let client = crate::pg::connect(&url).await?;
         // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
         // ingest spawn still ahead). `/v1/health` reports 202 until the ingest loop is running.
         self.health.store(HEALTH_STARTING, std::sync::atomic::Ordering::Relaxed);
-        // `*` (or empty) => introspect every public table with a PK (set isn't known up front).
-        let discovered;
-        let tables: &[String] = if tables.is_empty() || tables == ["*".to_string()] {
-            discovered = crate::pg::list_tables(&client).await?;
-            tracing::info!("introspect-all: {} tables", discovered.len());
-            &discovered
-        } else {
-            tables
-        };
+        // An empty setting means `*`, i.e. `public.*`: every table with a PK in `public` — NOT every
+        // schema (introspect-all sets REPLICA IDENTITY FULL, which is not ours to do to managed
+        // system schemas). `schema.*` opts another schema in explicitly.
+        let default_all = [TableSelector::AllIn(crate::table_ref::PUBLIC_SCHEMA.to_string())];
+        // Was the wildcard ASKED for, or is it the default? An explicit `schema.*` that finds
+        // nothing is a misconfiguration (wrong schema name, or the migrations never ran) and aborts
+        // the boot; the default `public.*` finding nothing is just an empty database, which is a
+        // legitimate cold start.
+        let explicit = !selectors.is_empty();
+        let selectors: &[TableSelector] = if explicit { selectors } else { &default_all };
+        // Resolve the selectors to a de-duplicated, ordered table set (a table named twice — say
+        // `other.*` plus `other.items` — is introspected once).
+        let mut tables: Vec<TableRef> = Vec::new();
+        for sel in selectors {
+            match sel {
+                TableSelector::AllIn(schema) => {
+                    let discovered = crate::pg::list_tables(&client, schema).await?;
+                    if explicit && discovered.is_empty() {
+                        bail!(
+                            "ELECTRIC_CIRCUITS_PG_TABLES selects '{schema}.*', but schema '{schema}' \
+                             has no base tables with a primary key"
+                        );
+                    }
+                    tracing::info!("introspect-all '{schema}.*': {} table(s)", discovered.len());
+                    tables.extend(discovered);
+                }
+                TableSelector::One(t) => tables.push(t.clone()),
+            }
+        }
+        tables.sort();
+        tables.dedup();
         let mut compiled = HashMap::new();
-        for t in tables {
+        for t in &tables {
             let def = crate::pg::introspect(&client, t).await?;
             let ts = TableSchema::from_def(t, &def)?;
             crate::pg::ensure_replica_identity_full(&client, t).await?;
@@ -739,6 +763,11 @@ impl Engine {
             tracing::error!("dbsp arrangements failed to start (falling back to Postgres): {e:#}");
         }
         if let Err(e) = self.restore_catalog(&compiled).await {
+            // A catalog written before ADR-0002 is not a restore failure to shrug off — booting past
+            // it would maintain two shapes for one table (see `CatalogPredatesQualification`).
+            if e.downcast_ref::<catalog::CatalogPredatesQualification>().is_some() {
+                return Err(e);
+            }
             tracing::error!("catalog restore failed (continuing empty): {e:#}");
         }
         {
@@ -799,7 +828,7 @@ impl Engine {
     /// the live tail separately (a base-predicate feed) to keep the page live.
     pub async fn query_subset(
         &self,
-        table: &str,
+        table: &TableRef,
         where_: Option<PredicateJson>,
         columns: Option<Vec<String>>,
         order_by: Option<(String, bool)>,
@@ -840,7 +869,7 @@ impl Engine {
 
     /// The column list + primary key of a replicated table, for the visualizer's add-row form. Reads the
     /// in-memory `TableSchema` (introspected at startup) — no Postgres round-trip.
-    pub async fn table_schema_info(&self, table: &str) -> Result<TableSchemaInfo> {
+    pub async fn table_schema_info(&self, table: &TableRef) -> Result<TableSchemaInfo> {
         let ts = {
             let st = self.state.lock().await;
             st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?
@@ -859,7 +888,7 @@ impl Engine {
             })
             .collect();
         let primary_key = ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect();
-        Ok(TableSchemaInfo { table: ts.name.clone(), columns, primary_key })
+        Ok(TableSchemaInfo { table: ts.table.clone(), columns, primary_key })
     }
 
     /// Insert one row into a replicated table's Postgres relation, so the change is captured by logical
@@ -869,7 +898,7 @@ impl Engine {
     /// each column's native type — no string-concatenated SQL.
     pub async fn insert_row(
         &self,
-        table: &str,
+        table: &TableRef,
         values: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let ts = {
@@ -912,7 +941,7 @@ impl Engine {
         }
         let sql = format!(
             "insert into {} ({}) values ({})",
-            crate::pg::quote_ident(table),
+            table.quote_qualified(),
             cols.join(", "),
             placeholders.join(", "),
         );
@@ -932,7 +961,7 @@ impl Engine {
     /// multi-row delete is a single transaction — one replication batch, one pipeline delta.
     pub async fn delete_rows(
         &self,
-        table: &str,
+        table: &TableRef,
         keys: &[serde_json::Map<String, serde_json::Value>],
     ) -> Result<serde_json::Value> {
         const MAX_KEYS: usize = 1000;
@@ -982,8 +1011,7 @@ impl Engine {
             }
             clauses.push(format!("({})", conj.join(" and ")));
         }
-        let sql =
-            format!("delete from {} where {}", crate::pg::quote_ident(table), clauses.join(" or "));
+        let sql = format!("delete from {} where {}", table.quote_qualified(), clauses.join(" or "));
         let url = self.pg_url.clone().context("delete_rows requires postgres mode")?;
         let client = crate::pg::pool_for(&url).get().await?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -1004,7 +1032,7 @@ impl Engine {
 
     /// The schema for `table`, if known (used by the Electric-protocol adapter for the schema header and
     /// value encoding).
-    pub async fn table_schema(&self, table: &str) -> Option<TableSchema> {
+    pub async fn table_schema(&self, table: &TableRef) -> Option<TableSchema> {
         self.state.lock().await.tables.get(table).cloned()
     }
 
@@ -1177,14 +1205,14 @@ impl Engine {
 
     /// The change-log offset up to which the sequencer has processed (global — all tables share
     /// the single ordered log), or `None` if the sequencer is not running yet.
-    pub async fn table_offset(&self, _table: &str) -> Option<String> {
+    pub async fn table_offset(&self, _table: &TableRef) -> Option<String> {
         let st = self.state.lock().await;
         st.sequencer.as_ref().map(|s| s.processed.lock().unwrap().clone())
     }
 
     /// The table's current circuit topology (shared families + standalone count), or `None` if no
     /// tailer exists.
-    pub async fn table_stats(&self, table: &str) -> Option<TableStats> {
+    pub async fn table_stats(&self, table: &TableRef) -> Option<TableStats> {
         let st = self.state.lock().await;
         st.sequencer.as_ref().and_then(|s| s.stats.lock().unwrap().get(table).cloned())
     }

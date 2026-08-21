@@ -12,7 +12,7 @@ impl Engine {
     /// request needs its own handle.
     pub async fn create_shape(
         &self,
-        table: &str,
+        table: &TableRef,
         where_: Option<PredicateJson>,
         columns: Option<Vec<String>>,
         changes_only: bool,
@@ -94,7 +94,7 @@ impl Engine {
         if where_.as_ref().is_some_and(predicate_has_subquery) {
             let where_json = where_.expect("subquery predicate present");
             let mut tables = referenced_tables(&where_json);
-            tables.push(table.to_string());
+            tables.push(table.clone());
             for t in &tables {
                 if !st.tables.contains_key(t) {
                     bail!("unknown table '{t}' referenced by subquery");
@@ -104,7 +104,7 @@ impl Engine {
             self.ensure_sequencer(&mut st);
             let rec = ShapeRecord {
                 id: id.clone(),
-                table: table.to_string(),
+                table: table.clone(),
                 stream_path: stream_path.clone(),
                 changes_only,
                 where_json: Some(where_json.clone()),
@@ -161,7 +161,7 @@ impl Engine {
                     let _ = ready_tx.send(ShareOutcome::Ready);
                     trace_lifecycle(
                         &self.trace_tx,
-                        crate::trace::GraphLifecycle::ShapeAdded { shape: id, table: table.to_string() },
+                        crate::trace::GraphLifecycle::ShapeAdded { shape: id, table: table.clone() },
                     );
                     crate::statsd::create_snapshot_task(created_at.elapsed());
                     return Ok(rec);
@@ -187,7 +187,7 @@ impl Engine {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         cmd_tx
             .send(SequencerCmd::BeginShape {
-                table: table.to_string(),
+                table: table.clone(),
                 shape_id: id.clone(),
                 num_id,
                 stream_path: stream_path.clone(),
@@ -200,7 +200,7 @@ impl Engine {
 
         let rec = ShapeRecord {
             id: id.clone(),
-            table: table.to_string(),
+            table: table.clone(),
             stream_path,
             changes_only,
             where_json: where_.clone(),
@@ -270,7 +270,7 @@ impl Engine {
     /// subquery predicates (use a plain filter); SUM/AVG/MIN/MAX require a column.
     pub async fn create_aggregate(
         &self,
-        table: &str,
+        table: &TableRef,
         where_: Option<PredicateJson>,
         func: AggFn,
         col: Option<String>,
@@ -327,7 +327,7 @@ impl Engine {
                         let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
                         cmd_tx
                             .send(SequencerCmd::CreateCircuitAgg {
-                                table: table.to_string(),
+                                table: table.clone(),
                                 shape_id: id.clone(),
                                 stream_path: stream_path.clone(),
                                 constraints,
@@ -336,7 +336,7 @@ impl Engine {
                             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
                         let rec = ShapeRecord {
                             id: id.clone(),
-                            table: table.to_string(),
+                            table: table.clone(),
                             stream_path: stream_path.clone(),
                             changes_only: false,
                             where_json: where_,
@@ -404,7 +404,7 @@ impl Engine {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         cmd_tx
             .send(SequencerCmd::BeginShape {
-                table: table.to_string(),
+                table: table.clone(),
                 shape_id: id.clone(),
                 num_id,
                 stream_path: stream_path.clone(),
@@ -418,7 +418,7 @@ impl Engine {
         let stream_path_c = stream_path.clone();
         let rec = ShapeRecord {
             id: id.clone(),
-            table: table.to_string(),
+            table: table.clone(),
             stream_path,
             changes_only: false,
             where_json: where_,
@@ -936,7 +936,7 @@ impl Engine {
     async fn create_subquery_three_phase(
         &self,
         id: &str,
-        table: &str,
+        table: &TableRef,
         stream_path: &str,
         where_json: &PredicateJson,
         out_cols: Option<Arc<Vec<usize>>>,
@@ -1085,7 +1085,7 @@ enum Registration {
 struct CreateGuard {
     engine: Engine,
     shape_id: String,
-    table: String,
+    table: TableRef,
     stream_path: String,
     registration: Registration,
     armed: bool,
@@ -1095,14 +1095,14 @@ impl CreateGuard {
     fn new(
         engine: &Engine,
         shape_id: &str,
-        table: &str,
+        table: &TableRef,
         stream_path: &str,
         registration: Registration,
     ) -> Self {
         Self {
             engine: engine.clone(),
             shape_id: shape_id.to_string(),
-            table: table.to_string(),
+            table: table.clone(),
             stream_path: stream_path.to_string(),
             registration,
             armed: true,
@@ -1180,7 +1180,7 @@ impl Engine {
     /// `RemoveShape` covers both states (it drops the pending buffer, the routed/standalone/
     /// aggregate registration, and the emit counter); commands are FIFO, so one sent while
     /// `BeginShape` is still queued still lands after it.
-    async fn rollback_create(&self, id: &str, table: &str, stream_path: &str, registration: Registration) {
+    async fn rollback_create(&self, id: &str, table: &TableRef, stream_path: &str, registration: Registration) {
         let mut st = self.state.lock().await;
         let existed = st.shapes.remove(id).is_some();
         st.circuit_placement.remove(id);
@@ -1196,7 +1196,7 @@ impl Engine {
         {
             let _ = seq
                 .cmd_tx
-                .send(SequencerCmd::RemoveShape { table: table.to_string(), shape_id: id.to_string() });
+                .send(SequencerCmd::RemoveShape { table: table.clone(), shape_id: id.to_string() });
         }
         drop(st);
         self.lives.lock().unwrap().remove(id);
@@ -1258,13 +1258,13 @@ mod cancellation_tests {
         st.feed_shares.insert(id.to_string(), FeedShare { sig: "sig".into(), refcount: 1, ready });
         drop(st);
         engine.lives.lock().unwrap().insert(id.to_string(), ShapeLife::active());
-        CreateGuard::new(engine, id, "outer_t", &format!("shape/{id}"), Registration::Registry)
+        CreateGuard::new(engine, id, &"outer_t".into(), &format!("shape/{id}"), Registration::Registry)
     }
 
     /// The detached rollback must leave nothing a later identical create could join or conflict with.
     async fn assert_rolled_back(engine: &Engine, id: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while engine.get_shape(id).await.is_some() || engine.subqueries.lock().await.touches("outer_t") {
+        while engine.get_shape(id).await.is_some() || engine.subqueries.lock().await.touches(&"outer_t".into()) {
             assert!(std::time::Instant::now() < deadline, "the cancelled create was never rolled back");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1286,7 +1286,7 @@ mod cancellation_tests {
             .subqueries
             .lock()
             .await
-            .begin_create("s1", "outer_t", "shape/s1", &where_json, None, false)
+            .begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false)
             .unwrap();
         assert_eq!(begin.seeds.len(), 1, "one fresh node to seed");
 
@@ -1305,7 +1305,7 @@ mod cancellation_tests {
             .subqueries
             .lock()
             .await
-            .begin_create("s1", "outer_t", "shape/s1", &where_json, None, false)
+            .begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false)
             .unwrap();
         let seeds = begin
             .seeds
@@ -1338,7 +1338,7 @@ mod cancellation_tests {
         let node_id = {
             let mut reg = engine.subqueries.lock().await;
             let begin =
-                reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+                reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
             let sig = begin.seeds[0].0.clone();
             reg.assert_seed_row_for_test(&sig, "1", Value::Int(7)).await;
             let node_id = reg.nodes[&sig].node_id;
@@ -1365,7 +1365,7 @@ mod cancellation_tests {
         id: &str,
         where_json: &PredicateJson,
     ) -> tokio::sync::watch::Sender<ShareOutcome> {
-        let sig = shape_signature("outer_t", &Some(where_json.clone()), &None, false);
+        let sig = shape_signature(&"outer_t".into(), &Some(where_json.clone()), &None, false);
         let (tx, rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
         let mut st = engine.state.lock().await;
         st.shapes.insert(id.to_string(), ShapeRecord {
@@ -1401,7 +1401,7 @@ mod cancellation_tests {
     fn join(engine: &Engine, where_json: &PredicateJson) -> tokio::task::JoinHandle<Result<ShapeRecord>> {
         let engine = engine.clone();
         let where_json = where_json.clone();
-        tokio::spawn(async move { engine.create_shape("outer_t", Some(where_json), None, false, true).await })
+        tokio::spawn(async move { engine.create_shape(&"outer_t".into(), Some(where_json), None, false, true).await })
     }
 
     /// A creator that refuses because the engine degraded publishes that REASON, so its joiner

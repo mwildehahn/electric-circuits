@@ -14,7 +14,7 @@ pub(crate) struct SequencerHandle {
     /// barrier.
     pub(crate) processed: Arc<std::sync::Mutex<String>>,
     /// Per-table circuit topology (shared families + standalone count), for tests/observability.
-    pub(crate) stats: Arc<std::sync::Mutex<HashMap<String, TableStats>>>,
+    pub(crate) stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     /// Live per-node state summaries, merged across all tables, keyed by graph node id.
     /// Republished after every processed batch and on shape add/remove; read by `GET /state`.
     pub(crate) node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
@@ -22,7 +22,7 @@ pub(crate) struct SequencerHandle {
 
 /// The tables the sequencer can decode, shared with the `Engine` (which updates it on
 /// `setup_postgres` / `define_schema`). A std lock: reads are brief and never held across awaits.
-pub(crate) type SharedTables = Arc<std::sync::RwLock<HashMap<String, TableSchema>>>;
+pub(crate) type SharedTables = Arc<std::sync::RwLock<HashMap<TableRef, TableSchema>>>;
 
 pub(crate) enum SequencerCmd {
     /// Phase 1 of shape creation: register a PENDING shape that buffers this table's deltas while
@@ -31,7 +31,7 @@ pub(crate) enum SequencerCmd {
     /// is acknowledged BEFORE the creator takes its snapshot, so no change can fall between the
     /// snapshot and activation.
     BeginShape {
-        table: String,
+        table: TableRef,
         shape_id: String,
         num_id: u64,
         stream_path: String,
@@ -46,7 +46,7 @@ pub(crate) enum SequencerCmd {
     /// `ready` mirrors the old add-shape handshake: `Ok(())` once the shape is live and its
     /// snapshot + gated buffer are on the stream, `Err(reason)` otherwise.
     ActivateShape {
-        table: String,
+        table: TableRef,
         shape_id: String,
         gate: crate::pg::SnapshotGate,
         /// Backfill rows for seeding an aggregate's fold (empty for plain shapes — the creator
@@ -57,21 +57,21 @@ pub(crate) enum SequencerCmd {
         ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     /// Creation failed after `BeginShape`: drop the pending buffer.
-    AbortShape { table: String, shape_id: String },
+    AbortShape { table: TableRef, shape_id: String },
     /// Retention: unregister a plain row shape's routing and hand back its resume state — the
     /// sequencer's fully-processed change-log offset (the batch preceding this command was fully
     /// fanned out + flushed, so the shape's stream is complete up to here) and the shape's
     /// backfill-snapshot gate. `None` if the shape is unknown (or an aggregate — not parkable).
     DeactivateShape {
-        table: String,
+        table: TableRef,
         shape_id: String,
         resp: tokio::sync::oneshot::Sender<Option<(String, crate::pg::SnapshotGate)>>,
     },
-    RemoveShape { table: String, shape_id: String },
+    RemoveShape { table: TableRef, shape_id: String },
     /// Create a **circuit-served** COUNT aggregate over the table's counts pipeline: seeded by
     /// summing matching groups, then updated from the pipeline's per-transaction group deltas.
     CreateCircuitAgg {
-        table: String,
+        table: TableRef,
         shape_id: String,
         stream_path: String,
         constraints: Vec<Option<std::collections::HashSet<Value>>>,
@@ -80,7 +80,7 @@ pub(crate) enum SequencerCmd {
     /// Dump the full internal state of one node (`family:<t>:<cols>` → the routing index
     /// contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX multiset).
     /// `None` if the node id is unknown. Serves `GET /state/node`.
-    DumpNode { table: String, node_id: String, resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>> },
+    DumpNode { table: TableRef, node_id: String, resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>> },
     /// On-demand owned-heap byte-walk of every table's live executor state (see
     /// `introspection::exec_heap_bytes`) — the memory probe's `bytes_executors` term. Sent only
     /// from `Engine::mem_bytes` (called only by `GET /memory` — never the 500ms background
@@ -105,7 +105,7 @@ pub(crate) fn spawn_sequencer(
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
-    arr_gates: HashMap<String, crate::pg::SnapshotGate>,
+    arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new(start_offset.clone()));
@@ -135,15 +135,15 @@ pub(crate) async fn publish_all(
     execs: &HashMap<String, TableExec>,
     offset: &str,
     emitted: &HashMap<String, u64>,
-    stats: &std::sync::Mutex<HashMap<String, TableStats>>,
+    stats: &std::sync::Mutex<HashMap<TableRef, TableStats>>,
     node_states: &std::sync::Mutex<HashMap<String, NodeStateSummary>>,
     subqueries: &Arc<Mutex<SubqueryRegistry>>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
     let mut stats_map = HashMap::new();
     let mut merged: HashMap<String, NodeStateSummary> = HashMap::new();
-    for (t, exec) in execs {
-        stats_map.insert(t.clone(), stats_of(exec));
+    for exec in execs.values() {
+        stats_map.insert(exec.ts.table.clone(), stats_of(exec));
         merged.extend(build_node_states(
             &exec.ts,
             offset,
@@ -218,15 +218,32 @@ pub(crate) struct PendingShape {
     pub(crate) buffered: Vec<Envelope>,
 }
 
-/// Get (or lazily create) the executor for `table`; `None` if the table has no known schema.
+/// Get (or lazily create) the executor for `table`; `None` if `table` is not a known table's
+/// **canonical** `schema.name`.
+///
+/// `execs` is keyed by that canonical string, not by [`TableRef`]: every caller already holds it —
+/// the envelope's `type` on the hot path, `cmd.table.as_str()` off it — so the steady-state lookup
+/// is a plain `&str` probe with no parse and no allocation.
+///
+/// **Strict, deliberately.** A non-canonical spelling (a bare `users`) is refused rather than
+/// resolved, because resolving it here would be resolved in only HALF the engine: the live fan-out
+/// would route it while `replay_changes_for_shape` — the dormant-reactivation / retained-stream
+/// catch-up — compares `env.type_ != table.as_str()` and would skip the very same envelopes, so a
+/// shape's live stream and its replayed stream would disagree. No legitimate writer produces a
+/// non-canonical `type`: the replication ingestor stamps `TableRef::to_string()`, and library-mode
+/// writes go through the protocol's `toTableEnvelope`/`canonicalTable`. One that somehow appears
+/// falls into the caller's "unknown table" branch — logged, highwater-advanced, dropped.
 pub(crate) fn exec_for<'a>(
     execs: &'a mut HashMap<String, TableExec>,
     tables: &SharedTables,
     table: &str,
 ) -> Option<&'a mut TableExec> {
     if !execs.contains_key(table) {
-        let ts = tables.read().unwrap().get(table).cloned()?;
-        execs.insert(table.to_string(), TableExec::new(ts));
+        // Cold miss: resolve the schema registry (keyed by `TableRef`), but only for a spelling
+        // that IS already canonical — `parse` alone would accept the bare-name sugar.
+        let tref = TableRef::parse(table).ok().filter(|t| t.as_str() == table)?;
+        let ts = tables.read().unwrap().get(&tref).cloned()?;
+        execs.insert(tref.to_string(), TableExec::new(ts));
     }
     execs.get_mut(table)
 }
@@ -244,12 +261,12 @@ pub(crate) async fn sequencer_loop(
     catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
-    stats: Arc<std::sync::Mutex<HashMap<String, TableStats>>>,
+    stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
-    arr_gates: HashMap<String, crate::pg::SnapshotGate>,
+    arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut offset = start_offset;
@@ -272,7 +289,7 @@ pub(crate) async fn sequencer_loop(
             biased;
             cmd = cmd_rx.recv() => match cmd {
                 Some(SequencerCmd::BeginShape { table, shape_id, num_id, stream_path, pred, out_cols, kind, ack }) => {
-                    match exec_for(&mut execs, &tables, &table) {
+                    match exec_for(&mut execs, &tables, table.as_str()) {
                         Some(exec) => {
                             exec.pending.insert(
                                 shape_id,
@@ -294,7 +311,7 @@ pub(crate) async fn sequencer_loop(
                     publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::AbortShape { table, shape_id }) => {
-                    if let Some(exec) = execs.get_mut(&table) {
+                    if let Some(exec) = execs.get_mut(table.as_str()) {
                         exec.pending.remove(&shape_id);
                     }
                 }
@@ -302,7 +319,7 @@ pub(crate) async fn sequencer_loop(
                     // Capture-and-unregister is atomic w.r.t. envelope processing (commands run
                     // between fully-flushed transactions), so `offset` is exactly "the shape's
                     // stream is complete up to here".
-                    let gate = execs.get_mut(&table).and_then(|exec| {
+                    let gate = execs.get_mut(table.as_str()).and_then(|exec| {
                         if let Some(shape) = exec.shapes.remove(&shape_id) {
                             exec.shape_index.remove(&shape_id);
                             Some(shape.gate)
@@ -333,7 +350,7 @@ pub(crate) async fn sequencer_loop(
                     publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::RemoveShape { table, shape_id }) => {
-                    if let Some(exec) = execs.get_mut(&table) {
+                    if let Some(exec) = execs.get_mut(table.as_str()) {
                         exec.pending.remove(&shape_id);
                         if exec.circuit_aggs.remove(&shape_id).is_some() {
                             // a circuit-served COUNT — nothing else to unwind
@@ -372,7 +389,8 @@ pub(crate) async fn sequencer_loop(
                     publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
-                    let val = execs.get(&table).and_then(|exec| dump_node_json(exec, &offset, &emitted, &node_id));
+                    let val =
+                        execs.get(table.as_str()).and_then(|exec| dump_node_json(exec, &offset, &emitted, &node_id));
                     let _ = resp.send(val);
                 }
                 Some(SequencerCmd::MemBytes { resp }) => {
@@ -500,14 +518,16 @@ pub(crate) async fn sequencer_loop(
 pub(crate) async fn activate_shape(
     ds: &DsClient,
     execs: &mut HashMap<String, TableExec>,
-    table: &str,
+    table: &TableRef,
     shape_id: &str,
     gate: crate::pg::SnapshotGate,
     agg_seed: Vec<Row>,
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
 ) -> Result<()> {
-    let exec = execs.get_mut(table).with_context(|| format!("no executor for table '{table}'"))?;
+    let exec = execs
+        .get_mut(table.as_str())
+        .with_context(|| format!("no executor for table '{table}'"))?;
     let p = exec
         .pending
         .remove(shape_id)
@@ -633,7 +653,7 @@ pub(crate) async fn activate_shape(
 pub(crate) async fn replay_changes_for_shape(
     ds: &DsClient,
     ts: &TableSchema,
-    table: &str,
+    table: &TableRef,
     pred: &CompiledPredicate,
     out_cols: Option<&Arc<Vec<usize>>>,
     gate: &crate::pg::SnapshotGate,
@@ -646,7 +666,8 @@ pub(crate) async fn replay_changes_for_shape(
         let rr = ds.read(crate::CHANGES_STREAM, &off, false).await?;
         let mut outs: Vec<Envelope> = Vec::new();
         for env in &rr.envelopes {
-            if env.type_ != table {
+            // The change log's `type` is the canonical `schema.name`.
+            if env.type_ != table.as_str() {
                 continue;
             }
             let Ok((delta, txid, lsn)) = apply_envelope(ts, env) else { continue };
@@ -691,7 +712,7 @@ pub(crate) async fn backfill_and_activate(
     pg_url: &Option<String>,
     cmd_tx: &mpsc::UnboundedSender<SequencerCmd>,
     ts: &TableSchema,
-    table: &str,
+    table: &TableRef,
     shape_id: &str,
     stream_path: &str,
     pred: &Arc<CompiledPredicate>,
@@ -702,7 +723,7 @@ pub(crate) async fn backfill_and_activate(
 ) -> std::result::Result<(), String> {
     let abort = || {
         let _ = cmd_tx.send(SequencerCmd::AbortShape {
-            table: table.to_string(),
+            table: table.clone(),
             shape_id: shape_id.to_string(),
         });
     };
@@ -752,7 +773,7 @@ pub(crate) async fn backfill_and_activate(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     if cmd_tx
         .send(SequencerCmd::ActivateShape {
-            table: table.to_string(),
+            table: table.clone(),
             shape_id: shape_id.to_string(),
             gate,
             agg_seed,
@@ -808,7 +829,7 @@ pub(crate) async fn process_envelope(
     // Per-envelope trace collection (hops, reached shape ids). `None` when nobody is subscribed,
     // so the untraced hot path pays only this one atomic load — see `crate::trace`.
     let mut tr: Option<(Vec<crate::trace::TraceHop>, Vec<String>)> = if trace_tx.receiver_count() > 0 {
-        Some((vec![crate::trace::TraceHop::new(format!("table:{}", ts.name), "passed")], Vec::new()))
+        Some((vec![crate::trace::TraceHop::new(format!("table:{}", ts.table), "passed")], Vec::new()))
     } else {
         None
     };
@@ -890,7 +911,7 @@ pub(crate) async fn process_envelope(
                 .map(|i| ts.columns.get(*i).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("col{i}")))
                 .collect::<Vec<_>>()
                 .join(",");
-            let node = format!("family:{}:{cols}", ts.name);
+            let node = format!("family:{}:{cols}", ts.table);
             if by_shape.is_empty() {
                 hops.push(crate::trace::TraceHop::new(node, "dropped"));
             } else {
@@ -925,7 +946,7 @@ pub(crate) async fn process_envelope(
         let mut work = std::collections::VecDeque::new();
         {
             let mut reg = subq.registry.lock().await;
-            if reg.touches(&ts.name) {
+            if reg.touches(&ts.table) {
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
                 work = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
                 if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
@@ -994,7 +1015,7 @@ pub(crate) async fn process_envelope(
         let ev = crate::trace::TraceEvent {
             lsn: lsn.clone(),
             txid: txid.clone(),
-            table: ts.name.clone(),
+            table: ts.table.clone(),
             delta: delta
                 .iter()
                 .take(crate::trace::DELTA_CAP)

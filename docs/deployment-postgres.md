@@ -57,7 +57,7 @@ Point it at Postgres, list the tables to watch, and give it the durable-streams 
 ```sh
 export ELECTRIC_CIRCUITS_DS_URL="https://streams.internal:8080"
 export ELECTRIC_CIRCUITS_PG_URL="postgres://user:pass@db.internal:5432/appdb"
-export ELECTRIC_CIRCUITS_PG_TABLES="users,projects,tasks"
+export ELECTRIC_CIRCUITS_PG_TABLES="users,projects,reporting.tasks"
 export ELECTRIC_CIRCUITS_BIND="0.0.0.0:9000"
 
 ./electric-circuits-engine
@@ -73,7 +73,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 |---------------------------|:--------:|------------------|---------|
 | `ELECTRIC_CIRCUITS_DS_URL`    | yes      | —                | durable-streams base URL. |
 | `ELECTRIC_CIRCUITS_PG_URL`    | yes¹     | —                | Postgres connection string. Setting it enables Postgres mode. |
-| `ELECTRIC_CIRCUITS_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch (in schema `public`). |
+| `ELECTRIC_CIRCUITS_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` / `*` for every table with a primary key in that schema. `*` and an empty setting both mean `public.*` — never every schema. |
 | `ELECTRIC_CIRCUITS_PG_SLOT`   | no       | `electric_circuits`  | Logical replication slot name (unique per engine). |
 | `ELECTRIC_CIRCUITS_PG_POLL_MS`| no       | —                | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery). |
 | `ELECTRIC_CIRCUITS_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |

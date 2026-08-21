@@ -11,9 +11,9 @@
 # Then point an ElectricSQL client at http://localhost:7010/v1/shape, or @electric-circuits/client at
 # http://localhost:8790 (API) + http://localhost:8791 (streams).
 #
-# Note: the engine introspects the table set at startup (ELECTRIC_CIRCUITS_PG_TABLES=* = every public
-# table with a primary key). Create your tables first — or `docker compose restart engine` after a
-# migration — for them to be picked up.
+# Note: the engine introspects the table set at startup (ELECTRIC_CIRCUITS_PG_TABLES=* = every table
+# with a primary key in the `public` schema; use `schema.name` / `schema.*` for others). Create your
+# tables first — or `docker compose restart engine` after a migration — for them to be picked up.
 
 name: electric-circuits
 

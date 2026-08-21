@@ -203,7 +203,8 @@ pub fn enabled() -> bool {
 // ---- high-level instrumentation (call sites stay terse; no-op when StatsD is off) --------------
 
 /// Every `/v1/shape` response (see conformance §4b). `elapsed` is the whole handler time; `body_bytes`
-/// is the response body size.
+/// is the response body size. `root_table` is the table's canonical `schema.name` (ADR-0002), so two
+/// same-named tables in different schemas are two series rather than one.
 pub fn serve_shape(root_table: &str, live: bool, status: u16, elapsed: Duration, body_bytes: u64) {
     let Some(s) = statsd() else { return };
     let ms = elapsed.as_secs_f64() * 1000.0;

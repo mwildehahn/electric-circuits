@@ -17,6 +17,12 @@ use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
 use electric_circuits_engine::schema::Schema;
 use electric_circuits_engine::statsd;
+use electric_circuits_engine::table_ref::TableRef;
+
+/// Table refs in tests: bare names are the `public.<name>` sugar.
+fn tref(name: &str) -> TableRef {
+    TableRef::parse(name).unwrap()
+}
 
 /// The sequencer starts consuming at `define_schema` — hold delivery until the shape is live so
 /// the insert actually fans out to it. Delivery is keyed on the read offset (serve the insert to
@@ -35,7 +41,7 @@ async fn ds_handler(req: Request) -> Response {
                 // One committed insert (txid 100) matching the match-all shape.
                 (
                     [("stream-next-offset", "01")],
-                    r#"[{"type":"t","key":"1","value":{"id":"1"},"headers":{"operation":"insert","txid":"100","lsn":"0/10","seq":0}}]"#,
+                    r#"[{"type":"public.t","key":"1","value":{"id":"1"},"headers":{"operation":"insert","txid":"100","lsn":"0/10","seq":0}}]"#,
                 )
                     .into_response()
             } else {
@@ -94,7 +100,7 @@ async fn live_append_emits_storage_txn_metrics() {
     }))
     .unwrap();
     engine.define_schema(&schema).await.unwrap();
-    engine.create_shape("t", None, None, false, false).await.unwrap();
+    engine.create_shape(&tref("t"), None, None, false, false).await.unwrap();
     READY.store(true, Ordering::SeqCst);
 
     // Let the sequencer read the change log, process the insert, append to the shape, and emit

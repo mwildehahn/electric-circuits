@@ -17,6 +17,12 @@ use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
 use electric_circuits_engine::predicate::PredicateJson;
 use electric_circuits_engine::schema::Schema;
+use electric_circuits_engine::table_ref::TableRef;
+
+/// Table refs in tests: bare names are the `public.<name>` sugar.
+fn tref(name: &str) -> TableRef {
+    TableRef::parse(name).unwrap()
+}
 
 #[derive(Clone, Default)]
 struct FakeDs {
@@ -69,7 +75,7 @@ async fn cancel_create(engine: &Engine, ds: &FakeDs, where_: &PredicateJson) {
     ds.park_puts.store(true, Ordering::SeqCst);
     let cancelled = tokio::time::timeout(
         Duration::from_millis(300),
-        engine.create_shape("child", Some(where_.clone()), None, false, true),
+        engine.create_shape(&tref("child"), Some(where_.clone()), None, false, true),
     )
     .await;
     assert!(cancelled.is_err(), "the create must still be parked when its future is dropped");
@@ -96,7 +102,7 @@ async fn cancelled_plain_create_lets_the_same_shape_be_created_again() {
     cancel_create(&engine, &ds, &where_).await;
 
     let rec = engine
-        .create_shape("child", Some(where_), None, false, true)
+        .create_shape(&tref("child"), Some(where_), None, false, true)
         .await
         .expect("the identical create must succeed once the cancelled one is rolled back");
     assert_ne!(rec.id, "s1", "the recreate must not reuse the abandoned shape");
@@ -119,7 +125,7 @@ async fn cancelled_subquery_create_does_not_poison_the_next_one() {
     cancel_create(&engine, &ds, &where_).await;
 
     let err = engine
-        .create_shape("child", Some(where_), None, false, true)
+        .create_shape(&tref("child"), Some(where_), None, false, true)
         .await
         .expect_err("library mode cannot seed a subquery shape")
         .to_string();

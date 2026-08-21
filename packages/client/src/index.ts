@@ -14,6 +14,7 @@ import type {
   TableDef,
   Value,
 } from '@electric-circuits/protocol'
+import { canonicalTable } from '@electric-circuits/protocol'
 import { stream } from '@durable-streams/client'
 import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
@@ -164,8 +165,13 @@ export function createClient(opts: {
         columns: def.columns,
       })) as ShapeHandle
 
+      // The envelope `type` on a shape stream is the table's CANONICAL `schema.name` (ADR-0002),
+      // whatever spelling the caller used — the collection must be registered under that or nothing
+      // materializes. `opts.schema.tables` stays keyed by the caller's own spelling: it is
+      // client-side config, not the wire.
+      const table = canonicalTable(def.table)
       const state = createStateSchema({
-        [def.table]: { schema: zodRowSchema(tableDef, def.columns), type: def.table, primaryKey: tableDef.primaryKey },
+        [table]: { schema: zodRowSchema(tableDef, def.columns), type: table, primaryKey: tableDef.primaryKey },
       })
       const streamUrl = opts.dsBaseUrl
         ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`
@@ -176,7 +182,7 @@ export function createClient(opts: {
         live: opts.liveMode ?? true,
       })
       await db.preload()
-      const collection = db.collections[def.table]
+      const collection = db.collections[table]
 
       const mat: ShapeMaterialization = {
         handle,

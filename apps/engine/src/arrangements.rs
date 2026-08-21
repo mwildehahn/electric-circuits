@@ -35,6 +35,7 @@ use dbsp::typed_batch::{BatchReader, SpineSnapshot};
 use dbsp::{OrdIndexedZSet, OutputHandle, Runtime, ZSetHandle};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::table_ref::TableRef;
 use crate::value::{Row, Tup2, Value, ZWeight};
 
 /// One counts pipeline: the live COUNT of `table`'s rows per distinct projection of
@@ -42,14 +43,14 @@ use crate::value::{Row, Tup2, Value, ZWeight};
 /// shapes whose predicate decomposes over these columns are served by summing groups.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CountSpec {
-    pub table: String,
+    pub table: TableRef,
     pub group_cols: Vec<usize>,
 }
 
 /// The net change of one count group in one circuit step: the group's count moved by `delta`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CountDelta {
-    pub table: String,
+    pub table: TableRef,
     pub group: Row,
     pub delta: i64,
 }
@@ -65,7 +66,7 @@ type CountOutput = OutputHandle<SpineSnapshot<OrdIndexedZSet<Row, ZWeight>>>;
 /// library-mode envelopes (no replication stamps), which bypass the highwater (they are only
 /// produced by tests that never redeliver).
 pub struct StampedDelta {
-    pub table: String,
+    pub table: TableRef,
     pub delta: Vec<Tup2<Row, ZWeight>>,
     pub lsn: Option<u64>,
     pub seq: Option<u64>,
@@ -80,7 +81,7 @@ enum Cmd {
     /// weighted row per group — O(groups), not O(rows)). Bypasses the highwater: seeding is
     /// fenced by the snapshot gate at the feed site, not by replication stamps.
     SeedGroups {
-        table: String,
+        table: TableRef,
         groups: Vec<(Row, i64)>,
         done: Option<oneshot::Sender<Result<(), String>>>,
     },
@@ -95,9 +96,9 @@ enum Cmd {
 pub struct Arrangements {
     tx: mpsc::Sender<Cmd>,
     /// Counts pipelines: per table, the group columns and the published count snapshot.
-    counts: Arc<HashMap<String, (Vec<usize>, CountSlot)>>,
+    counts: Arc<HashMap<TableRef, (Vec<usize>, CountSlot)>>,
     /// Tables whose initial seed completed (reads against unseeded tables return `None`).
-    seeded: Arc<HashMap<String, AtomicBool>>,
+    seeded: Arc<HashMap<TableRef, AtomicBool>>,
 }
 
 impl Arrangements {
@@ -112,18 +113,18 @@ impl Arrangements {
             anyhow::ensure!(pair[0].table != pair[1].table, "arrangements: one counts spec per table");
         }
 
-        let count_slots: Arc<HashMap<String, (Vec<usize>, CountSlot)>> = Arc::new(
+        let count_slots: Arc<HashMap<TableRef, (Vec<usize>, CountSlot)>> = Arc::new(
             counts.iter().map(|c| (c.table.clone(), (c.group_cols.clone(), CountSlot::default()))).collect(),
         );
-        let seeded: Arc<HashMap<String, AtomicBool>> =
+        let seeded: Arc<HashMap<TableRef, AtomicBool>> =
             Arc::new(counts.iter().map(|c| (c.table.clone(), AtomicBool::new(false))).collect());
 
         let ctor_counts = count_slots.clone();
         let ctor_specs = counts.clone();
         let (dbsp, (inputs, count_outputs)) =
             Runtime::init_circuit(CircuitConfig::with_workers(1), move |circuit| {
-                let mut handles: HashMap<String, ZSetHandle<Row>> = HashMap::new();
-                let mut count_handles: HashMap<String, CountOutput> = HashMap::new();
+                let mut handles: HashMap<TableRef, ZSetHandle<Row>> = HashMap::new();
+                let mut count_handles: HashMap<TableRef, CountOutput> = HashMap::new();
                 for spec in &ctor_specs {
                     let (stream, handle) = circuit.add_input_zset::<Row>();
                     let (gcols, cslot) = ctor_counts.get(&spec.table).expect("count slot").clone();
@@ -171,29 +172,29 @@ impl Arrangements {
 
     /// Seed a table's counts from `(group, count)` pairs (from
     /// `SELECT <group_cols>, count(*) … GROUP BY` under the seeding snapshot).
-    pub async fn seed_groups(&self, table: &str, groups: Vec<(Row, i64)>) -> Result<()> {
+    pub async fn seed_groups(&self, table: &TableRef, groups: Vec<(Row, i64)>) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.tx
-            .send(Cmd::SeedGroups { table: table.to_string(), groups, done: Some(done_tx) })
+            .send(Cmd::SeedGroups { table: table.clone(), groups, done: Some(done_tx) })
             .await
             .map_err(|_| anyhow::anyhow!("arrangements: circuit thread gone"))?;
         done_rx.await.map_err(|_| anyhow::anyhow!("arrangements: seed ack"))?.map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Mark a table's initial seed complete; count reads start serving.
-    pub fn finish_seed(&self, table: &str) {
+    pub fn finish_seed(&self, table: &TableRef) {
         if let Some(flag) = self.seeded.get(table) {
             flag.store(true, Ordering::Release);
         }
     }
 
     /// Whether `table`'s initial seed has completed. `false` for unknown tables.
-    pub fn is_seeded(&self, table: &str) -> bool {
+    pub fn is_seeded(&self, table: &TableRef) -> bool {
         self.seeded.get(table).is_some_and(|f| f.load(Ordering::Acquire))
     }
 
     /// The group columns of `table`'s counts pipeline, if one is compiled in.
-    pub fn counts_group_cols(&self, table: &str) -> Option<&[usize]> {
+    pub fn counts_group_cols(&self, table: &TableRef) -> Option<&[usize]> {
         self.counts.get(table).map(|(cols, _)| cols.as_slice())
     }
 
@@ -211,7 +212,7 @@ impl Arrangements {
     /// Every current count group of `table` with its count. `None` = no counts pipeline
     /// or table not seeded (caller falls back); `Some(vec![])` = authoritative empty.
     /// A group's current count is the value with positive net weight in the trace.
-    pub fn count_groups(&self, table: &str) -> Option<Vec<(Row, i64)>> {
+    pub fn count_groups(&self, table: &TableRef) -> Option<Vec<(Row, i64)>> {
         if !self.seeded.get(table)?.load(Ordering::Acquire) {
             return None;
         }
@@ -265,7 +266,7 @@ fn project(row: &Row, cols: &[usize]) -> Row {
 /// Drain a counts output handle: the transaction's per-group net deltas. The output stream
 /// is the delta of the (group → count) relation — a changed group appears as retract(old
 /// count) + insert(new count), so `Σ value×weight` per group is exactly the count's change.
-fn drain_count_deltas(table: &str, handle: &CountOutput, out: &mut Vec<CountDelta>) {
+fn drain_count_deltas(table: &TableRef, handle: &CountOutput, out: &mut Vec<CountDelta>) {
     let batch = handle.concat();
     let mut cursor = batch.inner().cursor();
     while cursor.key_valid() {
@@ -277,7 +278,7 @@ fn drain_count_deltas(table: &str, handle: &CountOutput, out: &mut Vec<CountDelt
             cursor.step_val();
         }
         if delta != 0 {
-            out.push(CountDelta { table: table.to_string(), group, delta });
+            out.push(CountDelta { table: table.clone(), group, delta });
         }
         cursor.step_key();
     }
@@ -287,8 +288,8 @@ fn drain_count_deltas(table: &str, handle: &CountOutput, out: &mut Vec<CountDelt
 /// `(lsn, seq)` highwater (Z-set deltas are not idempotent under redelivery).
 fn circuit_thread(
     mut dbsp: dbsp::DBSPHandle,
-    inputs: HashMap<String, ZSetHandle<Row>>,
-    count_outputs: HashMap<String, CountOutput>,
+    inputs: HashMap<TableRef, ZSetHandle<Row>>,
+    count_outputs: HashMap<TableRef, CountOutput>,
     mut rx: mpsc::Receiver<Cmd>,
 ) {
     let mut highwater: Option<(u64, u64)> = None;
@@ -383,8 +384,12 @@ mod tests {
         Row(vals.iter().map(|&v| Value::Int(v)).collect())
     }
 
+    fn tref(name: &str) -> TableRef {
+        TableRef::parse(name).unwrap()
+    }
+
     fn counts() -> Vec<CountSpec> {
-        vec![CountSpec { table: "t".into(), group_cols: vec![1] }]
+        vec![CountSpec { table: tref("t"), group_cols: vec![1] }]
     }
 
     /// Group-aggregated seeding is equivalent to row-by-row feeding: seeding `(group, n)`
@@ -393,20 +398,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn seed_groups_equivalent_to_rows_then_deltas() {
         let arr = Arrangements::start(counts()).unwrap();
-        assert_eq!(arr.counts_group_cols("t"), Some(&[1][..]));
+        assert_eq!(arr.counts_group_cols(&tref("t")), Some(&[1][..]));
         // Unseeded: reads refuse (fallback contract).
-        assert_eq!(arr.count_groups("t"), None);
+        assert_eq!(arr.count_groups(&tref("t")), None);
 
         // Seed from pre-aggregated groups: group 10 → 2 rows, group 30 → 1 row. The synthetic
         // group rows only need the group columns populated (position 1 here).
         arr.seed_groups(
-            "t",
+            &tref("t"),
             vec![(Row(vec![Value::Null, Value::Int(10)]), 2), (Row(vec![Value::Null, Value::Int(30)]), 1)],
         )
         .await
         .unwrap();
-        arr.finish_seed("t");
-        let mut groups = arr.count_groups("t").unwrap();
+        arr.finish_seed(&tref("t"));
+        let mut groups = arr.count_groups(&tref("t")).unwrap();
         groups.sort();
         assert_eq!(groups, vec![(row(&[10]), 2), (row(&[30]), 1)]);
 
@@ -414,7 +419,7 @@ mod tests {
         // count deltas are returned by apply_batch, netted per group.
         let mut deltas = arr
             .apply_batch(vec![StampedDelta {
-                table: "t".into(),
+                table: tref("t"),
                 delta: vec![
                     Tup2(row(&[2, 10]), -1),
                     Tup2(row(&[2, 20]), 1),
@@ -428,22 +433,22 @@ mod tests {
         assert_eq!(
             deltas,
             vec![
-                CountDelta { table: "t".into(), group: row(&[10]), delta: -1 },
-                CountDelta { table: "t".into(), group: row(&[20]), delta: 1 },
-                CountDelta { table: "t".into(), group: row(&[30]), delta: -1 },
+                CountDelta { table: tref("t"), group: row(&[10]), delta: -1 },
+                CountDelta { table: tref("t"), group: row(&[20]), delta: 1 },
+                CountDelta { table: tref("t"), group: row(&[30]), delta: -1 },
             ]
         );
         // A redelivered stamp is a no-op (no count deltas; Z-set deltas are not idempotent).
         let dup = arr
             .apply_batch(vec![StampedDelta {
-                table: "t".into(),
+                table: tref("t"),
                 delta: vec![Tup2(row(&[2, 10]), -1)],
                 lsn: Some(50),
                 seq: Some(0),
             }])
             .await;
         assert_eq!(dup, vec![]);
-        let mut groups = arr.count_groups("t").unwrap();
+        let mut groups = arr.count_groups(&tref("t")).unwrap();
         groups.sort();
         assert_eq!(groups, vec![(row(&[10]), 1), (row(&[20]), 1)]);
 
@@ -455,19 +460,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unknown_tables_are_refused() {
         let arr = Arrangements::start(counts()).unwrap();
-        assert!(arr.seed_groups("nope", vec![]).await.is_err());
-        assert_eq!(arr.count_groups("nope"), None);
+        assert!(arr.seed_groups(&tref("nope"), vec![]).await.is_err());
+        assert_eq!(arr.count_groups(&tref("nope")), None);
         // A batch for an unknown table is skipped without disturbing known state.
-        arr.seed_groups("t", vec![(Row(vec![Value::Null, Value::Int(1)]), 1)]).await.unwrap();
-        arr.finish_seed("t");
+        arr.seed_groups(&tref("t"), vec![(Row(vec![Value::Null, Value::Int(1)]), 1)]).await.unwrap();
+        arr.finish_seed(&tref("t"));
         arr.apply_batch(vec![StampedDelta {
-            table: "nope".into(),
+            table: tref("nope"),
             delta: vec![Tup2(row(&[1, 1]), 1)],
             lsn: Some(1),
             seq: Some(0),
         }])
         .await;
-        assert_eq!(arr.count_groups("t"), Some(vec![(row(&[1]), 1)]));
+        assert_eq!(arr.count_groups(&tref("t")), Some(vec![(row(&[1]), 1)]));
         arr.shutdown().await;
     }
 }

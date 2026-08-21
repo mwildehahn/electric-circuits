@@ -1,13 +1,15 @@
 // The State-Protocol change-event envelope that travels on every table/shape durable stream
-// and that `@durable-streams/state`'s createStreamDB consumes. `type` is the table name (the
-// collection discriminator), `key` is the stringified primary key, `headers.operation` is the
-// op. See decisions D4.
+// and that `@durable-streams/state`'s createStreamDB consumes. `type` is the table's canonical
+// `schema.name` (the collection discriminator — always qualified, see ADR-0002), `key` is the
+// stringified primary key, `headers.operation` is the op. See decisions D4.
 
+import { canonicalTable } from './sql.js'
 import type { Op, Row, Value } from './types.js'
 
 export type Operation = 'insert' | 'update' | 'delete' | 'upsert'
 
 export interface StreamEnvelope {
+  /** The table's canonical `schema.name` (ADR-0002); never a bare name. */
   type: string
   key: string
   /** Present for insert/update/upsert; omitted for delete. */
@@ -32,11 +34,15 @@ export interface StreamEnvelope {
   }
 }
 
-/** Build the table-stream envelope for an ingest write. */
+/**
+ * Build the table-stream envelope for an ingest write. `table` accepts the bare-name sugar; the
+ * envelope's `type` is always the canonical `schema.name` (ADR-0002), matching what the replication
+ * ingestor writes for the same table.
+ */
 export function toTableEnvelope(table: string, op: Op, pk: Value, row?: Row, txid?: string): StreamEnvelope {
   const headers: StreamEnvelope['headers'] = { operation: op }
   if (txid !== undefined) headers.txid = txid
-  const env: StreamEnvelope = { type: table, key: String(pk), headers }
+  const env: StreamEnvelope = { type: canonicalTable(table), key: String(pk), headers }
   if (op !== 'delete' && row !== undefined) env.value = row
   return env
 }

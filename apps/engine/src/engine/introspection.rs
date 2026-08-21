@@ -3,11 +3,21 @@
 
 use super::*;
 use crate::heap_size::HeapSize;
+use serde::Deserialize as _;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShapeRecord {
     pub id: String,
-    pub table: String,
+    /// The shape's table, canonical `schema.name` on the wire and in the durable catalog.
+    ///
+    /// Deserialization is **strict** — unlike API ingress, which accepts the bare-name sugar. A
+    /// catalog is engine-written, so a bare `table` there could only come from a catalog written
+    /// before ADR-0002, and silently resolving it would be worse than refusing: the `sig` stored
+    /// beside it keeps the bare spelling, so the restored shape would never share with an identical
+    /// post-cutover create and the engine would maintain two streams for one table. See
+    /// [`de_canonical_table`] and `catalog::restore_catalog`.
+    #[serde(deserialize_with = "de_canonical_table")]
+    pub table: TableRef,
     pub stream_path: String,
     /// Graph-introspection metadata (for `GET /graph` / the pipeline visualizer). Filled at creation.
     pub changes_only: bool,
@@ -24,6 +34,22 @@ pub struct ShapeRecord {
     /// Present iff this shape is a scalar **aggregation** (maintains a running COUNT/SUM/… over `where`,
     /// not the rows). Streams a single value that updates as rows enter/leave the predicate.
     pub aggregate: Option<AggInfo>,
+}
+
+/// Strict table deserializer for the durable catalog: the stored string must ALREADY be the
+/// canonical `schema.name`. `TableRef`'s own `Deserialize` is the lenient ingress rule (bare ⇒
+/// `public.<name>`); this one refuses that sugar, because in a catalog it can only mean the record
+/// predates ADR-0002.
+fn de_canonical_table<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<TableRef, D::Error> {
+    use serde::de::Error as _;
+    let raw = String::deserialize(d)?;
+    let t = TableRef::parse(&raw).map_err(|e| D::Error::custom(format!("{e:#}")))?;
+    if t.as_str() != raw {
+        return Err(D::Error::custom(format!(
+            "table '{raw}' is not the canonical 'schema.name' (expected '{t}')"
+        )));
+    }
+    Ok(t)
 }
 
 /// Aggregation descriptor carried on a shape record + `GET /graph` (for the visualizer).
@@ -60,7 +86,7 @@ impl HeapSize for ShapeRecord {
 #[serde(rename_all = "camelCase")]
 pub struct GraphShape {
     pub id: String,
-    pub table: String,
+    pub table: TableRef,
     pub stream_path: String,
     pub changes_only: bool,
     #[serde(rename = "where")]
@@ -88,7 +114,7 @@ pub struct GraphShape {
 #[serde(rename_all = "camelCase")]
 pub struct GraphNode {
     pub sig: String,
-    pub inner_table: String,
+    pub inner_table: TableRef,
     pub proj_col: String,
     pub distinct_values: usize,
     pub refcount: usize,
@@ -140,7 +166,7 @@ pub struct OpEdge {
 #[serde(rename_all = "camelCase")]
 pub struct ArrInput {
     pub id: String,
-    pub table: String,
+    pub table: TableRef,
     /// Whether the table's initial seed completed (until then, lookups fall back to Postgres).
     pub seeded: bool,
 }
@@ -154,7 +180,7 @@ pub struct ArrIndex {
     pub id: String,
     /// The feeding table input's node id (`arr:input:<table>`) — the input→index edge.
     pub input: String,
-    pub table: String,
+    pub table: TableRef,
     /// Index-key column names, in order.
     pub cols: Vec<String>,
     /// Mirrors the table input's seeded flag (an index serves iff its table is seeded).
@@ -207,7 +233,7 @@ pub struct ArrCounts {
     pub id: String,
     /// The feeding table input's node id (the input→counts edge).
     pub input: String,
-    pub table: String,
+    pub table: TableRef,
     pub group_cols: Vec<String>,
     pub seeded: bool,
 }
@@ -218,7 +244,7 @@ pub struct ArrCounts {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineGraph {
-    pub tables: Vec<String>,
+    pub tables: Vec<TableRef>,
     pub shapes: Vec<GraphShape>,
     pub subquery_nodes: Vec<GraphNode>,
     pub subquery_edges: Vec<GraphEdge>,
@@ -252,7 +278,7 @@ pub struct TableColumnInfo {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableSchemaInfo {
-    pub table: String,
+    pub table: TableRef,
     pub columns: Vec<TableColumnInfo>,
     pub primary_key: Vec<String>,
 }
@@ -334,7 +360,7 @@ pub struct FamilyStat {
 /// consistent with the topology: every operator's `hop` is a trace-hop id and every `state` is a
 /// `GET /state` key, so the circuit view animates and shows live state with zero client guessing.
 pub(crate) fn circuit_ops(
-    tables: &[String],
+    tables: &[TableRef],
     shapes: &[GraphShape],
     subquery_nodes: &[GraphNode],
     subquery_edges: &[GraphEdge],
@@ -353,7 +379,7 @@ pub(crate) fn circuit_ops(
     // Every table: the stream tailer (source) and the envelope → Z-set delta step it runs.
     for t in tables {
         let hop = format!("table:{t}");
-        ops.push(op(&format!("src:{t}"), "source", &hop, Some(hop.clone()), t));
+        ops.push(op(&format!("src:{t}"), "source", &hop, Some(hop.clone()), t.as_str()));
         ops.push(op(&format!("d:{t}"), "delta", &hop, None, "Δ change"));
         edges.push(flow(&format!("src:{t}"), &format!("d:{t}")));
     }
@@ -414,7 +440,7 @@ pub(crate) fn circuit_ops(
             let fam_hop = format!("family:{t}:{cols}");
             let (key_id, arr_id, join_id) =
                 (format!("key:{t}:{cols}"), format!("arr:{t}:{cols}"), format!("rjoin:{t}:{cols}"));
-            if fams_done.insert((t.clone(), cols.clone())) {
+            if fams_done.insert((t.to_string(), cols.clone())) {
                 ops.push(op(&key_id, "key", &fam_hop, None, &format!("↦ key({cols})")));
                 ops.push(op(&arr_id, "arrange", &fam_hop, Some(fam_hop.clone()), "params: key → shapes"));
                 ops.push(op(&join_id, "join", &fam_hop, None, "⋈ route"));
@@ -476,10 +502,10 @@ pub(crate) fn circuit_ops(
 /// for payload stability with the visualizer).
 pub(crate) fn arrangement_graph(
     arr: &crate::arrangements::Arrangements,
-    placements: &[(String, String, CircuitPlacement)],
-    col_name: &impl Fn(&str, usize) -> String,
+    placements: &[(String, TableRef, CircuitPlacement)],
+    col_name: &impl Fn(&TableRef, usize) -> String,
 ) -> ArrangementGraph {
-    let input_id = |table: &str| format!("arr:input:{table}");
+    let input_id = |table: &TableRef| format!("arr:input:{table}");
     let count_specs = arr.count_specs(); // sorted: deterministic node order across snapshots
     let inputs: Vec<ArrInput> = count_specs
         .iter()
@@ -530,7 +556,7 @@ pub(crate) fn build_node_states(
 ) -> HashMap<String, NodeStateSummary> {
     let mut out = HashMap::new();
     out.insert(
-        format!("table:{}", ts.name),
+        format!("table:{}", ts.table),
         NodeStateSummary::Table { processed_offset: offset.to_string(), envelopes },
     );
     let emitted_of = |path: &str| emitted.get(sid_of_path(path)).copied().unwrap_or(0);
@@ -682,7 +708,7 @@ pub(crate) fn dump_node_json(
         }
         return None;
     }
-    if node_id == format!("table:{}", exec.ts.name) {
+    if node_id == format!("table:{}", exec.ts.table) {
         return Some(serde_json::json!({
             "kind": "table",
             "node": node_id,
@@ -704,7 +730,7 @@ impl Engine {
             // Deterministic output: a consumer diffing consecutive snapshots (the visualizer's
             // "did the structure change" check) must see byte-identical output for an unchanged
             // pipeline.
-            let mut tables: Vec<String> = st.tables.keys().cloned().collect();
+            let mut tables: Vec<TableRef> = st.tables.keys().cloned().collect();
             tables.sort();
             let lives = self.lives.lock().unwrap();
             let life_of = |id: &str| -> Option<&'static str> {
@@ -734,8 +760,8 @@ impl Engine {
                 .collect();
             let mut shapes = shapes;
             shapes.sort_by_key(|s| s.id.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()).unwrap_or(u64::MAX));
-            let schemas: HashMap<String, TableSchema> = st.tables.clone();
-            let placements: Vec<(String, String, CircuitPlacement)> = st
+            let schemas: HashMap<TableRef, TableSchema> = st.tables.clone();
+            let placements: Vec<(String, TableRef, CircuitPlacement)> = st
                 .circuit_placement
                 .iter()
                 .filter_map(|(id, p)| {
@@ -744,7 +770,7 @@ impl Engine {
                 .collect();
             (tables, shapes, schemas, placements)
         };
-        let col_name = |table: &str, idx: usize| -> String {
+        let col_name = |table: &TableRef, idx: usize| -> String {
             schemas
                 .get(table)
                 .and_then(|ts| ts.columns.get(idx))
@@ -766,20 +792,16 @@ impl Engine {
         subquery_nodes.sort_by(|a, b| a.sig.cmp(&b.sig));
         // Each registry edge, resolved to (kind, id, queried table, connecting-column index):
         // the shape of a flip re-derivation, which is what the arrangement layer serves.
-        let dependents: Vec<(&'static str, String, String, usize)> = reg
+        let dependents: Vec<(&'static str, String, Option<TableRef>, usize)> = reg
             .all_edges()
             .map(|e| {
                 let (kind, dep_id, dep_table) = match &e.dependent {
-                    crate::subquery::Dependent::Shape(id) => (
-                        "shape",
-                        id.clone(),
-                        reg.shapes.get(id).map(|s| s.outer_table.clone()).unwrap_or_default(),
-                    ),
-                    crate::subquery::Dependent::Node(sig) => (
-                        "node",
-                        sig.clone(),
-                        reg.nodes.get(sig).map(|n| n.inner_table.clone()).unwrap_or_default(),
-                    ),
+                    crate::subquery::Dependent::Shape(id) => {
+                        ("shape", id.clone(), reg.shapes.get(id).map(|s| s.outer_table.clone()))
+                    }
+                    crate::subquery::Dependent::Node(sig) => {
+                        ("node", sig.clone(), reg.nodes.get(sig).map(|n| n.inner_table.clone()))
+                    }
                 };
                 (kind, dep_id, dep_table, e.connecting_col)
             })
@@ -791,7 +813,10 @@ impl Engine {
                 node_sig: e.node_sig.clone(),
                 dependent_kind: kind.to_string(),
                 dependent_id: dep_id.clone(),
-                connecting_col: col_name(dep_table, e.connecting_col),
+                connecting_col: dep_table
+                    .as_ref()
+                    .map(|t| col_name(t, e.connecting_col))
+                    .unwrap_or_else(|| format!("col{}", e.connecting_col)),
                 negated: e.negated,
             })
             .collect();
@@ -877,10 +902,12 @@ impl Engine {
             }
         }
         // Everything else is owned by a table tailer; resolve the table and round-trip a dump.
+        // Node ids are `<kind>:<table>[:<cols>]` — split on `:`, never on `.` (the table part is the
+        // canonical `schema.name` and carries a dot of its own).
         let table = if let Some(rest) = id.strip_prefix("family:") {
-            rest.split(':').next().map(str::to_string)
+            rest.split(':').next().and_then(|t| TableRef::parse(t).ok())
         } else if let Some(rest) = id.strip_prefix("table:") {
-            Some(rest.to_string())
+            TableRef::parse(rest).ok()
         } else if let Some(sid) = id.strip_prefix("shape:").or_else(|| id.strip_prefix("filter:")) {
             self.state.lock().await.shapes.get(sid).map(|r| r.table.clone())
         } else {
@@ -905,13 +932,13 @@ mod tests {
 
     /// Struct-specific sanity check (the byte-accounting tests otherwise committed are only the
     /// two generic ones in `heap_size.rs`): a populated `ShapeRecord` reports non-zero owned
-    /// heap, an all-empty one reports zero — proving the impl actually walks its fields instead
-    /// of e.g. returning a constant.
+    /// heap, an otherwise-empty one reports only its table identity's bytes (a `TableRef` is never
+    /// empty) — proving the impl actually walks its fields instead of e.g. returning a constant.
     #[test]
     fn shape_record_heap_bytes_reflects_populated_fields() {
         let empty = ShapeRecord {
             id: String::new(),
-            table: String::new(),
+            table: "t".into(),
             stream_path: String::new(),
             changes_only: false,
             where_json: None,
@@ -920,11 +947,15 @@ mod tests {
             is_subquery: false,
             aggregate: None,
         };
-        assert_eq!(empty.heap_bytes(), 0, "an all-empty ShapeRecord should own no heap");
+        assert_eq!(
+            empty.heap_bytes(),
+            empty.table.heap_bytes(),
+            "an otherwise-empty ShapeRecord should own only its table identity"
+        );
 
         let populated = ShapeRecord {
             id: "s1".to_string(),
-            table: "orders".to_string(),
+            table: "orders".into(),
             stream_path: "/streams/s1".to_string(),
             changes_only: false,
             where_json: None,

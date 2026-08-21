@@ -54,7 +54,8 @@ Three ideas carry the whole design:
 ## 1. Components
 
 - **durable-streams** — append-only, offset-addressed JSON streams with long-poll tailing. One
-  `changes` stream for all tables (the write log; the envelope's `type` carries the table name),
+  `changes` stream for all tables (the write log; the envelope's `type` carries the table's
+  canonical `schema.name` — always qualified, see ADR-0002),
   one `shape/<id>` stream per distinct shape (the
   result feed). The decoupling boundary between write and read paths.
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::heap_size::HeapSize;
 use crate::schema::TableSchema;
+use crate::table_ref::TableRef;
 use crate::value::{Row, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -26,7 +27,10 @@ pub enum LeafOp {
 /// `In` leaves (nested subqueries). Single column only.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubqueryJson {
-    pub table: String,
+    /// The inner table. Canonicalised at ingress by [`TableRef`]'s `Deserialize`, so a bare
+    /// `"table": "groups"` in a request body means `public.groups` and the signature/SQL below
+    /// carry the qualified form.
+    pub table: TableRef,
     pub project: String,
     #[serde(rename = "where", default)]
     pub where_: Option<Box<PredicateJson>>,
@@ -111,7 +115,7 @@ pub fn canonical_pred(p: &PredicateJson) -> String {
 }
 
 /// The canonical signature of a subquery node.
-pub fn subquery_sig(table: &str, project: &str, where_: Option<&PredicateJson>) -> SubquerySig {
+pub fn subquery_sig(table: &TableRef, project: &str, where_: Option<&PredicateJson>) -> SubquerySig {
     let w = where_.map(canonical_pred).unwrap_or_default();
     format!("{table}|{project}|{w}")
 }
@@ -130,7 +134,7 @@ pub fn subquery_sig(table: &str, project: &str, where_: Option<&PredicateJson>) 
 /// the un-lifted conjuncts, cloned, for the caller to compile as the template's shared
 /// filter (empty ⇒ match-all).
 pub fn subquery_template(
-    table: &str,
+    table: &TableRef,
     project: &str,
     where_: Option<&PredicateJson>,
 ) -> (String, Vec<(String, serde_json::Value)>, Vec<PredicateJson>) {
@@ -175,13 +179,13 @@ pub fn subquery_template(
 /// support subqueries, e.g. subset queries).
 pub trait SubqueryCollector {
     /// Register or dedupe a subquery node and return its canonical signature.
-    fn collect(&mut self, table: &str, project: &str, where_: Option<&PredicateJson>) -> Result<SubquerySig>;
+    fn collect(&mut self, table: &TableRef, project: &str, where_: Option<&PredicateJson>) -> Result<SubquerySig>;
 }
 
 /// A collector that rejects subqueries — for predicate paths where they are not supported.
 pub struct NoSubqueries;
 impl SubqueryCollector for NoSubqueries {
-    fn collect(&mut self, _t: &str, _p: &str, _w: Option<&PredicateJson>) -> Result<SubquerySig> {
+    fn collect(&mut self, _t: &TableRef, _p: &str, _w: Option<&PredicateJson>) -> Result<SubquerySig> {
         anyhow::bail!("subqueries are not supported here")
     }
 }
@@ -566,7 +570,7 @@ mod tests {
             "primaryKey": "id"
         });
         let def: TableDef = serde_json::from_value(json).unwrap();
-        TableSchema::from_def("users", &def).unwrap()
+        TableSchema::from_def(&"users".into(), &def).unwrap()
     }
 
     fn row(ts: &TableSchema, j: serde_json::Value) -> Row {
@@ -725,7 +729,7 @@ mod tests {
         sigs: Vec<SubquerySig>,
     }
     impl SubqueryCollector for RecordCollector {
-        fn collect(&mut self, t: &str, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
+        fn collect(&mut self, t: &TableRef, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
             let sig = subquery_sig(t, p, w);
             self.sigs.push(sig.clone());
             Ok(sig)
@@ -750,12 +754,12 @@ mod tests {
     fn subquery_signature_is_stable_and_order_insensitive() {
         // identical subqueries -> identical sig
         let a = subquery_sig(
-            "parent",
+            &"parent".into(),
             "id",
             Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
         );
         let b = subquery_sig(
-            "parent",
+            &"parent".into(),
             "id",
             Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
         );
@@ -767,12 +771,12 @@ mod tests {
         let p2: PredicateJson = serde_json::from_value(serde_json::json!({"and":[
             {"col":"x","op":"gt","value":1}, {"col":"active","op":"eq","value":true}
         ]})).unwrap();
-        assert_eq!(subquery_sig("t", "id", Some(&p1)), subquery_sig("t", "id", Some(&p2)));
+        assert_eq!(subquery_sig(&"t".into(), "id", Some(&p1)), subquery_sig(&"t".into(), "id", Some(&p2)));
         // a different inner where -> different sig
         let p3: PredicateJson = serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":false})).unwrap();
-        assert_ne!(subquery_sig("parent", "id", Some(&p3)), a);
+        assert_ne!(subquery_sig(&"parent".into(), "id", Some(&p3)), a);
         // a different project / table -> different sig
-        assert_ne!(subquery_sig("parent", "name", None), subquery_sig("parent", "id", None));
+        assert_ne!(subquery_sig(&"parent".into(), "name", None), subquery_sig(&"parent".into(), "id", None));
     }
 
     /// Template extraction factors literals OUT of the identity (the route-join model applied
@@ -783,17 +787,17 @@ mod tests {
         let w = |j: serde_json::Value| serde_json::from_value::<PredicateJson>(j).unwrap();
 
         // Different literals, same shape -> same key, different binds.
-        let (k1, b1, _) = subquery_template("pm", "project_id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":1}))));
-        let (k2, b2, _) = subquery_template("pm", "project_id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":2}))));
+        let (k1, b1, _) = subquery_template(&"pm".into(), "project_id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":1}))));
+        let (k2, b2, _) = subquery_template(&"pm".into(), "project_id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":2}))));
         assert_eq!(k1, k2, "one template per shape");
         assert_ne!(b1, b2);
         assert_eq!(b1, vec![("user_id".to_string(), serde_json::json!(1))]);
 
         // Multi-column AND: binds sorted by column name; conjunct order irrelevant.
-        let (k3, b3, _) = subquery_template("pm", "p", Some(&w(serde_json::json!({"and":[
+        let (k3, b3, _) = subquery_template(&"pm".into(), "p", Some(&w(serde_json::json!({"and":[
             {"col":"user_id","op":"eq","value":1}, {"col":"status","op":"eq","value":"active"}
         ]}))));
-        let (k4, b4, _) = subquery_template("pm", "p", Some(&w(serde_json::json!({"and":[
+        let (k4, b4, _) = subquery_template(&"pm".into(), "p", Some(&w(serde_json::json!({"and":[
             {"col":"status","op":"eq","value":"x"}, {"col":"user_id","op":"eq","value":9}
         ]}))));
         assert_eq!(k3, k4);
@@ -802,13 +806,13 @@ mod tests {
 
         // Ranges / OR / NOT / IS NULL / nested IN stay residual (literals baked in) — a
         // different range literal is a DIFFERENT template.
-        let (k5, b5, r5) = subquery_template("t", "id", Some(&w(serde_json::json!({"and":[
+        let (k5, b5, r5) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
             {"col":"user_id","op":"eq","value":1}, {"col":"age","op":"gt","value":18}
         ]}))));
-        let (k6, _, _) = subquery_template("t", "id", Some(&w(serde_json::json!({"and":[
+        let (k6, _, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
             {"col":"user_id","op":"eq","value":2}, {"col":"age","op":"gt","value":18}
         ]}))));
-        let (k7, _, _) = subquery_template("t", "id", Some(&w(serde_json::json!({"and":[
+        let (k7, _, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
             {"col":"user_id","op":"eq","value":1}, {"col":"age","op":"gt","value":21}
         ]}))));
         assert_eq!(k5, k6, "same residual range literal -> same template");
@@ -817,23 +821,23 @@ mod tests {
         assert_eq!(r5.len(), 1, "the range conjunct is the residual");
 
         // NULL equality literal never lifts (SQL `= NULL` is UNKNOWN, not a key).
-        let (_, b8, r8) = subquery_template("t", "id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":null}))));
+        let (_, b8, r8) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":null}))));
         assert!(b8.is_empty());
         assert_eq!(r8.len(), 1, "the NULL equality stays residual");
 
         // No where -> empty params, stable key; distinct from a lifted one.
-        let (k9, b9, r9) = subquery_template("t", "id", None);
+        let (k9, b9, r9) = subquery_template(&"t".into(), "id", None);
         assert!(b9.is_empty());
         assert!(r9.is_empty(), "no where -> empty residual (match-all)");
         assert_ne!(k9, k1);
-        assert_eq!(k9, subquery_template("t", "id", None).0);
+        assert_eq!(k9, subquery_template(&"t".into(), "id", None).0);
 
         // Duplicate column (`a=1 AND a=2`, degenerate): one lift, the other residual —
         // deterministic regardless of author order.
-        let (k10, b10, _) = subquery_template("t", "id", Some(&w(serde_json::json!({"and":[
+        let (k10, b10, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
             {"col":"a","op":"eq","value":1}, {"col":"a","op":"eq","value":2}
         ]}))));
-        let (k11, b11, _) = subquery_template("t", "id", Some(&w(serde_json::json!({"and":[
+        let (k11, b11, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
             {"col":"a","op":"eq","value":2}, {"col":"a","op":"eq","value":1}
         ]}))));
         assert_eq!(k10, k11);
@@ -856,12 +860,12 @@ mod tests {
                 assert_eq!(col, ts.column_index("id").unwrap());
                 assert!(negated);
                 let want = subquery_sig(
-                    "groups",
+                    &"groups".into(),
                     "gid",
                     Some(&serde_json::from_value(serde_json::json!({"col":"name","op":"eq","value":"a"})).unwrap()),
                 );
                 assert_eq!(sig, &want);
-                assert!(sig.starts_with("groups|gid|"));
+                assert!(sig.starts_with("public.groups|gid|"), "node signatures carry the canonical table: {sig}");
             }
             _ => panic!("expected InSubquery, got {cp:?}"),
         }

@@ -65,7 +65,7 @@ pub(crate) fn translate_output(
         let pk = match ts.key_string(&row) {
             Ok(pk) => pk,
             Err(e) => {
-                tracing::warn!("translate_output: dropping row with unextractable pk on table {}: {e:#}", ts.name);
+                tracing::warn!("translate_output: dropping row with unextractable pk on table {}: {e:#}", ts.table);
                 continue;
             }
         };
@@ -81,7 +81,7 @@ pub(crate) fn translate_output(
     let mut envs = Vec::with_capacity(pos.len() + neg.len());
     for (pk, row) in order.iter().filter_map(|pk| pos.get_key_value(pk)) {
         envs.push(Envelope {
-            type_: ts.name.clone(),
+            type_: ts.table.to_string(),
             key: pk.clone(),
             value: Some(ts.row_to_json_cols(row, out_cols)),
             old: None,
@@ -96,7 +96,7 @@ pub(crate) fn translate_output(
             continue;
         }
         envs.push(Envelope {
-            type_: ts.name.clone(),
+            type_: ts.table.to_string(),
             key: pk.clone(),
             value: None,
             old: None,
@@ -116,7 +116,7 @@ pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<
     }
     pks.into_iter()
         .map(|pk| Envelope {
-            type_: ts.name.clone(),
+            type_: ts.table.to_string(),
             key: pk,
             value: None,
             old: None,
@@ -130,7 +130,7 @@ pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<
 /// counts ([`super::executors::CircuitAgg`]) so the two aggregate tiers cannot drift apart on
 /// the wire format.
 pub(crate) fn agg_envelope(
-    table: &str,
+    table: &crate::table_ref::TableRef,
     value: serde_json::Value,
     n: i64,
     txid: Option<String>,

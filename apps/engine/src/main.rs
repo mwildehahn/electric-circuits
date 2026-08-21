@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     // Anchor process-uptime / boot-to-ready timing before anything else runs.
     statsd::mark_start();
 
-    let config = Config::from_env();
+    let config = Config::from_env().context("resolving boot configuration")?;
     init_tracing(&config.log_filter);
 
     // Unknown ELECTRIC_* vars are accepted, never fatal — surface them once so operators can see the

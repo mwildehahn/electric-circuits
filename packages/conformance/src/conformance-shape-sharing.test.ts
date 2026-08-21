@@ -17,6 +17,11 @@ interface GraphShape {
   aggregate: { func: string; col: string | null } | null
 }
 
+// `/graph` reports every table with its canonical `schema.name` (ADR-0002); the bare names in the
+// shape definitions below are the `public.<name>` ingress sugar for the same tables.
+const PARENT = 'public.parent'
+const CHILD = 'public.child'
+
 async function graphShapes(h: Harness): Promise<GraphShape[]> {
   const res = await fetch(`${h.engineUrl}/graph`)
   return ((await res.json()) as { shapes: GraphShape[] }).shapes
@@ -45,7 +50,7 @@ describe('conformance: equal shapes share one engine shape', () => {
     await h.client.shape(def) // byte-identical -> must join the first
     await drainEngine(h)
     const matching = (await graphShapes(h)).filter(
-      (s) => s.table === 'parent' && !s.aggregate && !s.isSubquery && sameWhere(s.where, where),
+      (s) => s.table === PARENT && !s.aggregate && !s.isSubquery && sameWhere(s.where, where),
     )
     expect(matching.length).toBe(1)
   }, 60000)
@@ -57,7 +62,7 @@ describe('conformance: equal shapes share one engine shape', () => {
     await h.client.shape(def)
     await drainEngine(h)
     // Only this test creates `child` shapes; the two identical subquery shapes must collapse to one.
-    const matching = (await graphShapes(h)).filter((s) => s.table === 'child' && s.isSubquery)
+    const matching = (await graphShapes(h)).filter((s) => s.table === CHILD && s.isSubquery)
     expect(matching.length).toBe(1)
   }, 60000)
 
@@ -66,7 +71,7 @@ describe('conformance: equal shapes share one engine shape', () => {
     await h.client.aggregate(def)
     await h.client.aggregate(def)
     await drainEngine(h)
-    const aggs = (await graphShapes(h)).filter((s) => s.aggregate?.func === 'count' && s.table === 'parent')
+    const aggs = (await graphShapes(h)).filter((s) => s.aggregate?.func === 'count' && s.table === PARENT)
     expect(aggs.length).toBe(1)
   }, 60000)
 
@@ -79,8 +84,8 @@ describe('conformance: equal shapes share one engine shape', () => {
     await h.client.aggregate({ table: 'parent', where: { col: 'active', op: 'eq', value: false }, fn: 'count' })
     await drainEngine(h)
     const shapes = await graphShapes(h)
-    expect(shapes.filter((s) => s.table === 'parent' && !s.aggregate && !s.isSubquery && sameWhere(s.where, { col: 'active', op: 'eq', value: false })).length).toBe(1)
-    expect(shapes.filter((s) => s.table === 'parent' && s.columns?.length === 1).length).toBe(1)
+    expect(shapes.filter((s) => s.table === PARENT && !s.aggregate && !s.isSubquery && sameWhere(s.where, { col: 'active', op: 'eq', value: false })).length).toBe(1)
+    expect(shapes.filter((s) => s.table === PARENT && s.columns?.length === 1).length).toBe(1)
     expect(shapes.filter((s) => s.aggregate?.func === 'count' && sameWhere(s.where, { col: 'active', op: 'eq', value: false })).length).toBe(1)
   }, 60000)
 })

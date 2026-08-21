@@ -6,6 +6,8 @@ import { PGlite } from '@electric-sql/pglite'
 import {
   type ChangeEvent,
   changeEventToDML,
+  parseTableRef,
+  qualifiedIdent,
   type Row,
   type Schema,
   type ShapeDef,
@@ -27,6 +29,10 @@ export interface Oracle {
 export async function createOracle(schema: Schema): Promise<Oracle> {
   const db = await PGlite.create('memory://')
   for (const [name, def] of Object.entries(schema.tables)) {
+    // A non-`public` table needs its schema to exist first (a bare key is `public.<name>` sugar,
+    // which always exists).
+    const ref = parseTableRef(name)
+    if (ref.schema !== 'public') await db.exec(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`)
     await db.exec(`${tableDDL(name, def)};`)
   }
 
@@ -48,7 +54,7 @@ export async function createOracle(schema: Schema): Promise<Oracle> {
 
     async reset() {
       for (const name of Object.keys(schema.tables)) {
-        await db.exec(`TRUNCATE "${name.replace(/"/g, '""')}" RESTART IDENTITY CASCADE;`)
+        await db.exec(`TRUNCATE ${qualifiedIdent(name)} RESTART IDENTITY CASCADE;`)
       }
     },
 
@@ -69,8 +75,13 @@ export async function createPgTables(connectionString: string, schema: Schema): 
   await client.connect()
   try {
     for (const [name, def] of Object.entries(schema.tables)) {
+      // Non-`public` tables need their schema created before the table (see `createOracle`).
+      const ref = parseTableRef(name)
+      if (ref.schema !== 'public') {
+        await client.query(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`)
+      }
       await client.query(`${tableDDL(name, def)};`)
-      await client.query(`ALTER TABLE "${name.replace(/"/g, '""')}" REPLICA IDENTITY FULL;`)
+      await client.query(`ALTER TABLE ${qualifiedIdent(name)} REPLICA IDENTITY FULL;`)
     }
   } finally {
     await client.end()
@@ -101,7 +112,7 @@ export async function createPgOracle(schema: Schema, connectionString: string): 
 
     async reset() {
       for (const name of Object.keys(schema.tables)) {
-        await client.query(`TRUNCATE "${name.replace(/"/g, '""')}" RESTART IDENTITY CASCADE;`)
+        await client.query(`TRUNCATE ${qualifiedIdent(name)} RESTART IDENTITY CASCADE;`)
       }
     },
 

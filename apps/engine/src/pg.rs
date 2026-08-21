@@ -12,6 +12,7 @@ use tokio_postgres::{Client, NoTls};
 use crate::heap_size::HeapSize;
 use crate::predicate::CompiledPredicate;
 use crate::schema::{ColumnDef, ColumnType, TableDef, TableSchema};
+use crate::table_ref::TableRef;
 use crate::value::Row;
 
 /// Connect and drive the connection on a background task. Returns the query `Client`.
@@ -139,38 +140,59 @@ fn map_pg_type(data_type: &str) -> ColumnType {
     }
 }
 
-/// List all base tables in the `public` schema that have a primary key (skipping the engine's own
-/// `__el_sync` bookkeeping table). Used by "introspect all" mode (`ELECTRIC_CIRCUITS_PG_TABLES=*`), where the
-/// set of tables isn't known up front (e.g. driving Electric's integration tests over varied schemas).
-pub async fn list_tables(client: &Client) -> Result<Vec<String>> {
+/// List all base tables in `schema` that have a primary key, skipping the engine's own bookkeeping
+/// table — which is `public.__el_sync` **specifically**: a user table that happens to be called
+/// `__el_sync` in another schema is ordinary data and is replicated like any other. Used by "introspect all" mode (`ELECTRIC_CIRCUITS_PG_TABLES=*` → `public`,
+/// `schema.*` → that schema), where the set of tables isn't known up front (e.g. driving Electric's
+/// integration tests over varied schemas). The schema is a bound parameter, and `to_regclass` gets
+/// the properly quoted qualified name, so an odd schema name can neither inject nor mis-resolve.
+pub async fn list_tables(client: &Client, schema: &str) -> Result<Vec<TableRef>> {
     let rows = client
         .query(
             "select t.table_name from information_schema.tables t \
-             where t.table_schema = 'public' and t.table_type = 'BASE TABLE' \
-               and t.table_name <> '__el_sync' \
-               and exists (select 1 from pg_index i where i.indrelid = to_regclass('public.'||t.table_name) and i.indisprimary) \
+             where t.table_schema = $1 and t.table_type = 'BASE TABLE' \
+               and not (t.table_schema = 'public' and t.table_name = '__el_sync') \
+               and exists (select 1 from pg_index i \
+                           where i.indrelid = to_regclass(quote_ident(t.table_schema)||'.'||quote_ident(t.table_name)) \
+                             and i.indisprimary) \
              order by t.table_name",
-            &[],
+            &[&schema],
         )
         .await
-        .context("list public tables")?;
-    Ok(rows.iter().map(|r| r.get(0)).collect())
+        .with_context(|| format!("list tables in schema '{schema}'"))?;
+    // A relation whose name cannot be spelled as a canonical `schema.name` (a quoted identifier
+    // containing a dot or a quote) has no unambiguous identity under ADR-0002, so discovery skips it
+    // — loudly. It is then simply untracked: a shape on it is refused with "unknown table" at the
+    // API boundary, never served wrong. An EXPLICIT list entry for such a table cannot exist at all
+    // (the config parse rejects it), so this is discovery's case only.
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let name: String = r.get(0);
+            TableRef::new(schema, &name)
+                .map_err(|e| tracing::warn!("introspect-all: skipping relation '{schema}'.'{name}': {e:#}"))
+                .ok()
+        })
+        .collect())
 }
 
-/// Introspect a table's columns (+ types) and single-column primary key from the catalog.
-pub async fn introspect(client: &Client, table: &str) -> Result<TableDef> {
+/// Introspect a table's columns (+ types) and single-column primary key from the catalog. Both the
+/// column lookup and the primary-key lookup are qualified by `(table_schema, table_name)` / the
+/// quoted qualified `to_regclass`, so same-named tables in different schemas never cross.
+pub async fn introspect(client: &Client, table: &TableRef) -> Result<TableDef> {
+    let (schema, name) = (table.schema(), table.name());
     let col_rows = client
         .query(
             "select column_name, data_type, udt_name, \
                     (is_identity = 'YES' or column_default is not null) as has_default \
              from information_schema.columns \
-             where table_schema = 'public' and table_name = $1 order by ordinal_position",
-            &[&table],
+             where table_schema = $1 and table_name = $2 order by ordinal_position",
+            &[&schema, &name],
         )
         .await
         .context("introspect columns")?;
     if col_rows.is_empty() {
-        bail!("table '{table}' not found in postgres (schema public)");
+        bail!("table '{table}' not found in postgres");
     }
     let mut columns = BTreeMap::new();
     for r in &col_rows {
@@ -186,13 +208,14 @@ pub async fn introspect(client: &Client, table: &str) -> Result<TableDef> {
 
     // Composite primary keys are supported (e.g. Electric's `*_tags` tables); columns are ordered by
     // their position in the index key so the synthesized row key is deterministic.
+    let qualified = table.quote_qualified();
     let pk_rows = client
         .query(
             "select a.attname from pg_index i \
              join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey) \
              where i.indrelid = to_regclass($1) and i.indisprimary \
              order by array_position(i.indkey, a.attnum)",
-            &[&table],
+            &[&qualified],
         )
         .await
         .context("introspect primary key")?;
@@ -204,9 +227,9 @@ pub async fn introspect(client: &Client, table: &str) -> Result<TableDef> {
 }
 
 /// `ALTER TABLE … REPLICA IDENTITY FULL` so logical decoding carries the full old row.
-pub async fn ensure_replica_identity_full(client: &Client, table: &str) -> Result<()> {
+pub async fn ensure_replica_identity_full(client: &Client, table: &TableRef) -> Result<()> {
     client
-        .batch_execute(&format!("ALTER TABLE {} REPLICA IDENTITY FULL", quote_ident(table)))
+        .batch_execute(&format!("ALTER TABLE {} REPLICA IDENTITY FULL", table.quote_qualified()))
         .await
         .with_context(|| format!("set REPLICA IDENTITY FULL on {table}"))
 }
@@ -408,8 +431,9 @@ async fn backfill_where_in_txn(
     };
     let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-    let q = format!("select {} from {} t{}", row_json_expr(ts), quote_ident(&ts.name), where_clause);
-    let rows = client.query(&q, &param_refs).await.with_context(|| format!("backfill select {}", ts.name))?;
+    let q = format!("select {} from {} t{}", row_json_expr(ts), ts.table.quote_qualified(), where_clause);
+    let rows =
+        client.query(&q, &param_refs).await.with_context(|| format!("backfill select {}", ts.table))?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let j: serde_json::Value = r.get(0);
@@ -464,10 +488,10 @@ async fn group_counts_in_txn(
     let q = format!(
         "select jsonb_build_object({}), count(*)::bigint from {} t group by {}",
         args.join(", "),
-        quote_ident(&ts.name),
+        ts.table.quote_qualified(),
         by.join(", ")
     );
-    let rows = client.query(&q, &[]).await.with_context(|| format!("counts seed select {}", ts.name))?;
+    let rows = client.query(&q, &[]).await.with_context(|| format!("counts seed select {}", ts.table))?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let j: serde_json::Value = r.get(0);
@@ -577,13 +601,13 @@ async fn query_subset_in_txn(
     let q = format!(
         "select {} from {} t{}{}{}{}",
         row_json_expr(ts),
-        quote_ident(&ts.name),
+        ts.table.quote_qualified(),
         where_clause,
         order_sql,
         limit_sql,
         offset_sql
     );
-    let rows = client.query(&q, &param_refs).await.with_context(|| format!("subset select {}", ts.name))?;
+    let rows = client.query(&q, &param_refs).await.with_context(|| format!("subset select {}", ts.table))?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let j: serde_json::Value = r.get(0);

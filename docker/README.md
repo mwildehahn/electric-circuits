@@ -98,7 +98,8 @@ via `tsx`.
 ## Env knobs
 
 - `PG_PORT` / `DS_PORT` / `ENGINE_PORT` / `API_PORT` — host port mappings.
-- `ELECTRIC_CIRCUITS_PG_TABLES` — comma list of tables instead of `*`.
+- `ELECTRIC_CIRCUITS_PG_TABLES` — comma list of tables instead of `*`: `schema.name`, a bare `name`
+  (= `public.<name>`), or `schema.*` for a whole schema.
 - `DS_MEMORY=1` (on the `ds` service) — in-memory streams: no fsync-per-append ceiling, no persistence.
 - Engine tuning: `ELECTRIC_CIRCUITS_PG_SLOT`, `ELECTRIC_CIRCUITS_PG_POLL_MS`, `ELECTRIC_CIRCUITS_LOG`,
   `ELECTRIC_HANDLE_TTL` (idle `/v1/shape` handle-state eviction; the shape is retained), and the

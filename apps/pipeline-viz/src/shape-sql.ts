@@ -20,6 +20,25 @@ function qi(id: string): string {
   return `"${id.replace(/"/g, '""')}"`
 }
 
+/**
+ * Quote a TABLE position: the engine reports every table as its canonical `schema.name` (ADR-0002),
+ * so it must be quoted as TWO identifiers (`"public"."issues"`) — `qi()` alone would render
+ * `"public.issues"`, a single identifier naming a different (nonexistent) relation, and the
+ * paste-into-psql promise of this module would be broken.
+ *
+ * Mirrors `qualifiedIdent` in `packages/protocol/src/sql.ts` (this app deliberately has no
+ * dependency on that package — it keeps its own `./types`). A name that is not `schema.name` or a
+ * bare name cannot come from the engine; it degrades to one quoted identifier rather than throwing,
+ * because this is a display path.
+ */
+function qt(table: string): string {
+  const dot = table.indexOf('.')
+  if (dot === -1) return `${qi('public')}.${qi(table)}`
+  const [schema, name] = [table.slice(0, dot), table.slice(dot + 1)]
+  if (schema === '' || name === '' || name.includes('.')) return qi(table)
+  return `${qi(schema)}.${qi(name)}`
+}
+
 /** Format a value as a SQL literal. */
 function lit(v: unknown): string {
   if (v === null || v === undefined) return 'NULL'
@@ -46,7 +65,7 @@ function wrap(p: Predicate): string {
 /** `(SELECT proj FROM inner [WHERE …])` for an IN-subquery reference. */
 export function subquerySql(s: SubqueryRef): string {
   const w = s.where ? ` WHERE ${predicateSql(s.where)}` : ''
-  return `(SELECT ${qi(s.project)} FROM ${qi(s.table)}${w})`
+  return `(SELECT ${qi(s.project)} FROM ${qt(s.table)}${w})`
 }
 
 /** The `SELECT`-list projection for a shape: the aggregate, the explicit column list, or `*`. */
@@ -63,7 +82,7 @@ function projection(shape: GraphShape): string {
  * own lines so a compound visibility+filter predicate stays readable.
  */
 export function shapeSql(shape: GraphShape): string {
-  const head = `SELECT ${projection(shape)} FROM ${qi(shape.table)}`
+  const head = `SELECT ${projection(shape)} FROM ${qt(shape.table)}`
   const w = shape.where
   if (!w) return `${head};`
   const conjuncts = 'and' in w ? w.and : [w]
@@ -110,5 +129,5 @@ export function nodeInnerSql(graph: EngineGraph, sig: string, innerTable: string
   const shape = edge ? graph.shapes.find((s) => s.id === edge.dependentId) : undefined
   const ref = shape ? findInRef(shape.where, innerTable, projCol) : null
   const where = ref?.where ? ` WHERE ${predicateSql(ref.where)}` : ''
-  return `SELECT DISTINCT ${qi(projCol)} FROM ${qi(innerTable)}${where};`
+  return `SELECT DISTINCT ${qi(projCol)} FROM ${qt(innerTable)}${where};`
 }

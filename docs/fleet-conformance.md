@@ -118,7 +118,7 @@ Do NOT emit BEAM-only internals we can't honestly measure: `vm.memory.atom*`, `v
 | `electric.plug.serve_shape.count` | c | every non-live `/v1/shape` request |
 | `electric.plug.serve_shape.bytes` | c (sum) | response bytes, non-live |
 | `electric.plug.serve_shape.requests.count` | c | every `/v1/shape` request; tags `status`, `known_error:true/false`, `live:true/false` |
-| `electric.shape.response_size.bytes` | d | per response; tags `root_table`, `is_live`, `stack_id` (stack_id = `single_stack` or replication stream id) |
+| `electric.shape.response_size.bytes` | d | per response; tags `root_table` (canonical `schema.name`), `is_live`, `stack_id` (stack_id = `single_stack` or replication stream id) |
 | `electric.postgres.replication.transaction_received.count` | c | per replicated txn |
 | `electric.postgres.replication.transaction_received.bytes` | c (sum) | txn payload bytes |
 | `electric.postgres.replication.transaction_received.operations` | d | ops per txn |

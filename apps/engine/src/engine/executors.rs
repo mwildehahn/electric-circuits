@@ -21,7 +21,7 @@ impl CircuitAgg {
     }
 
     /// The shared aggregate wire envelope (see [`super::output::agg_envelope`]).
-    pub(crate) fn envelope(&self, table: &str, txid: Option<String>, lsn: Option<String>) -> Envelope {
+    pub(crate) fn envelope(&self, table: &crate::table_ref::TableRef, txid: Option<String>, lsn: Option<String>) -> Envelope {
         super::output::agg_envelope(table, serde_json::json!(self.value), self.value, txid, lsn)
     }
 }
@@ -353,7 +353,7 @@ impl AggShape {
     /// The shared aggregate wire envelope (see [`super::output::agg_envelope`]) carrying the
     /// current value (key `"agg"`, so the client materializes one row).
     pub(crate) fn envelope(&self, ts: &TableSchema, txid: Option<String>, lsn: Option<String>) -> Envelope {
-        super::output::agg_envelope(&ts.name, self.value(), self.count, txid, lsn)
+        super::output::agg_envelope(&ts.table, self.value(), self.count, txid, lsn)
     }
 }
 
