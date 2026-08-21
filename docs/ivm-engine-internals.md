@@ -119,7 +119,15 @@ duplicates at the exact boundary; the xid gate decides both cases. Guarded by
 
 There is **one sequencer task for all tables** (`sequencer_loop`) — the LSN-ordered executor.
 It long-polls the change log's current segment (whole commits, in commit order; on a rotation it
-follows the segment's control-envelope pointer to the next one) and for each change:
+follows the segment's control-envelope pointer to the next one).
+
+A page can end **mid-transaction**: a commit too large for one request body reaches the log as
+several appends (ADR-0003), and durable-streams exposes each atomically. The trailing run of such a
+page is HELD — carried into the next read, de-duplicated within itself by `seq` — until the envelope
+carrying the transaction-end marker (`headers.last`) arrives, so what the steps below see is always a
+complete transaction. Nothing is published past the page a held run began in.
+
+For each change:
 
 1. **de-duplicate**: skip if the envelope's `(commit lsn, seq)` is at/below the sequencer's
    global highwater — the ingestor's delivery is at-least-once (unacknowledged commits

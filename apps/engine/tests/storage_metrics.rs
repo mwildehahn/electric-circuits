@@ -40,10 +40,13 @@ async fn ds_handler(req: Request) -> Response {
         Method::GET if path.contains("/changes") && is_long_poll => {
             let at_start = req.uri().query().unwrap_or("").contains("offset=-1");
             if READY.load(Ordering::SeqCst) && at_start {
-                // One committed insert (txid 100) matching the match-all shape.
+                // One committed insert (txid 100) matching the match-all shape. `last: true` is the
+                // transaction-end marker every producer stamps on a commit's final envelope
+                // (ADR-0003); without it the sequencer would HOLD this run, waiting for the rest of
+                // a transaction that is never coming, and nothing would be flushed.
                 (
                     [("stream-next-offset", "01")],
-                    r#"[{"type":"public.t","key":"1","value":{"id":"1"},"headers":{"operation":"insert","txid":"100","lsn":"0/10","seq":0}}]"#,
+                    r#"[{"type":"public.t","key":"1","value":{"id":"1"},"headers":{"operation":"insert","txid":"100","lsn":"0/10","seq":0,"last":true}}]"#,
                 )
                     .into_response()
             } else {

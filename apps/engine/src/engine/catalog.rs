@@ -33,7 +33,19 @@ pub(crate) enum CatalogEvent {
     /// A dormant shape was reactivated (replayed + re-registered).
     Reactivated { id: String },
     Dropped { id: String },
-    Offset { pos: LogPosition },
+    /// The sequencer's checkpoint: the change-log position a restart replays from, plus the
+    /// `(lsn, seq)` de-duplication highwater it had applied up to at that position (ADR-0003).
+    ///
+    /// The highwater has to travel WITH the position. A commit too large for one request body is
+    /// appended in several chunks, so a crash can leave a prefix of a transaction applied and
+    /// checkpointed while the rest is re-delivered; without the restored highwater that prefix would
+    /// be applied twice, and aggregate/subquery contributor weights are not idempotent under
+    /// duplicates. `None` is a checkpoint taken before anything was applied (a fresh boot).
+    Offset {
+        pos: LogPosition,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        highwater: Option<(u64, u64)>,
+    },
     /// The change log rotated (ADR-0006): `segment` became the CURRENT segment at `at` (unix
     /// seconds). Written on the first creation of segment 0 too, so every segment's start time is
     /// in the log — segment `n` was closed when `n+1` began, which is what the retain window that
@@ -132,7 +144,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient) -> CatalogWriter {
             // position a restart would resume from, and treating it as one would license deleting
             // the segment underneath it.
             let checkpoint = match &ev {
-                CatalogEvent::Offset { pos } => Some(pos.clone()),
+                CatalogEvent::Offset { pos, .. } => Some(pos.clone()),
                 _ => None,
             };
             match serde_json::to_value(&ev) {
@@ -267,6 +279,8 @@ pub(crate) struct CatalogFold {
     recs: HashMap<String, Restored>,
     /// The sequencer's change-log replay start (the last `Offset` checkpoint).
     start_pos: LogPosition,
+    /// The `(lsn, seq)` de-duplication highwater recorded with that checkpoint (ADR-0003).
+    start_highwater: Option<(u64, u64)>,
     /// The change log's current segment: the last `ChangesRotated`, else 0 (ADR-0006). A lower
     /// bound — a process can die between closing a segment and recording the rotation — so the
     /// boot walks forward from here (`changelog::resolve_current`).
@@ -283,6 +297,7 @@ impl Default for CatalogFold {
         CatalogFold {
             recs: HashMap::new(),
             start_pos: LogPosition::start(),
+            start_highwater: None,
             binding: None,
             current_segment: 0,
             segment_starts: std::collections::BTreeMap::new(),
@@ -321,7 +336,10 @@ impl CatalogFold {
             CatalogEvent::Dropped { id } => {
                 self.recs.remove(&id);
             }
-            CatalogEvent::Offset { pos } => self.start_pos = pos,
+            CatalogEvent::Offset { pos, highwater } => {
+                self.start_pos = pos;
+                self.start_highwater = highwater;
+            }
             // The LAST rotation is the current segment; every one of them is kept, because the
             // retain window needs to know when each segment began (see the variant).
             CatalogEvent::ChangesRotated { segment, at } => {
@@ -420,12 +438,16 @@ impl Engine {
         if fold.is_empty() {
             return Ok(());
         }
-        let CatalogFold { recs, start_pos, .. } = fold;
+        let CatalogFold { recs, start_pos, start_highwater, .. } = fold;
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The restored checkpoint IS durable (it was read back out of the log), so it is the
         // segment-deletion floor from boot rather than from this process's first checkpoint.
         self.catalog_tx.seed_durable_offset(start_pos.clone());
         *self.seq_start.lock().unwrap() = start_pos;
+        // The de-duplication highwater is restored with the position (ADR-0003), so a prefix of a
+        // chunked commit that was applied and checkpointed before a crash is not applied twice when
+        // Postgres re-delivers the transaction.
+        *self.seq_highwater.lock().unwrap() = start_highwater;
 
         if mode == RestoreMode::Park {
             // The epoch broke: hold the records, touch nothing else (see `RestoreMode::Park`).
@@ -725,11 +747,58 @@ mod tests {
     /// engine to create a slot from nothing (ADR-0004).
     #[test]
     fn a_catalog_without_a_binding_folds_to_no_epoch() {
-        let fold = fold_of(vec![CatalogEvent::Offset { pos: pos(0, "42") }]);
+        let fold = fold_of(vec![CatalogEvent::Offset { pos: pos(0, "42"), highwater: None }]);
         assert!(fold.binding.is_none());
         assert_eq!(fold.start_pos, pos(0, "42"));
         // Nothing at all folds to the empty catalog, which the restore skips outright.
         assert!(CatalogFold::default().is_empty());
+    }
+
+    /// The de-duplication highwater is checkpointed WITH the position (ADR-0003), and the fold's
+    /// last `Offset` wins for both together.
+    ///
+    /// It has to travel with the position because a commit too large for one request body is
+    /// appended in several chunks: a crash can leave a prefix of a transaction applied and
+    /// checkpointed while the rest is still to be re-delivered. Restoring the position without the
+    /// highwater would re-apply that prefix — and aggregate/subquery contributor weights are not
+    /// idempotent under duplicates.
+    #[test]
+    fn the_dedup_highwater_is_restored_with_the_checkpoint_it_was_taken_at() {
+        let fold = fold_of(vec![
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x10, 3)) },
+            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)) },
+        ]);
+        assert_eq!(fold.start_pos, pos(0, "20"));
+        assert_eq!(fold.start_highwater, Some((0x20, 7)), "the last checkpoint's highwater, not the first");
+
+        // A checkpoint taken before anything was applied carries none, and CLEARS an older one:
+        // last-writer-wins for the pair, never a mix of a new position and a stale highwater.
+        let fold = fold_of(vec![
+            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)) },
+            CatalogEvent::Offset { pos: pos(1, "0"), highwater: None },
+        ]);
+        assert_eq!(fold.start_pos, pos(1, "0"));
+        assert_eq!(fold.start_highwater, None);
+
+        // Nothing at all: no highwater, so a first boot de-duplicates from scratch.
+        assert_eq!(CatalogFold::default().start_highwater, None);
+    }
+
+    /// The wire form: the highwater is omitted when absent (so a checkpoint that has applied
+    /// nothing is the same bytes it always was) and round-trips when present.
+    #[test]
+    fn the_checkpoint_wire_form_carries_the_highwater_only_when_there_is_one() {
+        let bare = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9"), highwater: None }).unwrap();
+        assert_eq!(bare.get("highwater"), None, "{bare}");
+        let with = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9"), highwater: Some((5, 6)) }).unwrap();
+        assert_eq!(with["highwater"], serde_json::json!([5, 6]));
+        match serde_json::from_value::<CatalogEvent>(with).unwrap() {
+            CatalogEvent::Offset { pos: p, highwater } => {
+                assert_eq!(p, pos(2, "9"));
+                assert_eq!(highwater, Some((5, 6)));
+            }
+            other => panic!("expected Offset, got {other:?}"),
+        }
     }
 
     /// The change log's segmentation folds out of the same log (ADR-0006): the last rotation is the
@@ -739,7 +808,7 @@ mod tests {
     fn rotations_fold_to_the_current_segment_and_every_segments_start() {
         let fold = fold_of(vec![
             CatalogEvent::ChangesRotated { segment: 0, at: 100 },
-            CatalogEvent::Offset { pos: pos(0, "9") },
+            CatalogEvent::Offset { pos: pos(0, "9"), highwater: None },
             CatalogEvent::ChangesRotated { segment: 1, at: 200 },
             CatalogEvent::ChangesRotated { segment: 2, at: 300 },
         ]);
@@ -783,13 +852,13 @@ mod tests {
         let fold = fold_of(vec![
             created,
             CatalogEvent::Dormant { id: "s1".to_string(), resume: pos(3, "77"), gate },
-            CatalogEvent::Offset { pos: pos(4, "12") },
+            CatalogEvent::Offset { pos: pos(4, "12"), highwater: None },
         ]);
         assert_eq!(fold.start_pos, pos(4, "12"));
         assert_eq!(fold.recs.get("s1").and_then(|r| r.3.as_ref()).map(|(p, _)| p.clone()), Some(pos(3, "77")));
 
         // Wire form: an object, never a bare string.
-        let json = serde_json::to_value(CatalogEvent::Offset { pos: pos(4, "12") }).unwrap();
+        let json = serde_json::to_value(CatalogEvent::Offset { pos: pos(4, "12"), highwater: None }).unwrap();
         assert_eq!(json["t"], "offset");
         assert_eq!(json["pos"]["segment"], 4);
         assert_eq!(json["pos"]["offset"], "12");
@@ -820,7 +889,7 @@ mod tests {
         assert!(detail.contains("s7"), "the refusal names the shape: {detail}");
 
         // The current spellings are not mistaken for the old ones.
-        let now = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9") }).unwrap();
+        let now = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9"), highwater: None }).unwrap();
         assert!(predates_segmentation(&now).is_none());
         let gate = crate::pg::SnapshotGate::passthrough();
         let now = serde_json::to_value(CatalogEvent::Dormant {

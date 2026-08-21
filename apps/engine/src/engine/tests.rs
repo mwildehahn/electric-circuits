@@ -441,7 +441,7 @@ fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_
         key: key.into(),
         value,
         old,
-        headers: EnvelopeHeaders { operation: op.into(), txid: None, offset: None, lsn: None, seq: None },
+        headers: EnvelopeHeaders { operation: op.into(), txid: None, offset: None, lsn: None, seq: None, last: None },
     }
 }
 
@@ -1011,7 +1011,7 @@ async fn emission_lanes_order_and_barrier() {
         key: format!("{i}"),
         value: None,
         old: None,
-        headers: EnvelopeHeaders { operation: "upsert".into(), txid: None, offset: None, lsn: None, seq: None },
+        headers: EnvelopeHeaders { operation: "upsert".into(), txid: None, offset: None, lsn: None, seq: None, last: None },
     };
     // Interleave two streams; per-stream order must survive whatever lane assignment they get.
     for i in 0..50 {

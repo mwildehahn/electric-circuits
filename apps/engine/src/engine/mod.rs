@@ -164,6 +164,9 @@ pub struct Engine {
     changes: ChangeLogWriter,
     /// Change-log position the sequencer starts from (set by catalog restore before the spawn).
     seq_start: Arc<std::sync::Mutex<LogPosition>>,
+    /// The `(lsn, seq)` de-duplication highwater the sequencer starts from, restored with the
+    /// checkpoint (ADR-0003). `None` = start de-duplicating from nothing.
+    seq_highwater: Arc<std::sync::Mutex<Option<(u64, u64)>>>,
     /// Per-shape retention lifecycle + last-read instant. A separate sync mutex (not
     /// `EngineState`) so hot read paths can touch it without the async engine lock. Lock order:
     /// when both are held, `state` first, then `lives`; never across `.await`.
@@ -184,6 +187,10 @@ pub struct Engine {
     retrying: Arc<std::sync::Mutex<HashSet<TableRef>>>,
     /// dbsp arrangement settings (`ELECTRIC_CIRCUITS_DBSP*`), set before `setup_postgres`.
     dbsp_cfg: Arc<std::sync::Mutex<Option<crate::config::DbspConfig>>>,
+    /// Large-transaction settings for the ingestor's per-transaction buffer (ADR-0003), set before
+    /// `setup_postgres` (which spawns the ingestor). Defaults apply when nothing sets them — the
+    /// binary always does, from the boot config.
+    txn_cfg: Arc<std::sync::Mutex<crate::txn_buffer::TxnBufferConfig>>,
     /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
     arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
@@ -597,6 +604,7 @@ impl Engine {
             catalog_tx,
             changes,
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
+            seq_highwater: Arc::new(std::sync::Mutex::new(None)),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -604,6 +612,7 @@ impl Engine {
             resolving: Arc::new(drift::Resolving::default()),
             retrying: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
+            txn_cfg: Arc::new(std::sync::Mutex::new(crate::txn_buffer::TxnBufferConfig::default())),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
@@ -614,6 +623,13 @@ impl Engine {
     /// [`setup_postgres`](Self::setup_postgres), which builds and seeds it).
     pub fn set_dbsp_config(&self, cfg: crate::config::DbspConfig) {
         *self.dbsp_cfg.lock().unwrap() = Some(cfg);
+    }
+
+    /// Configure large-transaction handling on the ingest path — the per-transaction memory cap,
+    /// the spill directory and the append byte budget (ADR-0003). Call before
+    /// [`setup_postgres`](Self::setup_postgres), which spawns the ingestor.
+    pub fn set_txn_config(&self, cfg: crate::txn_buffer::TxnBufferConfig) {
+        *self.txn_cfg.lock().unwrap() = cfg;
     }
 
     /// Start the dbsp counts layer and seed it, when configured. Seeds each counts pipeline
@@ -795,10 +811,12 @@ impl Engine {
     fn ensure_sequencer<'a>(&self, st: &'a mut EngineState) -> &'a SequencerHandle {
         if st.sequencer.is_none() {
             let start = self.seq_start.lock().unwrap().clone();
+            let highwater = *self.seq_highwater.lock().unwrap();
             st.sequencer = Some(spawn_sequencer(
                 self.ds.clone(),
                 self.tables_shared.clone(),
                 start,
+                highwater,
                 self.catalog_tx.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
@@ -995,6 +1013,7 @@ impl Engine {
             Arc::new(self.clone()) as Arc<dyn crate::replication::EpochEvents>,
             self.repl_lsn.clone(),
             self.repl_sync.clone(),
+            self.txn_cfg.lock().unwrap().clone(),
         ));
         // DDL with no following DML produces no `Relation` message; the reconciler catches it.
         self.ensure_schema_reconciler();

@@ -1040,7 +1040,11 @@ impl Engine {
                 // is also what licenses the delete, once it lands) and the in-memory start position
                 // `ensure_sequencer` reads.
                 *self.seq_start.lock().unwrap() = target.clone();
-                self.catalog_tx.send(CatalogEvent::Offset { pos: target });
+                // No highwater: nothing has been applied at this position — there is no sequencer.
+                // Both halves move together, in memory and durably, so a sequencer spawned later
+                // starts from exactly what the catalog says (ADR-0003).
+                *self.seq_highwater.lock().unwrap() = None;
+                self.catalog_tx.send(CatalogEvent::Offset { pos: target, highwater: None });
             }
         }
         // The floor. `None` = nothing durable yet (a first boot that has not checkpointed), which

@@ -110,6 +110,14 @@ pub struct Metrics {
     pub epoch_resets: AtomicU64,       // ADR-0004: new epochs bound (every shape retired, fresh slot)
     pub changes_rotations: AtomicU64,  // ADR-0006: change-log segments closed and succeeded
     pub changes_segments_deleted: AtomicU64, // ADR-0006: rotated-out segments retired (nothing could resume inside)
+    pub txn_spills: AtomicU64,         // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
+    /// COUNTER (cumulative), not a gauge: bytes ever written to transaction spill files. A gauge
+    /// would be meaningless — a spill file exists only between one `Begin` and its `Commit`, so any
+    /// sample would almost always read zero. `reset()` clears it with the other counters.
+    pub txn_spill_bytes: AtomicU64,
+    /// ADR-0003: chunk appends made by commits too large for a single append. A commit that fits in
+    /// one append contributes 0, so this counts exactly the chunked commits' POSTs.
+    pub txn_chunked_appends: AtomicU64,
     /// GAUGE, not a counter: how many change-log segments exist right now (republished by every
     /// retention sweep). `reset()` leaves it alone — a gauge describes the world, not the window.
     pub changes_segments_retained: AtomicU64,
@@ -136,6 +144,9 @@ pub fn metrics() -> &'static Metrics {
         changes_rotations: AtomicU64::new(0),
         changes_segments_deleted: AtomicU64::new(0),
         changes_segments_retained: AtomicU64::new(0),
+        txn_spills: AtomicU64::new(0),
+        txn_spill_bytes: AtomicU64::new(0),
+        txn_chunked_appends: AtomicU64::new(0),
         process_envelope: Hist::new(),
         family_step: Hist::new(),
         append: Hist::new(),
@@ -159,6 +170,9 @@ impl Metrics {
                 "epoch_resets_total": self.epoch_resets.load(Ordering::Relaxed),
                 "changes_rotations_total": self.changes_rotations.load(Ordering::Relaxed),
                 "changes_segments_deleted_total": self.changes_segments_deleted.load(Ordering::Relaxed),
+                "txn_spills_total": self.txn_spills.load(Ordering::Relaxed),
+                "txn_spill_bytes": self.txn_spill_bytes.load(Ordering::Relaxed),
+                "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),
             },
             "gauges": {
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
@@ -185,6 +199,9 @@ impl Metrics {
         self.epoch_resets.store(0, Ordering::Relaxed);
         self.changes_rotations.store(0, Ordering::Relaxed);
         self.changes_segments_deleted.store(0, Ordering::Relaxed);
+        self.txn_spills.store(0, Ordering::Relaxed);
+        self.txn_spill_bytes.store(0, Ordering::Relaxed);
+        self.txn_chunked_appends.store(0, Ordering::Relaxed);
         // `changes_segments_retained` is deliberately NOT reset: it is a gauge of what exists.
         self.process_envelope.reset();
         self.family_step.reset();

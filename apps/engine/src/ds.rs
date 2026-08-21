@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
+
+use crate::heap_size::HeapSize;
 use serde::{Deserialize, Serialize};
 
 /// A State-Protocol change event, the JSON item on every table/shape stream.
@@ -39,6 +41,49 @@ pub struct EnvelopeHeaders {
     /// after a partial failure or a crash between append and slot-advance (at-least-once delivery).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// **Transaction-end marker**: `Some(true)` on the LAST envelope of a transaction, and only
+    /// there (ADR-0003).
+    ///
+    /// It is what keeps per-transaction atomic emission true on the wire now that a commit too
+    /// large for one request body is appended in several chunks. Each append is exposed atomically
+    /// by durable-streams, so without the marker the sequencer would see chunk 1 as a complete
+    /// `(txid, lsn)` run, fan it out and flush it to shape streams, then do the same for chunks
+    /// 2..N — a subscriber would observe a fraction of a transaction. With it, the sequencer HOLDS a
+    /// trailing run whose last envelope is unmarked and processes the transaction only once the
+    /// marker arrives.
+    ///
+    /// Every producer sets it: the ingestor on the last envelope of the last chunk (single-chunk
+    /// commits included, so the rule is uniform), and library-mode writers on every envelope
+    /// (one-envelope transactions). An envelope WITHOUT it that is not followed by one is an
+    /// incomplete transaction, by definition — never a transaction that opted out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<bool>,
+}
+
+impl crate::heap_size::HeapSize for EnvelopeHeaders {
+    fn heap_bytes(&self) -> usize {
+        self.operation.heap_bytes()
+            + self.txid.heap_bytes()
+            + self.offset.heap_bytes()
+            + self.lsn.heap_bytes()
+    }
+}
+
+impl crate::heap_size::HeapSize for Envelope {
+    fn heap_bytes(&self) -> usize {
+        self.type_.heap_bytes() + self.key.heap_bytes() + self.value.heap_bytes() + self.old.heap_bytes()
+            + self.headers.heap_bytes()
+    }
+}
+
+/// What one envelope costs to hold in memory: its inline representation plus the heap it owns.
+///
+/// This is the quantity `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` is measured in (ADR-0003), so the knob
+/// counts what is actually held rather than what the same data would serialize to. It is a lower
+/// bound in the same sense as every other [`crate::heap_size::HeapSize`] estimate (allocator
+/// overhead and `serde_json::Map` bucket overhead are not modelled).
+pub fn envelope_memory_bytes(env: &Envelope) -> u64 {
+    (std::mem::size_of::<Envelope>() + env.heap_bytes()) as u64
 }
 
 pub struct ReadResult {

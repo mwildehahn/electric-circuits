@@ -9,12 +9,30 @@
 //! rotated. The ingestor itself knows nothing about segments, the catalog or shapes.
 //!
 //! Delivery is append-then-acknowledge: a transaction's changes are buffered between `Begin` and
-//! `Commit`, appended to durable-streams as ONE batch, and only then acknowledged to Postgres
+//! `Commit`, appended to durable-streams, and only then acknowledged to Postgres
 //! (`update_applied_lsn` → the slot's `confirmed_flush_lsn`). A failed append tears the
 //! replication connection down instead of acknowledging; on reconnect the server resends from the
 //! confirmed position, so nothing is lost. (Acknowledgements are flushed on an interval, so a
 //! crash can re-deliver whole transactions. Delivery is therefore at-least-once; the sequencer
 //! restores exactly-once effect by de-duplicating on the stamped `(lsn, seq)`.)
+//!
+//! **Large transactions do not have to fit in memory** (ADR-0003). The buffer between `Begin` and
+//! `Commit` is a [`TxnBuffer`]: past `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` it spills to a local
+//! temporary file, and at `Commit` the transaction is streamed back out in **chunks**, each
+//! appended to the current segment and each within `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`. The
+//! slot is acknowledged — `last_lsn` published, the drain barrier's sentinel released — only after
+//! the **last** chunk has landed. A failure on any chunk tears the connection down unacknowledged,
+//! so Postgres re-delivers the whole transaction and the sequencer's `(lsn, seq)` de-duplication
+//! discards the chunks that already landed.
+//!
+//! Chunking would otherwise be visible downstream as several transactions: durable-streams exposes
+//! each append atomically, so a reader long-polling the segment tail gets chunk 1 on its own. The
+//! ingestor therefore stamps a **transaction-end marker** (`headers.last`) on the final envelope of
+//! the final chunk — on single-chunk commits too, so "no marker" unambiguously means "there is more
+//! of this transaction coming" — and the sequencer holds an unterminated trailing run back until it
+//! arrives (see `engine/sequencer.rs`). Contiguity on the segment is what makes that work: the
+//! ingestor is the only writer, and rotation is a transaction-boundary decision, so a commit's
+//! chunks are never interleaved with anything else.
 //!
 //! Each envelope is stamped with its transaction's COMMIT LSN (not the per-change record LSN), so
 //! the backfill/replication boundary (see `pg::SnapshotGate`) lines up with snapshot *commit*
@@ -53,6 +71,7 @@ use crate::ds::{Envelope, EnvelopeHeaders};
 use crate::pgoutput::{self, Cell, Message, OldTuple, RelColumn, Tuple};
 use crate::schema::{ColumnType, SchemaFingerprint, SharedTables, TableSchema};
 use crate::table_ref::TableRef;
+use crate::txn_buffer::{Stamp, TxnBuffer, TxnBufferConfig};
 
 /// A boxed future — the trait-object-safe form of the two `async fn`s on [`SchemaEvents`] (the
 /// engine implements it, so a native `async fn` in trait would make it non-dyn-safe).
@@ -219,7 +238,18 @@ pub async fn run(
     epoch: Arc<dyn EpochEvents>,
     last_lsn: Arc<std::sync::Mutex<String>>,
     sync_seq: Arc<AtomicI64>,
+    txn_cfg: TxnBufferConfig,
 ) {
+    // A spill file lives only between a `Begin` and its `Commit`, so anything of ours still in the
+    // spill dir belongs to a process that died mid-transaction (ADR-0003). Sweep it once, here,
+    // before the first connection.
+    let swept = crate::txn_buffer::sweep_spill_dir(&txn_cfg.spill_dir);
+    if swept > 0 {
+        tracing::warn!(
+            "replicator: removed {swept} transaction spill file(s) left in {} by a previous process",
+            txn_cfg.spill_dir.display()
+        );
+    }
     let mut attempt: u32 = 0;
     loop {
         // The epoch gate. A refusal is never fatal — it is "not yet", and what could change the
@@ -242,7 +272,8 @@ pub async fn run(
             }
         };
         let mut connected = false;
-        match stream_loop(cfg, &log, &tables, events.as_ref(), &last_lsn, &sync_seq, &mut connected).await {
+        match stream_loop(cfg, &log, &tables, events.as_ref(), &last_lsn, &sync_seq, &txn_cfg, &mut connected).await
+        {
             Ok(()) => tracing::warn!("replicator: stream ended; reconnecting"),
             Err(e) => tracing::error!("replicator: {e:#}; reconnecting"),
         }
@@ -320,6 +351,7 @@ async fn stream_loop(
     events: &dyn SchemaEvents,
     last_lsn: &Arc<std::sync::Mutex<String>>,
     sync_seq: &Arc<AtomicI64>,
+    txn_cfg: &TxnBufferConfig,
     // Set once the server has actually delivered something, so the caller can tell "the server
     // never let us in" from "we streamed and then something went wrong" when choosing the next
     // backoff. NOT set at `connect`: that only spawns the worker task, and TCP, auth, `pg_hba` and
@@ -329,14 +361,16 @@ async fn stream_loop(
 ) -> Result<()> {
     let mut client = ReplicationClient::connect(cfg).await.context("replication connect")?;
     let mut dec = Decoder::new(tables.clone());
-    let mut txn: Option<TxnBuf> = None;
+    // Dropped on every exit path (a replaced `Begin`, an error return, the stream ending), which is
+    // what removes a spilled transaction's temporary file (ADR-0003).
+    let mut txn: Option<TxnBuffer> = None;
     loop {
         let ev = client.recv().await.context("replication stream")?;
         *connected = true;
         let Some(ev) = ev else { return Ok(()) };
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
-                txn = Some(TxnBuf { xid, envs: Vec::new(), sync: None, bytes: 0 });
+                txn = Some(TxnBuffer::new(xid, txn_cfg.clone()));
             }
             ReplicationEvent::XLogData { data, .. } => {
                 let msg = pgoutput::decode(&data)?;
@@ -344,7 +378,7 @@ async fn stream_loop(
                 // anything else is decoded, so the dependents of a drifted/truncated table are
                 // already retired and its compiled schema already swapped by the time the next
                 // change for it arrives (ADR-0005).
-                let txn_ref = txn.as_ref().map(|t: &TxnBuf| TxnRef { xid: t.xid });
+                let txn_ref = txn.as_ref().map(|t: &TxnBuffer| TxnRef { xid: t.xid() });
                 if let Message::Relation { .. } = msg {
                     dec.on_relation(msg, events, txn_ref).await;
                     continue;
@@ -355,51 +389,50 @@ async fn stream_loop(
                 }
                 let Some(t) = txn.as_mut() else { continue };
                 match dec.on_change(msg) {
-                    Decoded::Env(env) => {
-                        t.bytes += data.len() as u64;
-                        t.envs.push(env);
-                    }
-                    Decoded::Sync(n) => t.sync = Some(n),
+                    // Serialized once, here, and only the bytes are kept — the buffer spills to
+                    // disk past its memory cap, so a transaction of any size stays bounded
+                    // (ADR-0003). A spill-file write failure tears the connection down
+                    // unacknowledged, exactly like a failed append.
+                    Decoded::Env(env) => t.push(env, data.len() as u64).context("buffering a change")?,
+                    Decoded::Sync(n) => t.set_sync(n),
                     Decoded::None => {}
                 }
             }
             ReplicationEvent::Commit { lsn, end_lsn, .. } => {
-                let Some(t) = txn.take() else { continue };
+                let Some(mut t) = txn.take() else { continue };
                 let t0 = std::time::Instant::now();
                 let commit_lsn = lsn.to_string();
-                // Stamp the buffered changes with the commit LSN, the transaction's xid (the
-                // backfill snapshot's xid-visibility fence), and each change's position within the
-                // transaction (the sequencer's de-duplication key).
-                let ops = t.envs.len() as u64;
-                let mut envs = t.envs;
-                for (i, env) in envs.iter_mut().enumerate() {
-                    env.headers.lsn = Some(commit_lsn.clone());
-                    env.headers.txid = Some(t.xid.to_string());
-                    env.headers.seq = Some(i as u64);
-                }
-                // The whole commit is ONE append to the single ordered log's CURRENT segment;
-                // acknowledge only on success. A failure tears the connection down (re-delivery;
-                // the sequencer de-duplicates).
-                if !envs.is_empty() {
-                    log.append_commit(&envs).await.context("append changes")?;
-                }
+                let (ops, raw_bytes, sync) = (t.len(), t.raw_bytes(), t.sync());
+                // Append the whole transaction — from memory, or from its spill file — in chunks,
+                // in order, to the CURRENT segment. `?` here is the ack-after-the-last-chunk rule:
+                // nothing below runs unless every chunk landed.
+                append_commit_chunked(log, &mut t, &commit_lsn, t0).await?;
+                // ...and only NOW, with every chunk on the log, is the transaction acknowledged.
                 client.update_applied_lsn(end_lsn);
                 *last_lsn.lock().unwrap() = commit_lsn;
                 // Publish the drain-barrier sentinel only after the whole commit is on the streams
                 // and acknowledged locally, so the barrier can't claim "drained" early.
-                if let Some(n) = t.sync {
+                if let Some(n) = sync {
                     sync_seq.fetch_max(n, Ordering::Relaxed);
                 }
+                // Releasing the buffer here (rather than at the end of the arm) removes the spill
+                // file as soon as the commit is durable, not after the rotation check.
+                drop(t);
                 // Per-txn replication metrics. `receive_lag` here is ingest-side append latency
                 // (commit frame received → appended), not source-commit→receipt lag.
                 if ops > 0 && crate::statsd::enabled() {
                     let lag_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    crate::statsd::replication_txn(ops, t.bytes, lag_ms);
+                    crate::statsd::replication_txn(ops, raw_bytes, lag_ms);
                 }
                 // Rotation is a TRANSACTION-BOUNDARY decision, taken after the commit is on the log
-                // and acknowledged: a segment never splits a transaction, and a rotation that fails
-                // (storage hiccup) is logged and retried at the next commit rather than failing —
-                // or duplicating — a commit that already landed (ADR-0006).
+                // and acknowledged: a segment never splits a transaction — chunking does not change
+                // that, every chunk of a commit goes to the segment that was current when the
+                // commit began — and a rotation that fails (storage hiccup) is logged and retried at
+                // the next commit rather than failing (or duplicating) a commit that already landed
+                // (ADR-0006). The one way a transaction still straddles segments is a predecessor
+                // process that closed the segment under us mid-commit; `append_commit` routes the
+                // remaining chunks forward to the open segment, and readers cross the pointer, so
+                // the run stays ordered and complete.
                 log.maybe_rotate().await;
             }
             ReplicationEvent::KeepAlive { .. }
@@ -409,14 +442,54 @@ async fn stream_loop(
     }
 }
 
-/// A transaction being buffered between `Begin` and `Commit`.
-struct TxnBuf {
-    xid: u32,
-    envs: Vec<Envelope>,
-    /// `__el_sync` counter carried by this transaction (drain barrier).
-    sync: Option<i64>,
-    /// Raw pgoutput payload bytes of the tracked changes (StatsD).
-    bytes: u64,
+/// Append one whole transaction to the change log's CURRENT segment, in **chunks** (ADR-0003), and
+/// report how many chunks it took.
+///
+/// The buffered changes are streamed out — from memory, or from the spill file if this transaction
+/// outgrew its cap — and each is stamped with the commit LSN, the transaction's xid (the backfill
+/// snapshot's xid-visibility fence) and its position within the transaction (`seq`, the sequencer's
+/// de-duplication key, contiguous `0..n` across every chunk). Chunks are appended **in order**, each
+/// small enough to be one durable-streams request body.
+///
+/// The final envelope of the final chunk additionally carries the
+/// **transaction-end marker** (`headers.last`), which is what lets the sequencer recognise the run
+/// as complete rather than fanning out chunk 1 on its own.
+///
+/// The chunks are contiguous on the segment (the ingestor is the only writer) and carry the same
+/// `(txid, lsn)`, so the sequencer folds them back into one transaction. **Every** failure
+/// propagates — the caller must not acknowledge the slot, must not publish `last_lsn` and must not
+/// release the drain barrier unless this returns `Ok`. Postgres then re-delivers the whole
+/// transaction on reconnect and the `(lsn, seq)` de-duplication discards the chunks that already
+/// landed.
+pub async fn append_commit_chunked(
+    log: &ChangeLogWriter,
+    buf: &mut TxnBuffer,
+    commit_lsn: &str,
+    started: std::time::Instant,
+) -> Result<u64> {
+    let (xid, changes, bytes, spilled) = (buf.xid(), buf.len(), buf.buffered_bytes(), buf.spilled());
+    let stamp = Stamp { lsn: commit_lsn.to_string(), txid: xid.to_string() };
+    let mut chunks = 0u64;
+    let mut drain = buf.drain(stamp).context("reading the buffered transaction")?;
+    while let Some(chunk) = drain.next_chunk().context("reading the buffered transaction")? {
+        log.append_commit(&chunk).await.context("append changes")?;
+        chunks += 1;
+    }
+    if chunks > 1 {
+        crate::metrics::metrics().txn_chunked_appends.fetch_add(chunks, Ordering::Relaxed);
+    }
+    if spilled || chunks > 1 {
+        tracing::info!(
+            xid,
+            changes,
+            bytes,
+            chunks,
+            spilled,
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "large transaction appended to the change log"
+        );
+    }
+    Ok(chunks)
 }
 
 /// What one decoded DML message amounts to for the ingestor.
@@ -570,7 +643,7 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
         key: key_from_obj(key_src, ts),
         value,
         old,
-        headers: EnvelopeHeaders { operation: operation.to_string(), txid: None, offset: None, lsn: None, seq: None },
+        headers: EnvelopeHeaders { operation: operation.to_string(), txid: None, offset: None, lsn: None, seq: None, last: None },
     };
     match msg {
         Message::Insert { new, .. } => {

@@ -86,9 +86,10 @@ Three ideas carry the whole design:
   per-feed delete gate lives host-side, `subq_feed.rs`). Row arrangements no longer exist —
   row data lives in Postgres.
 - **Envelope** (`ds.rs`) — the unit on every stream:
-  `{ type, key, value, old, headers{ operation, txid, offset, lsn, seq } }`. The ingestor stamps
-  `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), and `seq` (the change's position
-  within its transaction).
+  `{ type, key, value, old, headers{ operation, txid, offset, lsn, seq, last } }`. The ingestor stamps
+  `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), `seq` (the change's position
+  within its transaction) and `last` (the transaction-end marker, on its final envelope only —
+  ADR-0003, §3).
 
 ---
 
@@ -100,6 +101,47 @@ Each transaction's changes are buffered between `Begin` and `Commit`, stamped wi
 `(commit LSN, xid, seq)`, appended to the change log's **current segment**, and only **then**
 acknowledged to Postgres (`confirmed_flush_lsn`) — a failed append tears the connection down
 unacknowledged, and the server resends from the confirmed position.
+
+**The buffer is bounded; large transactions spill and are appended in chunks** (ADR-0003). A
+transaction cannot be appended before its commit frame (the commit LSN is unknown and it may still
+abort), so it must be held — and a million-row `UPDATE` under `REPLICA IDENTITY FULL` carries old and
+new for every row. The buffer holds `Envelope` structs (nothing is serialized on the way in) and
+measures them as held memory; once that reaches `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (128 MiB) it is
+serialized out to one NDJSON file under `ELECTRIC_CIRCUITS_TXN_SPILL_DIR`, memory is released, and
+every further change of that transaction goes straight to the file. At the commit the transaction is
+streamed back in order, stamped, and appended in chunks of at most
+`ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` (64 MiB, ≤ the durable-streams body cap) — **acknowledging
+the slot, publishing `last_lsn` and releasing the drain barrier only after the LAST chunk lands**.
+Peak **ingestor** memory is the cap plus one chunk (the sequencer's own read page, held run and
+pending appends are bounded by the transaction's size, not by this knob), and transaction size never
+invalidates a shape.
+
+**Chunking is not visible as several transactions.** Durable-streams exposes each append atomically,
+so the sequencer's long-poll returns chunk 1 on its own; splitting a page by `(txid, lsn)` alone would
+fan that chunk out and flush it to the shape streams as a whole commit. The ingestor therefore stamps
+a **transaction-end marker** on the last envelope of every transaction (`headers.last`, on
+single-chunk commits too; library-mode writers stamp their one-envelope writes), and the sequencer
+**holds** a trailing run that no marker terminates: held envelopes are carried into the next read and
+the transaction is processed and flushed only when the marker arrives.
+
+A re-delivery has to fold into that hold. When the ingestor fails part-way it acknowledges nothing,
+so Postgres re-sends the interrupted transaction from its start — and, because acknowledgements are
+flushed on an interval, it can re-send earlier **complete** commits first. So the "already held, skip
+it" filter (`seq` greater than the last one held) applies to the **leading run of the page and only
+while that run is the held transaction**: `seq` is the running index over one transaction and means
+nothing against another, and a page-wide filter would silently drop whole acknowledged transactions
+whose seqs happen to be lower. If the held transaction is not what came next at all — a reconnect
+delivering complete commits first, or an epoch reset abandoning it — the fragment is discarded: it
+will arrive again in full, and any commit already applied is skipped by the highwater.
+
+Nothing is published past the page a held run began in — `processed`, the checkpoint, the
+segment-deletion floor and a shape's dormant resume position all stay there — so a crash, or a park,
+re-reads the whole transaction. A page that completes one held run and starts another re-pins to its
+own page, so a catch-up over consecutive chunked commits keeps checkpointing. And the checkpoint
+carries the `(lsn, seq)` de-duplication highwater **with** the position — written whenever either
+moves, since the highwater advances while the position is pinned — so a prefix applied before a crash
+is not applied twice. (The dormant-shape replay does not hold: it appends absolute per-pk rows, so a
+partial commit is a prefix of the same rows.)
 
 **The change log is segmented** (ADR-0006): `changes/0`, `changes/1`, … , never a bare `changes`
 stream, because durable-streams offers whole-stream TTL but no prefix trimming and one ever-growing
@@ -544,7 +586,7 @@ absolute membership emission makes them unnecessary for convergence).
 | seam | mechanism | guarantee |
 |---|---|---|
 | backfill ↔ live | `SnapshotGate` (xid visibility; LSN fallback) | each change counts exactly once per shape/aggregate/node |
-| ingestor → change log | append → acknowledge + `(lsn,seq)` sequencer de-dup | at-least-once delivery, exactly-once effect |
+| ingestor → change log | append (chunked past `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`; contiguous on one segment, last envelope marked `headers.last`) → acknowledge **after the last chunk**; reader holds an unterminated run + `(lsn,seq)` de-dup, checkpointed together — ADR-0003 | at-least-once delivery, exactly-once effect; a commit of any size at bounded INGESTOR memory, still one unit of visibility |
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + refcount + ready-watch + atomic rollback | joiners see a live, backfilled stream or an error; last drop tears everything down |
@@ -567,9 +609,9 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | unit | threads | notes |
 |------|---------|-------|
 | engine main | tokio multi-thread | sequencer + flush run here |
-| sequencer (all tables) | 1 task | commit-ordered change processing; per-txn atomic flush |
+| sequencer (all tables) | 1 task | commit-ordered change processing; per-txn atomic flush (holds a trailing run until its transaction-end marker arrives) |
 | shapes (any kind) | **0** | no per-shape thread or circuit |
-| replication ingestor | 1 task | stream pgoutput/decode/append/acknowledge |
+| replication ingestor | 1 task | stream pgoutput/decode/buffer (spilling past the memory cap)/append in chunks/acknowledge |
 | subquery registry | 0 (a mutex) | eval + emission-lane enqueue under it (in-memory only; no network under the lock) |
 | flip workers | ≤ `ELECTRIC_CIRCUITS_FLIP_WORKERS` tasks (default 8) | concurrent deferred query-backs; PG round-trips never hold the registry lock |
 | emission lanes | `ELECTRIC_CIRCUITS_EMIT_LANES` tasks (default 8) | per-stream FIFO writers: append order = eval order per shape |
@@ -582,7 +624,8 @@ Threads are flat in the number of shapes *and* in the number of equality templat
 
 ## 11. Telemetry
 
-- `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`) +
+- `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`,
+  `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions) +
   log-bucket latency histograms (`process_envelope`, `family_step`, `append`) with p50/p99/p999/max.
 - `GET /memory` + OTel gauges (`engine_shapes`, `engine_subquery_nodes`, `engine_subquery_contributors`,
   `engine_family_circuits`, …) — the cardinalities that drive RSS; `GET /metrics/prometheus` exports.

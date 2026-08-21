@@ -960,6 +960,7 @@ mod tests {
                 offset: Some(offset.into()),
                 lsn: None,
                 seq: None,
+                last: None,
             },
         }
     }

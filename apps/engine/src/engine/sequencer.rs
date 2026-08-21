@@ -103,6 +103,7 @@ pub(crate) fn spawn_sequencer(
     ds: DsClient,
     tables: SharedTables,
     start: LogPosition,
+    restore_highwater: Option<(u64, u64)>,
     catalog_tx: CatalogWriter,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
@@ -117,6 +118,7 @@ pub(crate) fn spawn_sequencer(
         ds,
         tables,
         start,
+        restore_highwater,
         catalog_tx,
         cmd_rx,
         processed.clone(),
@@ -260,6 +262,8 @@ pub(crate) async fn sequencer_loop(
     ds: DsClient,
     tables: SharedTables,
     start: LogPosition,
+    // The `(lsn, seq)` de-duplication highwater restored with `start` (ADR-0003).
+    restore_highwater: Option<(u64, u64)>,
     catalog_tx: CatalogWriter,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<LogPosition>>,
@@ -277,6 +281,11 @@ pub(crate) async fn sequencer_loop(
     // resumes on the segment the log actually moved to.
     let mut last_ckpt = std::time::Instant::now();
     let mut ckpt_pos = pos.clone();
+    // The highwater the last checkpoint carried. While a transaction is HELD the position is
+    // pinned, so the position alone stops changing — but transactions completed before the hold
+    // keep advancing the highwater, and that progress has to reach the catalog or a crash
+    // re-applies them (ADR-0003).
+    let mut ckpt_hw: Option<(u64, u64)> = restore_highwater;
     // The rotation pointer this segment carried (ADR-0006). It can arrive in a batch that is not
     // yet flagged `closed` — the pointer append and the close are two requests — so it is
     // remembered until the close actually lands, and the segment is only left once BOTH are in.
@@ -288,7 +297,28 @@ pub(crate) async fn sequencer_loop(
     // weights. Every ingestor envelope carries (commit lsn, seq = position in txn), strictly
     // increasing on the single ordered log, so anything at/below the highwater has already been
     // applied and is skipped. Envelopes without both stamps (library mode) bypass this.
-    let mut highwater: Option<(u64, u64)> = None;
+    let mut highwater: Option<(u64, u64)> = restore_highwater;
+
+    // The TRAILING RUN of a page whose last envelope is not marked `headers.last` (ADR-0003).
+    //
+    // Durable-streams exposes each append atomically, so a commit appended in several chunks
+    // arrives as several pages. Splitting on `(txid, lsn)` alone would make chunk 1 look like a
+    // whole transaction and flush it to shape streams on its own — a subscriber would see a
+    // fraction of a commit, which per-transaction atomic emission forbids. So an unterminated
+    // trailing run is HELD here and carried into the next read, and the transaction is processed
+    // (and flushed) only once the marker arrives.
+    let mut held: Vec<Envelope> = Vec::new();
+    // Where a restart must resume while a run is held: the read position from BEFORE the page the
+    // held run started in. `processed` (and therefore the checkpoint, and therefore the segment
+    // deletion floor) never moves past it, so a crash re-reads the whole held transaction. The read
+    // cursor `pos` moves on normally — only what is *published* is pinned.
+    let mut held_from: Option<LogPosition> = None;
+    // When the current hold started, and how many times it has been reported. A hold is normal and
+    // short (the ingestor is appending the next chunk), but it freezes `processed` — the restart
+    // point, the convergence barrier and the segment-deletion floor — so a hold that does NOT end
+    // has to be visible rather than looking like an idle engine.
+    let mut held_since: Option<std::time::Instant> = None;
+    let mut held_warnings: u32 = 0;
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -324,8 +354,13 @@ pub(crate) async fn sequencer_loop(
                 }
                 Some(SequencerCmd::DeactivateShape { table, shape_id, resp }) => {
                     // Capture-and-unregister is atomic w.r.t. envelope processing (commands run
-                    // between fully-flushed transactions), so `pos` is exactly "the shape's
-                    // stream is complete up to here".
+                    // between fully-flushed transactions), so the shape's stream is complete up to
+                    // the PUBLISHED position — which is the read cursor unless a transaction is
+                    // being held mid-append (ADR-0003), in which case it is where that run began.
+                    // Handing back the read cursor there would park the shape past a transaction it
+                    // never saw, and its reactivation replay would start after those rows. Resuming
+                    // from the pin instead re-reads the completed run, which is idempotent: the
+                    // replay appends absolute per-pk rows.
                     let gate = execs.get_mut(table.as_str()).and_then(|exec| {
                         if let Some(shape) = exec.shapes.remove(&shape_id) {
                             exec.shape_index.remove(&shape_id);
@@ -353,7 +388,7 @@ pub(crate) async fn sequencer_loop(
                     if gate.is_some() {
                         emitted.remove(&shape_id);
                     }
-                    let _ = resp.send(gate.map(|g| (pos.clone(), g)));
+                    let _ = resp.send(gate.map(|g| (published(&pos, &held_from), g)));
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::RemoveShape { table, shape_id }) => {
@@ -435,10 +470,107 @@ pub(crate) async fn sequencer_loop(
                         rotate_to = Some(n);
                     }
                     envs.retain(|e| !crate::changelog::is_control(e));
+                    // Re-attach the run held from an earlier page (ADR-0003).
+                    //
+                    // A re-delivery complicates this: when the ingestor fails part-way through a
+                    // chunked commit it acknowledges nothing, so Postgres re-sends that whole
+                    // transaction — and, because acknowledgements are flushed on an interval, it
+                    // can re-send earlier COMPLETE commits ahead of it too. So the "already held,
+                    // skip it" filter applies to the LEADING run of this page and only while that
+                    // run is the held transaction: `seq` is the running index over one transaction,
+                    // so it is meaningless against any other one, and applying it page-wide would
+                    // silently drop whole transactions whose seqs happen to be lower.
+                    let held_key = held.last().map(run_key_owned);
+                    let mut merged_from = None;
+                    if let Some(key) = held_key {
+                        let lead = envs.iter().take_while(|e| run_key(e) == key_ref(&key)).count();
+                        if lead == 0 && !envs.is_empty() {
+                            // The held transaction is not what came next. Two things produce that,
+                            // and neither can ever complete this fragment: a reconnect re-delivering
+                            // earlier complete commits first (the held transaction's own
+                            // re-delivery follows in full, and the complete ones are skipped by the
+                            // `(lsn, seq)` highwater if already applied), and an epoch reset, which
+                            // abandons the fragment outright. Discarding it is the only correct
+                            // move — emitting a fragment of a transaction is what the marker exists
+                            // to prevent.
+                            tracing::warn!(
+                                "sequencer: the held (incomplete) transaction {:?} was followed by a different one \
+                                 {:?}; discarding the fragment — it will arrive again in full (a reconnect \
+                                 re-delivers earlier complete commits first) or has been abandoned (epoch reset)",
+                                key,
+                                run_key_owned(&envs[0]),
+                            );
+                            held.clear();
+                            held_from = None;
+                            held_since = None;
+                            held_warnings = 0;
+                        } else {
+                            // Only the leading run is filtered; everything after the first envelope
+                            // of a different transaction passes through untouched.
+                            let last_seq = held.last().and_then(|e| e.headers.seq);
+                            let mut rest = envs.split_off(lead);
+                            envs.retain(|e| match (e.headers.seq, last_seq) {
+                                (Some(seq), Some(hs)) => seq > hs,
+                                _ => true,
+                            });
+                            envs.append(&mut rest);
+                            let mut merged = std::mem::take(&mut held);
+                            merged.append(&mut envs);
+                            envs = merged;
+                            merged_from = Some(key);
+                        }
+                    }
+                    // Hold back a TRAILING run that is not terminated by the transaction-end marker
+                    // (ADR-0003): it is a commit whose remaining chunks have not been appended yet.
+                    // Everything before it is complete and processed now.
+                    match unterminated_tail(&envs) {
+                        Some(cut) => {
+                            // Is this the SAME transaction that was already held, or a new one that
+                            // starts after the held one completed on this page? A new hold must
+                            // re-pin to THIS page, or a catch-up over consecutive chunked commits
+                            // would keep the pin (and the checkpoint) frozen at the first page for
+                            // the whole run.
+                            let continuation = merged_from.as_ref().is_some_and(|k| run_key(&envs[cut]) == key_ref(k));
+                            if !continuation {
+                                held_from = Some(LogPosition { segment: pos.segment, offset: read_off.clone() });
+                                held_since = Some(std::time::Instant::now());
+                                held_warnings = 0;
+                            }
+                            held = envs.split_off(cut);
+                            let since = *held_since.get_or_insert_with(std::time::Instant::now);
+                            // A hold longer than a minute is no longer "the next chunk is coming":
+                            // ingest has stalled mid-transaction, and everything downstream of
+                            // `processed` is frozen with it. Say so, then once a minute after that.
+                            if since.elapsed() >= HELD_RUN_WARN_AFTER * (held_warnings + 1) {
+                                held_warnings += 1;
+                                tracing::warn!(
+                                    "sequencer: transaction {:?} at lsn {:?} has been incomplete on the change \
+                                     log for {:?} ({} envelope(s) held); the change-log position is pinned at \
+                                     {} until its final chunk arrives",
+                                    held.first().and_then(|e| e.headers.txid.clone()),
+                                    held.first().and_then(|e| e.headers.lsn.clone()),
+                                    since.elapsed(),
+                                    held.len(),
+                                    published(&pos, &held_from),
+                                );
+                            }
+                        }
+                        // Nothing is held any more (the marker arrived, or never was one): release
+                        // the pin so `processed`, the checkpoint and the deletion floor move again.
+                        // Safe here — the run it was pinning is processed and flushed below, before
+                        // anything is published.
+                        None => {
+                            held_from = None;
+                            held_since = None;
+                            held_warnings = 0;
+                        }
+                    }
                     // Split the read batch into transactions (runs of equal (txid, lsn) — the
                     // ingestor appends whole commits contiguously, in commit order) and flush each
                     // transaction's appends before processing the next: atomic per-transaction
-                    // emission, across tables.
+                    // emission, across tables. Every run left here is COMPLETE: it ends on an
+                    // envelope carrying `headers.last`, so a commit appended in several chunks
+                    // (ADR-0003) is processed once, whole, not chunk by chunk.
                     let mut touched = false;
                     let mut i = 0;
                     while i < envs.len() {
@@ -517,9 +649,11 @@ pub(crate) async fn sequencer_loop(
                         i = j;
                     }
                     // Publish the processed position only after the whole batch is fanned out +
-                    // flushed.
+                    // flushed — and never past a run still being HELD (ADR-0003): a restart must
+                    // re-read the whole incomplete transaction, and `processed` is also what
+                    // `GET /tables/{name}/offset` and the segment-deletion floor read.
                     if next.is_some() {
-                        *processed.lock().unwrap() = pos.clone();
+                        *processed.lock().unwrap() = published(&pos, &held_from);
                     }
                     // The segment ended (ADR-0006). Cross only once a read of it comes back EMPTY
                     // (or stops advancing): "closed" can arrive alongside a page of data, and
@@ -534,7 +668,7 @@ pub(crate) async fn sequencer_loop(
                             Some(n) => {
                                 tracing::info!("sequencer: {} closed; continuing on {}", pos.path(), segment_path(n));
                                 pos = LogPosition::start_of(n);
-                                *processed.lock().unwrap() = pos.clone();
+                                *processed.lock().unwrap() = published(&pos, &held_from);
                                 crossed = true;
                             }
                             None => {
@@ -552,7 +686,7 @@ pub(crate) async fn sequencer_loop(
                                             segment_path(n)
                                         );
                                         pos = LogPosition::start_of(n);
-                                        *processed.lock().unwrap() = pos.clone();
+                                        *processed.lock().unwrap() = published(&pos, &held_from);
                                         crossed = true;
                                     }
                                     Err(e) => {
@@ -567,10 +701,19 @@ pub(crate) async fn sequencer_loop(
                             }
                         }
                     }
-                    if crossed || (next.is_some() && pos != ckpt_pos && last_ckpt.elapsed() >= std::time::Duration::from_secs(2)) {
-                        ckpt_pos = pos.clone();
+                    let ckpt = published(&pos, &held_from);
+                    // Either half moving is progress worth persisting: the position, or — while the
+                    // position is pinned behind a held run — the de-duplication highwater.
+                    let ckpt_moved = ckpt != ckpt_pos || highwater != ckpt_hw;
+                    if crossed || (next.is_some() && ckpt_moved && last_ckpt.elapsed() >= std::time::Duration::from_secs(2)) {
+                        ckpt_pos = ckpt.clone();
+                        ckpt_hw = highwater;
                         last_ckpt = std::time::Instant::now();
-                        catalog_tx.send(CatalogEvent::Offset { pos: pos.clone() });
+                        // The de-duplication highwater rides WITH the position (ADR-0003): a crash
+                        // after a prefix of a chunked commit was applied and checkpointed would
+                        // otherwise re-apply that prefix on re-delivery, and aggregate/subquery
+                        // weights are not idempotent under duplicates.
+                        catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater });
                     }
                     if touched {
                         publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
@@ -595,6 +738,60 @@ pub(crate) async fn sequencer_loop(
             },
         }
     }
+}
+
+/// How long a transaction may stay incomplete on the change log before the sequencer says so (and
+/// again every interval after that). Long enough that appending the next chunk of a genuinely huge
+/// commit is never reported, short enough that a stalled ingest is not silent.
+const HELD_RUN_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The position a HELD run pins publication to: while a transaction is only partly on the log
+/// (ADR-0003), `processed` — and therefore the restart point, `GET /tables/{name}/offset`, and the
+/// segment-deletion floor — stays at the page the held run began in. The read cursor moves on
+/// regardless; only what is published is pinned.
+fn published(pos: &LogPosition, held_from: &Option<LogPosition>) -> LogPosition {
+    held_from.clone().unwrap_or_else(|| pos.clone())
+}
+
+/// The `(txid, lsn)` pair identifying the transaction an envelope belongs to — the key the change
+/// log's runs are split on.
+fn run_key(env: &Envelope) -> (Option<&str>, Option<&str>) {
+    (env.headers.txid.as_deref(), env.headers.lsn.as_deref())
+}
+
+/// [`run_key`], owned — needed to remember a held run's identity across the move that re-attaches it.
+fn run_key_owned(env: &Envelope) -> (Option<String>, Option<String>) {
+    (env.headers.txid.clone(), env.headers.lsn.clone())
+}
+
+/// Borrow an owned run key back for comparison with [`run_key`].
+fn key_ref(k: &(Option<String>, Option<String>)) -> (Option<&str>, Option<&str>) {
+    (k.0.as_deref(), k.1.as_deref())
+}
+
+/// The index at which a page's trailing, INCOMPLETE transaction begins — `None` when the page ends
+/// on a complete one, or carries nothing that could be incomplete.
+///
+/// "Complete" is the ingestor's transaction-end marker (`headers.last`), set on the final envelope
+/// of the final chunk of every commit (ADR-0003). Without it a commit appended in several chunks
+/// would be processed chunk by chunk, and each chunk flushed to shape streams as if it were a whole
+/// transaction.
+///
+/// An envelope with no `seq` is NOT held: only the ingestor structures its envelopes into
+/// transactions, and a library-mode write is a one-envelope transaction. Holding one would wait for
+/// a marker no producer is going to send.
+fn unterminated_tail(envs: &[Envelope]) -> Option<usize> {
+    let last = envs.last()?;
+    if last.headers.last == Some(true) {
+        return None;
+    }
+    last.headers.seq?;
+    let (txid, lsn) = (&last.headers.txid, &last.headers.lsn);
+    let mut i = envs.len() - 1;
+    while i > 0 && (&envs[i - 1].headers.txid, &envs[i - 1].headers.lsn) == (txid, lsn) {
+        i -= 1;
+    }
+    Some(i)
 }
 
 /// Make a pending shape live: register its routing, then replay its buffered deltas through the
@@ -742,6 +939,14 @@ pub(crate) async fn activate_shape(
 /// resume inside it, so this should be unreachable) surfaces as a read error, which fails the
 /// resume and drops the shape. That is the right outcome: a shape whose replay start no longer
 /// exists can never be brought up to date, and its subscribers must recreate it.
+///
+/// It deliberately does NOT hold back an unterminated transaction the way the live loop does
+/// (ADR-0003). Nothing here depends on transaction boundaries: it filters by table through the
+/// shape's snapshot gate and appends **absolute per-pk** rows (`upsert`/`delete` by key), so a
+/// partly-appended commit produces a prefix of the same absolute rows and the next page produces
+/// the rest — no delta is counted twice and no intermediate state is wrong, only briefly
+/// incomplete, on a stream the shape is not live on yet. The live loop's rule is what governs from
+/// the moment the shape is registered.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn replay_changes_for_shape(
     ds: &DsClient,
@@ -1192,5 +1397,92 @@ pub(crate) async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<En
             });
         }
         while set.join_next().await.is_some() {}
+    }
+}
+
+#[cfg(test)]
+mod txn_boundary_tests {
+    use super::*;
+    use crate::ds::EnvelopeHeaders;
+
+    /// One change-log envelope as the ingestor stamps it.
+    fn env(lsn: &str, txid: &str, seq: u64, last: bool) -> Envelope {
+        Envelope {
+            type_: "public.t".into(),
+            key: seq.to_string(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "insert".into(),
+                txid: Some(txid.into()),
+                offset: None,
+                lsn: Some(lsn.into()),
+                seq: Some(seq),
+                last: last.then_some(true),
+            },
+        }
+    }
+
+    /// A library-mode write: no transaction structure at all (no `seq`).
+    fn lib_env(key: &str) -> Envelope {
+        Envelope {
+            type_: "public.t".into(),
+            key: key.into(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "insert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        }
+    }
+
+    /// A page that ends on a marked envelope is entirely processable; one that does not has its
+    /// trailing run held back, from the run's FIRST envelope — never mid-transaction.
+    #[test]
+    fn a_page_ending_mid_transaction_holds_back_the_whole_trailing_run() {
+        // Complete: nothing held.
+        let done = vec![env("0/10", "1", 0, false), env("0/10", "1", 1, true)];
+        assert_eq!(unterminated_tail(&done), None);
+
+        // Incomplete: the trailing run starts at index 0.
+        let open = vec![env("0/10", "1", 0, false), env("0/10", "1", 1, false)];
+        assert_eq!(unterminated_tail(&open), Some(0));
+
+        // A complete transaction followed by the first chunk of the next: only the second is held.
+        let mixed = vec![
+            env("0/10", "1", 0, true),
+            env("0/20", "2", 0, false),
+            env("0/20", "2", 1, false),
+        ];
+        assert_eq!(unterminated_tail(&mixed), Some(1));
+
+        // Empty page: nothing to hold.
+        assert_eq!(unterminated_tail(&[]), None);
+    }
+
+    /// A library-mode envelope is a one-envelope transaction with no `seq`. Holding one would wait
+    /// forever for a marker no producer sends, so it is never held.
+    #[test]
+    fn an_envelope_with_no_transaction_structure_is_never_held() {
+        assert_eq!(unterminated_tail(&[lib_env("a")]), None);
+        assert_eq!(unterminated_tail(&[env("0/10", "1", 0, true), lib_env("a")]), None);
+    }
+
+    /// While a run is held, everything PUBLISHED — the restart point, `GET /tables/{n}/offset`, the
+    /// segment-deletion floor — stays at the page the run began in, even after the read cursor has
+    /// moved on (and even across a segment crossing). Otherwise a crash would resume past a
+    /// transaction that was never applied.
+    #[test]
+    fn publication_is_pinned_to_where_a_held_run_began() {
+        let cursor = LogPosition { segment: 3, offset: "99".into() };
+        assert_eq!(published(&cursor, &None), cursor, "nothing held: the read cursor is published");
+
+        let held_from = LogPosition { segment: 2, offset: "40".into() };
+        assert_eq!(published(&cursor, &Some(held_from.clone())), held_from);
     }
 }

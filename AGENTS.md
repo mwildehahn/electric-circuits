@@ -223,6 +223,35 @@ canvas update, screenshot.
   = shape retired, discard). The sequencer's processed offset is published only after the whole batch
   landed, and each source transaction's appends are flushed before the next transaction is processed
   (per-transaction atomic emission).
+- **A transaction is one unit of visibility even when it is several appends** (ADR-0003). A commit
+  larger than `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` reaches the change log as several appends, and
+  durable-streams exposes each atomically — so splitting a read page into transactions by
+  `(txid, lsn)` alone would flush a fraction of a commit to the shape streams. The rule on the wire is
+  the **transaction-end marker**: `headers.last = true` on the LAST envelope of every transaction, and
+  only there. Every producer sets it (the ingestor on the final envelope of the final chunk, including
+  single-chunk commits; `toTableEnvelope` on each library-mode write, which is a one-envelope
+  transaction), and the sequencer HOLDS a trailing run that no marker terminates — carrying it into
+  the next read and publishing nothing (not `processed`, not the checkpoint, not the deletion floor,
+  not a dormant shape's resume position) past the page that run began in. Two sharp edges: the
+  "already held, skip it" `seq` filter applies to the **leading run of a page and only while it is
+  the held transaction** (a page-wide filter silently drops acknowledged transactions whose seqs are
+  lower — a reconnect re-delivers complete commits ahead of the interrupted one), and a page that
+  completes one held run and starts another must **re-pin to its own page**, or the checkpoint
+  freezes for the whole catch-up. If you add a producer, stamp the marker; if you add a change-log
+  reader that cares about transactions, hold like the sequencer does. The ingest-side ack (`update_applied_lsn`), `last_lsn` and the drain-barrier sentinel come
+  **only after the last chunk landed** — never from inside the chunk loop.
+- **The sequencer's de-dup highwater is checkpointed with its position** (`Offset { pos, highwater }`),
+  and written whenever **either** moves — while a hold pins the position, the highwater still advances
+  on the transactions completed before it. A crash can leave a prefix of a chunked commit applied and
+  checkpointed while the rest is re-delivered; aggregate and subquery weights are not idempotent, so
+  the position alone is not a restart point.
+- **The INGESTOR's memory is bounded, and transaction size never invalidates anything** (ADR-0003).
+  Its per-transaction buffer holds `Envelope` structs (nothing is serialized on the way in) and spills
+  to a temp file past `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (`txn_buffer.rs`), so its peak is that cap
+  plus one chunk. That bound is the ingestor's alone — the sequencer's read page, held run and
+  `txn_pending` are bounded by a transaction's size. There is no "transaction too large" branch: no
+  shape is retired, nothing is purged, nothing is refused for being big. If you add work between
+  `Begin` and `Commit`, it must not accumulate unbounded state of its own.
 - **Schema drift, `TRUNCATE` and a replica-identity regression retire that table's dependents**
   (ADR 0005; `engine/drift.rs`). The compiled schema carries a fingerprint (`attnum`-ordered
   `(name, type oid, typmod)` + `relreplident`); a pgoutput `Relation` that disagrees with it, a

@@ -47,6 +47,9 @@ discover the bound port.
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Change log: rotate once the current segment is this old. `0` disables the age criterion (both `0` = never rotate, i.e. an unbounded log) |
 | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | Change log: how long a rotated-out segment may stay pinned by a **dormant** shape before that shape is evicted and the segment deleted. `0` = a dormant shape pins its segment forever |
+| `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM) |
+| `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
+| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for the largest transaction the database can produce, must be writable at boot, and must not be shared between engines |
 | `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` (Electric parity) retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
 | `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before its **handle state** is evicted and its shape subscription released (the shape + stream are retained and follow the retention lifecycle); a late request gets `409 must-refetch` and rejoins the retained shape |
@@ -175,6 +178,57 @@ everything in between is changes it has not read. A closed segment with **no** s
 produced by the engine (rotation creates the successor first), so that state is refused loudly rather
 than skipped past — as is a boot whose restored position, or whose recorded current segment, names a
 stream storage no longer has.
+
+### Large transactions
+
+A transaction is only appendable once its `Commit` frame arrives (before that the commit LSN is
+unknown and the transaction may still abort), so everything between `Begin` and `Commit` has to be
+held somewhere — and a million-row `UPDATE` under `REPLICA IDENTITY FULL` carries old **and** new for
+every row. The ingestor bounds that (`docs/adr/0003-ingest-pgoutput-v1-with-spill.md`): it buffers
+`Envelope` structs (nothing is serialized on the way in, so an ordinary commit costs what it always
+did), measures them as held memory, and once that reaches `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES`
+serializes the whole buffer out to one temporary file under `ELECTRIC_CIRCUITS_TXN_SPILL_DIR`
+(newline-delimited JSON, mode 0600 in a 0700 directory), releases the memory, and writes every
+further change of that transaction straight to the file. Peak **ingestor** memory is then the cap
+plus one chunk, for a transaction of any size — a bound on the ingestor, not on the engine: the
+sequencer's read page, the run it holds, and its per-transaction pending appends are still bounded by
+the transaction's size. **Transaction size never invalidates anything** — there is no fail-loud
+branch, no shape is retired and nothing is purged for being big. The spill directory is probed at
+boot; an unwritable one refuses the boot rather than failing every large commit.
+
+At the commit the transaction is streamed back out in order, stamped with `(lsn, txid, seq)` (`seq`
+contiguous `0..n` across every chunk), and appended in chunks of at most
+`ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` to the segment that was current when the commit began. The
+slot is acknowledged — and `GET /replication/lsn` advanced, and the drain barrier's sentinel
+released — **only after the last chunk has landed**; a failure on any chunk tears the connection down
+unacknowledged, so Postgres re-delivers the whole transaction and the sequencer's `(lsn, seq)`
+de-duplication discards the chunks that already landed. Rotation remains a transaction-boundary
+decision, so a segment never splits a commit.
+
+**Chunking stays invisible to subscribers.** Durable-streams exposes each append atomically, so a
+reader long-polling the segment tail sees chunk 1 on its own; fanning that out would flush a fraction
+of a transaction to the shape streams. The ingestor therefore marks the **last envelope of every
+transaction** — `headers.last`, set on single-chunk commits too, so "no marker" always means
+"incomplete" — and the sequencer holds back a trailing run that no marker terminates, carrying it
+into the next read and processing the transaction only once the marker arrives. A re-delivered prefix
+of the held transaction folds in by `seq`; that filter is confined to the page's leading run while it
+belongs to the held transaction, because a reconnect can re-deliver earlier complete commits first
+and their seqs restart from 0. If the held transaction is not what comes next at all (that reconnect,
+or an epoch reset), the fragment is discarded — it will arrive again in full.
+
+While a run is held, nothing is published past the page it began in: the restart point,
+`GET /tables/{name}/offset`, the segment-deletion floor and the resume position of a shape going
+dormant all stay there, so a crash (or a park) re-reads the whole transaction. A page that completes
+one held run and starts another re-pins to its own page, so a catch-up over consecutive chunked
+commits keeps checkpointing. The checkpoint carries the de-duplication highwater alongside the
+position and is written whenever either moves, so a prefix that was applied before a crash is not
+applied twice.
+
+The spill file is scratch, not state: it is removed at commit, at abort and on connection teardown,
+and a file left by a process that died mid-transaction is swept at the next boot by pid liveness.
+Pids only mean something inside one pid namespace, so a spill directory must belong to exactly one
+engine — give each engine its own `ELECTRIC_CIRCUITS_TXN_SPILL_DIR`. `GET /metrics` reports
+`txn_spills_total`, `txn_spill_bytes` and `txn_chunked_appends_total`.
 
 ## Schema changes
 

@@ -46,6 +46,7 @@ mod subq_index;
 pub mod subquery;
 pub mod table_ref;
 pub mod trace;
+pub mod txn_buffer;
 pub mod value;
 pub mod where_sql;
 

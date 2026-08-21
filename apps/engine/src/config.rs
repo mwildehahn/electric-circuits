@@ -12,9 +12,10 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::table_ref::{TableRef, TableSelector};
+use crate::txn_buffer::TxnBufferConfig;
 
 /// A StatsD destination (`host[:port]`, default port 8125).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +75,9 @@ pub struct Config {
     /// dbsp-backed table arrangements (always built; see `arrangements.rs`). The circuit is
     /// mandatory infrastructure — the sub-knobs below tune it, but it can no longer be turned off.
     pub dbsp: DbspConfig,
+    /// Large-transaction handling on the ingest path (ADR-0003): the per-transaction memory cap
+    /// before the buffer spills to disk, the spill directory, and the byte budget for one append.
+    pub txn: TxnBufferConfig,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
@@ -161,8 +165,8 @@ pub fn parse_human_duration(s: &str) -> Option<Duration> {
 
 impl Config {
     /// Resolve configuration from an env getter. Pure (no process-env access) so precedence is
-    /// testable. `Err` is a boot-fatal misconfiguration (today: an unparseable
-    /// `ELECTRIC_CIRCUITS_PG_TABLES` entry).
+    /// testable. `Err` is a boot-fatal misconfiguration (an unparseable `ELECTRIC_CIRCUITS_PG_TABLES`
+    /// entry, or a large-transaction knob that could never work — see [`TxnBufferConfig::resolve`]).
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
         let g = |k: &str| nonempty(get(k));
 
@@ -314,6 +318,10 @@ impl Config {
                 .collect(),
         };
 
+        // Large transactions (ADR-0003). Boot-fatal on an unusable setting: a memory cap or append
+        // budget that was meant to be applied and silently was not is the worst of both worlds.
+        let txn = TxnBufferConfig::resolve(g).context("large-transaction configuration")?;
+
         Ok(Config {
             pg_url,
             ds_url,
@@ -332,6 +340,7 @@ impl Config {
             db_pool_size,
             trace,
             dbsp,
+            txn,
             noop_vars: Vec::new(),
         })
     }
@@ -351,7 +360,8 @@ impl Config {
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} storage_dir={} prometheus_port={:?} trace={} log={}",
+             secret={} storage_dir={} prometheus_port={:?} trace={} log={} \
+             txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
@@ -365,6 +375,9 @@ impl Config {
             self.prometheus_port,
             self.trace,
             self.log_filter,
+            self.txn.memory_bytes,
+            self.txn.append_bytes,
+            self.txn.spill_dir.display(),
         )
     }
 }

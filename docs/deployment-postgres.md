@@ -82,6 +82,9 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | no | `1073741824` | Change-log segment size before rotation (`0` disables the size criterion). See "Change-log disk" below. |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | no | `86400` | Change-log segment age before rotation (`0` disables the age criterion). |
 | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | no | `604800` | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted and the segment deleted (`0` = pin forever). |
+| `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | no | `134217728` | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below. |
+| `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | no | `67108864` | Byte budget for one append when a large commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — outside that, the engine refuses to boot. |
+| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Where a spilled transaction's temporary file goes (created 0700, files 0600). Must have room for your largest transaction, must be writable at boot, and must not be shared between engines. |
 
 ¹ Omit `ELECTRIC_CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
 
@@ -124,6 +127,28 @@ activeUsers.subscribe((rows) => render(rows))
   case, plus your shape streams. Setting both rotation criteria to `0` disables rotation entirely and
   the log grows without bound. `GET /metrics` reports `changes_rotations_total`,
   `changes_segments_deleted_total` and the `changes_segments_retained` gauge.
+- **Large transactions spill to disk, they do not blow up the ingestor's memory.** A transaction is
+  only appendable once its commit arrives, so the ingestor has to hold it — and a bulk
+  `UPDATE`/`DELETE` under `REPLICA IDENTITY FULL` carries the old *and* new row for every change. Past
+  `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (128 MiB of held changes) the buffer is written to one
+  temporary file in `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` and memory is released, so peak **ingestor**
+  memory is that cap plus one append chunk whatever the transaction's size. That bound is the
+  ingestor's alone: downstream, the sequencer reads and applies the transaction as one unit, so its
+  read page and pending appends still scale with the transaction — size the pod for the largest
+  transaction you expect to sync, not just for this knob. **Size the spill directory for the largest
+  single transaction your database can produce** — the file holds that transaction's changes as JSON,
+  roughly the size of the rows involved (doubled for updates and deletes, which carry the prior row
+  too), and it exists only between that transaction's `BEGIN` and its commit. The directory defaults
+  to a private `<temp dir>/circuits-txn-spill-<uid>` (0700, files 0600), is **probed at boot** — an
+  unwritable one refuses the boot rather than failing every large commit — and must not be shared
+  between engines (leftovers are identified by pid, which means nothing across containers): give each
+  engine its own. The commit is then appended in chunks of at most
+  `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`, and the replication slot is acknowledged only after the
+  last chunk lands, so an interruption re-delivers the whole transaction rather than losing part of
+  it; subscribers still see the transaction as one unit, never chunk by chunk. Nothing is invalidated
+  or dropped for being large. If the engine dies mid-transaction the file is left behind; the next
+  boot sweeps it. `GET /metrics` reports `txn_spills_total`, `txn_spill_bytes` and
+  `txn_chunked_appends_total`.
 - **Replication slot lag:** an engine that is stopped for a long time holds its slot, and Postgres
   retains WAL for it. If you decommission an engine, drop its slot:
   `SELECT pg_drop_replication_slot('<slot>');` Monitor `pg_replication_slots.confirmed_flush_lsn` vs

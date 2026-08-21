@@ -48,6 +48,13 @@ async fn main() -> Result<()> {
         .clone()
         .context("ELECTRIC_CIRCUITS_DS_URL must be set to the durable-streams server base URL")?;
 
+    // Large transactions spill to disk (ADR-0003), so the spill directory must exist, be private
+    // and be writable NOW. A spill that fails mid-commit tears the replication connection down and
+    // is retried forever against the same broken directory — an ingest stall nobody sees — so this
+    // is boot-fatal, like an unusable ELECTRIC_CIRCUITS_PG_TABLES entry. (Kept out of
+    // `Config::resolve`, which is a pure function of an env getter.)
+    config.txn.probe().context("checking the large-transaction spill directory")?;
+
     // TEST-ONLY: surface an injected fault so a faulted run is never silent (no-op when unset).
     if electric_circuits_engine::fault::active() != electric_circuits_engine::fault::Fault::None {
         tracing::warn!("ELECTRIC_CIRCUITS_FAULT active: {:?}", electric_circuits_engine::fault::active());
@@ -64,6 +71,9 @@ async fn main() -> Result<()> {
             // The dbsp arrangement circuit is mandatory infrastructure — always configured.
             tracing::info!("dbsp arrangements: dir {}", config.dbsp.dir.display());
             engine.set_dbsp_config(config.dbsp.clone());
+            // Large transactions (ADR-0003): the ingestor's buffer spills past the memory cap and
+            // appends the commit in chunks. Must be set before `setup_postgres` spawns the ingestor.
+            engine.set_txn_config(config.txn.clone());
             engine
                 .setup_postgres(&config.tables, &config.slot)
                 .await

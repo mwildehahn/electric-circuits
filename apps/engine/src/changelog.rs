@@ -124,6 +124,7 @@ pub fn rotation_envelope(next: u32) -> Envelope {
             offset: None,
             lsn: None,
             seq: None,
+            last: None,
         },
     }
 }
@@ -340,7 +341,17 @@ impl ChangeLogWriter {
         &self.cfg
     }
 
-    /// Append one whole commit to the current segment.
+    /// Append one commit — or, for a commit too large for a single request body, one **chunk** of
+    /// it (ADR-0003) — to the current segment.
+    ///
+    /// A chunked commit calls this repeatedly, in order. Since the ingestor is the only writer, the
+    /// chunks land contiguously and carry one `(txid, lsn)`, and the last envelope of the last chunk
+    /// carries the transaction-end marker — which together are what let the sequencer treat the
+    /// several appends as one transaction (it holds a run back until the marker arrives; a reader
+    /// that split on `(txid, lsn)` alone would fan out a fraction of a commit, because
+    /// durable-streams exposes every append atomically). The caller acknowledges the slot only after
+    /// the last call returns `Ok`. Rotation is unaffected: it is a transaction-boundary decision, so
+    /// a segment is never rotated *between* two chunks of the same commit.
     ///
     /// Errors propagate (unlike a shape append, which may discard on a retired stream): a dropped
     /// change-log append loses data outright, so the ingestor must tear the connection down
@@ -694,6 +705,7 @@ mod tests {
                 offset: None,
                 lsn: None,
                 seq: None,
+                last: None,
             },
         };
         assert!(!is_control(&data));
@@ -714,6 +726,7 @@ mod tests {
                     offset: None,
                     lsn: None,
                     seq: None,
+                    last: None,
                 },
             },
         ];
