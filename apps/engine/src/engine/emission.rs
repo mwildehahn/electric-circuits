@@ -11,8 +11,8 @@
 //!     eval order — and return immediately;
 //!   * each stream path hashes to ONE lane (a FIFO drained by one writer task), so batches
 //!     for a stream land in enqueue order;
-//!   * appends use `append_reliable` (retry-until-landed; the only non-retried case is 404 —
-//!     the shape was dropped, discard is correct).
+//!   * appends use `append_reliable` (retry-until-landed; the only non-retried case is a retired
+//!     stream — 404/410/`stream-closed` — the shape was dropped or evicted, discard is correct).
 //!
 //! The convergence barrier: every enqueued batch increments the shared `pending` counter
 //! (the engine's `pendingFlips` term) and decrements it only after the append **landed**, so
@@ -50,7 +50,8 @@ impl EmissionLanes {
             tokio::spawn(async move {
                 while let Some(b) = rx.recv().await {
                     // Reliable: a dropped subquery envelope is permanent divergence for the
-                    // shape's subscribers. 404 (shape dropped mid-flight) discards, correctly.
+                    // shape's subscribers. A retired stream (shape dropped/evicted mid-flight)
+                    // discards, correctly.
                     ds.append_reliable(&b.stream_path, &b.envs).await;
                     pending.fetch_sub(1, Ordering::SeqCst);
                 }

@@ -174,8 +174,10 @@ impl Engine {
         }
         // Restored dormant shapes still need the TTL/eviction layers running.
         self.ensure_retention_sweeper();
+        // Retirement: clients may still be tailing these streams from before the restart, so close
+        // before deleting — their long-poll is released at once with `stream-closed`.
         for path in dead_streams {
-            let _ = self.ds.delete_stream(&path).await;
+            let _ = self.ds.retire_stream(&path).await;
         }
 
         // 3. Re-register with the sequencer. Plain/routed shapes resume without a backfill and
@@ -195,6 +197,14 @@ impl Engine {
                 let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: rec.id.clone() });
                 if let Some(share) = st.feed_shares.remove(&rec.id) {
                     st.feed_by_sig.remove(&share.sig);
+                }
+                drop(st);
+                // Engine-initiated removal, so retire the stream (close, then delete): the shape is
+                // gone, and a client still tailing it from before the restart must learn that rather
+                // than sit on a stream nothing will ever append to again. Logged, never fatal — a
+                // storage hiccup must not abort the restore of the other shapes.
+                if let Err(e) = self.ds.retire_stream(&rec.stream_path).await {
+                    tracing::warn!("restore: failed to retire stream {} for dropped shape {}: {e:#}", rec.stream_path, rec.id);
                 }
             }
         }

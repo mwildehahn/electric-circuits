@@ -81,8 +81,9 @@ the convergence barrier `sync caught up + offsets at tail + pendingFlips == 0` n
 computed effect has landed, or the engine is degraded and says so*), `GET /replication/lsn` reports
 a non-zero `flipFailures`, `/v1/health` turns `degraded` (503), and `POST /shapes`, `POST /aggregate`,
 `POST /query`, `GET /shapes/{id}(/rows|/log)` and `GET /v1/shape` answer 503 with
-`{"error":"degraded: …"}`. Every subquery shape's durable stream is deleted too — clients read
-durable-streams directly, past the HTTP surface, so that is the only way they learn. Observability
+`{"error":"degraded: …"}`. Every subquery shape's durable stream is retired too — closed, then
+deleted — clients read durable-streams directly, past the HTTP surface, so that is the only way they
+learn; the close releases a tailing long-poll at once with `stream-closed`. Observability
 (`/replication/lsn`, `/metrics*`, `/memory`, `/subqueries`, `/graph`, `/state`, `/trace`, `/tables/*`,
 `/health`) stays up. **Recovery is a restart**, which re-seeds every node from Postgres. A restart
 *drops* every subquery shape — their inner-node state is not persisted, so the catalog restore
@@ -140,8 +141,12 @@ maintained:
   routing state is dropped, the durable stream and shape record are retained at zero engine cost.
   Any touch (rejoin, `/v1/shape` re-snapshot, rows/log read) reactivates by replaying the
   `table/<name>` stream from the captured resume offset — no Postgres backfill.
-- **Evicted** — stream + record deleted. Returning `/v1/shape` clients get `409 must-refetch` and
-  re-snapshot; extended-API clients get `404` and recreate.
+- **Evicted** — record deleted and the stream **retired**: closed, then deleted (see
+  `docs/adr/0007-retirement-closes-before-delete.md`), so a client tailing it is released at once
+  with `stream-closed` rather than blocking to the long-poll timeout. `/v1/shape` clients get
+  `409 must-refetch` (the adapter turns a closed stream into that) and re-snapshot; extended-API
+  clients **must** treat `stream-closed`, `404` and `410` alike: re-subscribe. (A **dormant**
+  shape's stream is never closed — reactivation appends to it.)
 
 Eviction is layered, least-recently-read first, and **dormant-only** (active shapes are never
 evicted): the dormancy TTL (hygiene), the `ELECTRIC_CIRCUITS_MAX_SHAPES` count cap (engine cost bound),

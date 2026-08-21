@@ -634,10 +634,11 @@ impl Engine {
         };
         tracing::error!("degraded: deleting {} subquery shape stream(s); clients must recreate against a restarted engine", paths.len());
         for path in paths {
-            // Retried until storage accepts the delete (`delete_stream` counts a 404 as done): a
-            // stream left behind keeps serving rows the engine can no longer maintain.
+            // Retirement (close, then delete), retried until storage accepts the delete
+            // (`delete_stream` counts a 404 as done): a stream left behind keeps serving rows the
+            // engine can no longer maintain, and the close releases subscribers tailing it now.
             let mut attempt = 0u32;
-            while let Err(e) = self.ds.delete_stream(&path).await {
+            while let Err(e) = self.ds.retire_stream(&path).await {
                 attempt += 1;
                 let backoff = std::time::Duration::from_millis(
                     100u64.saturating_mul(1 << attempt.min(5)).min(2000),

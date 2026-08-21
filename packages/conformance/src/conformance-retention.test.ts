@@ -99,6 +99,21 @@ async function foldStream(streamUrl: string): Promise<Map<string, Row>> {
   return rows
 }
 
+/** Read a stream to its tail and return the offset a live client would park a long-poll on. */
+async function tailOffset(streamUrl: string): Promise<string> {
+  let offset = '-1'
+  for (let i = 0; i < 100; i++) {
+    const res = await fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}`)
+    if (res.status !== 200 && res.status !== 204) throw new Error(`GET ${streamUrl} -> ${res.status}`)
+    await res.text() // drain
+    const next = res.headers.get('stream-next-offset')
+    const upToDate = res.headers.get('stream-up-to-date') !== null
+    if (next && next !== offset) offset = next
+    if (upToDate || !next) break
+  }
+  return offset
+}
+
 describe('shape retention lifecycle (active / dormant / evicted)', () => {
   it('idle unsubscribed shape goes dormant; rejoin reactivates with the changes missed while dormant', async () => {
     await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 5)')
@@ -176,6 +191,90 @@ describe('shape retention lifecycle (active / dormant / evicted)', () => {
     const b = await createShape(where)
     expect(b.shapeId).not.toBe(a.shapeId)
     expect((await foldStream(b.streamUrl)).has('1')).toBe(true)
+  })
+
+  // Engine-initiated retirement CLOSES the shape stream before deleting it (ADR 0007): a client
+  // parked on a long-poll is released immediately with `stream-closed` instead of blocking until the
+  // durable-streams long-poll timeout (30 s) and then finding a deleted stream.
+  it('purge closes the stream before deleting it: a waiting long-poll is released with stream-closed', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, 10)')
+    await drainEngine(h)
+
+    const a = await createShape({ col: 'n', op: 'gte', value: 10 })
+
+    // Park a live read at the tail, the position a subscribed client tails from.
+    const tail = await tailOffset(a.streamUrl)
+    const started = Date.now()
+    const pending = fetch(`${a.streamUrl}?offset=${encodeURIComponent(tail)}&live=long-poll`)
+    await sleep(250) // let the long-poll actually block on the server before retiring the stream
+
+    await fetch(`${h.engineUrl}/shapes/${a.shapeId}?purge=true`, { method: 'DELETE' })
+
+    const res = await pending
+    const elapsed = Date.now() - started
+    await res.text() // drain
+    // Only the close can free the read this fast — the long-poll timeout is 30 s.
+    expect(elapsed).toBeLessThan(5000)
+    expect(res.headers.get('stream-closed')).toBe('true')
+    // 204 here (the close is the only thing that happened at this offset); a close that lands with
+    // pending data returns 200 + the data, carrying the same header.
+    expect([200, 204]).toContain(res.status)
+
+    // Retirement is close THEN delete: the stream is gone afterwards.
+    expect((await fetch(a.streamUrl)).status).toBe(404)
+  })
+
+  it('TTL eviction closes the stream before deleting it: a tailing long-poll is released with stream-closed', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, 10)')
+    await drainEngine(h)
+
+    const a = await createShape({ col: 'n', op: 'gte', value: 10 })
+    await release(a.shapeId)
+    await waitFor(async () => (await shapeInfo(a.shapeId)).state === 'dormant', 'shape to go dormant')
+
+    // Tail the retained (dormant) stream — a raw durable-streams read is not an engine touch, so the
+    // ~4 s dormancy TTL still evicts underneath it. Eviction is terminal, so it retires the stream.
+    const tail = await tailOffset(a.streamUrl)
+    const started = Date.now()
+    const res = await fetch(`${a.streamUrl}?offset=${encodeURIComponent(tail)}&live=long-poll`)
+    const elapsed = Date.now() - started
+    await res.text() // drain
+    expect(elapsed).toBeLessThan(15000) // TTL-bounded, well inside the 30 s long-poll timeout
+    expect(res.headers.get('stream-closed')).toBe('true')
+    expect([200, 204]).toContain(res.status)
+
+    await waitFor(async () => (await fetch(a.streamUrl)).status === 404, 'stream deletion')
+  })
+
+  // The `/v1/shape` adapter must turn a retired stream into the answer an evicted handle already
+  // gets (`409 must-refetch`) — not a 500 once the delete lands, and not a full live-timeout wait
+  // (`ELECTRIC_LIVE_TIMEOUT_MS`, 20 s by default).
+  it('a live /v1/shape poll is released with 409 must-refetch when the underlying shape is purged', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, 10)')
+    await drainEngine(h)
+
+    const where = 'n >= 10'
+    const snap = await fetch(`${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset: '-1', where })}`)
+    expect(snap.status).toBe(200)
+    const handle = snap.headers.get('electric-handle') as string
+    const offset = snap.headers.get('electric-offset') as string
+    await snap.text() // drain
+
+    const started = Date.now()
+    const live = fetch(
+      `${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset, handle, live: 'true', where })}`,
+    )
+    await sleep(250) // let the long-poll park on the durable-streams server
+
+    // A handle is `<shapeId>h<seq>` over a shared engine shape; purge the shape underneath it.
+    await fetch(`${h.engineUrl}/shapes/${handle.replace(/h\d+$/, '')}?purge=true`, { method: 'DELETE' })
+
+    const res = await live
+    const elapsed = Date.now() - started
+    const msgs = (await res.json()) as Array<{ headers: { control?: string } }>
+    expect(res.status).toBe(409)
+    expect(msgs[0]?.headers.control).toBe('must-refetch')
+    expect(elapsed).toBeLessThan(5000)
   })
 
   it('the dormancy TTL evicts: record 404s, stream is deleted, rejoin creates a fresh shape', async () => {

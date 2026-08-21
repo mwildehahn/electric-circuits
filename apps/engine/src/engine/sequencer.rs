@@ -627,7 +627,8 @@ pub(crate) async fn activate_shape(
 /// Replay the global change log from `from` for one dormant shape: apply each of its table's
 /// envelopes through the shape's snapshot gate + predicate + projection and append the matches to
 /// the retained stream. Pages until the log reports up-to-date. Appends are direct (`ds.append`):
-/// a 404 means the retained stream vanished (evicted/purged mid-replay) and must fail the resume.
+/// a retired stream (404/410/closed) means it vanished (evicted/purged mid-replay) and must fail
+/// the resume.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn replay_changes_for_shape(
     ds: &DsClient,
@@ -1037,8 +1038,8 @@ pub(crate) fn emit_storage_txn_metrics(txn_pending: &HashMap<String, Vec<Envelop
 /// Appends are **reliable**: transient failures retry with backoff (`append_reliable`) rather than
 /// being dropped — a lost shape append is a permanent divergence for that shape's subscribers, and
 /// the tailer's processed-offset barrier (published after this returns) must mean "every subscriber
-/// stream reflects the batch". The only non-retried case is a 404 (the shape was dropped mid-flush),
-/// which discards cleanly.
+/// stream reflects the batch". The only non-retried case is a retired stream (404/410/closed — the
+/// shape was dropped or evicted mid-flush), which discards cleanly.
 pub(crate) async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<Envelope>>) {
     const CAP: usize = 32; // bound in-flight appends so we don't swamp the storage server
     let mut items: Vec<(String, Vec<Envelope>)> = pending.into_iter().collect();

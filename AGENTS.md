@@ -219,10 +219,15 @@ canvas update, screenshot.
 - **Ingest is at-least-once; consumers restore exactly-once effect.** The ingestor stamps
   `(commit lsn, xid, seq)`; the sequencer de-duplicates by `(lsn, seq)`. Aggregates and subquery contributor
   weights are NOT idempotent under duplicates — never bypass the highwater.
-- **Live shape appends must not drop.** Use `ds.append_reliable` (retry/backoff; 404 = shape dropped,
-  discard). The sequencer's processed offset is published only after the whole batch landed, and
-  each source transaction's appends are flushed before the next transaction is processed
+- **Live shape appends must not drop.** Use `ds.append_reliable` (retry/backoff; 404/410/`stream-closed`
+  = shape retired, discard). The sequencer's processed offset is published only after the whole batch
+  landed, and each source transaction's appends are flushed before the next transaction is processed
   (per-transaction atomic emission).
+- **Engine-initiated retirement closes the stream, then deletes it** (`ds.retire_stream`; ADR 0007):
+  purge, eviction, drop-at-restore, the degraded subquery reap. The close releases a tailing
+  long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
+  close — a parked dormant shape's stream must stay appendable, and a rolled-back create's stream
+  had no subscriber (plain `delete_stream`).
 - **Subqueries: emit outer membership *absolutely*** — per touched pk, `upsert` if the row matches
   *now* else idempotent `delete`. Flip-driven query-backs run deferred on the flip-propagator task
   (out of commit order relative to the sequencer), so delta-based emission would miss move-outs.

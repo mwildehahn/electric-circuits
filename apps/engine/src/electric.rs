@@ -383,7 +383,8 @@ fn offset_after(a: &str, b: &str) -> bool {
 /// ignored (used when a client retries an older offset — folding to the tail instead would drop
 /// deletes / mis-classify inserts in the replayed window). `done` is set on `up-to-date`, when the
 /// target offset is passed, or when the next offset stops advancing; an empty page mid-stream does
-/// **not** end the fold (that truncated snapshots).
+/// **not** end the fold (that truncated snapshots), but a `closed` page does: a retired stream is
+/// terminal, so there is nothing further to wait for.
 struct StreamFold {
     rows: HashMap<String, serde_json::Value>,
     /// Keys in first-appearance (stream) order. `rows` alone would randomize the snapshot's
@@ -444,7 +445,7 @@ impl StreamFold {
             }
             _ => false,
         };
-        if r.up_to_date || !advanced {
+        if r.up_to_date || r.closed || !advanced {
             self.done = true;
         }
     }
@@ -523,12 +524,16 @@ impl crate::predicate::SubqueryCollector for ValidateOnly {
 
 /// The result of one positioned read on a handle, cloneable to every coalesced waiter. `body: None`
 /// is the `204` long-poll-deadline response; `Some` carries the serialized JSON message array.
+/// `retired` short-circuits both: the shape's stream was closed by the engine (retirement), so the
+/// caller answers `409 must-refetch` — the same answer an evicted handle already gets. Coalesced
+/// waiters at the same offset all receive it, which is correct: the shape is gone for all of them.
 #[derive(Clone)]
 struct ReadOutcome {
     offset: String,
     up_to_date: bool,
     cursor: u64,
     body: Option<String>,
+    retired: bool,
 }
 
 /// Coalesce concurrent live requests at one (handle, offset): the first arrival becomes the leader,
@@ -588,13 +593,16 @@ where
     }
 }
 
-/// The live polling loop: repeatedly `read(from)` until a page carries envelopes or `deadline`
-/// elapses. Each poll is bounded by the **remaining** deadline — the ds server holds an idle
+/// The live polling loop: repeatedly `read(from)` until a page carries envelopes, the stream is
+/// **closed**, or `deadline` elapses. Each poll is bounded by the **remaining** deadline — the ds
+/// server holds an idle
 /// long-poll far longer than our window, so an unbounded read would blow straight through the
 /// deadline (observed: idle `live=true` requests hanging >60s instead of 204 at ~20s). On expiry
 /// the last empty page is returned so a `next_offset` advanced past empty pages is preserved;
 /// expiry mid-poll (no page yet) yields an offset-less empty result, leaving the handle offset
-/// unchanged.
+/// unchanged. A `closed` page ends the loop immediately: the engine retired the shape, so the stream
+/// can never grow — re-polling would hammer the storage server (a closed stream answers a long-poll
+/// at once) for the whole live window.
 async fn poll_live_until<F, Fut, E>(
     mut from: String,
     deadline: Instant,
@@ -604,7 +612,7 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<ReadResult, E>>,
 {
-    let mut last = ReadResult { envelopes: Vec::new(), next_offset: None, up_to_date: false };
+    let mut last = ReadResult { envelopes: Vec::new(), next_offset: None, up_to_date: false, closed: false };
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -614,7 +622,7 @@ where
             Err(_elapsed) => return Ok(last),
             Ok(page) => {
                 let page = page?;
-                if !page.envelopes.is_empty() {
+                if page.closed || !page.envelopes.is_empty() {
                     return Ok(page);
                 }
                 if let Some(n) = &page.next_offset {
@@ -659,6 +667,21 @@ async fn positioned_read(
         engine.read_shape_stream(&entry.stream_path, &from, false).await?
     };
 
+    // The engine retired this shape (its stream was closed before being deleted): answer
+    // `409 must-refetch` — identical to an evicted handle — instead of serving a dead stream or
+    // failing with a 500 once the delete lands. Handle state is left for the TTL to reap; the client
+    // re-requests at offset=-1 and gets a fresh shape + handle.
+    if r.closed {
+        drop(st);
+        return Ok(ReadOutcome {
+            offset: offset.to_string(),
+            up_to_date: false,
+            cursor: next_cursor(),
+            body: None,
+            retired: true,
+        });
+    }
+
     if let Some(n) = &r.next_offset {
         st.offset = n.clone();
     }
@@ -669,7 +692,7 @@ async fn positioned_read(
         let served_offset = st.offset.clone();
         drop(st);
         entry.touch();
-        return Ok(ReadOutcome { offset: served_offset, up_to_date: true, cursor: next_cursor(), body: None });
+        return Ok(ReadOutcome { offset: served_offset, up_to_date: true, cursor: next_cursor(), body: None, retired: false });
     }
 
     let mut messages = apply_changes(&mut st.keys, &entry.pk_name, r.envelopes);
@@ -684,6 +707,7 @@ async fn positioned_read(
         up_to_date: r.up_to_date,
         cursor: next_cursor(),
         body: Some(serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into())),
+        retired: false,
     })
 }
 
@@ -887,6 +911,10 @@ async fn shape_inner(
         positioned_read(&engine, &entry, &offset, false).await?
     };
 
+    if outcome.retired {
+        return Ok(must_refetch());
+    }
+
     let mut headers = HeaderMap::new();
     headers.insert(HeaderName::from_static("electric-handle"), hv(&handle));
     headers.insert(HeaderName::from_static("electric-offset"), hv(&outcome.offset));
@@ -933,7 +961,7 @@ mod tests {
     }
 
     fn page(envs: Vec<Envelope>, next: &str, up_to_date: bool) -> ReadResult {
-        ReadResult { envelopes: envs, next_offset: Some(next.into()), up_to_date }
+        ReadResult { envelopes: envs, next_offset: Some(next.into()), up_to_date, closed: false }
     }
 
     fn op_and_key(msg: &serde_json::Value) -> (String, String) {
@@ -1143,6 +1171,7 @@ mod tests {
                         up_to_date: true,
                         cursor: 1,
                         body: Some("[]".into()),
+                        retired: false,
                     })
                 }
             })

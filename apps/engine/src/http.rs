@@ -331,13 +331,15 @@ async fn get_shape_log(
                 entries.pop_front();
             }
         }
-        // Break when caught up, the page was empty, or the offset failed to advance (a defensive
-        // guard against a non-empty page with a missing/unchanged next offset looping forever).
+        // Break when caught up, the stream is closed (retired: terminal, treat it as up-to-date),
+        // the page was empty, or the offset failed to advance (a defensive guard against a non-empty
+        // page with a missing/unchanged next offset looping forever).
+        let closed = r.closed;
         let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || empty || !advanced {
+        if r.up_to_date || closed || empty || !advanced {
             break;
         }
     }
@@ -376,12 +378,13 @@ async fn get_shape_rows(
                 rows.insert(env.key, v);
             }
         }
-        // Same defensive break as get_shape_log: never spin on a non-advancing offset.
+        // Same breaks as get_shape_log: caught up, closed (retired), empty, or non-advancing.
+        let closed = r.closed;
         let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || empty || !advanced {
+        if r.up_to_date || closed || empty || !advanced {
             break;
         }
     }

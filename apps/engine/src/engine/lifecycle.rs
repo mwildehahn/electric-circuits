@@ -515,7 +515,8 @@ impl Engine {
         // Subquery shapes live in the registry (a no-op for plain shapes).
         self.subqueries.lock().await.drop_subquery_shape(id).await;
         if let Some(rec) = removed {
-            if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
+            // Retirement: close (releasing any tailing long-poll with `stream-closed`) then delete.
+            if let Err(e) = self.ds.retire_stream(&rec.stream_path).await {
                 tracing::warn!("failed to delete stream {} for purged shape {id}: {e:#}", rec.stream_path);
             }
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
@@ -718,6 +719,9 @@ impl Engine {
     /// routing and hands back the resume state (fully-processed change-log offset + the shape's
     /// snapshot gate); the stream and record are retained. Rechecks eligibility under the locks —
     /// a touch or rejoin racing the sweep wins.
+    ///
+    /// Parking is NOT retirement: the retained stream is never closed, because reactivation appends
+    /// the replayed changes to it (closing is terminal for appends).
     pub(crate) async fn deactivate_shape(&self, id: &str) -> Result<()> {
         let st = self.state.lock().await;
         let Some(rec) = st.shapes.get(id).cloned() else { return Ok(()) }; // already gone
@@ -826,7 +830,9 @@ impl Engine {
             self.subqueries.lock().await.drop_subquery_shape(id).await;
         }
         if let Some(rec) = removed {
-            if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
+            // Eviction is terminal (unlike deactivation), so the stream is retired: closed, then
+            // deleted — a client still tailing it is released at once with `stream-closed`.
+            if let Err(e) = self.ds.retire_stream(&rec.stream_path).await {
                 tracing::warn!("failed to delete stream {} for evicted shape {id}: {e:#}", rec.stream_path);
             }
             metrics().shapes_evicted.fetch_add(1, Ordering::Relaxed);
@@ -1200,6 +1206,8 @@ impl Engine {
         if registration == Registration::Registry {
             self.subqueries.lock().await.abort_create(id).await;
         }
+        // Deleted, not retired: the create never returned, so the stream was never handed to a
+        // subscriber and there is no one to signal with a close.
         let _ = self.ds.delete_stream(stream_path).await;
     }
 }

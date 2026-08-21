@@ -221,9 +221,25 @@ signature so all future identical creates silently join a dead feed.
 
 A lost shape-stream append is a permanent divergence for every subscriber, so live-path appends use
 `append_reliable`: transient failures retry with capped backoff (backpressuring the sequencer — the same
-stance as the ingestor's read-then-commit), and the only non-retried case is 404 (the shape was
-dropped mid-flush; discard is correct). Because shape envelopes are absolute per-pk
-(`upsert`/`delete` by key), an ambiguous-failure double-append is idempotent for readers.
+stance as the ingestor's read-then-commit), and the only non-retried case is a **retired** stream —
+404 (deleted), 410 (soft-deleted) or 409 + `stream-closed` (retirement closes the stream before
+deleting it, §5.6) — i.e. the shape was dropped/evicted mid-flush; discard is correct. Because
+shape envelopes are absolute per-pk (`upsert`/`delete` by key), an ambiguous-failure double-append
+is idempotent for readers.
+
+### 5.6 Retirement closes the stream before deleting it
+
+When the engine removes a shape stream of its own accord — purge, eviction, drop-at-restore, the
+degraded subquery reap — it **retires** it (`ds.retire_stream`): first a close (`POST` with
+`Stream-Closed: true`), then the delete. The close releases every waiting long-poll immediately with
+`stream-closed` instead of leaving it parked until the 30 s read timeout, and "closed" unambiguously
+means *the engine retired this shape; re-subscribe*. Clients **must** treat `stream-closed`, 404 and
+410 alike; on the `/v1/shape` adapter the engine does that for them (a closed stream ends the live
+poll with `409 must-refetch`, the evicted-handle answer). Closing is terminal, so it is applied only
+to retirement: a **dormant** shape's retained
+stream stays appendable for reactivation, a rolled-back create's stream was never handed to a
+subscriber, and a restart keeps restored shapes on their existing streams
+(`docs/adr/0007-retirement-closes-before-delete.md`).
 
 ---
 
@@ -265,7 +281,8 @@ sequencer feeds every table's deltas into:
   the engine **fails closed**: the batch never decrements `pendingFlips` (the barrier can only
   reach zero when every computed effect really landed), `flipFailures` counts it, `/v1/health`
   turns `degraded` (503), every membership-bearing route answers 503, and every subquery shape's
-  durable stream is deleted so clients reading storage directly learn it too. Recovery is a
+  durable stream is retired — closed, then deleted (§5.6) — so clients reading storage directly
+  learn it too: a tailing read is released with `stream-closed` and must re-subscribe. Recovery is a
   **restart**, which re-seeds every node from Postgres; it *drops* every subquery shape (their
   inner-node state is not persisted — see the restart row of the durability table) and clients
   recreate them with `POST /shapes`.
@@ -437,7 +454,9 @@ is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
 drop their engine state but keep the stream, and any touch reactivates them by change-log replay
 from the captured resume offset (through the sequencer's two-phase pending-buffer handshake);
-see `apps/engine/src/retention.rs`). A request with an evicted handle gets `409 must-refetch`,
+eviction **retires** the stream: closed, then deleted (§5.6), so a client tailing it is released
+with `stream-closed` and must re-subscribe; see `apps/engine/src/retention.rs`). A request with an
+evicted handle gets `409 must-refetch`,
 which the Electric client handles by re-syncing onto the retained shape. Conformance against Electric's own oracle + integration tests lives in
 `electric-conformance/` (see its README for scope and known gaps — e.g. row `tags` are not emitted;
 absolute membership emission makes them unnecessary for convergence).
@@ -559,7 +578,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (pushdown) / SQL `WHERE` → predicate (Electric path) |
 | `apps/engine/src/electric.rs` | Electric `/v1/shape` adapter (handles, offsets, TTL eviction) |
-| `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_reliable`, `delete_stream`, reads |
+| `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_reliable`, `close_stream`, `retire_stream`, `delete_stream`, reads |
 | `apps/engine/src/http.rs` | control-plane HTTP |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |

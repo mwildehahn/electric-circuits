@@ -45,12 +45,18 @@ pub struct ReadResult {
     pub envelopes: Vec<Envelope>,
     pub next_offset: Option<String>,
     pub up_to_date: bool,
+    /// The server reported `stream-closed`: the stream is **terminal** — it will never grow again,
+    /// and for a shape stream that means the engine retired the shape (close-then-delete, see
+    /// [`DsClient::retire_stream`]). Readers must stop, not re-poll: a closed stream answers a
+    /// long-poll instantly, so looping on "empty page, same offset" would spin on the server.
+    pub closed: bool,
 }
 
-/// Why an append failed: the stream no longer exists (shape dropped — discard), or a transient/other
-/// error (retry or surface).
+/// Why an append failed: the stream is retired — deleted (404), soft-deleted (410) or closed
+/// (409 + `stream-closed`), all terminal, discard — or a transient/other error (retry or surface).
+/// `Gone` carries the status so the log/error names which of the three it was.
 enum AppendError {
-    Gone,
+    Gone(u16),
     Other(anyhow::Error),
 }
 
@@ -167,10 +173,12 @@ impl DsClient {
         Ok((events, next_offset, up_to_date))
     }
 
+    /// Append envelopes. A retired stream (404/410/closed) is an error here; the live path uses
+    /// [`Self::append_reliable`], which discards instead.
     pub async fn append(&self, path: &str, envelopes: &[Envelope]) -> Result<()> {
         match self.append_once(path, envelopes).await {
             Ok(()) => Ok(()),
-            Err(AppendError::Gone) => bail!("POST {path} -> 404 (stream gone)"),
+            Err(AppendError::Gone(status)) => bail!("POST {path} -> {status} (stream retired)"),
             Err(AppendError::Other(e)) => Err(e),
         }
     }
@@ -193,13 +201,17 @@ impl DsClient {
             .await
             .map_err(|e| AppendError::Other(anyhow::Error::new(e).context(format!("POST {path}"))))?;
         let status = res.status();
+        // A retired stream answers 404 (deleted), 410 (soft-deleted) or 409 + `stream-closed: true`
+        // (closed, which retirement does before deleting). Read the header before the body consumes
+        // the response; the body text ("stream is closed") is not the contract.
+        let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
         // Drain the body so the connection can be pooled and reused (avoids a socket leak per append).
         let body = res.text().await.unwrap_or_default();
         if status.is_success() {
             *self.appended.lock().unwrap().entry(path.to_string()).or_insert(0) += payload_len;
             Ok(())
-        } else if status.as_u16() == 404 {
-            Err(AppendError::Gone)
+        } else if status.as_u16() == 404 || status.as_u16() == 410 || (status.as_u16() == 409 && closed) {
+            Err(AppendError::Gone(status.as_u16()))
         } else {
             Err(AppendError::Other(anyhow::anyhow!("POST {path} -> {status}: {body}")))
         }
@@ -209,17 +221,22 @@ impl DsClient {
     /// lands. A dropped shape-stream append is a permanent divergence for every subscriber of that
     /// shape, so the only sound behaviors are (a) retry until success — the storage server being down
     /// simply backpressures the tailer, matching the ingestor's read-then-commit stance — or (b) stop
-    /// because the stream was deleted (the shape was dropped mid-flush), which is a clean no-op.
-    /// Envelopes are absolute per-pk (`upsert`/`delete` by key), so an at-least-once retry that
-    /// double-appends after an ambiguous network failure is idempotent for readers.
-    /// Returns `false` iff the stream is gone (404).
+    /// because the stream was retired (the shape was dropped/evicted mid-flush), which is a clean
+    /// no-op. Envelopes are absolute per-pk (`upsert`/`delete` by key), so an at-least-once retry
+    /// that double-appends after an ambiguous network failure is idempotent for readers.
+    /// Returns `false` iff the stream is retired (404, 410, or closed).
+    ///
+    /// Treating a **closed** stream as terminal is sound only for shape streams: their envelopes are
+    /// absolute per-pk and the stream is about to be deleted, so the discarded batch has no reader
+    /// left to diverge. The change log must keep using [`Self::append`] (which propagates): a closed
+    /// `changes/*` segment is a routing signal, and silently dropping ingest there would lose data.
     pub async fn append_reliable(&self, path: &str, envelopes: &[Envelope]) -> bool {
         let mut attempt = 0u32;
         loop {
             match self.append_once(path, envelopes).await {
                 Ok(()) => return true,
-                Err(AppendError::Gone) => {
-                    tracing::debug!("append to {path}: stream gone (shape dropped); discarding {} envelopes", envelopes.len());
+                Err(AppendError::Gone(status)) => {
+                    tracing::debug!("append to {path}: stream retired ({status}); discarding {} envelopes", envelopes.len());
                     return false;
                 }
                 Err(AppendError::Other(e)) => {
@@ -236,12 +253,53 @@ impl DsClient {
         }
     }
 
-    /// Delete a stream (DELETE). Absent stream (404) is a success — deletion is idempotent.
+    /// Close a stream: `POST` with `Stream-Closed: true` and an empty body. Closing is terminal —
+    /// appends are refused with `409` + `stream-closed` afterwards — and it releases every waiting
+    /// long-poll reader immediately with `stream-closed: true` instead of leaving it blocked until
+    /// the read times out. Idempotent (`204` again for an already-closed stream); an absent (`404`)
+    /// or soft-deleted (`410`) stream is a success, there is nothing left to close.
+    pub async fn close_stream(&self, path: &str) -> Result<()> {
+        let res = self
+            .http
+            .post(self.stream_url(path))
+            .header("stream-closed", "true")
+            .send()
+            .await
+            .with_context(|| format!("POST {path} (close)"))?;
+        let status = res.status();
+        // Drain the body so the connection returns to reqwest's pool (see `ensure_stream`).
+        let body = res.text().await.unwrap_or_default();
+        if status.is_success() || status.as_u16() == 404 || status.as_u16() == 410 {
+            Ok(())
+        } else {
+            bail!("POST {path} (close) -> {status}: {body}")
+        }
+    }
+
+    /// Retire a stream: close it, THEN delete it (see `docs/adr/0007-retirement-closes-before-delete.md`).
+    /// Every engine-initiated removal of a shape stream goes through here — eviction, purge,
+    /// drop-at-restore, the degraded subquery reap, and the future schema-drift / epoch-reset paths —
+    /// so a tailing client is released at once with `stream-closed` and "closed" unambiguously means
+    /// "the engine retired this shape; re-subscribe". Closing is terminal, so the paths that are NOT
+    /// retirement must not use it: deactivation parks a dormant shape whose stream stays appendable
+    /// for reactivation, and creation rollback removes a stream no subscriber ever saw.
+    /// A failed close is logged and does not block the delete: removing the stream is the must-have,
+    /// the close is the courtesy signal. Returns the delete's result.
+    pub async fn retire_stream(&self, path: &str) -> Result<()> {
+        if let Err(e) = self.close_stream(path).await {
+            tracing::warn!("retiring stream {path}: close failed ({e:#}); deleting anyway");
+        }
+        self.delete_stream(path).await
+    }
+
+    /// Delete a stream (DELETE). An already-gone stream — absent (404) or soft-deleted (410) — is a
+    /// success: deletion is idempotent, and a retry loop (the degraded reap) must not spin forever
+    /// on a stream storage has already retired.
     pub async fn delete_stream(&self, path: &str) -> Result<()> {
         let res = self.http.delete(self.stream_url(path)).send().await.with_context(|| format!("DELETE {path}"))?;
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        if status.is_success() || status.as_u16() == 404 {
+        if status.is_success() || status.as_u16() == 404 || status.as_u16() == 410 {
             self.appended.lock().unwrap().remove(path);
             Ok(())
         } else {
@@ -259,10 +317,13 @@ impl DsClient {
         let status = res.status();
         let next_offset = header(&res, "stream-next-offset");
         let up_to_date = res.headers().get("stream-up-to-date").is_some();
+        // The single place `stream-closed` is parsed off a read; every caller works from
+        // `ReadResult::closed`.
+        let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
-        // 204 = long-poll timeout / no new data.
+        // 204 = long-poll timeout / no new data / a close that woke this long-poll.
         if status.as_u16() == 204 {
-            return Ok(ReadResult { envelopes: Vec::new(), next_offset, up_to_date });
+            return Ok(ReadResult { envelopes: Vec::new(), next_offset, up_to_date, closed });
         }
         if !status.is_success() {
             bail!("GET {path} -> {status}");
@@ -273,7 +334,7 @@ impl DsClient {
         } else {
             serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?
         };
-        Ok(ReadResult { envelopes, next_offset, up_to_date })
+        Ok(ReadResult { envelopes, next_offset, up_to_date, closed })
     }
 }
 
