@@ -289,7 +289,10 @@ live decision most recently applied per pk; a query-back drops every candidate w
 read snapshot could not have seen — that decision is newer and already stands. The test is xid
 visibility against the read's `SnapshotGate` (§ the same fence a backfill uses), not an LSN
 comparison. The map is cleared when the last in-flight query-back for the shape finishes, so the
-steady state carries nothing per pk.
+steady state carries nothing per pk. A parent **node**'s re-derivation is fenced identically (its
+own per-pk map, kept only while one is in flight): it reconciles an in-memory set rather than
+appending, but its dependent shape appends what its flips say, so re-asserting a contribution a
+newer inner-table commit already decided is the same permanent divergence one level down.
 
 State retained: `O(inner result size)` contributor pks per node, **shared** across all shapes
 that reference the same inner query. The outer shape stores nothing extra beyond that in-flight

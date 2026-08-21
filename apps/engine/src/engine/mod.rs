@@ -305,21 +305,40 @@ struct EngineState {
 struct FeedShare {
     sig: String,
     refcount: usize,
-    /// Creation outcome, observed by joiners: `None` while the creator's backfill/registration is in
-    /// flight, `Some(true)` once the shape is live (its snapshot is readable), `Some(false)` if
-    /// creation failed (the entry is removed; joiners must error, not return a dead stream).
-    ready: tokio::sync::watch::Receiver<Option<bool>>,
+    /// Creation outcome, observed by joiners (see [`ShareOutcome`]).
+    ready: tokio::sync::watch::Receiver<ShareOutcome>,
+}
+
+/// What a shared shape's creator publishes to the joiners waiting on it.
+///
+/// Typed rather than a bare `bool` because the REASON travels with it: a create refused because the
+/// engine degraded must give every joiner the same typed [`Degraded`] refusal the creator returns
+/// (503), not a generic initialization failure (500) — identical requests from identical clients
+/// cannot be allowed to disagree about why the engine said no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShareOutcome {
+    /// The creator's backfill/registration is still in flight.
+    Pending,
+    /// The shape is live: its snapshot is readable.
+    Ready,
+    /// Creation failed (the entry is removed; joiners must error, not return a dead stream).
+    Failed,
+    /// The create overlapped a degradation and refused (see [`Engine::ensure_create_not_degraded`]).
+    Degraded,
 }
 
 /// Wait until a shared shape's creator reports the shape live (or failed). Joining before the
 /// backfill lands would hand the caller a stream whose snapshot isn't readable yet.
-async fn await_share_ready(mut rx: tokio::sync::watch::Receiver<Option<bool>>, id: &str) -> Result<()> {
+async fn await_share_ready(mut rx: tokio::sync::watch::Receiver<ShareOutcome>, id: &str) -> Result<()> {
     loop {
         let state = *rx.borrow();
         match state {
-            Some(true) => return Ok(()),
-            Some(false) => bail!("shared shape '{id}' failed to initialize; retry the create"),
-            None => {
+            ShareOutcome::Ready => return Ok(()),
+            // The creator's own refusal, verbatim: the HTTP layer downcasts it to 503 exactly as
+            // it does for the creator's error.
+            ShareOutcome::Degraded => return Err(anyhow::Error::new(Degraded)),
+            ShareOutcome::Failed => bail!("shared shape '{id}' failed to initialize; retry the create"),
+            ShareOutcome::Pending => {
                 if rx.changed().await.is_err() {
                     bail!("shared shape '{id}' creator died before completing; retry the create");
                 }

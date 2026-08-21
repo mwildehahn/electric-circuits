@@ -53,6 +53,18 @@ impl Engine {
                     drop(st);
                     if let Err(e) = await_share_ready(ready, &existing_id).await {
                         // The failed creator already removed the share entries; undo nothing.
+                        // A degraded outcome arrives typed, so this joiner answers 503 with the
+                        // same reason the creator did.
+                        return Err(e);
+                    }
+                    // The creator succeeded — but it may have succeeded a moment BEFORE the
+                    // degradation mark, in which case the reaper is about to delete the very
+                    // stream this handle points at. This is the joiner's equivalent of the
+                    // creator's final `ensure_create_not_degraded`: check the same latch after
+                    // the work is done, and give back the refcount taken above so a refused
+                    // join does not pin the shape.
+                    if let Err(e) = self.ensure_not_degraded() {
+                        self.release_shape(&existing_id).await;
                         return Err(e);
                     }
                     // A rejoin is a touch: if the shape went dormant since the last subscriber
@@ -117,7 +129,7 @@ impl Engine {
             // Register this (first) subquery shape so later identical ones join it by ref-count.
             // Joiners wait on `ready_tx` — the shape isn't live until the registry has seeded its
             // nodes and backfilled the stream.
-            let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
             if let Some(sig) = feed_sig {
                 st.feed_by_sig.insert(sig.clone(), id.clone());
                 st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: ready_rx });
@@ -141,12 +153,12 @@ impl Engine {
                     // then already reaped and the handle would be dead on arrival. Refuse instead of
                     // answering success (see `ensure_create_not_degraded`).
                     if let Err(e) = self.ensure_create_not_degraded() {
-                        let _ = ready_tx.send(Some(false));
+                        let _ = ready_tx.send(ShareOutcome::Degraded);
                         creating.rollback().await;
                         return Err(e);
                     }
                     creating.complete();
-                    let _ = ready_tx.send(Some(true));
+                    let _ = ready_tx.send(ShareOutcome::Ready);
                     trace_lifecycle(
                         &self.trace_tx,
                         crate::trace::GraphLifecycle::ShapeAdded { shape: id, table: table.to_string() },
@@ -157,7 +169,7 @@ impl Engine {
                 Err(e) => {
                     // Registration failed: wake any joiners with the failure, then undo everything
                     // this create registered so later identical creates don't join a dead stream.
-                    let _ = ready_tx.send(Some(false));
+                    let _ = ready_tx.send(ShareOutcome::Failed);
                     creating.rollback().await;
                     return Err(e);
                 }
@@ -206,7 +218,7 @@ impl Engine {
         self.ensure_retention_sweeper();
         // Register the (first) shared feed so later identical subset feeds join it. Joiners wait on
         // `share_tx` for the backfill outcome.
-        let (share_tx, share_rx) = tokio::sync::watch::channel(None);
+        let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
         if let Some(sig) = feed_sig {
             st.feed_by_sig.insert(sig.clone(), id.clone());
             st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
@@ -230,12 +242,12 @@ impl Engine {
                 // then already reaped and the handle would be dead on arrival. Refuse instead of
                 // answering success (see `ensure_create_not_degraded`).
                 if let Err(e) = self.ensure_create_not_degraded() {
-                    let _ = share_tx.send(Some(false));
+                    let _ = share_tx.send(ShareOutcome::Degraded);
                     creating.rollback().await;
                     return Err(e);
                 }
                 creating.complete();
-                let _ = share_tx.send(Some(true));
+                let _ = share_tx.send(ShareOutcome::Ready);
                 trace_lifecycle(
                     &self.trace_tx,
                     crate::trace::GraphLifecycle::ShapeAdded { shape: rec.id.clone(), table: rec.table.clone() },
@@ -246,7 +258,7 @@ impl Engine {
             Err(e) => {
                 // Backfill/registration failed: wake any joiners, then undo the whole registration
                 // (no zombie shape a later identical create would join) and surface the error.
-                let _ = share_tx.send(Some(false));
+                let _ = share_tx.send(ShareOutcome::Failed);
                 creating.rollback().await;
                 bail!("shape '{id}' creation failed: {e}")
             }
@@ -347,7 +359,7 @@ impl Engine {
                             .send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
                         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
                         self.ensure_retention_sweeper();
-                        let (share_tx, share_rx) = tokio::sync::watch::channel(None);
+                        let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
                         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
                         st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
                         drop(st);
@@ -362,12 +374,12 @@ impl Engine {
                                 // then already reaped and the handle would be dead on arrival. Refuse instead of
                                 // answering success (see `ensure_create_not_degraded`).
                                 if let Err(e) = self.ensure_create_not_degraded() {
-                                    let _ = share_tx.send(Some(false));
+                                    let _ = share_tx.send(ShareOutcome::Degraded);
                                     creating.rollback().await;
                                     return Err(e);
                                 }
                                 creating.complete();
-                                let _ = share_tx.send(Some(true));
+                                let _ = share_tx.send(ShareOutcome::Ready);
                                 trace_lifecycle(
                                     &self.trace_tx,
                                     crate::trace::GraphLifecycle::ShapeAdded {
@@ -378,7 +390,7 @@ impl Engine {
                                 Ok(rec)
                             }
                             Err(e) => {
-                                let _ = share_tx.send(Some(false));
+                                let _ = share_tx.send(ShareOutcome::Failed);
                                 creating.rollback().await;
                                 bail!("aggregate '{id}' creation failed: {e}")
                             }
@@ -423,7 +435,7 @@ impl Engine {
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
         // Register this (first) aggregate so later identical ones join it by ref-count.
-        let (share_tx, share_rx) = tokio::sync::watch::channel(None);
+        let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
         st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
         drop(st);
@@ -439,12 +451,12 @@ impl Engine {
                 // then already reaped and the handle would be dead on arrival. Refuse instead of
                 // answering success (see `ensure_create_not_degraded`).
                 if let Err(e) = self.ensure_create_not_degraded() {
-                    let _ = share_tx.send(Some(false));
+                    let _ = share_tx.send(ShareOutcome::Degraded);
                     creating.rollback().await;
                     return Err(e);
                 }
                 creating.complete();
-                let _ = share_tx.send(Some(true));
+                let _ = share_tx.send(ShareOutcome::Ready);
                 trace_lifecycle(
                     &self.trace_tx,
                     crate::trace::GraphLifecycle::ShapeAdded { shape: rec.id.clone(), table: rec.table.clone() },
@@ -452,7 +464,7 @@ impl Engine {
                 Ok(rec)
             }
             Err(e) => {
-                let _ = share_tx.send(Some(false));
+                let _ = share_tx.send(ShareOutcome::Failed);
                 creating.rollback().await;
                 bail!("aggregate '{id}' creation failed: {e}")
             }
@@ -1233,7 +1245,7 @@ mod cancellation_tests {
             is_subquery: true,
             aggregate: None,
         });
-        let (_ready_tx, ready) = tokio::sync::watch::channel(None);
+        let (_ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Pending);
         st.feed_by_sig.insert("sig".into(), id.to_string());
         st.feed_shares.insert(id.to_string(), FeedShare { sig: "sig".into(), refcount: 1, ready });
         drop(st);
@@ -1333,5 +1345,106 @@ mod cancellation_tests {
             0,
             "the partial seed was retracted with the node it belonged to"
         );
+    }
+
+    // --- the sharing rendezvous carries the creator's REASON ------------------------------------
+
+    /// Everything an in-flight shared create leaves behind for a joiner to find: the shape record,
+    /// the signature a later identical create matches on, and the share entry whose outcome the
+    /// joiner waits for. Returns the creator's end of that outcome channel.
+    async fn pending_share(
+        engine: &Engine,
+        id: &str,
+        where_json: &PredicateJson,
+    ) -> tokio::sync::watch::Sender<ShareOutcome> {
+        let sig = shape_signature("outer_t", &Some(where_json.clone()), &None, false);
+        let (tx, rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
+        let mut st = engine.state.lock().await;
+        st.shapes.insert(id.to_string(), ShapeRecord {
+            id: id.to_string(),
+            table: "outer_t".into(),
+            stream_path: format!("shape/{id}"),
+            changes_only: false,
+            where_json: Some(where_json.clone()),
+            columns: None,
+            family_key: None,
+            is_subquery: true,
+            aggregate: None,
+        });
+        st.feed_by_sig.insert(sig.clone(), id.to_string());
+        st.feed_shares.insert(id.to_string(), FeedShare { sig, refcount: 1, ready: rx });
+        tx
+    }
+
+    async fn refcount(engine: &Engine, id: &str) -> usize {
+        engine.state.lock().await.feed_shares.get(id).map(|s| s.refcount).unwrap_or(0)
+    }
+
+    /// Park until the joiner has actually joined (its refcount is taken) and is waiting on the
+    /// creator's outcome, so the outcome below is published INTO that wait.
+    async fn await_joined(engine: &Engine, id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while refcount(engine, id).await < 2 {
+            assert!(std::time::Instant::now() < deadline, "the joiner never joined the share");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn join(engine: &Engine, where_json: &PredicateJson) -> tokio::task::JoinHandle<Result<ShapeRecord>> {
+        let engine = engine.clone();
+        let where_json = where_json.clone();
+        tokio::spawn(async move { engine.create_shape("outer_t", Some(where_json), None, false, true).await })
+    }
+
+    /// A creator that refuses because the engine degraded publishes that REASON, so its joiner
+    /// answers with the same typed error (503) instead of the generic "failed to initialize"
+    /// (500). Two identical requests from identical clients must not disagree about why the
+    /// engine said no.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_of_a_degraded_create_gets_the_typed_refusal() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let ready_tx = pending_share(&engine, "s1", &where_json).await;
+        let joining = join(&engine, &where_json);
+        await_joined(&engine, "s1").await;
+
+        let _ = ready_tx.send(ShareOutcome::Degraded);
+        let err = joining.await.unwrap().expect_err("the joiner must be refused");
+        assert!(
+            err.downcast_ref::<Degraded>().is_some(),
+            "the joiner must get the creator's typed refusal, not a generic failure: {err:#}"
+        );
+    }
+
+    /// The other half: the creator finished a moment BEFORE the mark, so the outcome is `Ready` —
+    /// but the reaper is about to delete the stream that handle points at. The joiner re-checks
+    /// the same latch the creator's final check uses, and gives back the refcount it took (a
+    /// refused join must not pin the shape).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_ready_after_the_mark_is_refused_and_gives_back_its_refcount() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let ready_tx = pending_share(&engine, "s1", &where_json).await;
+        let joining = join(&engine, &where_json);
+        await_joined(&engine, "s1").await;
+
+        engine.force_degraded();
+        let _ = ready_tx.send(ShareOutcome::Ready);
+        let err = joining.await.unwrap().expect_err("the joiner must be refused");
+        assert!(err.downcast_ref::<Degraded>().is_some(), "and typed, like the creator's: {err:#}");
+        assert_eq!(refcount(&engine, "s1").await, 1, "the refused join released its subscription");
+    }
+
+    /// An ordinary creation failure stays an ordinary failure: only degradation is special-cased,
+    /// so a retryable init failure must not start answering 503.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_of_a_failed_create_still_gets_the_generic_error() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let ready_tx = pending_share(&engine, "s1", &where_json).await;
+        let joining = join(&engine, &where_json);
+        await_joined(&engine, "s1").await;
+
+        let _ = ready_tx.send(ShareOutcome::Failed);
+        let err = joining.await.unwrap().expect_err("the joiner must be refused");
+        assert!(err.downcast_ref::<Degraded>().is_none(), "not a degradation: {err:#}");
+        assert!(format!("{err:#}").contains("failed to initialize"), "{err:#}");
     }
 }

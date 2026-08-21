@@ -289,7 +289,10 @@ sequencer feeds every table's deltas into:
   undo. Each query-back drops the candidates whose recorded stamp is **not visible to its own read
   snapshot** (`SnapshotGate` xid visibility, the same fence a backfill uses — not an LSN compare):
   that decision is newer than the row in hand, so it stands. The map is bounded by the in-flight
-  window and cleared when the last query-back for the shape finishes.
+  window and cleared when the last query-back for the shape finishes. The same fence applies to a
+  parent **node**'s re-derivation, which reads its inner rows the same way: it appends nothing
+  itself, but its dependent shape appends what its flips say, so a re-asserted stale contribution
+  is the same permanent divergence one level down.
 - **NULL sensitivity** — SQL: a NULL in the inner set makes `x NOT IN S` UNKNOWN. A NULL flip
   re-derives exactly the dependents that can change: those whose `IN` leaf is negated **or sits under
   any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and

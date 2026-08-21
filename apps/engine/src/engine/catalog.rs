@@ -142,8 +142,8 @@ impl Engine {
                 st.shapes.insert(id.clone(), rec.clone());
                 if let Some(sig) = sig {
                     // Restored feeds are live immediately (their streams already hold data).
-                    let (ready_tx, ready_rx) = tokio::sync::watch::channel(Some(true));
-                    drop(ready_tx); // receivers keep observing Some(true)
+                    let (ready_tx, ready_rx) = tokio::sync::watch::channel(ShareOutcome::Ready);
+                    drop(ready_tx); // receivers keep observing `Ready`
                     st.feed_by_sig.insert(sig.clone(), id.clone());
                     st.feed_shares.insert(id.clone(), FeedShare { sig, refcount, ready: ready_rx });
                 }

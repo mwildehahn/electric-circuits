@@ -73,7 +73,14 @@ pub struct SubqueryNode {
     /// arrive mid-seed are buffered here and replayed through the seed gate at install — never
     /// applied to a half-seeded set (a snapshot row landing after a fresher delta would be a
     /// stale overwrite). `None` = live.
-    pub(crate) seed_buffer: Option<Vec<Tup2<Row, ZWeight>>>,
+    ///
+    /// Each buffered delta keeps the commit stamp it arrived under ([`BufferedDelta`], the same
+    /// type the outer shape's buffer uses), because the replay is a LIVE per-pk decision and is
+    /// stamped like every other one (see [`SubqueryNode::recent`]). Today no re-derivation can be
+    /// in flight for a node that is mid-seed — [`SubqueryRegistry::queue_node_deferred`] defers it,
+    /// and only a freshly minted node ever gets a seed buffer — so the stamp makes the replay's
+    /// freshness explicit instead of an unstated consequence of that ordering.
+    pub(crate) seed_buffer: Option<Vec<BufferedDelta>>,
     /// Re-derivations a CHILD node's flip aimed at this node while it was still seeding
     /// (`seed_buffer.is_some()`), replayed after the seed is installed — see
     /// [`SubqueryRegistry::queue_node_deferred`]. The parent-node analogue of
@@ -88,11 +95,33 @@ pub struct SubqueryNode {
     pub(crate) bind: Row,
     /// Number of dependents (shapes + parent nodes) referencing this node; drop the node at 0.
     pub refcount: usize,
+    /// **Per-pk recency, for the duration of a node query-back only** — inner-row pk (the key
+    /// [`SubqueryRegistry::assert_node_row`] and [`SubqueryRegistry::apply_node_evals`] work in)
+    /// → the commit stamp `(lsn, xid)` of the LIVE contribution decision most recently taken for
+    /// that pk on this node.
+    ///
+    /// The node analogue of [`SubqueryShape::recent`], and needed for the same reason: a parent
+    /// node's re-derivation ([`requery_and_reconcile_parent`]) reads its inner rows from Postgres
+    /// with the registry lock RELEASED, so a direct inner-table change committed after that read's
+    /// snapshot is reconciled by [`SubqueryRegistry::on_table_delta`] step 1 in between — and the
+    /// re-derivation would then re-assert the old contribution last. That is not a stream append,
+    /// but it changes maintained node state, and the DEPENDENT shape appends what the node's flips
+    /// say: the divergence is the same permanent one, one level down.
+    ///
+    /// Populated ONLY while [`inflight_querybacks`](Self::inflight_querybacks) `> 0` and cleared
+    /// when it returns to zero — the steady state carries no per-pk map at all.
+    pub(crate) recent: HashMap<String, (u64, Option<u64>)>,
+    /// How many re-derivations of this node are between their registry-lock release and their
+    /// reconcile. Non-zero is exactly the window `recent` has to cover.
+    pub(crate) inflight_querybacks: u32,
 }
 
 impl HeapSize for SubqueryNode {
     /// `pred` (`Arc<CompiledPredicate>`) is shared with the registry's compiled evaluators, not
     /// uniquely owned by this node — skipped, like every other `Arc<...>` field in this module.
+    /// `recent` is bounded by the pks touched while a re-derivation is in flight and is dropped
+    /// when the last one finishes, but it is owned heap while it lives, so it is counted;
+    /// `inflight_querybacks` (`u32`) is inline.
     fn heap_bytes(&self) -> usize {
         self.sig.heap_bytes()
             + self.inner_table.heap_bytes()
@@ -102,6 +131,7 @@ impl HeapSize for SubqueryNode {
             + self.deferred.heap_bytes()
             + self.template_key.heap_bytes()
             + self.bind.heap_bytes()
+            + self.recent.heap_bytes()
     }
 }
 
@@ -128,6 +158,8 @@ impl SubqueryNode {
             template_key: String::new(),
             bind: Row(Vec::new()),
             refcount: 0,
+            recent: HashMap::new(),
+            inflight_querybacks: 0,
         }
     }
 }
@@ -291,13 +323,15 @@ pub(crate) enum EmissionSource<'a> {
     QueryBack { gate: &'a crate::pg::SnapshotGate },
 }
 
-/// One outer-table delta buffered by a mid-create shape, WITH the commit stamp it arrived under.
+/// One table delta buffered by a mid-create shape (outer table) or a mid-seed node (inner table),
+/// WITH the commit stamp it arrived under.
 ///
 /// The stamp is retained (it used to be dropped, leaving the install replay unstamped) because the
 /// replay is a live decision like any other: a create hands back deferred work that can run a
-/// query-back the moment the shape is installed, and that query-back must be able to tell that the
-/// replayed decision is newer than its own read. See [`EmissionSource::Replay`].
-struct BufferedDelta {
+/// query-back the moment the shape is installed — or a node re-derivation the moment the seed is —
+/// and that query-back must be able to tell that the replayed decision is newer than its own read.
+/// See [`EmissionSource::Replay`] for the shape half and [`SubqueryNode::recent`] for the node half.
+pub(crate) struct BufferedDelta {
     /// Commit LSN of the change (`0` = unknown).
     lsn: u64,
     /// Commit xid, when the source stamped one — the exact half of the visibility test.
@@ -1079,12 +1113,14 @@ impl SubqueryRegistry {
                 .get_mut(&sig)
                 .and_then(|n| n.seed_buffer.take())
                 .unwrap_or_default();
-            if !buffered.is_empty() {
-                // Replay through the gate: only deltas the snapshot could NOT contain apply.
-                // (Buffered stamps aren't retained; the gate's xid test is per-eval at the
-                // node phase — here we re-evaluate membership by identity, which is idempotent
-                // against the seed for snapshot-visible rows, so replaying all is convergent.)
-                let evals = self.node_present_values(&sig, &ts, &buffered);
+            // Replayed one buffered delta at a time, in arrival order, so each keeps its own
+            // commit stamp and is recorded as the live decision it is (the outer buffer's replay
+            // below does the same). Membership is re-evaluated by identity per pk and is
+            // idempotent against the seed for snapshot-visible rows, so replaying every delta is
+            // convergent — replaying per delta just also lands the intermediate states.
+            for b in buffered {
+                let evals = self.node_present_values(&sig, &ts, &b.delta);
+                self.record_node_recency(&sig, evals.iter().map(|(pk, _)| pk), b.lsn, b.xid);
                 for f in self.apply_node_evals(&sig, evals).await {
                     work.push_back((sig.clone(), f));
                 }
@@ -1401,7 +1437,10 @@ impl SubqueryRegistry {
                 // set must not be reconciled — the snapshot could stale-overwrite a fresher
                 // delta).
                 if let Some(buf) = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.as_mut()) {
-                    buf.extend(delta.iter().cloned());
+                    // Keep this commit's stamp with the delta: the install replay is a live
+                    // decision and has to be able to out-rank a node query-back's older read
+                    // (see [`BufferedDelta`]).
+                    buf.push(BufferedDelta { lsn, xid, delta: delta.to_vec() });
                     hop(&mut trace, format!("node:{sig}"), "buffered");
                 } else if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
                     hop(&mut trace, format!("node:{sig}"), "dropped");
@@ -1508,6 +1547,54 @@ impl SubqueryRegistry {
             .collect()
     }
 
+    /// The per-pk contributions a node RE-DERIVATION should assert: its Postgres rows evaluated
+    /// against the node's predicate, MINUS every pk whose live decision the read could not have
+    /// seen. `None` = the node vanished while the read ran.
+    ///
+    /// This is the node tier of the query-back recency fence, the exact analogue of the candidate
+    /// filter [`emit_for_shapes`](Self::emit_for_shapes) applies to a shape's query-back, with the
+    /// same predicate: `gate.should_skip(lsn, xid)` is "this commit was already visible to that
+    /// read's snapshot", so the rows in hand already reflect it and the candidate is current. Its
+    /// negation is "the live decision is NEWER than this read": the row is stale, the live verdict
+    /// already stands, and re-deriving that pk would re-assert the contribution the verdict just
+    /// removed (or withhold one it just added). The node appends nothing itself, but its dependent
+    /// shape appends what the node's flips say — so a stale re-assertion is the same permanent
+    /// divergence, one level down. (An unstamped live decision — no LSN and no xid — reads as
+    /// "newer" and is dropped: only non-Postgres sources leave a change unstamped, and a
+    /// re-derivation cannot run without Postgres.)
+    fn node_queryback_evals(
+        &self,
+        sig: &SubquerySig,
+        ts: &TableSchema,
+        rows: &[Row],
+        gate: &crate::pg::SnapshotGate,
+    ) -> Option<Vec<(String, Option<Value>)>> {
+        let (pred, proj, recent) = match self.nodes.get(sig) {
+            Some(n) => (n.pred.clone(), n.proj_col, &n.recent),
+            None => return None,
+        };
+        Some(
+            rows.iter()
+                .filter_map(|r| {
+                    let pk = ts.key_string(r).unwrap_or_default();
+                    // `recent` empty (nothing decided live during this read) is the common case
+                    // and costs nothing: no candidate is re-examined at all.
+                    if let Some(&(lsn, xid)) = recent.get(&pk)
+                        && !gate.should_skip(lsn, xid)
+                    {
+                        return None;
+                    }
+                    let pv = if pred.matches_ctx(r, self) {
+                        Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
+                    } else {
+                        None
+                    };
+                    Some((pk, pv))
+                })
+                .collect(),
+        )
+    }
+
     /// For each touched pk, the row's target contribution under one template: `Some((node
     /// sig, projected value))` when the latest row matches the residual AND its projected
     /// params hit a registered bind, else `None`. One residual eval + one hash lookup per pk —
@@ -1547,6 +1634,14 @@ impl SubqueryRegistry {
     /// the node's seed gate says the snapshot already contains this change — in both cases
     /// the node's seed is (or will be) the authority, and absolute assertion absorbs any
     /// overlap idempotently.
+    ///
+    /// This is the per-(node, pk) LIVE decision point, so it is also where node recency is
+    /// recorded (see [`SubqueryNode::recent`]): for every bind of this template that has a
+    /// re-derivation in flight, this delta decides the pk's contribution ABSOLUTELY — target
+    /// bind or not — so the stamp is recorded for each of them, including the pks whose verdict
+    /// is "no contribution". Recording only the pks that produced an assertion would miss
+    /// exactly the case the fence exists for: a pk the node does not hold yet, whose live
+    /// verdict is "still not a contributor", which a stale re-derivation would then admit.
     fn template_assertions(
         &mut self,
         tkey: &str,
@@ -1559,8 +1654,33 @@ impl SubqueryRegistry {
                 .get(sig)
                 .is_some_and(|n| n.seed_buffer.is_none() && !n.gate.should_skip(lsn, xid))
         };
+        // The binds whose decisions have an older read to beat. Empty in the steady state (no
+        // node re-derivation outstanding), so the recording below costs nothing then.
+        let fenced: Vec<SubquerySig> = self
+            .templates
+            .get(tkey)
+            .map(|t| {
+                t.binds
+                    .values()
+                    .filter(|sig| {
+                        self.nodes.get(*sig).is_some_and(|n| n.inflight_querybacks > 0)
+                            && node_applies(self, sig)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut asserts = Vec::new();
         for (pk, target) in evals {
+            // This commit decided this pk's contribution on every fenced bind (it is the target
+            // of at most one of them, and a non-contributor to the rest), so all of them record
+            // it — a re-derivation reading Postgres older than this commit must drop the pk
+            // whichever bind it is re-deriving.
+            for sig in &fenced {
+                if let Some(n) = self.nodes.get_mut(sig) {
+                    n.recent.insert(pk.clone(), (lsn, xid));
+                }
+            }
             // A pk with no interned id was never asserted, so it can hold no contribution — probe
             // without minting (a never-member delete must not grow the dictionary).
             let holders: Vec<SubquerySig> = self
@@ -1611,6 +1731,52 @@ impl SubqueryRegistry {
             if s.inflight_querybacks == 0 {
                 s.recent = HashMap::new();
             }
+        }
+    }
+
+    /// [`begin_queryback`](Self::begin_queryback), one tier down: mark a re-derivation of `sig`'s
+    /// inner rows as in flight, under the lock it is about to RELEASE for its Postgres read, so
+    /// every live contribution decision taken while that read is outstanding lands in
+    /// [`SubqueryNode::recent`]. Increment first, release second — the reverse order would leave a
+    /// hole exactly the size of the race being closed.
+    fn begin_node_queryback(&mut self, sig: &SubquerySig) {
+        if let Some(n) = self.nodes.get_mut(sig) {
+            n.inflight_querybacks = n.inflight_querybacks.saturating_add(1);
+        }
+    }
+
+    /// Balance [`begin_node_queryback`](Self::begin_node_queryback) — under the lock, on EVERY exit
+    /// path of the re-derivation (the read's error path and the "node vanished" path included), or
+    /// the node would keep recording recency (and dropping candidates) forever. A node dropped in
+    /// the meantime has nothing to decrement. The last one out clears `recent`: with no outstanding
+    /// read there is nothing left that could re-assert a stale contribution.
+    fn end_node_queryback(&mut self, sig: &SubquerySig) {
+        if let Some(n) = self.nodes.get_mut(sig) {
+            n.inflight_querybacks = n.inflight_querybacks.saturating_sub(1);
+            if n.inflight_querybacks == 0 {
+                n.recent = HashMap::new();
+            }
+        }
+    }
+
+    /// Record a batch of LIVE per-pk contribution decisions for one node — a no-op unless a
+    /// re-derivation of that node is in flight, which is the only window the map has to cover.
+    /// (The template path records inline; this is for the seed-buffer replay, which decides one
+    /// node's pks directly rather than through a template's binds. See
+    /// [`SubqueryNode::seed_buffer`] for why that replay is stamped at all.)
+    fn record_node_recency<'a>(
+        &mut self,
+        sig: &SubquerySig,
+        pks: impl Iterator<Item = &'a String>,
+        lsn: u64,
+        xid: Option<u64>,
+    ) {
+        let Some(n) = self.nodes.get_mut(sig) else { return };
+        if n.inflight_querybacks == 0 {
+            return;
+        }
+        for pk in pks {
+            n.recent.insert(pk.clone(), (lsn, xid));
         }
     }
 
@@ -2183,33 +2349,34 @@ async fn requery_and_reconcile_parent(
             return Ok(None);
         }
         let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
-        (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
+        let snapshot = (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone());
+        // In flight from here until the reconcile below: live contribution decisions taken in that
+        // window are stamped on the node and beat whatever this read returns.
+        reg.begin_node_queryback(parent_sig);
+        snapshot
     };
-    // The parent's read gate is not consulted: a node re-derivation reconciles an in-memory value
-    // set through `apply_node_evals`, it appends nothing to a stream, so there is no "last word"
-    // an older read could take. The per-pk recency fence belongs to the emission tail only.
-    let (rows, _gate) = match filter {
-        Some((col, value)) => query_candidates(&pg_url, &ts, col, value).await?,
-        None => query_all(&pg_url, &ts).await?,
+    // Every exit from here on must decrement — the read's error path included — or the node would
+    // keep recording recency forever. There is no guard object that can do it: the registry mutex
+    // is async and cannot be taken in `Drop` (same reason as `move_shape_for_value`).
+    let read = match filter {
+        Some((col, value)) => query_candidates(&pg_url, &ts, col, value).await,
+        None => query_all(&pg_url, &ts).await,
+    };
+    let (rows, gate) = match read {
+        Ok(r) => r,
+        Err(e) => {
+            registry.lock().await.end_node_queryback(parent_sig);
+            return Err(e);
+        }
     };
     let mut reg = registry.lock().await;
-    let (pred, proj) = match reg.nodes.get(parent_sig) {
-        Some(n) => (n.pred.clone(), n.proj_col),
-        None => return Ok(None),
+    let Some(evals) = reg.node_queryback_evals(parent_sig, &ts, &rows, &gate) else {
+        reg.end_node_queryback(parent_sig);
+        return Ok(None);
     };
-    let evals: Vec<(String, Option<Value>)> = rows
-        .iter()
-        .map(|r| {
-            let pk = ts.key_string(r).unwrap_or_default();
-            let pv = if pred.matches_ctx(r, &*reg) {
-                Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
-            } else {
-                None
-            };
-            (pk, pv)
-        })
-        .collect();
-    Ok(Some((ts.name.clone(), reg.apply_node_evals(parent_sig, evals).await)))
+    let flips = reg.apply_node_evals(parent_sig, evals).await;
+    reg.end_node_queryback(parent_sig);
+    Ok(Some((ts.name.clone(), flips)))
 }
 
 /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
@@ -3707,6 +3874,134 @@ mod tests {
             vec!["upsert", "delete"],
             "the stale query-back must not resurrect a row the live path just retracted"
         );
+    }
+
+    // --- node re-derivation vs. live ordering (per-pk recency, one tier down) ------------------
+    //
+    // The same race as above, on a membership NODE: `requery_and_reconcile_parent` reads the
+    // node's inner rows from Postgres with the registry lock released, so a direct inner-table
+    // change committed after that read is reconciled by `on_table_delta` step 1 in between, and
+    // the re-derivation would re-assert the old contribution last. The node appends nothing
+    // itself, but its dependent shape appends what the node's flips say, so the divergence is the
+    // same permanent one.
+
+    /// `t(gid, id)` — the projected value and the pk of a membership node's inner table (columns
+    /// are positioned in sorted order, so `gid` is 0 and `id` is 1, matching `insert_test_node`).
+    fn inner_ts() -> TableSchema {
+        use crate::schema::TableDef;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "gid": {"type":"int"}, "id": {"type":"int"} },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        TableSchema::from_def("t", &def).unwrap()
+    }
+
+    fn inner_row(gid: i64, id: i64) -> Row {
+        Row(vec![Value::Int(gid), Value::Int(id)])
+    }
+
+    /// (a) With a re-derivation of the node in flight, the live contribution decisions it races
+    /// are stamped per pk, and a re-derivation holding an OLDER read of those pks drops them —
+    /// while one whose snapshot already saw the live commit applies its rows as usual.
+    ///
+    /// pk 2 is the case the conformance schedule hits and an assertion-driven fence would miss:
+    /// the node never held it, so the live verdict ("still not a contributor") asserts nothing at
+    /// all — and the stale read's row for it would otherwise be admitted as a fresh contribution.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_node_requery_cannot_overwrite_a_newer_live_contribution() {
+        let ts = inner_ts();
+        let sig: SubquerySig = "t|gid|MatchAll".into();
+        let mut reg = registry_with_node(&sig);
+        reg.apply_node_evals(&sig, vec![("1".into(), Some(Value::Int(100)))]).await;
+        assert!(reg.contains(&sig, &Value::Int(100)));
+
+        // A re-derivation of this node is between its Postgres read and its reconcile.
+        reg.begin_node_queryback(&sig);
+
+        // Meanwhile both inner rows are deleted in a transaction (xid 50) that read cannot see.
+        // Absolute verdict: neither pk contributes — and for pk 2, which the node never held,
+        // that verdict asserts nothing.
+        reg.on_table_delta(
+            &ts,
+            &[Tup2(inner_row(100, 1), -1), Tup2(inner_row(200, 2), -1)],
+            0x200,
+            Some(50),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!reg.contains(&sig, &Value::Int(100)), "the live delta retracted pk 1");
+        assert_eq!(
+            reg.nodes[&sig].recent.get("1"),
+            Some(&(0x200u64, Some(50u64))),
+            "the live decision's commit stamp must be recorded while a re-derivation is in flight"
+        );
+        assert_eq!(
+            reg.nodes[&sig].recent.get("2"),
+            Some(&(0x200u64, Some(50u64))),
+            "including the pk whose verdict is 'no contribution', which asserts nothing"
+        );
+
+        // The in-flight read still has both rows; its snapshot (xmin 40, xmax 45) predates xid 50.
+        let stale = crate::pg::SnapshotGate::parse("40:45:", "0/100");
+        let evals = reg
+            .node_queryback_evals(&sig, &ts, &[inner_row(100, 1), inner_row(200, 2)], &stale)
+            .expect("the node is live");
+        assert!(evals.is_empty(), "every candidate older than its live decision must be dropped");
+        reg.apply_node_evals(&sig, evals).await;
+        assert!(!reg.contains(&sig, &Value::Int(100)), "a stale re-derivation must not re-admit a value");
+        assert!(!reg.contains(&sig, &Value::Int(200)), "nor admit one the live verdict refused");
+
+        // A read whose snapshot (xmin 60) DID see xid 50 is not stale: whatever it read is at
+        // least as new as the live decision (here: both rows are back), so it applies normally.
+        let fresh = crate::pg::SnapshotGate::parse("60:70:", "0/300");
+        let evals = reg
+            .node_queryback_evals(&sig, &ts, &[inner_row(100, 1), inner_row(200, 2)], &fresh)
+            .expect("the node is live");
+        reg.apply_node_evals(&sig, evals).await;
+        assert!(reg.contains(&sig, &Value::Int(100)));
+        assert!(reg.contains(&sig, &Value::Int(200)));
+        reg.end_node_queryback(&sig);
+    }
+
+    /// (b) The node's map is bounded by the in-flight window exactly like the shape's: nothing is
+    /// recorded with no re-derivation outstanding, and the last one to finish clears what was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_recency_is_recorded_only_while_a_requery_is_in_flight() {
+        let ts = inner_ts();
+        let sig: SubquerySig = "t|gid|MatchAll".into();
+        let mut reg = registry_with_node(&sig);
+
+        // Nothing in flight: an ordinary live delta records nothing.
+        reg.on_table_delta(&ts, &[Tup2(inner_row(100, 1), 1)], 1, Some(10), None, None).await.unwrap();
+        assert!(reg.contains(&sig, &Value::Int(100)));
+        assert!(
+            reg.nodes[&sig].recent.is_empty(),
+            "with nothing to protect against, no per-pk state is kept"
+        );
+
+        // Two re-derivations in flight; a live delta now records for the pks it decides.
+        reg.begin_node_queryback(&sig);
+        reg.begin_node_queryback(&sig);
+        reg.on_table_delta(&ts, &[Tup2(inner_row(100, 1), 1)], 2, Some(11), None, None).await.unwrap();
+        assert_eq!(reg.nodes[&sig].recent.len(), 1);
+
+        // The first to finish does NOT clear: the other read is still outstanding.
+        reg.end_node_queryback(&sig);
+        assert_eq!(reg.nodes[&sig].recent.len(), 1, "one re-derivation is still in flight");
+
+        // The last one does.
+        reg.end_node_queryback(&sig);
+        assert!(reg.nodes[&sig].recent.is_empty(), "the last re-derivation out clears the map");
+        assert_eq!(reg.nodes[&sig].inflight_querybacks, 0);
+
+        // An unbalanced decrement (a failed read, or a node dropped mid-flight) must not wrap the
+        // counter into a permanently "in flight" state.
+        reg.end_node_queryback(&sig);
+        assert_eq!(reg.nodes[&sig].inflight_querybacks, 0);
+        reg.end_node_queryback(&"gone".to_string());
     }
 
     #[tokio::test(flavor = "multi_thread")]
