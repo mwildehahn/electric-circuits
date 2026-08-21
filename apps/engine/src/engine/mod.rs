@@ -179,6 +179,13 @@ pub(crate) enum FlipWork {
     /// that it is installed (see `SubqueryRegistry::finish_create`). Its dependency walk already
     /// happened, so there is nothing left to walk.
     Deferred { shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
+    /// Work that reached a fresh parent NODE while a create was still seeding it, re-derived now
+    /// that its set is installed (see `SubqueryRegistry::finish_create`). Unlike `Deferred`, this
+    /// one DOES walk: reconciling the node produces flips, and the dependents below it — the
+    /// create's own shape included — have not seen them.
+    DeferredNode {
+        work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::DeferredNodeWork)>,
+    },
 }
 
 /// Everything a tailer needs to route deltas through the subquery layer: the shared registry for
@@ -234,6 +241,18 @@ fn spawn_flip_propagator(
                             .await
                             .err()
                             .map(|e| (e, work.len()))
+                    }
+                    FlipWork::DeferredNode { mut work } => {
+                        // The walk the re-derivations feed starts empty and is carried across the
+                        // retries with them, so an exhausted batch reports both halves of what it
+                        // never got through.
+                        let mut walk = std::collections::VecDeque::new();
+                        crate::subquery::propagate_deferred_node_with_retry(
+                            &registry, &mut work, &mut walk, &trace_tx,
+                        )
+                        .await
+                        .err()
+                        .map(|e| (e, work.len() + walk.len()))
                     }
                 };
                 if let Some((e, unfinished)) = failed {
@@ -585,8 +604,10 @@ impl Engine {
     /// Delete every registered subquery shape's durable stream. Clients read durable-streams
     /// directly, past the HTTP surface that now answers 503, so a deleted stream is the only way
     /// they learn their shape is no longer maintained. The shape RECORDS stay registered (the
-    /// engine answers 503, not 404), and a restart re-seeds every node from Postgres and recreates
-    /// the streams — so this destroys nothing a restart would have kept.
+    /// engine answers 503, not 404). This destroys nothing a restart would have kept: a restart
+    /// re-seeds every node from Postgres but DROPS every subquery shape — their inner-node state
+    /// is not persisted, so the catalog restore deliberately does not restore them (see
+    /// `Engine::restore_from_catalog`) — and clients recreate them with `POST /shapes`.
     async fn reap_subquery_streams(&self) {
         let paths: Vec<String> = {
             let st = self.state.lock().await;

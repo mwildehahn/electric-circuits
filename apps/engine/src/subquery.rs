@@ -74,6 +74,12 @@ pub struct SubqueryNode {
     /// applied to a half-seeded set (a snapshot row landing after a fresher delta would be a
     /// stale overwrite). `None` = live.
     pub(crate) seed_buffer: Option<Vec<Tup2<Row, ZWeight>>>,
+    /// Re-derivations a CHILD node's flip aimed at this node while it was still seeding
+    /// (`seed_buffer.is_some()`), replayed after the seed is installed — see
+    /// [`SubqueryRegistry::queue_node_deferred`]. The parent-node analogue of
+    /// [`PendingSubqueryShape::deferred`]: reconciling against a pre-seed (empty) set would
+    /// derive nothing and the seed would then overwrite the change with the older snapshot.
+    pub(crate) deferred: VecDeque<DeferredNodeWork>,
     /// The node's key in the membership circuit (registry-assigned, unique per live node).
     pub node_id: i64,
     /// The template this node is a bind of (see [`crate::predicate::subquery_template`]).
@@ -93,6 +99,7 @@ impl HeapSize for SubqueryNode {
             + self.where_json.heap_bytes()
             + self.gate.heap_bytes()
             + self.seed_buffer.heap_bytes()
+            + self.deferred.heap_bytes()
             + self.template_key.heap_bytes()
             + self.bind.heap_bytes()
     }
@@ -116,6 +123,7 @@ impl SubqueryNode {
             where_json: None,
             gate: crate::pg::SnapshotGate::passthrough(),
             seed_buffer: None,
+            deferred: VecDeque::new(),
             node_id,
             template_key: String::new(),
             bind: Row(Vec::new()),
@@ -221,13 +229,86 @@ pub struct SubqueryShape {
     /// contained is structurally a no-op — the wake-storm gate (PR #30) with no filter to keep
     /// in sync.
     pub(crate) feed_id: i64,
+    /// **Per-pk recency, for the duration of a query-back only** — `pk_dict` id → the commit
+    /// stamp `(lsn, xid)` of the LIVE outer-row decision most recently applied to this shape's
+    /// stream for that pk.
+    ///
+    /// A membership query-back reads its candidate rows from Postgres *without* the registry
+    /// lock and evaluates them when it reacquires it, so a direct outer-row change committed
+    /// after that read's snapshot can be evaluated and emitted in between — and the query-back's
+    /// older row would then land last on the stream. Native consumers fold by durable-stream
+    /// offset, so "last" is "final": permanent divergence from Postgres. Recording the live
+    /// decision's stamp here lets the query-back drop exactly those candidates whose live
+    /// decision its own snapshot could not have seen (see [`EmissionSource`]).
+    ///
+    /// Populated ONLY while [`inflight_querybacks`](Self::inflight_querybacks) `> 0` and cleared
+    /// when it returns to zero: with no query-back in flight there is no older read to lose to,
+    /// so the steady state carries no per-pk map at all.
+    pub(crate) recent: HashMap<u32, (u64, Option<u64>)>,
+    /// How many query-backs for this shape are between their registry-lock release and their
+    /// evaluation. Non-zero is exactly the window `recent` has to cover.
+    pub(crate) inflight_querybacks: u32,
 }
 
 impl HeapSize for SubqueryShape {
-    /// `pred`/`out_cols` are `Arc`-shared, not uniquely owned; `emitted` (`AtomicU64`) and
-    /// `feed_id` (`i64`) are inline.
+    /// `pred`/`out_cols` are `Arc`-shared, not uniquely owned; `emitted` (`AtomicU64`),
+    /// `feed_id` (`i64`) and `inflight_querybacks` (`u32`) are inline. `recent` is bounded by the
+    /// pks touched while a query-back is in flight and is dropped when the last one finishes, but
+    /// it is owned heap while it lives, so it is counted.
     fn heap_bytes(&self) -> usize {
-        self.shape_id.heap_bytes() + self.outer_table.heap_bytes() + self.stream_path.heap_bytes() + self.gate.heap_bytes()
+        self.shape_id.heap_bytes()
+            + self.outer_table.heap_bytes()
+            + self.stream_path.heap_bytes()
+            + self.gate.heap_bytes()
+            + self.recent.heap_bytes()
+    }
+}
+
+/// Where the candidates handed to [`SubqueryRegistry::emit_for_shapes`] came from — which decides
+/// how that evaluation relates in TIME to the other evaluations racing for the same stream.
+///
+/// The emission tail is absolute per pk (upsert if the row matches now, else an idempotent gated
+/// delete), so convergence never depended on ordering *between* pks. It does depend on the last
+/// evaluation of a given pk being the freshest one, and that is exactly what a query-back cannot
+/// promise on its own: it reads Postgres at one snapshot with the registry lock released.
+///
+/// * `Live`/`Replay` carry the commit stamp of the outer-table change being evaluated. They are
+///   the freshest possible verdict for their pks, so while a query-back is in flight they RECORD
+///   that stamp in [`SubqueryShape::recent`].
+/// * `QueryBack` carries the gate of the read its candidates came from, and DROPS every candidate
+///   whose recorded live stamp is not visible to that gate — the live decision was taken on a
+///   commit this read could not have seen, so this row is stale and re-emitting it would make an
+///   older read the stream's last word.
+pub(crate) enum EmissionSource<'a> {
+    /// A live outer-table delta from [`SubqueryRegistry::on_table_delta`] step 2.
+    Live { lsn: u64, xid: Option<u64> },
+    /// A buffered outer-table delta replayed at install ([`SubqueryRegistry::finish_create`]),
+    /// with the stamp it was buffered under. Identical to `Live` in effect — a create's deferred
+    /// query-back can run immediately after install, so these decisions must be protected the
+    /// same way — and kept a distinct variant because the two call sites are not interchangeable.
+    Replay { lsn: u64, xid: Option<u64> },
+    /// Candidates read from Postgres by a query-back, under `gate`'s snapshot.
+    QueryBack { gate: &'a crate::pg::SnapshotGate },
+}
+
+/// One outer-table delta buffered by a mid-create shape, WITH the commit stamp it arrived under.
+///
+/// The stamp is retained (it used to be dropped, leaving the install replay unstamped) because the
+/// replay is a live decision like any other: a create hands back deferred work that can run a
+/// query-back the moment the shape is installed, and that query-back must be able to tell that the
+/// replayed decision is newer than its own read. See [`EmissionSource::Replay`].
+struct BufferedDelta {
+    /// Commit LSN of the change (`0` = unknown).
+    lsn: u64,
+    /// Commit xid, when the source stamped one — the exact half of the visibility test.
+    xid: Option<u64>,
+    delta: Vec<Tup2<Row, ZWeight>>,
+}
+
+impl HeapSize for BufferedDelta {
+    /// `lsn`/`xid` are inline.
+    fn heap_bytes(&self) -> usize {
+        self.delta.heap_bytes()
     }
 }
 
@@ -276,6 +357,28 @@ impl HeapSize for DeferredShapeWork {
     }
 }
 
+/// Propagation work that reached a PARENT NODE while it was still being seeded, deferred until its
+/// seed is installed (see [`SubqueryNode::deferred`]).
+///
+/// The node analogue of [`DeferredShapeWork`], minus the `txid`: re-deriving a node reconciles an
+/// in-memory value set and emits nothing, so there is no envelope for a txid to travel on — the
+/// flips it produces carry the change onward to the dependents that do emit.
+pub enum DeferredNodeWork {
+    /// A child value flipped: re-derive the parent's inner rows with `connecting_col = value`.
+    Value { connecting_col: usize, value: Value },
+    /// A NULL flip on a NULL-sensitive edge: re-derive every inner row of the parent.
+    Full,
+}
+
+impl HeapSize for DeferredNodeWork {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            DeferredNodeWork::Value { value, .. } => value.heap_bytes(),
+            DeferredNodeWork::Full => 0,
+        }
+    }
+}
+
 /// A subquery shape between `begin_create` and `finish_create`: registration exists (so its
 /// nodes are refcounted, its edges recorded, and its deltas buffered) but seeding/backfill runs
 /// outside the registry lock.
@@ -288,8 +391,9 @@ pub struct PendingSubqueryShape {
     pub changes_only: bool,
     /// This create's node-refcount log (for exact rollback on failure).
     collect_log: Vec<SubquerySig>,
-    /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install.
-    buffer: Vec<Tup2<Row, ZWeight>>,
+    /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install,
+    /// each with the commit stamp it arrived under (see [`BufferedDelta`]).
+    buffer: Vec<BufferedDelta>,
     /// Flips that reached this shape's edges before it was installed, replayed at install.
     ///
     /// Phase A commits the shape's edges, so a flip on a node it SHARES with an already-live shape
@@ -318,6 +422,21 @@ pub struct BeginCreate {
     pub seeds: Vec<(SubquerySig, String, Option<PredicateJson>)>,
     /// Schema map snapshot for SQL emission.
     pub schemas: SchemaMap,
+}
+
+/// What phase C hands the caller to propagate once the create's registry lock is released. All
+/// three are effects the create computed but did not deliver, so all three are barrier-covered
+/// (`pendingFlips`) and fail closed exactly like a live flip batch.
+pub struct FinishedCreate {
+    /// Flips produced by replaying the fresh nodes' buffered inner deltas through their seed gates.
+    pub work: VecDeque<(SubquerySig, Flip)>,
+    /// Work that reached the SHAPE while it was pending (see [`PendingSubqueryShape::deferred`]),
+    /// to run against the now-installed shape.
+    pub deferred: VecDeque<DeferredShapeWork>,
+    /// Work that reached a fresh PARENT NODE while it was still seeding (see
+    /// [`SubqueryNode::deferred`]), to re-derive now that the node's set is real. Each item's flips
+    /// are then walked on down the DAG like any other.
+    pub node_work: VecDeque<(SubquerySig, DeferredNodeWork)>,
 }
 
 /// The cross-table registry of subquery nodes + shapes + edges. Implements [`SubqueryEval`] so a
@@ -520,6 +639,14 @@ impl SubqueryRegistry {
         // Every assertion belongs to `sig`, so the sig on each flip is redundant here.
         let flips = self.apply_asserts(asserts).await;
         flips.into_iter().map(|(_, f)| f).collect()
+    }
+
+    /// Test seam (never compiled into the engine): assert one contributor onto a node exactly as
+    /// phase C's seed install does, so a cancellation test can park a create with a fresh node
+    /// already holding real membership-circuit state.
+    #[cfg(test)]
+    pub(crate) async fn assert_seed_row_for_test(&mut self, sig: &SubquerySig, pk: &str, value: Value) {
+        self.apply_node_evals(sig, vec![(pk.to_string(), Some(value))]).await;
     }
 
     /// The node's current distinct-value count, read from the circuit snapshot.
@@ -847,20 +974,70 @@ impl SubqueryRegistry {
         true
     }
 
-    /// Phase C (under the registry lock; brief, in-memory + lane enqueues): install the seeds,
-    /// replay every buffered delta through the seed gates, register the shape, and return the
-    /// flips the replays produced (the caller enqueues them for propagation). `seeded` counts
-    /// the phase-B snapshot envelopes (for the shape's emitted counter). `seeded_pks` is the
-    /// backfilled outer rows' pks, seeding `known_members` so a later delta that finds one of
-    /// them no longer matching correctly emits a delete (not silently dropped as "never known").
+    /// Queue a re-derivation aimed at a parent node that is still being SEEDED, if it is one.
+    /// Returns whether it was queued — `false` means the node is live (or gone) and the caller
+    /// reconciles now.
     ///
-    /// Also returns whatever propagation work reached the shape while it was pending
-    /// ([`PendingSubqueryShape::deferred`]) for the caller to run against the installed shape.
-    /// **The invariant that makes that lossless**: taking the queue off the pending entry and
-    /// installing the shape both happen inside this one `&mut self` step, which the registry mutex
-    /// holds exclusively for its whole duration (the internal awaits cannot yield the registry to
-    /// another task). So a live flip either queues onto the pending entry before this step or finds
-    /// the shape installed after it — there is no state in between for it to fall through.
+    /// A flip must never reconcile a mid-seed node: its set is still empty until phase C installs
+    /// the seed, so the re-derivation finds nothing to move — and the seed, taken from a snapshot
+    /// OLDER than the flip, is then installed over the change. The node and every dependent below
+    /// it stay stale for the life of the shape. Deferring is the same answer
+    /// [`queue_deferred`](Self::queue_deferred) gives for a not-yet-installed shape.
+    ///
+    /// Exactly ONE create can own any seeding node: [`begin_create`](Self::begin_create) refuses a
+    /// create whose compile touches a node another create is still seeding (the "create conflict"
+    /// its caller retries on), so every seeding node is fresh for one in-flight create and that
+    /// create's `finish_create` is the single place this queue is handed back — or, if the create
+    /// dies, the node goes and the queue with it.
+    ///
+    /// Deduped like the shape queue: the replay is absolute, so running a value's re-derive once is
+    /// running it enough, and a `Full` re-derive covers every value, so it subsumes the rest.
+    fn queue_node_deferred(&mut self, sig: &SubquerySig, work: DeferredNodeWork) -> bool {
+        let Some(node) = self.nodes.get_mut(sig) else { return false };
+        if node.seed_buffer.is_none() {
+            return false;
+        }
+        let has_full = node.deferred.iter().any(|w| matches!(w, DeferredNodeWork::Full));
+        match &work {
+            DeferredNodeWork::Full => {
+                if !has_full {
+                    node.deferred.clear();
+                    node.deferred.push_back(work);
+                }
+            }
+            DeferredNodeWork::Value { connecting_col, value } => {
+                let dup = node.deferred.iter().any(|w| {
+                    matches!(w, DeferredNodeWork::Value { connecting_col: c, value: v }
+                        if c == connecting_col && v == value)
+                });
+                if !has_full && !dup {
+                    node.deferred.push_back(work);
+                }
+            }
+        }
+        true
+    }
+
+    /// Phase C (under the registry lock; brief, in-memory + lane enqueues): install the seeds,
+    /// replay every buffered delta through the seed gates, register the shape, and return the work
+    /// the caller must propagate (see [`FinishedCreate`]). `seeded` counts the phase-B snapshot
+    /// envelopes (for the shape's emitted counter). `seeded_pks` is the backfilled outer rows' pks,
+    /// seeding the feed so a later delta that finds one of them no longer matching correctly emits a
+    /// delete (not silently dropped as "never known").
+    ///
+    /// **The invariant that makes the deferred hand-off lossless**: taking the queue off the pending
+    /// entry and installing the shape both happen inside ONE synchronous `&mut self` step below, and
+    /// the registry mutex is held exclusively for the whole call. So a live flip either queues onto
+    /// the pending entry before that step or finds the shape installed after it — there is no state
+    /// in between for it to fall through.
+    ///
+    /// **The invariant that makes it cancellable**: the pending entry stays IN `pending_shapes`
+    /// across every await here, so the registry — not this future's stack — owns the create's
+    /// rollback state (compile log, buffers, fresh nodes) for the whole of phase C. A create whose
+    /// future is dropped at one of these awaits therefore leaves a pending entry
+    /// [`abort_create`](Self::abort_create) can unwind exactly, node seeds already asserted into the
+    /// membership circuit included. After the atomic tail the create is an ordinary installed shape,
+    /// which the same `abort_create` unwinds through the ordinary drop path.
     pub async fn finish_create(
         &mut self,
         shape_id: &str,
@@ -868,15 +1045,13 @@ impl SubqueryRegistry {
         outer_gate: crate::pg::SnapshotGate,
         seeded: u64,
         seeded_pks: std::collections::HashSet<String>,
-    ) -> Result<(VecDeque<(SubquerySig, Flip)>, VecDeque<DeferredShapeWork>)> {
-        let idx = self
-            .pending_shapes
-            .iter()
-            .position(|p| p.shape_id == shape_id)
-            .context("finish_create: pending shape vanished")?;
-        let mut pending = self.pending_shapes.remove(idx);
-        let deferred = std::mem::take(&mut pending.deferred);
+    ) -> Result<FinishedCreate> {
+        anyhow::ensure!(
+            self.pending_shapes.iter().any(|p| p.shape_id == shape_id),
+            "finish_create: pending shape vanished"
+        );
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
+        let mut node_work: VecDeque<(SubquerySig, DeferredNodeWork)> = VecDeque::new();
         // 1. Install node seeds, then replay each node's buffered deltas through its gate.
         for (sig, rows, gate) in node_seeds {
             let (ts, proj_col) = {
@@ -914,14 +1089,32 @@ impl SubqueryRegistry {
                     work.push_back((sig.clone(), f));
                 }
             }
+            // The node is live from here (its seed and its raw deltas are both in), so a child
+            // flip that arrived while it was seeding can finally be re-derived against a set that
+            // is not a lie. Taking the queue drains it for good: the node no longer defers.
+            if let Some(n) = self.nodes.get_mut(&sig) {
+                for w in std::mem::take(&mut n.deferred) {
+                    node_work.push_back((sig.clone(), w));
+                }
+            }
         }
-        // 2. Register the shape, then replay its buffered outer deltas through the gate
-        //    (absolute emission; idempotent against the backfill for snapshot-visible rows).
+        // 2. Everything that can still fail happens BEFORE the pending entry leaves the registry,
+        //    so a failure here returns with the create still exactly unwindable.
+        let idx = self
+            .pending_shapes
+            .iter()
+            .position(|p| p.shape_id == shape_id)
+            .context("finish_create: pending shape vanished")?;
         let ts = self
             .schemas
-            .get(&pending.outer_table)
+            .get(&self.pending_shapes[idx].outer_table)
             .cloned()
             .context("finish_create: unknown outer table")?;
+        // The atomic tail: ONE synchronous `&mut self` step, no `.await` inside it — take the
+        // pending entry (and with it the deferred queue), register the shape, seed its feed. This
+        // is the step the deferred hand-off's losslessness rests on (see the doc comment).
+        let mut pending = self.pending_shapes.remove(idx);
+        let deferred = std::mem::take(&mut pending.deferred);
         let feed_id = self.next_feed_id;
         self.next_feed_id += 1;
         self.install_shape(SubqueryShape {
@@ -933,6 +1126,8 @@ impl SubqueryRegistry {
             gate: outer_gate,
             emitted: std::sync::atomic::AtomicU64::new(seeded),
             feed_id,
+            recent: HashMap::new(),
+            inflight_querybacks: 0,
         });
         // Seed the feed with the backfilled pks (the stream already carries the snapshot) —
         // replaces the old known_members hand-off. This is phase C, under the registry lock,
@@ -943,11 +1138,24 @@ impl SubqueryRegistry {
             let pk_id = self.pk_dict.get_or_insert(&pk);
             self.feed_sets.insert(feed_id, pk_id);
         }
-        if !pending.buffer.is_empty() {
-            let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
-            self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None).await?;
+        // 3. Replay the shape's buffered outer deltas through the gate (absolute emission;
+        //    idempotent against the backfill for snapshot-visible rows). Replayed one buffered
+        //    delta at a time, in arrival order, so each keeps its own commit stamp: the deferred
+        //    work returned below can start a query-back the instant this call releases the lock,
+        //    and a replayed decision it must not undo is recognisable only by its stamp. Per-pk
+        //    emission is absolute, so replaying per delta rather than folding them into one
+        //    verdict lands the same final state — it just also lands the intermediate ones.
+        for buffered in std::mem::take(&mut pending.buffer) {
+            let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &buffered.delta);
+            self.emit_for_shapes(
+                &ts,
+                vec![(shape_id.to_string(), candidates)],
+                None,
+                EmissionSource::Replay { lsn: buffered.lsn, xid: buffered.xid },
+            )
+            .await?;
         }
-        Ok((work, deferred))
+        Ok(FinishedCreate { work, deferred, node_work })
     }
 
     /// Install a fully-built outer shape. The shapes map, the feed-id reverse map and the
@@ -955,9 +1163,10 @@ impl SubqueryRegistry {
     /// wasted probe, but a shape with no index entry is invisible to every later delta (silently
     /// dropped envelopes). One call site so they cannot drift, and one synchronous `&mut self`
     /// step so no live delta can observe a half-installed shape. Registration is only reachable
-    /// from `finish_create`, the atomic tail of shape creation: a create that fails earlier never
-    /// got here, so [`abort_create`](Self::abort_create) has only its compile log to unwind — one
-    /// abandoned after it undoes this install through [`drop_subquery_shape`](Self::drop_subquery_shape).
+    /// from `finish_create`, the atomic tail of shape creation: a create that fails or is cancelled
+    /// earlier never got here, so [`abort_create`](Self::abort_create) unwinds its still-registered
+    /// pending entry — one abandoned after it undoes this install through
+    /// [`drop_subquery_shape`](Self::drop_subquery_shape).
     fn install_shape(&mut self, shape: SubqueryShape) {
         self.feed_by_id.insert(shape.feed_id, shape.shape_id.clone());
         self.shape_index.insert(&shape.shape_id, &shape.outer_table, &shape.pred);
@@ -975,11 +1184,19 @@ impl SubqueryRegistry {
         self.shape_index.candidates(table, delta)
     }
 
-    /// Abort a create in whichever phase it died in. Before `finish_create` that means unwinding
-    /// its compile log (edges, refcounts, fresh nodes with their buffers); afterwards the shape is
-    /// installed like any other, so the ordinary drop path — which also retracts its seeded circuit
-    /// state and feed bookkeeping — is the correct undo. A create cancelled between `finish_create`
-    /// returning and the engine publishing the shape lands in that second case.
+    /// Abort a create in whichever phase it died in. Before the atomic tail of `finish_create` that
+    /// means unwinding its pending entry (edges, refcounts, fresh nodes with their buffers and their
+    /// deferred queues, and any seed already asserted into the membership circuit); after it the
+    /// shape is installed like any other, so the ordinary drop path is the correct undo. A create
+    /// cancelled between `finish_create` returning and the engine publishing the shape lands in that
+    /// second case.
+    ///
+    /// The pending branch must cover a create that died ANYWHERE in phase C, not just before it:
+    /// phase C installs node seeds one await at a time, so a dropped future can leave a fresh node
+    /// holding a full seed. Removing it without retracting those contributor tuples would leave the
+    /// membership circuit carrying a dead node's set forever, so removal goes through the same
+    /// retracting path a refcount-0 drop uses — unconditionally, because a node with no state
+    /// retracts nothing and the check would cost the same scan as the retraction.
     pub async fn abort_create(&mut self, shape_id: &str) {
         if self.shapes.contains_key(shape_id) {
             self.drop_subquery_shape(shape_id).await;
@@ -989,23 +1206,28 @@ impl SubqueryRegistry {
             return;
         };
         // Taking the whole entry discards its deferred queue with it: work aimed at a shape that
-        // will never exist has nowhere to land and nothing to correct.
+        // will never exist has nowhere to land and nothing to correct. The same goes for the
+        // deferred queue of each fresh node removed below — it dies with the node it was waiting on.
         let pending = self.pending_shapes.remove(idx);
         // Shape edges live under the pred's leaf sigs — remove only there, not a global scan.
         self.remove_shape_edges(&pending.pred, &pending.shape_id);
+        let mut asserts = Assertions::default();
         for sig in pending.collect_log {
-            if let Some(n) = self.nodes.get_mut(&sig) {
-                n.refcount = n.refcount.saturating_sub(1);
-                if n.refcount == 0 {
-                    if let Some(node) = self.nodes.remove(&sig) {
-                        let child_sigs: Vec<SubquerySig> =
-                            collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
-                        self.remove_node_edges(&sig, &child_sigs);
-                        self.remove_node_entry(&node);
-                    }
-                    self.pending_seed.retain(|s| s != &sig);
-                }
+            let Some(n) = self.nodes.get_mut(&sig) else { continue };
+            n.refcount = n.refcount.saturating_sub(1);
+            if n.refcount > 0 {
+                continue;
             }
+            // No cascade here (unlike `decref_nodes`): the compile log has one entry per `collect()`
+            // call, deeper nodes included, so this walk already visits every node the create
+            // referenced — cascading would decrement a child a second time.
+            self.remove_node_with_state(&sig, &mut asserts);
+            self.pending_seed.retain(|s| s != &sig);
+        }
+        // The nodes are gone and their ids are never reused, so these retractions have no dependent
+        // left to move and their flips are discarded.
+        if !asserts.is_empty() {
+            let _ = self.circuit.apply(asserts).await;
         }
     }
 
@@ -1022,8 +1244,9 @@ impl SubqueryRegistry {
         }
     }
 
-    /// Drop a removed node's id/template bookkeeping (the circuit retraction, when the node
-    /// has state, is the caller's job — pre-seed nodes have none).
+    /// Drop a removed node's id/template bookkeeping. The circuit retraction is the caller's job —
+    /// see [`remove_node_with_state`](Self::remove_node_with_state), which does both for a node
+    /// that may hold state.
     fn remove_node_entry(&mut self, node: &SubqueryNode) {
         self.node_by_id.remove(&node.node_id);
         if let Some(tpl) = self.templates.get_mut(&node.template_key) {
@@ -1082,34 +1305,47 @@ impl SubqueryRegistry {
             if node.refcount > 0 {
                 continue;
             }
-            // Refcount hit zero: gather child sigs, retract state, remove node + edges, recurse.
-            let child_sigs: Vec<SubquerySig> =
-                collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
-            let node = self.nodes.remove(&sig).expect("node fetched above");
-            // The node's contributor slice comes from the circuit's own integral (prefix
-            // scan) — there is no host pk list to drain anymore. Keys are pk ids; the retraction
-            // re-asserts the same id, so no dictionary round-trip is needed here.
-            for (pk_id, _v) in self.circuit.contributor_entries(node.node_id) {
-                if let Some(tpl) = self.templates.get_mut(&node.template_key) {
-                    if let Some(set) = tpl.pk_nodes.get_mut(&pk_id) {
-                        set.remove(&sig);
-                        if set.is_empty() {
-                            tpl.pk_nodes.remove(&pk_id);
-                        }
-                    }
-                }
-                asserts
-                    .contributors
-                    .push(Tup2(PkKey { id: node.node_id, pk: pk_id }, Assert::Delete));
-            }
-            self.remove_node_entry(&node);
-            self.remove_node_edges(&sig, &child_sigs);
-            stack.extend(child_sigs);
+            // Refcount hit zero: retract state, remove node + edges, recurse into its children.
+            stack.extend(self.remove_node_with_state(&sig, &mut asserts));
         }
         // Refcount-0 removal ⇒ no dependents remain; the flips are discarded.
         if !asserts.is_empty() {
             let _ = self.circuit.apply(asserts).await;
         }
+    }
+
+    /// Remove a node that has reached the end of its life: retract its contributor tuples into
+    /// `asserts` (the caller applies one batch), drop its id/template/edge bookkeeping, and return
+    /// its child sigs. The one removal path for a node that may hold circuit state — shared by the
+    /// refcount-0 drop ([`decref_nodes`](Self::decref_nodes), which recurses into the returned
+    /// children) and by [`abort_create`](Self::abort_create), whose fresh node may have taken its
+    /// seed before the create was cancelled.
+    ///
+    /// The contributor slice comes from the circuit's own integral (prefix scan) — there is no host
+    /// pk list to drain. Keys are pk ids; the retraction re-asserts the same id, so no dictionary
+    /// round-trip is needed here.
+    fn remove_node_with_state(
+        &mut self,
+        sig: &SubquerySig,
+        asserts: &mut Assertions,
+    ) -> Vec<SubquerySig> {
+        let Some(node) = self.nodes.remove(sig) else { return Vec::new() };
+        let child_sigs: Vec<SubquerySig> =
+            collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
+        for (pk_id, _v) in self.circuit.contributor_entries(node.node_id) {
+            if let Some(tpl) = self.templates.get_mut(&node.template_key) {
+                if let Some(set) = tpl.pk_nodes.get_mut(&pk_id) {
+                    set.remove(sig);
+                    if set.is_empty() {
+                        tpl.pk_nodes.remove(&pk_id);
+                    }
+                }
+            }
+            asserts.contributors.push(Tup2(PkKey { id: node.node_id, pk: pk_id }, Assert::Delete));
+        }
+        self.remove_node_entry(&node);
+        self.remove_node_edges(sig, &child_sigs);
+        child_sigs
     }
 
     // --- live maintenance ---------------------------------------------------------------------
@@ -1211,13 +1447,20 @@ impl SubqueryRegistry {
             }
             groups.push((id, crate::engine::membership::latest_rows_by_pk(ts, delta)));
         }
-        for (id, emitted, _net) in self.emit_for_shapes(ts, groups, txid.clone()).await? {
+        // This is the freshest verdict any path can have for these pks: it is derived from the
+        // commit itself. `EmissionSource::Live` carries that commit's stamp so a query-back
+        // already reading Postgres cannot later overwrite the decision with an older row.
+        for (id, emitted, _net) in
+            self.emit_for_shapes(ts, groups, txid.clone(), EmissionSource::Live { lsn, xid }).await?
+        {
             hop(&mut trace, format!("shape:{id}"), if emitted { "passed" } else { "dropped" });
         }
 
-        // 2b. Pending shapes (mid-create) on this table: buffer for gated replay at install.
+        // 2b. Pending shapes (mid-create) on this table: buffer for gated replay at install,
+        // keeping this commit's stamp with it (the replay is a live decision — see
+        // [`BufferedDelta`]).
         for p in self.pending_shapes.iter_mut().filter(|p| p.outer_table == table) {
-            p.buffer.extend(delta.iter().cloned());
+            p.buffer.push(BufferedDelta { lsn, xid, delta: delta.to_vec() });
         }
 
         // 3. Flip propagation (the Postgres query-backs) is deferred: the caller enqueues `work`
@@ -1343,6 +1586,34 @@ impl SubqueryRegistry {
         asserts
     }
 
+    /// Mark a query-back for `shape_id` as in flight — called under the lock the query-back is
+    /// about to RELEASE for its Postgres read, so every live decision taken while that read (and
+    /// the evaluation that follows it) is outstanding lands in [`SubqueryShape::recent`].
+    /// Increment first, release second: the reverse order would leave a hole exactly the size of
+    /// the race being closed.
+    fn begin_queryback(&mut self, shape_id: &str) {
+        if let Some(s) = self.shapes.get_mut(shape_id) {
+            s.inflight_querybacks = s.inflight_querybacks.saturating_add(1);
+        }
+    }
+
+    /// Balance [`begin_queryback`](Self::begin_queryback) — under the lock, on EVERY exit path of
+    /// the query-back (including the read's error path and the "nothing came back" path).
+    /// A shape dropped in the meantime has nothing to decrement.
+    ///
+    /// The last in-flight query-back to finish clears `recent`: with no outstanding read there is
+    /// nothing left that could overwrite a live decision, so keeping per-pk stamps would only be
+    /// unbounded growth. This is what makes the map cost proportional to a query-back window
+    /// rather than to the shape.
+    fn end_queryback(&mut self, shape_id: &str) {
+        if let Some(s) = self.shapes.get_mut(shape_id) {
+            s.inflight_querybacks = s.inflight_querybacks.saturating_sub(1);
+            if s.inflight_querybacks == 0 {
+                s.recent = HashMap::new();
+            }
+        }
+    }
+
     /// Deferred-propagation helper: snapshot what a query-back needs (brief lock scope at the
     /// call site — see the free functions below).
     fn snapshot_for_table(&self, table: &str) -> Result<TableSchema> {
@@ -1363,11 +1634,23 @@ impl SubqueryRegistry {
     /// decision atomic with its bitmap transition (borrow-checker-enforced — no `.await` between).
     /// `candidates` are each shape's touched rows: `(latest row, still-exists)`.
     /// Returns per shape whether anything was delivered (trace hops).
+    ///
+    /// **Per-stream order is not enough on its own.** Holding the lock makes append order equal
+    /// evaluation order, but a query-back's candidates were READ before it took the lock, so
+    /// "evaluated last" and "freshest" are different things for exactly the pks a live commit
+    /// touched in between. `source` closes that gap ([`EmissionSource`]): a live/replayed
+    /// decision records its commit stamp for every pk it evaluates while a query-back is in
+    /// flight, and a query-back drops every candidate whose recorded stamp its own snapshot could
+    /// not see. Both halves are needed — recording only the pks that produced an envelope would
+    /// let a stale query-back upsert re-add a row whose live verdict was "not a member, and it
+    /// was never in the feed", which emits nothing and is precisely the divergence seen in
+    /// practice.
     async fn emit_for_shapes(
         &mut self,
         ts: &TableSchema,
         groups: Vec<(String, Vec<(Row, bool)>)>,
         txid: Option<String>,
+        source: EmissionSource<'_>,
     ) -> Result<Vec<(String, bool, i64)>> {
         // Phase 1: evaluate each candidate against the current membership snapshot and, in the
         // SAME synchronous step (no `.await`), transition the host-side FeedSet — building the
@@ -1378,10 +1661,52 @@ impl SubqueryRegistry {
         // wake-storm gate, PR #30). Upserts are delivered for every current member unconditionally.
         let mut staged: Vec<(String, Vec<Row>)> = Vec::new();
         let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
+        // The commit stamp a live/replayed decision records for the pks it evaluates; `None` for a
+        // query-back, which reads this map instead of writing it.
+        let live_stamp: Option<(u64, Option<u64>)> = match &source {
+            EmissionSource::Live { lsn, xid } | EmissionSource::Replay { lsn, xid } => {
+                Some((*lsn, *xid))
+            }
+            EmissionSource::QueryBack { .. } => None,
+        };
         for (shape_id, candidates) in groups {
             let Some(shape) = self.shapes.get(&shape_id) else { continue };
             let (pred, feed_id) = (shape.pred.clone(), shape.feed_id);
+            // Recency is only worth recording while some query-back for THIS shape is between its
+            // Postgres read and its evaluation; outside that window there is no older read that
+            // could overwrite this decision, so the map stays empty (and no pk id is minted for a
+            // non-member that would otherwise never need one).
+            let record_recency = shape.inflight_querybacks > 0 && live_stamp.is_some();
+            // A query-back's candidates are pre-filtered against the live decisions taken since
+            // its snapshot. `should_skip(lsn, xid)` is "this commit was already visible to that
+            // snapshot" — i.e. the read already reflects it, so the candidate row is current and
+            // the query-back may evaluate it. Its negation is "the live decision is NEWER than
+            // this read": the row in hand is stale, the live verdict already stands, and this
+            // evaluation must not touch the pk at all. (An unstamped live decision — no LSN and
+            // no xid — reads as "newer" and is dropped: only non-Postgres sources leave a change
+            // unstamped, and a query-back cannot run without Postgres.)
+            let candidates: Vec<(Row, bool)> = match &source {
+                // `recent` empty (nothing decided live during this read) is the common case and
+                // costs nothing: no pk is recomputed for the whole candidate set.
+                EmissionSource::QueryBack { gate } if !shape.recent.is_empty() => {
+                    let recent = &shape.recent;
+                    candidates
+                        .into_iter()
+                        .filter(|(row, _)| {
+                            let Ok(pk) = ts.key_string(row) else { return true };
+                            match self.pk_dict.get(&pk).and_then(|id| recent.get(&id)) {
+                                Some(&(lsn, xid)) => gate.should_skip(lsn, xid),
+                                None => true,
+                            }
+                        })
+                        .collect()
+                }
+                EmissionSource::QueryBack { .. }
+                | EmissionSource::Live { .. }
+                | EmissionSource::Replay { .. } => candidates,
+            };
             let mut members: Vec<Row> = Vec::new();
+            let mut evaluated: Vec<u32> = Vec::new();
             for (row, exists) in candidates {
                 let pk = match ts.key_string(&row) {
                     Ok(pk) => pk,
@@ -1391,15 +1716,35 @@ impl SubqueryRegistry {
                     // Current member: deliver the upsert and record presence in the feed.
                     let pk_id = self.pk_dict.get_or_insert(&pk);
                     self.feed_sets.insert(feed_id, pk_id);
-                    members.push(row);
-                } else if let Some(pk_id) = self.pk_dict.get(&pk) {
-                    // Non-member: emit a delete only if the pk was actually in the feed. Probe the
-                    // dictionary WITHOUT minting — a never-interned pk can never have been a
-                    // member, so it gates with no id allocated (the same probe-without-mint
-                    // rationale as `template_assertions`).
-                    if self.feed_sets.remove(feed_id, pk_id) {
-                        deletes.entry(shape_id.clone()).or_default().push(pk);
+                    if record_recency {
+                        evaluated.push(pk_id);
                     }
+                    members.push(row);
+                } else {
+                    // Non-member. The delete is emitted only if the pk was actually in the feed;
+                    // the dictionary is probed WITHOUT minting — a never-interned pk can never
+                    // have been a member, so it gates with no id allocated (the same
+                    // probe-without-mint rationale as `template_assertions`).
+                    if let Some(pk_id) = self.pk_dict.get(&pk) {
+                        if self.feed_sets.remove(feed_id, pk_id) {
+                            deletes.entry(shape_id.clone()).or_default().push(pk);
+                        }
+                        if record_recency {
+                            evaluated.push(pk_id);
+                        }
+                    } else if record_recency {
+                        // A never-interned non-member emits nothing — and still has to win over a
+                        // query-back holding an older row for this pk, which WOULD emit an upsert
+                        // (the empty-shape row-moved-away case). Recording it needs an id, so this
+                        // is the one place a non-member mints one; it is bounded by the pks a live
+                        // commit touches while a query-back is in flight.
+                        evaluated.push(self.pk_dict.get_or_insert(&pk));
+                    }
+                }
+            }
+            if let (Some(stamp), Some(shape)) = (live_stamp, self.shapes.get_mut(&shape_id)) {
+                for pk_id in evaluated {
+                    shape.recent.insert(pk_id, stamp);
                 }
             }
             staged.push((shape_id, members));
@@ -1452,6 +1797,14 @@ impl SubqueryRegistry {
 //    stale — permanent divergence). This is the same guarantee the old
 //    hold-the-lock-across-append design gave, without network under the lock and without a
 //    single-task bottleneck. Postgres round-trips run outside the lock, concurrently.
+//  * **Per-pk recency across the read**: evaluation order is not freshness order for a query-back,
+//    whose candidate rows were READ before it took the lock. A live outer-row change committed
+//    after that read's snapshot can be evaluated in between, and the query-back would then
+//    evaluate its older row last. So while a query-back is in flight the shape records the commit
+//    stamp of every live decision it applies, and the query-back drops the candidates whose stamp
+//    its own snapshot could not see (`SubqueryShape::recent`, `EmissionSource`). Without this the
+//    two invariants above still leave the stream's last word for that pk stale forever — native
+//    consumers fold by durable-stream offset, so an older LSN on the envelope repairs nothing.
 
 /// How many times a flip batch's propagation is attempted before the engine gives up on the batch
 /// — and on itself (see [`propagate_with_retry`]).
@@ -1562,6 +1915,77 @@ pub async fn propagate_deferred_shape_work(
     Ok(())
 }
 
+/// [`propagate_deferred_node_work`], on the same retry schedule (and with the same fail-closed
+/// treatment by the caller) as every other propagation: a re-derivation a create deferred is
+/// exactly as unreproducible once dropped as a live flip's.
+pub async fn propagate_deferred_node_with_retry(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    work: &mut VecDeque<(SubquerySig, DeferredNodeWork)>,
+    walk: &mut VecDeque<(SubquerySig, Flip)>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+) -> Result<()> {
+    let mut backoff = FLIP_BACKOFF_START;
+    let mut attempt = 1u32;
+    loop {
+        let e = match propagate_deferred_node_work(registry, work, walk, trace_tx).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        tracing::warn!(
+            "deferred node propagation failed (attempt {attempt} of {FLIP_ATTEMPTS}, {} re-derivation(s) + {} flip(s) left): {e:#}",
+            work.len(),
+            walk.len()
+        );
+        if attempt >= FLIP_ATTEMPTS {
+            return Err(e);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(FLIP_BACKOFF_MAX);
+        attempt += 1;
+    }
+}
+
+/// Run the re-derivations that reached a parent NODE while its create was still seeding it, now
+/// that its set is installed — then walk whatever they flip on down the DAG, so the dependents
+/// below (the create's own shape included, installed by now) move too.
+///
+/// Both queues are drained in place and both are resumable, so the retry picks up where the failed
+/// attempt stopped rather than restarting: a failed `requery_and_reconcile_parent` fails at its
+/// Postgres read, BEFORE it consumes the transition it was called for, so its item goes back at the
+/// front unchanged; and once a re-derivation has produced flips they live on `walk`, which
+/// [`propagate_flips`] drains with the same discipline. Restarting instead would find the parent
+/// already reconciled and derive nothing while its dependents never moved.
+pub async fn propagate_deferred_node_work(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    work: &mut VecDeque<(SubquerySig, DeferredNodeWork)>,
+    walk: &mut VecDeque<(SubquerySig, Flip)>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+) -> Result<()> {
+    while let Some((sig, item)) = work.pop_front() {
+        let filter = match &item {
+            DeferredNodeWork::Value { connecting_col, value } => Some((*connecting_col, value)),
+            DeferredNodeWork::Full => None,
+        };
+        match requery_and_reconcile_parent(registry, &sig, filter).await {
+            Ok(Some((_inner, flips))) => {
+                for f in flips {
+                    walk.push_back((sig.clone(), f));
+                }
+            }
+            // The node was dropped while the work waited: nothing to re-derive, nothing to walk.
+            Ok(None) => {}
+            Err(e) => {
+                work.push_front((sig, item));
+                return Err(e);
+            }
+        }
+    }
+    // No trace is emitted for the re-derivation itself, for the same reason the deferred shape
+    // replay emits none: the walk that queued it already lit the source table → flipped node path.
+    // The flips it produced light their own hops from this node down.
+    propagate_flips(registry, walk, None, None, trace_tx).await
+}
+
 /// Propagate a batch of inner-set flips up the dependency DAG (BFS), querying back affected rows.
 /// `work` is the walk's whole state and is drained IN PLACE: on failure the item being processed
 /// goes back at the front and the rest is untouched, so the caller's retry can resume (see
@@ -1634,6 +2058,9 @@ async fn propagate_one(
                 }
             }
             Dependent::Node(parent_sig) => {
+                // `None` = the parent vanished, or it is a fresh node its own create is still
+                // seeding — in which case the re-derivation was queued on the node and runs when
+                // that create installs the seed (see `queue_node_deferred`).
                 let new_flips =
                     requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value))).await?;
                 if let Some((_inner, flips)) = new_flips {
@@ -1688,19 +2115,41 @@ async fn move_shape_for_value(
             return Ok(None);
         }
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-        (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone())
+        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone());
+        // In flight from here until the evaluation below: live decisions taken in that window are
+        // stamped on the shape and beat whatever this read returns.
+        reg.begin_queryback(shape_id);
+        snapshot
     };
-    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
+    // Every exit from here on must decrement — including the read's error path — or the shape
+    // would keep recording recency (and dropping candidates) forever. There is no guard object
+    // that can do it: the registry mutex is async and cannot be taken in `Drop`.
+    let (rows, gate) = match query_candidates(&pg_url, &ts, connecting_col, value).await {
+        Ok(r) => r,
+        Err(e) => {
+            registry.lock().await.end_queryback(shape_id);
+            return Err(e);
+        }
+    };
     if rows.is_empty() {
+        registry.lock().await.end_queryback(shape_id);
         return Ok(None);
     }
     // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
-    // (candidates from a query-back all still exist).
+    // (candidates from a query-back all still exist), filtered against the live decisions taken
+    // since `gate`'s snapshot.
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-    let results =
-        reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid).await?;
-    Ok(match results.first() {
+    let emitted = reg
+        .emit_for_shapes(
+            &ts,
+            vec![(shape_id.to_string(), candidates)],
+            txid,
+            EmissionSource::QueryBack { gate: &gate },
+        )
+        .await;
+    reg.end_queryback(shape_id);
+    Ok(match emitted?.first() {
         Some((_, true, net)) => Some((ts.name.clone(), *net)),
         _ => None,
     })
@@ -1717,11 +2166,29 @@ async fn requery_and_reconcile_parent(
     filter: Option<(usize, &Value)>,
 ) -> Result<Option<(String, Vec<Flip>)>> {
     let (ts, pg_url) = {
-        let reg = registry.lock().await;
+        let mut reg = registry.lock().await;
+        // Same as `move_shape_for_value`'s pending-shape check, one tier down: a parent node whose
+        // own create is still seeding it has edges (phase A) but no set to reconcile against. The
+        // work waits on the node and runs at install, instead of re-deriving against an empty set
+        // whose seed — older than this flip — would then be installed over the change.
+        if reg.queue_node_deferred(
+            parent_sig,
+            match filter {
+                Some((col, value)) => {
+                    DeferredNodeWork::Value { connecting_col: col, value: value.clone() }
+                }
+                None => DeferredNodeWork::Full,
+            },
+        ) {
+            return Ok(None);
+        }
         let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
         (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
     };
-    let rows = match filter {
+    // The parent's read gate is not consulted: a node re-derivation reconciles an in-memory value
+    // set through `apply_node_evals`, it appends nothing to a stream, so there is no "last word"
+    // an older read could take. The per-pk recency fence belongs to the emission tail only.
+    let (rows, _gate) = match filter {
         Some((col, value)) => query_candidates(&pg_url, &ts, col, value).await?,
         None => query_all(&pg_url, &ts).await?,
     };
@@ -1786,13 +2253,32 @@ async fn rederive_shape(
             return Ok(());
         }
         let Some(s) = reg.shapes.get(shape_id) else { return Ok(()) };
-        (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
+        let snapshot = (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone());
+        reg.begin_queryback(shape_id);
+        snapshot
     };
-    let rows = query_all(&pg_url, &ts).await?;
-    // Full re-derive: every row is a candidate; the ONE emission tail decides.
+    // Same accounting discipline as `move_shape_for_value`: decrement on every path.
+    let (rows, gate) = match query_all(&pg_url, &ts).await {
+        Ok(r) => r,
+        Err(e) => {
+            registry.lock().await.end_queryback(shape_id);
+            return Err(e);
+        }
+    };
+    // Full re-derive: every row is a candidate; the ONE emission tail decides — except for pks a
+    // live commit decided after this read's snapshot, which it drops.
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-    reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid).await?;
+    let emitted = reg
+        .emit_for_shapes(
+            &ts,
+            vec![(shape_id.to_string(), candidates)],
+            txid,
+            EmissionSource::QueryBack { gate: &gate },
+        )
+        .await;
+    reg.end_queryback(shape_id);
+    emitted?;
     Ok(())
 }
 
@@ -2282,15 +2768,143 @@ mod tests {
         move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
 
         let mut reg = registry.into_inner();
-        let (work, deferred) = reg
+        let finished = reg
             .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
             .await
             .unwrap();
 
-        assert!(work.is_empty(), "no buffered inner deltas to replay");
-        assert_eq!(deferred.len(), 1, "the queued flip comes back for the caller to run");
+        assert!(finished.work.is_empty(), "no buffered inner deltas to replay");
+        assert_eq!(finished.deferred.len(), 1, "the queued flip comes back for the caller to run");
+        assert!(finished.node_work.is_empty(), "no flip reached a node mid-seed");
         assert!(reg.pending_shapes.is_empty(), "the pending entry is gone, and its queue with it");
         assert!(reg.shapes.contains_key("s1"), "the shape is installed: later flips run straight through");
+    }
+
+    /// `outer_t(gid, id)` + `mid_t(gid, id)` + `deep_t(gid, id)`: enough to compile the NESTED
+    /// `gid IN (SELECT gid FROM mid_t WHERE gid IN (SELECT gid FROM deep_t))`, which registers two
+    /// fresh nodes — a deepest one and a PARENT node depending on it.
+    fn nested_schemas() -> HashMap<String, TableSchema> {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            TableSchema::from_def(name, &def).unwrap()
+        };
+        ["outer_t", "mid_t", "deep_t"].into_iter().map(|t| (t.to_string(), mk(t))).collect()
+    }
+
+    /// A registry parked in a NESTED create's phase B: both fresh nodes seeding (deepest first),
+    /// the child→parent edge committed, no shape installed. Returns the registry, the deepest
+    /// node's sig and the parent node's.
+    fn registry_mid_nested_create() -> (SubqueryRegistry, SubquerySig, SubquerySig) {
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        reg.set_schemas(Arc::new(nested_schemas()));
+        let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "gid",
+            "in": {
+                "table": "mid_t",
+                "project": "gid",
+                "where": { "col": "gid", "in": { "table": "deep_t", "project": "gid" } }
+            }
+        }))
+        .unwrap();
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        assert_eq!(begin.seeds.len(), 2, "two fresh nodes, deepest first");
+        let (deep, mid) = (begin.seeds[0].0.clone(), begin.seeds[1].0.clone());
+        (reg, deep, mid)
+    }
+
+    /// **A flip that reaches a still-seeding parent NODE waits, it is not reconciled.** The node's
+    /// set is empty until phase C installs its seed, so re-deriving now derives nothing — and the
+    /// seed, taken from a snapshot older than the flip, is then installed over the change, leaving
+    /// the node and everything below it stale for the life of the shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flip_reaching_a_seeding_parent_node_waits_on_it() {
+        let (reg, deep, mid) = registry_mid_nested_create();
+        let mid_id = reg.nodes[&mid].node_id;
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        // No `pg_url`: had the flip fallen through to its query-back instead of being deferred,
+        // this walk would fail rather than complete quietly.
+        let flip = |v: i64| -> VecDeque<(SubquerySig, Flip)> {
+            [(deep.clone(), Flip { value: Value::Int(v), dir: FlipDir::Enter })].into_iter().collect()
+        };
+        propagate_flips(&registry, &mut flip(7), None, None, &trace_tx).await.unwrap();
+        // A hot inner table flips the same value repeatedly during one seed; the re-derive is
+        // absolute, so running it once at install is running it enough.
+        propagate_flips(&registry, &mut flip(7), None, None, &trace_tx).await.unwrap();
+        {
+            let reg = registry.lock().await;
+            let queued = &reg.nodes[&mid].deferred;
+            assert_eq!(queued.len(), 1, "queued once on the parent node; the repeat deduped");
+            assert!(matches!(
+                queued[0],
+                DeferredNodeWork::Value { connecting_col: 0, value: Value::Int(7) }
+            ));
+            assert_eq!(reg.circuit_distinct(mid_id), 0, "the seeding node's set is untouched");
+            assert!(reg.nodes[&mid].seed_buffer.is_some(), "and it is still seeding");
+        }
+
+        // A full re-derive covers every value, so it subsumes what was queued before it.
+        assert!(requery_and_reconcile_parent(&registry, &mid, None).await.unwrap().is_none());
+        let reg = registry.lock().await;
+        let queued = &reg.nodes[&mid].deferred;
+        assert_eq!(queued.len(), 1, "the full re-derive replaced the per-value work");
+        assert!(matches!(queued[0], DeferredNodeWork::Full));
+    }
+
+    /// `finish_create` hands the node's deferred work back once that node's seed and its buffered
+    /// raw deltas are both in — the first moment re-deriving it against Postgres means anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finish_create_hands_back_the_node_work() {
+        let (reg, deep, mid) = registry_mid_nested_create();
+        let seeds: Vec<(SubquerySig, Vec<Row>, crate::pg::SnapshotGate)> = [&deep, &mid]
+            .into_iter()
+            .map(|sig| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let mut work: VecDeque<(SubquerySig, Flip)> =
+            [(deep.clone(), Flip { value: Value::Int(7), dir: FlipDir::Enter })].into_iter().collect();
+        propagate_flips(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        let mut reg = registry.into_inner();
+        let finished = reg
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(finished.node_work.len(), 1, "the parent node's re-derivation comes back");
+        assert_eq!(finished.node_work[0].0, mid, "aimed at the parent node that deferred it");
+        assert!(reg.nodes[&mid].deferred.is_empty(), "taken, not copied");
+        assert!(reg.nodes[&mid].seed_buffer.is_none(), "and the node is live, so nothing defers again");
+    }
+
+    /// A create cancelled in the MIDDLE of phase C — one fresh node's seed already asserted into
+    /// the membership circuit, the shape not installed — leaves nothing behind. The rollback state
+    /// is the registry's (the pending entry never left it), so the abort can retract the partial
+    /// seed as well as unwind the refcounts, edges and templates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abort_after_a_partial_phase_c_leaves_no_state() {
+        let (mut reg, deep, mid) = registry_mid_nested_create();
+        let (deep_id, mid_id) = (reg.nodes[&deep].node_id, reg.nodes[&mid].node_id);
+        // Phase C got as far as installing the deepest node's seed, then the request was dropped.
+        reg.apply_node_evals(&deep, vec![("1".to_string(), Some(Value::Int(7)))]).await;
+        assert_eq!(reg.circuit_distinct(deep_id), 1, "the partial seed really landed");
+
+        reg.abort_create("s1").await;
+
+        assert!(reg.pending_shapes.is_empty(), "no pending entry");
+        assert!(reg.shapes.is_empty(), "and no installed shape either");
+        assert!(reg.nodes.is_empty(), "both fresh nodes are gone");
+        assert_eq!(reg.edges_count(), 0, "no edge outlives the create that staged it");
+        assert!(reg.templates.is_empty(), "no template bind outlives its only node");
+        assert!(reg.pending_seed.is_empty(), "nothing is left waiting to be seeded");
+        assert_eq!(reg.circuit_distinct(deep_id), 0, "the partial seed was retracted");
+        assert_eq!(reg.circuit_distinct(mid_id), 0);
     }
 
     /// The deferred replay is resumable for the same reason the live walk is: a failed item goes
@@ -2527,7 +3141,12 @@ mod tests {
         // configured, so an emission would attempt a real append and fail loudly; emitted
         // stays 0 and the result reports nothing delivered).
         let results = reg
-            .emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(1), true)])], None)
+            .emit_for_shapes(
+                &ts,
+                vec![("s1".to_string(), vec![(row(1), true)])],
+                None,
+                EmissionSource::Live { lsn: 1, xid: None },
+            )
             .await
             .unwrap();
         assert_eq!(results, vec![("s1".to_string(), false, 0)], "never-member delete must be dropped");
@@ -2574,9 +3193,14 @@ mod tests {
 
         // A delete for a brand-new pk (42), never interned before: `exists = false` forces
         // `member = false` regardless of the (always-true) predicate. The fix must skip minting.
-        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(42), false)])], None)
-            .await
-            .unwrap();
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(row(42), false)])],
+            None,
+            EmissionSource::Live { lsn: 1, xid: None },
+        )
+        .await
+        .unwrap();
         assert_eq!(reg.pk_dict.len(), 0, "a never-member delete candidate must not mint a pk_dict id");
 
         // A non-matching (but existing) candidate for another brand-new pk (43) must likewise
@@ -2586,16 +3210,26 @@ mod tests {
         // through `install_shape`.)
         reg.shapes.get_mut("s1").unwrap().pred =
             Arc::new(CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
-        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(43), true)])], None)
-            .await
-            .unwrap();
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(row(43), true)])],
+            None,
+            EmissionSource::Live { lsn: 1, xid: None },
+        )
+        .await
+        .unwrap();
         assert_eq!(reg.pk_dict.len(), 0, "a non-matching candidate must not mint a pk_dict id");
 
         // A genuinely matching insert (pk 44) DOES mint exactly one id.
         reg.shapes.get_mut("s1").unwrap().pred = Arc::new(CompiledPredicate::MatchAll);
-        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(44), true)])], None)
-            .await
-            .unwrap();
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(row(44), true)])],
+            None,
+            EmissionSource::Live { lsn: 1, xid: None },
+        )
+        .await
+        .unwrap();
         assert_eq!(reg.pk_dict.len(), 1, "a matching candidate must mint exactly one pk_dict id");
     }
 
@@ -2699,6 +3333,8 @@ mod tests {
             gate: crate::pg::SnapshotGate::passthrough(),
             emitted: std::sync::atomic::AtomicU64::new(0),
             feed_id,
+            recent: HashMap::new(),
+            inflight_querybacks: 0,
         });
     }
 
@@ -2891,7 +3527,14 @@ mod tests {
         let flips = reg.apply_node_evals(&sig, vec![("pm-1".into(), None)]).await;
         assert_eq!(flips, vec![Flip { value: Value::Int(100), dir: FlipDir::Leave }]);
         let results =
-            reg.emit_for_shapes(&ts, vec![("s2".to_string(), vec![(issue(1, 100), true)])], None).await.unwrap();
+            reg.emit_for_shapes(
+                &ts,
+                vec![("s2".to_string(), vec![(issue(1, 100), true)])],
+                None,
+                EmissionSource::Live { lsn: 1, xid: None },
+            )
+            .await
+            .unwrap();
         assert_eq!(
             results,
             vec![("s2".to_string(), true, -1)],
@@ -2899,6 +3542,171 @@ mod tests {
         );
         assert_eq!(emitted(&reg), 4);
         assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert", "delete", "upsert", "delete"]);
+    }
+
+    // --- query-back vs. live ordering (per-pk recency) -----------------------------------------
+    //
+    // A membership query-back reads its candidate rows from Postgres with the registry lock
+    // RELEASED, so a direct outer-row change committed after that read can be evaluated and
+    // emitted in between. Without a fence the query-back's older row is evaluated last and
+    // becomes the stream's last word — and native consumers fold by durable-stream offset, so
+    // "last" is final. These three tests pin the fence: live decisions stamp the pks they touch
+    // while a query-back is in flight, and a query-back drops the pks whose stamp its own
+    // snapshot could not have seen.
+
+    /// A shape over `project_id = 100 AND project_id IN <node>`, its node containing 100, with a
+    /// fake durable-streams server so appends actually land and can be inspected.
+    async fn recency_fixture() -> (TableSchema, DsStore, SubqueryRegistry) {
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        insert_outer_shape(&mut reg, "s1", "issues", keyed_membership_pred(100, &sig));
+        (ts, store, reg)
+    }
+
+    /// (a) With a query-back in flight, a live decision for pk 1 is stamped, and a query-back
+    /// holding an OLDER read of that pk drops it — while one whose snapshot already saw the live
+    /// commit applies its row as usual.
+    ///
+    /// The live decision here emits nothing at all (the row moved out of the shape and the feed
+    /// never contained it), which is exactly the case an emission-driven fence would miss: the
+    /// stale query-back's upsert would be the stream's only word about pk 1, and Postgres says
+    /// the row is not in the shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_query_back_cannot_overwrite_a_newer_live_decision() {
+        let (ts, store, mut reg) = recency_fixture().await;
+
+        // A query-back for the flipped value is between its Postgres read and its evaluation.
+        reg.begin_queryback("s1");
+
+        // Meanwhile the row moves out of project 100, in a transaction (xid 50) the read below
+        // cannot see. Absolute verdict: not a member — and nothing is emitted, because the feed
+        // never contained pk 1.
+        reg.on_table_delta(
+            &ts,
+            &[Tup2(issue(1, 100), -1), Tup2(issue(1, 999), 1)],
+            0x200,
+            Some(50),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(ops_for(&store, "shape/s1").is_empty(), "a never-member verdict emits nothing");
+        let pk_id = reg.pk_dict.get("1").expect("the live decision must record recency for pk 1");
+        assert_eq!(
+            reg.shapes["s1"].recent.get(&pk_id),
+            Some(&(0x200u64, Some(50u64))),
+            "the live decision's commit stamp must be recorded while a query-back is in flight"
+        );
+
+        // The in-flight read: its snapshot (xmin 40, xmax 45) predates xid 50, so its row for
+        // pk 1 — still in project 100 — is stale. It must be dropped, not emitted.
+        let stale = crate::pg::SnapshotGate::parse("40:45:", "0/100");
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(issue(1, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &stale },
+        )
+        .await
+        .unwrap();
+        assert!(
+            ops_for(&store, "shape/s1").is_empty(),
+            "a query-back row older than the live decision for that pk must be dropped"
+        );
+        assert_eq!(reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // A query-back whose snapshot (xmin 60) DID see xid 50 is not stale: whatever it read is
+        // at least as new as the live decision (here: the row moved back into project 100), so
+        // it applies normally.
+        let fresh = crate::pg::SnapshotGate::parse("60:70:", "0/300");
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(issue(1, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &fresh },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ops_for(&store, "shape/s1"),
+            vec!["upsert"],
+            "a query-back that already saw the live commit must still apply its row"
+        );
+    }
+
+    /// (b) The map is bounded by the in-flight window: nothing is recorded with no query-back
+    /// outstanding, and the last one to finish clears what was recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recency_is_recorded_only_while_a_query_back_is_in_flight() {
+        let (ts, store, mut reg) = recency_fixture().await;
+
+        // No query-back in flight: an ordinary live delta records nothing.
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, Some(10), None, None).await.unwrap();
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert"]);
+        assert!(
+            reg.shapes["s1"].recent.is_empty(),
+            "with nothing to protect against, no per-pk state is kept"
+        );
+
+        // Two query-backs in flight; a live delta now records for the pks it evaluates.
+        reg.begin_queryback("s1");
+        reg.begin_queryback("s1");
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 2, Some(11), None, None).await.unwrap();
+        assert_eq!(reg.shapes["s1"].recent.len(), 1);
+
+        // The first to finish does NOT clear: the other read is still outstanding.
+        reg.end_queryback("s1");
+        assert_eq!(reg.shapes["s1"].recent.len(), 1, "one query-back is still in flight");
+
+        // The last one does.
+        reg.end_queryback("s1");
+        assert!(reg.shapes["s1"].recent.is_empty(), "the last query-back out clears the map");
+        assert_eq!(reg.shapes["s1"].inflight_querybacks, 0);
+
+        // An unbalanced decrement (a shape whose query-back failed twice, or a dropped shape)
+        // must not wrap the counter into a permanently "in flight" state.
+        reg.end_queryback("s1");
+        assert_eq!(reg.shapes["s1"].inflight_querybacks, 0);
+        reg.end_queryback("gone");
+    }
+
+    /// (c) The same fence protects a live LEAVE: once the delete has been emitted, a stale
+    /// query-back must not resurrect the row with an upsert — the stream's last word for that pk
+    /// has to stay the newer verdict.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_leave_is_not_undone_by_a_stale_query_back() {
+        let (ts, store, mut reg) = recency_fixture().await;
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, Some(10), None, None).await.unwrap();
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert"]);
+
+        reg.begin_queryback("s1");
+        // The row is deleted in a newer transaction (xid 50): the feed retracts, a delete lands.
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x200, Some(50), None, None)
+            .await
+            .unwrap();
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert", "delete"]);
+
+        // The in-flight read still has the row. Applying it would make "upsert" the last word.
+        let stale = crate::pg::SnapshotGate::parse("40:45:", "0/100");
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(issue(1, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &stale },
+        )
+        .await
+        .unwrap();
+        reg.end_queryback("s1");
+        assert_eq!(
+            ops_for(&store, "shape/s1"),
+            vec!["upsert", "delete"],
+            "the stale query-back must not resurrect a row the live path just retracted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

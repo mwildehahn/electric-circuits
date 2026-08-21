@@ -19,7 +19,10 @@ impl Engine {
         share: bool,
     ) -> Result<ShapeRecord> {
         // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
-        // so it refuses to make one rather than backfill from state it knows is wrong.
+        // so it refuses to make one rather than backfill from state it knows is wrong. This early
+        // check is the cheap refusal and the only one the *join* path takes; a create that gets
+        // past it checks again under the state lock before registering, and once more before
+        // handing back a handle (see `ensure_create_not_degraded`).
         self.ensure_not_degraded()?;
         // Whole shape-creation timer (backfill + registration); emitted by the creator on success only
         // (joiners return early before this fires) as `create_snapshot_task.stop.duration`.
@@ -98,6 +101,12 @@ impl Engine {
                 is_subquery: true,
                 aggregate: None,
             };
+            // The load-bearing degrade check: taken under the state lock, in the same critical
+            // section as the registration below. The degradation reaper snapshots every registered
+            // subquery stream under this same lock, so with respect to that snapshot a create either
+            // registered before it (and is refused by its final check — see
+            // `ensure_create_not_degraded`) or observes `degraded` here and never registers at all.
+            self.ensure_not_degraded()?;
             st.shapes.insert(id.clone(), rec.clone());
             let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
@@ -128,6 +137,14 @@ impl Engine {
             .await;
             match res {
                 Ok(()) => {
+                    // The create's work is done, but it may have overlapped a degradation — its stream is
+                    // then already reaped and the handle would be dead on arrival. Refuse instead of
+                    // answering success (see `ensure_create_not_degraded`).
+                    if let Err(e) = self.ensure_create_not_degraded() {
+                        let _ = ready_tx.send(Some(false));
+                        creating.rollback().await;
+                        return Err(e);
+                    }
                     creating.complete();
                     let _ = ready_tx.send(Some(true));
                     trace_lifecycle(
@@ -180,6 +197,9 @@ impl Engine {
             is_subquery: false,
             aggregate: None,
         };
+        // Under the state lock, immediately before registering — see `ensure_create_not_degraded`
+        // for why this check and the one after the create's work are together sufficient.
+        self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
         let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
@@ -206,6 +226,14 @@ impl Engine {
         };
         match outcome {
             Ok(()) => {
+                // The create's work is done, but it may have overlapped a degradation — its stream is
+                // then already reaped and the handle would be dead on arrival. Refuse instead of
+                // answering success (see `ensure_create_not_degraded`).
+                if let Err(e) = self.ensure_create_not_degraded() {
+                    let _ = share_tx.send(Some(false));
+                    creating.rollback().await;
+                    return Err(e);
+                }
                 creating.complete();
                 let _ = share_tx.send(Some(true));
                 trace_lifecycle(
@@ -305,6 +333,10 @@ impl Engine {
                             is_subquery: false,
                             aggregate: Some(AggInfo { func, col }),
                         };
+                        // Under the state lock, immediately before registering — see
+                        // `ensure_create_not_degraded` for why this check and the one after the
+                        // create's work are together sufficient.
+                        self.ensure_not_degraded()?;
                         st.shapes.insert(id.clone(), rec.clone());
                         st.circuit_placement.insert(
                             id.clone(),
@@ -326,6 +358,14 @@ impl Engine {
                             .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
                         {
                             Ok(()) => {
+                                // The create's work is done, but it may have overlapped a degradation — its stream is
+                                // then already reaped and the handle would be dead on arrival. Refuse instead of
+                                // answering success (see `ensure_create_not_degraded`).
+                                if let Err(e) = self.ensure_create_not_degraded() {
+                                    let _ = share_tx.send(Some(false));
+                                    creating.rollback().await;
+                                    return Err(e);
+                                }
                                 creating.complete();
                                 let _ = share_tx.send(Some(true));
                                 trace_lifecycle(
@@ -375,6 +415,9 @@ impl Engine {
             is_subquery: false,
             aggregate: Some(AggInfo { func, col }),
         };
+        // Under the state lock, immediately before registering — see `ensure_create_not_degraded`
+        // for why this check and the one after the create's work are together sufficient.
+        self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
         let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
@@ -392,6 +435,14 @@ impl Engine {
         .await;
         match outcome {
             Ok(()) => {
+                // The create's work is done, but it may have overlapped a degradation — its stream is
+                // then already reaped and the handle would be dead on arrival. Refuse instead of
+                // answering success (see `ensure_create_not_degraded`).
+                if let Err(e) = self.ensure_create_not_degraded() {
+                    let _ = share_tx.send(Some(false));
+                    creating.rollback().await;
+                    return Err(e);
+                }
                 creating.complete();
                 let _ = share_tx.send(Some(true));
                 trace_lifecycle(
@@ -950,12 +1001,26 @@ impl Engine {
         // the caller's create rollback (which reaches the registry via `abort_create`), so there is
         // exactly one undo path whether the create failed or was cancelled.
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
-        let (work, deferred) = self
+        let finished = self
             .subqueries
             .lock()
             .await
             .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
             .await?;
+        let crate::subquery::FinishedCreate { work, deferred, node_work } = finished;
+        if !node_work.is_empty() {
+            // Re-derivations a child node's flip aimed at one of THIS create's fresh nodes while it
+            // was still seeding: reconciling then would have run against an empty set, and the seed
+            // (from an older snapshot) would have been installed over the change. Handed off first
+            // so the node's set is right before anything reads it — though the order against the
+            // shape-deferred hand-off below is not load-bearing: emission is absolute per pk, and
+            // this walk re-derives every dependent of the node anyway, so whichever of the two runs
+            // last evaluates against the reconciled set.
+            self.pending_flips.fetch_add(1, Ordering::SeqCst);
+            if self.flip_tx.send(FlipWork::DeferredNode { work: node_work }).is_err() {
+                self.pending_flips.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
         if !work.is_empty() {
             // Replay flips propagate exactly like live ones (barrier-covered).
             self.pending_flips.fetch_add(1, Ordering::SeqCst);
@@ -1063,6 +1128,30 @@ impl Drop for CreateGuard {
 }
 
 impl Engine {
+    /// The second half of a create's degrade gate: taken after the create's work is done and before
+    /// it hands back a handle. `Err(Degraded)` means the caller must roll the create back and answer
+    /// 503 rather than return the record.
+    ///
+    /// **Why this check plus the one under the state lock is sufficient.** The degradation reaper
+    /// snapshots every registered subquery stream under the state lock
+    /// (`Engine::reap_subquery_streams`) and deletes exactly those. Every create checks `degraded`
+    /// under that same lock in the same critical section that registers its record. So, against that
+    /// snapshot, a create either
+    ///
+    /// * observed `degraded` under the lock and never registered — nothing to reap, nothing handed
+    ///   back; or
+    /// * registered BEFORE the snapshot, so its stream is IN the snapshot and will be deleted — and
+    ///   this final check, which runs after the create's own work finished and therefore after the
+    ///   mark that caused the snapshot, sees `degraded` and refuses.
+    ///
+    /// A successful create can therefore never return a handle whose stream the reaper has already
+    /// deleted. The one window left is a mark landing after this check: indistinguishable from a
+    /// degradation an instant after the response, which every client must handle anyway — and that
+    /// create's stream is registered, so the reaper deletes it like any other.
+    fn ensure_create_not_degraded(&self) -> Result<()> {
+        self.ensure_not_degraded()
+    }
+
     /// Undo a create: the one implementation of "this shape was never made", shared by the explicit
     /// error paths and by [`CreateGuard`]'s cancelled path.
     ///
@@ -1215,5 +1304,34 @@ mod cancellation_tests {
         drop(guard);
         assert_rolled_back(&engine, "s1").await;
         assert!(engine.graph().await.shapes.is_empty());
+    }
+
+    /// Cancelled in the MIDDLE of phase C: the fresh node's seed is already asserted into the
+    /// membership circuit and the shape is not installed. The pending entry never left the registry,
+    /// so the detached rollback finds it and unwinds the whole create — the partial seed's
+    /// contributor tuples included. Without that, the leaked half-seeded node makes every later
+    /// create sharing it conflict until the engine restarts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_mid_phase_c_unwinds_the_partly_seeded_node() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let guard = register(&engine, "s1", &where_json).await;
+        let node_id = {
+            let mut reg = engine.subqueries.lock().await;
+            let begin =
+                reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+            let sig = begin.seeds[0].0.clone();
+            reg.assert_seed_row_for_test(&sig, "1", Value::Int(7)).await;
+            let node_id = reg.nodes[&sig].node_id;
+            assert_eq!(reg.circuit_distinct(node_id), 1, "the partial seed really landed");
+            node_id
+        };
+
+        drop(guard);
+        assert_rolled_back(&engine, "s1").await;
+        assert_eq!(
+            engine.subqueries.lock().await.circuit_distinct(node_id),
+            0,
+            "the partial seed was retracted with the node it belonged to"
+        );
     }
 }

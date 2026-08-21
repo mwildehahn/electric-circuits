@@ -84,8 +84,10 @@ a non-zero `flipFailures`, `/v1/health` turns `degraded` (503), and `POST /shape
 `{"error":"degraded: …"}`. Every subquery shape's durable stream is deleted too — clients read
 durable-streams directly, past the HTTP surface, so that is the only way they learn. Observability
 (`/replication/lsn`, `/metrics*`, `/memory`, `/subqueries`, `/graph`, `/state`, `/trace`, `/tables/*`,
-`/health`) stays up. **Recovery is a restart**: it re-seeds every node from Postgres and recreates
-the streams, so nothing a restart would have kept is destroyed.
+`/health`) stays up. **Recovery is a restart**, which re-seeds every node from Postgres. A restart
+*drops* every subquery shape — their inner-node state is not persisted, so the catalog restore
+deliberately does not restore them — and clients recreate them with `POST /shapes`. Deleting the
+streams therefore destroys nothing a restart would have kept.
 
 **StatsD telemetry** (`statsd.rs`) is the fleet's only metrics channel — the datadog wire format
 (`name:value|type|#instance_id:<id>,...`), non-blocking (bounded channel → batched ≤1432-byte UDP
@@ -116,6 +118,15 @@ unchanged.
 
 The `/v1/shape` adapter parses Electric's SQL `where` grammar and is validated against Electric's own
 oracle/property/integration tests ([electric-conformance/](../../electric-conformance/README.md)).
+
+**Creating a subquery shape** (`POST /shapes` with an `IN (SELECT …)` predicate) registers the
+shape's dependency edges before it reads Postgres, so a membership change can reach it mid-create:
+work aimed at the not-yet-installed shape is queued on the pending create, and work aimed at a
+parent inner-set node this create is still seeding is queued on that node — both replayed (and, for
+a node, walked on down the graph) the moment the seed and the shape are in. The create's rollback
+state stays registry-owned across the whole install, so a client disconnect at any point — a
+partly-installed membership seed included — is unwound exactly and the same shape is immediately
+creatable again.
 
 ## Shape retention lifecycle
 

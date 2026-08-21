@@ -255,12 +255,19 @@ subqueries).
    counts it, and the engine degrades: every membership-bearing route answers 503, `/v1/health`
    reports `degraded`, every subquery shape's durable stream is deleted (clients read storage
    directly, past the HTTP surface), and only a restart — which re-seeds every node from Postgres
-   — recovers.
+   — recovers. The restart *drops* every subquery shape (their inner-node state is not persisted,
+   so the catalog restore deliberately does not restore them); clients recreate them with
+   `POST /shapes`.
    A shape whose own create is still in flight has edges (registered before its backfill) but no
    installed shape to move: that work is **queued on the pending create** and replayed against the
    shape the moment it is installed, in the same step that removes the pending entry. So an inner
    change committing after the backfill's snapshot — the window a create shares an already-live
-   node through — is never dropped.
+   node through — is never dropped. A flip that reaches a *parent node* a create is still seeding
+   is deferred the same way — queued on the node, then re-derived and walked on down the DAG once
+   its seed and buffered deltas are in — because reconciling an empty pre-seed set derives nothing
+   and the older seed would then be installed over the change. And because the pending entry stays
+   in the registry across every await of phase C, a create cancelled mid-install (node seeds already
+   asserted into the membership circuit) is still unwound exactly, partial seed retracted.
 3. **`table` is a SubqueryShape's outer table:** evaluate the shape filter on the delta with
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 
@@ -272,9 +279,21 @@ converges regardless of cross-table order, which is why we don't need Electric's
 row-tag streaming protocol — our conformance asserts *convergence after drain*, not a control-
 message stream.
 
+Absolute emission makes *which* pk is evaluated first irrelevant, but not *which evaluation of a
+pk is last*: a query-back reads its candidate rows at one Postgres snapshot with the registry lock
+released, so a direct outer-row change committed after that snapshot can be evaluated and emitted
+in between, and the query-back's older row would then be the stream's last word for that pk (native
+consumers fold by durable-stream offset, so an older LSN on the envelope repairs nothing). Each
+shape therefore keeps, **only while one of its query-backs is in flight**, the commit stamp of the
+live decision most recently applied per pk; a query-back drops every candidate whose stamp its own
+read snapshot could not have seen — that decision is newer and already stands. The test is xid
+visibility against the read's `SnapshotGate` (§ the same fence a backfill uses), not an LSN
+comparison. The map is cleared when the last in-flight query-back for the shape finishes, so the
+steady state carries nothing per pk.
+
 State retained: `O(inner result size)` contributor pks per node, **shared** across all shapes
-that reference the same inner query. The outer shape stores nothing extra; affected rows are
-fetched by a keyed query-back on flip.
+that reference the same inner query. The outer shape stores nothing extra beyond that in-flight
+window; affected rows are fetched by a keyed query-back on flip.
 
 ### 3.4 Strategy summary
 

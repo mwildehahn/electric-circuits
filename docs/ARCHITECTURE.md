@@ -254,8 +254,9 @@ sequencer feeds every table's deltas into:
   `ELECTRIC_DB_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
   **enqueue** of the resulting envelopes happen atomically under the lock, and each shape stream
   drains through one ordered **emission lane** (`engine/emission.rs`, `ELECTRIC_CIRCUITS_EMIT_LANES`),
-  so per-shape append order equals evaluation order — a stale move can never land after a fresher
-  emission — without network under the lock. The engine exposes the in-flight count
+  so per-shape append order equals evaluation order — without network under the lock. (Evaluation
+  order alone is not freshness for a query-back, whose rows were read before it took the lock; the
+  per-pk recency fence below closes that gap.) The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
   undrained flips and enqueued-but-unlanded lane batches. A failed query-back is **retried**, and
   the retry resumes the DAG walk where the failure stopped (the walk consumes transitions, so
@@ -265,7 +266,9 @@ sequencer feeds every table's deltas into:
   reach zero when every computed effect really landed), `flipFailures` counts it, `/v1/health`
   turns `degraded` (503), every membership-bearing route answers 503, and every subquery shape's
   durable stream is deleted so clients reading storage directly learn it too. Recovery is a
-  **restart**, which re-seeds every node from Postgres and recreates the streams.
+  **restart**, which re-seeds every node from Postgres; it *drops* every subquery shape (their
+  inner-node state is not persisted — see the restart row of the durability table) and clients
+  recreate them with `POST /shapes`.
 - **Absolute emission via the per-feed key set** — the correctness rule that keeps deferred
   flips convergent: for each touched pk the registry asserts the row's *current* membership into
   the shape's **feed set** (`subq_feed::FeedSet`, one host-side Roaring bitmap per feed), never a
@@ -275,6 +278,18 @@ sequencer feeds every table's deltas into:
   never-member spurious delete (the PR #30 wake-storm) cannot be emitted at all. Flip
   propagation runs deferred (out of commit order); absolute assertion converges regardless of
   that timing — which is why the Electric-style LSN-buffering/tag protocol isn't needed here.
+- **Query-back recency** — absolute assertion makes cross-pk ordering irrelevant, but the *last*
+  evaluation of a given pk still has to be the freshest one. A query-back reads its candidates at
+  one Postgres snapshot with the registry lock released, so a direct outer-row change committed
+  after that snapshot can be evaluated and emitted in between — and the query-back's older row
+  would then be the stream's last word for that pk (consumers fold by durable-stream offset, so an
+  older LSN on the envelope would not repair it). While a shape has a query-back in flight it
+  therefore records, per pk, the commit stamp of the live decision it applied — including
+  decisions that emitted nothing, which is the case a stale query-back would otherwise silently
+  undo. Each query-back drops the candidates whose recorded stamp is **not visible to its own read
+  snapshot** (`SnapshotGate` xid visibility, the same fence a backfill uses — not an LSN compare):
+  that decision is newer than the row in hand, so it stands. The map is bounded by the in-flight
+  window and cleared when the last query-back for the shape finishes.
 - **NULL sensitivity** — SQL: a NULL in the inner set makes `x NOT IN S` UNKNOWN. A NULL flip
   re-derives exactly the dependents that can change: those whose `IN` leaf is negated **or sits under
   any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and
@@ -284,7 +299,14 @@ sequencer feeds every table's deltas into:
   an inner node it *shares* with an already-live shape reaches it while there is no shape to move
   yet. Such work is **queued on the pending create** and replayed once the shape is installed (both
   in one registry step, so a flip either queues or finds the shape), which is what keeps an inner
-  change committed after the backfill's snapshot from being lost for the new shape.
+  change committed after the backfill's snapshot from being lost for the new shape. The same holds
+  one tier down: a flip reaching a *parent node* the create is still seeding is **queued on that
+  node** (its set is empty until the seed lands, and the seed — from an older snapshot — would be
+  installed over the change), then re-derived and walked on down the DAG at install.
+- **Phase-C ownership** — the create's rollback state (compile log, buffers, fresh nodes) stays in
+  the registry across every await of the install, so a client disconnect anywhere in phase C —
+  including after some node seeds have reached the membership circuit — leaves a pending entry the
+  detached rollback unwinds exactly, retracting the partial seed with it.
 
 ---
 

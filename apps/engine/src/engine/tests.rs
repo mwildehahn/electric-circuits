@@ -1145,10 +1145,11 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
         .collect();
     {
         let mut reg = engine.subqueries.lock().await;
-        let (replay, deferred) =
+        let finished =
             reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default()).await.unwrap();
-        assert!(replay.is_empty(), "nothing was buffered mid-create");
-        assert!(deferred.is_empty(), "no flip reached the shape mid-create");
+        assert!(finished.work.is_empty(), "nothing was buffered mid-create");
+        assert!(finished.deferred.is_empty(), "no flip reached the shape mid-create");
+        assert!(finished.node_work.is_empty(), "no flip reached a node mid-seed");
     }
 
     // Delete the only inner row carrying gid 7: the node loses the value (reconciled in memory,

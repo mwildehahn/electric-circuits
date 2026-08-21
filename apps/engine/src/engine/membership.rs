@@ -51,24 +51,36 @@ pub(crate) fn fold_refcount_flips(
 /// lives in Postgres, never engine-side. Concurrency is bounded by the shared pool
 /// (`ELECTRIC_DB_POOL_SIZE`); reads see PG-current state, which converges under absolute
 /// per-pk emission exactly as deferred flip propagation always has.
+///
+/// The read's [`SnapshotGate`](crate::pg::SnapshotGate) is returned WITH the rows: it is the
+/// only thing that says *how old* these rows are, and the emission tail needs exactly that to
+/// tell a candidate that is still current from one a live commit has already superseded (see
+/// `subquery::EmissionSource::QueryBack`). Discarding it — as this used to — is what let an
+/// older read become a shape stream's last word.
 pub(crate) async fn query_rows_by_col(
     pg_url: &Option<String>,
     ts: &TableSchema,
     col: usize,
     value: &Value,
-) -> Result<Vec<Row>> {
+) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
     let where_sql =
         value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
-    Ok(crate::pg::backfill_where(&client, ts, Some(where_sql)).await?.rows)
+    let bf = crate::pg::backfill_where(&client, ts, Some(where_sql)).await?;
+    Ok((bf.rows, bf.gate))
 }
 
-/// Query all rows of `ts` (full re-derive) from Postgres on a pooled connection.
-pub(crate) async fn query_rows_all(pg_url: &Option<String>, ts: &TableSchema) -> Result<Vec<Row>> {
+/// Query all rows of `ts` (full re-derive) from Postgres on a pooled connection, with the read's
+/// snapshot gate (see [`query_rows_by_col`]).
+pub(crate) async fn query_rows_all(
+    pg_url: &Option<String>,
+    ts: &TableSchema,
+) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
-    Ok(crate::pg::backfill_where(&client, ts, None).await?.rows)
+    let bf = crate::pg::backfill_where(&client, ts, None).await?;
+    Ok((bf.rows, bf.gate))
 }
 
 /// Build a `WHERE col = value` fragment + params for a move query-back (the LIVE re-derive path).
