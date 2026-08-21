@@ -246,7 +246,21 @@ subqueries).
    and never hold the registry lock. Evaluation and the **enqueue** of the resulting envelopes
    happen atomically under the lock, and per-stream FIFO emission lanes make append order equal
    eval order per shape. The in-flight count (flips + enqueued-but-unlanded batches) is the
-   extra convergence-barrier term (`GET /replication/lsn` → `pendingFlips`).
+   extra convergence-barrier term (`GET /replication/lsn` → `pendingFlips`). A failed query-back
+   is retried, **resuming** the walk from where it stopped: reconciling a parent node consumes the
+   transition that produced its flips, so a restart from the roots would find the parent already
+   moved and derive nothing. Exhausting the retries loses effects that cannot be re-derived, so
+   the engine fails closed — the batch keeps its `pendingFlips` count forever (the barrier now
+   means "every computed effect has landed **or** the engine says it is degraded"), `flipFailures`
+   counts it, and the engine degrades: every membership-bearing route answers 503, `/v1/health`
+   reports `degraded`, every subquery shape's durable stream is deleted (clients read storage
+   directly, past the HTTP surface), and only a restart — which re-seeds every node from Postgres
+   — recovers.
+   A shape whose own create is still in flight has edges (registered before its backfill) but no
+   installed shape to move: that work is **queued on the pending create** and replayed against the
+   shape the moment it is installed, in the same step that removes the pending entry. So an inner
+   change committing after the backfill's snapshot — the window a create shares an already-live
+   node through — is never dropped.
 3. **`table` is a SubqueryShape's outer table:** evaluate the shape filter on the delta with
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 

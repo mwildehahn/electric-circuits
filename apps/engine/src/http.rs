@@ -86,11 +86,16 @@ fn health_json(status: &str) -> String {
     format!("{{\"status\":\"{status}\"}}")
 }
 
-/// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200. Caches are disabled so the fleet's
-/// 500ms poll always sees the live phase.
+/// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200, `degraded` → 503 (the engine lost
+/// membership effects and only a restart fixes it; 503 keeps a load balancer from routing to it).
+/// Caches are disabled so the fleet's 500ms poll always sees the live phase.
 async fn health_v1(State(engine): State<Engine>) -> Response {
     let status = engine.health_status();
-    let code = if status == "active" { StatusCode::OK } else { StatusCode::ACCEPTED };
+    let code = match status {
+        "active" => StatusCode::OK,
+        "degraded" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::ACCEPTED,
+    };
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -145,6 +150,7 @@ async fn query_subset(
     State(engine): State<Engine>,
     Json(req): Json<QueryReq>,
 ) -> Result<Json<QueryResp>, AppError> {
+    engine.ensure_not_degraded()?;
     let order_by = req.order_by.map(|o| (o.col, o.desc));
     let (rows, lsn) =
         engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
@@ -226,6 +232,7 @@ async fn get_shape(
     State(engine): State<Engine>,
     Path(id): Path<String>,
 ) -> Result<Json<ShapeResp>, AppError> {
+    engine.ensure_not_degraded()?;
     match engine.get_shape(&id).await {
         Some(rec) => {
             let state = engine.shape_lifecycle(&rec.id).await;
@@ -293,6 +300,7 @@ async fn get_shape_log(
     Path(id): Path<String>,
     Query(q): Query<ShapeRowsQuery>,
 ) -> Result<Json<ShapeLogResp>, AppError> {
+    engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
         return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
     };
@@ -349,6 +357,7 @@ async fn get_shape_rows(
     Path(id): Path<String>,
     Query(q): Query<ShapeRowsQuery>,
 ) -> Result<Json<ShapeRowsResp>, AppError> {
+    engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
         return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
     };
@@ -553,8 +562,12 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         "lsn": engine.replication_lsn(),
         "sync": engine.replication_sync(),
         // Deferred subquery flip batches not yet propagated. Convergence barrier = sync caught up
-        // + per-table offsets at tail + pendingFlips == 0.
+        // + per-table offsets at tail + pendingFlips == 0. An abandoned batch never decrements, so
+        // pendingFlips can only reach 0 when every computed effect really did land.
         "pendingFlips": engine.pending_flips(),
+        // Flip batches abandoned after exhausting their retries; non-zero means the engine is
+        // degraded (its membership-bearing routes answer 503) and must be restarted.
+        "flipFailures": engine.flip_failures(),
     }))
 }
 
@@ -603,7 +616,14 @@ struct AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
-        AppError { status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("{e:#}") }
+        // A lost-effects degradation is the one engine failure that is not a 500: the request was
+        // fine, the engine is not. Matched by type, never by message text.
+        let status = if e.downcast_ref::<crate::engine::Degraded>().is_some() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        AppError { status, msg: format!("{e:#}") }
     }
 }
 

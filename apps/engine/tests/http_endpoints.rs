@@ -131,3 +131,55 @@ async fn introspection_enabled_by_default() {
         assert_ne!(res.status(), StatusCode::NOT_FOUND, "{route} should be registered");
     }
 }
+
+/// A degraded engine has lost membership effects it cannot re-derive, so every route that would
+/// answer WITH membership must refuse (503 + the typed error body) rather than serve what the
+/// engine knows is wrong — while the observability surface stays up, because that is what an
+/// operator needs to see the failure and decide to restart.
+#[tokio::test]
+async fn degraded_refuses_the_membership_routes_and_keeps_observability_up() {
+    let engine = library_engine();
+    engine.force_degraded();
+    let call = async |method: &str, uri: &str, body: &'static str| {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        router(engine.clone()).oneshot(req).await.unwrap()
+    };
+
+    for (method, uri, body) in [
+        ("POST", "/shapes", r#"{"table":"t"}"#),
+        ("POST", "/aggregate", r#"{"table":"t","fn":"count"}"#),
+        ("POST", "/query", r#"{"table":"t"}"#),
+        ("GET", "/shapes/s1", ""),
+        ("GET", "/shapes/s1/rows", ""),
+        ("GET", "/shapes/s1/log", ""),
+        ("GET", "/v1/shape?table=t&offset=-1", ""),
+    ] {
+        let res = call(method, uri, body).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{method} {uri} must refuse");
+        assert_eq!(
+            body_string(res).await,
+            r#"{"error":"degraded: subquery membership effects were lost; restart required"}"#,
+            "{method} {uri} body"
+        );
+    }
+
+    // `/v1/health` reports the state (503 + `degraded`), and the barrier endpoint still answers so
+    // the held `pendingFlips` and the `flipFailures` count are readable.
+    let res = call("GET", "/v1/health", "").await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_string(res).await, r#"{"status":"degraded"}"#);
+
+    let res = call("GET", "/replication/lsn", "").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+    assert_eq!(v["flipFailures"], 1);
+
+    for uri in ["/metrics", "/memory", "/subqueries", "/graph", "/state", "/health"] {
+        assert_eq!(call("GET", uri, "").await.status(), StatusCode::OK, "{uri} must stay up");
+    }
+}

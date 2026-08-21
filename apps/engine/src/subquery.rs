@@ -258,6 +258,24 @@ pub struct NodeStat {
     pub template: String,
 }
 
+/// Propagation work that reached a shape while it was still being created, deferred until it is
+/// installed (see [`PendingSubqueryShape::deferred`]).
+pub enum DeferredShapeWork {
+    /// An inner-set value flipped: re-derive the outer rows with `connecting_col = value`.
+    Value { connecting_col: usize, value: Value, txid: Option<String> },
+    /// A NULL flip on a NULL-sensitive edge: re-derive every outer row.
+    Full { txid: Option<String> },
+}
+
+impl HeapSize for DeferredShapeWork {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            DeferredShapeWork::Value { value, txid, .. } => value.heap_bytes() + txid.heap_bytes(),
+            DeferredShapeWork::Full { txid } => txid.heap_bytes(),
+        }
+    }
+}
+
 /// A subquery shape between `begin_create` and `finish_create`: registration exists (so its
 /// nodes are refcounted, its edges recorded, and its deltas buffered) but seeding/backfill runs
 /// outside the registry lock.
@@ -272,6 +290,14 @@ pub struct PendingSubqueryShape {
     collect_log: Vec<SubquerySig>,
     /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install.
     buffer: Vec<Tup2<Row, ZWeight>>,
+    /// Flips that reached this shape's edges before it was installed, replayed at install.
+    ///
+    /// Phase A commits the shape's edges, so a flip on a node it SHARES with an already-live shape
+    /// is propagated immediately — while phase B is still backfilling and there is no shape to
+    /// move. The inner change may have committed after the backfill's snapshot, so those outer rows
+    /// are in neither the snapshot nor the flip's reach: dropping the flip loses them for good.
+    /// Buffering it here is the same answer the outer `buffer` gives to outer deltas.
+    deferred: VecDeque<DeferredShapeWork>,
 }
 
 impl HeapSize for PendingSubqueryShape {
@@ -282,6 +308,7 @@ impl HeapSize for PendingSubqueryShape {
             + self.stream_path.heap_bytes()
             + self.collect_log.heap_bytes()
             + self.buffer.heap_bytes()
+            + self.deferred.heap_bytes()
     }
 }
 
@@ -782,8 +809,42 @@ impl SubqueryRegistry {
             changes_only,
             collect_log: log,
             buffer: Vec::new(),
+            deferred: VecDeque::new(),
         });
         Ok(BeginCreate { seeds, schemas: self.schemas.clone() })
+    }
+
+    /// Queue propagation work for a shape that is still being created, if it is one. Returns
+    /// whether it was queued — `false` means the shape is installed (or gone) and the caller
+    /// proceeds normally.
+    ///
+    /// Deduped, because the queue is replayed against Postgres one item at a time and a hot inner
+    /// table can flip the same value repeatedly during one backfill: a re-derive is absolute, so
+    /// running it once at install is running it enough. A full re-derive covers every value, so it
+    /// subsumes — and is not added to — anything else in the queue.
+    fn queue_deferred(&mut self, shape_id: &str, work: DeferredShapeWork) -> bool {
+        let Some(pending) = self.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id) else {
+            return false;
+        };
+        let has_full = pending.deferred.iter().any(|w| matches!(w, DeferredShapeWork::Full { .. }));
+        match &work {
+            DeferredShapeWork::Full { .. } => {
+                if !has_full {
+                    pending.deferred.clear();
+                    pending.deferred.push_back(work);
+                }
+            }
+            DeferredShapeWork::Value { connecting_col, value, .. } => {
+                let dup = pending.deferred.iter().any(|w| {
+                    matches!(w, DeferredShapeWork::Value { connecting_col: c, value: v, .. }
+                        if c == connecting_col && v == value)
+                });
+                if !has_full && !dup {
+                    pending.deferred.push_back(work);
+                }
+            }
+        }
+        true
     }
 
     /// Phase C (under the registry lock; brief, in-memory + lane enqueues): install the seeds,
@@ -792,6 +853,14 @@ impl SubqueryRegistry {
     /// the phase-B snapshot envelopes (for the shape's emitted counter). `seeded_pks` is the
     /// backfilled outer rows' pks, seeding `known_members` so a later delta that finds one of
     /// them no longer matching correctly emits a delete (not silently dropped as "never known").
+    ///
+    /// Also returns whatever propagation work reached the shape while it was pending
+    /// ([`PendingSubqueryShape::deferred`]) for the caller to run against the installed shape.
+    /// **The invariant that makes that lossless**: taking the queue off the pending entry and
+    /// installing the shape both happen inside this one `&mut self` step, which the registry mutex
+    /// holds exclusively for its whole duration (the internal awaits cannot yield the registry to
+    /// another task). So a live flip either queues onto the pending entry before this step or finds
+    /// the shape installed after it — there is no state in between for it to fall through.
     pub async fn finish_create(
         &mut self,
         shape_id: &str,
@@ -799,13 +868,14 @@ impl SubqueryRegistry {
         outer_gate: crate::pg::SnapshotGate,
         seeded: u64,
         seeded_pks: std::collections::HashSet<String>,
-    ) -> Result<VecDeque<(SubquerySig, Flip)>> {
+    ) -> Result<(VecDeque<(SubquerySig, Flip)>, VecDeque<DeferredShapeWork>)> {
         let idx = self
             .pending_shapes
             .iter()
             .position(|p| p.shape_id == shape_id)
             .context("finish_create: pending shape vanished")?;
-        let pending = self.pending_shapes.remove(idx);
+        let mut pending = self.pending_shapes.remove(idx);
+        let deferred = std::mem::take(&mut pending.deferred);
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         // 1. Install node seeds, then replay each node's buffered deltas through its gate.
         for (sig, rows, gate) in node_seeds {
@@ -877,7 +947,7 @@ impl SubqueryRegistry {
             let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
             self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None).await?;
         }
-        Ok(work)
+        Ok((work, deferred))
     }
 
     /// Install a fully-built outer shape. The shapes map, the feed-id reverse map and the
@@ -885,8 +955,9 @@ impl SubqueryRegistry {
     /// wasted probe, but a shape with no index entry is invisible to every later delta (silently
     /// dropped envelopes). One call site so they cannot drift, and one synchronous `&mut self`
     /// step so no live delta can observe a half-installed shape. Registration is only reachable
-    /// from `finish_create`, the atomic tail of shape creation: a create that fails earlier
-    /// (`abort_create`) never got here, so there is nothing for it to roll back.
+    /// from `finish_create`, the atomic tail of shape creation: a create that fails earlier never
+    /// got here, so [`abort_create`](Self::abort_create) has only its compile log to unwind — one
+    /// abandoned after it undoes this install through [`drop_subquery_shape`](Self::drop_subquery_shape).
     fn install_shape(&mut self, shape: SubqueryShape) {
         self.feed_by_id.insert(shape.feed_id, shape.shape_id.clone());
         self.shape_index.insert(&shape.shape_id, &shape.outer_table, &shape.pred);
@@ -904,12 +975,21 @@ impl SubqueryRegistry {
         self.shape_index.candidates(table, delta)
     }
 
-    /// Abort an in-flight create (phase B failed): drop the pending entry and roll back the
-    /// registration exactly (edges, refcounts, fresh nodes with their buffers).
-    pub fn abort_create(&mut self, shape_id: &str) {
+    /// Abort a create in whichever phase it died in. Before `finish_create` that means unwinding
+    /// its compile log (edges, refcounts, fresh nodes with their buffers); afterwards the shape is
+    /// installed like any other, so the ordinary drop path — which also retracts its seeded circuit
+    /// state and feed bookkeeping — is the correct undo. A create cancelled between `finish_create`
+    /// returning and the engine publishing the shape lands in that second case.
+    pub async fn abort_create(&mut self, shape_id: &str) {
+        if self.shapes.contains_key(shape_id) {
+            self.drop_subquery_shape(shape_id).await;
+            return;
+        }
         let Some(idx) = self.pending_shapes.iter().position(|p| p.shape_id == shape_id) else {
             return;
         };
+        // Taking the whole entry discards its deferred queue with it: work aimed at a shape that
+        // will never exist has nowhere to land and nothing to correct.
         let pending = self.pending_shapes.remove(idx);
         // Shape edges live under the pred's leaf sigs — remove only there, not a global scan.
         self.remove_shape_edges(&pending.pred, &pending.shape_id);
@@ -1373,77 +1453,208 @@ impl SubqueryRegistry {
 //    hold-the-lock-across-append design gave, without network under the lock and without a
 //    single-task bottleneck. Postgres round-trips run outside the lock, concurrently.
 
+/// How many times a flip batch's propagation is attempted before the engine gives up on the batch
+/// — and on itself (see [`propagate_with_retry`]).
+pub const FLIP_ATTEMPTS: u32 = 5;
+/// Delay after the first failed attempt; doubled per attempt, capped at [`FLIP_BACKOFF_MAX`]. The
+/// point is to sit out a transient Postgres fault (a killed backend, a failover, a lock timeout)
+/// long enough that the retry has a different answer. Shrunk under `cfg(test)` so the exhaustion
+/// test costs milliseconds instead of spending the production schedule's several seconds waiting.
+const FLIP_BACKOFF_START: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 1 } else { 50 });
+const FLIP_BACKOFF_MAX: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 8 } else { 2000 });
+
+/// [`propagate_flips`], retried on failure — the only form callers should use.
+///
+/// A retry RESUMES the walk rather than restarting it: `work` is drained in place and a failed
+/// attempt leaves behind exactly what it did not finish (the failing item back at the front), so
+/// the next attempt picks up where the last one stopped. Restarting from the original roots would
+/// be silently wrong — reconciling a parent node CONSUMES the transition that produced its flips,
+/// so a re-walk from the roots finds the parent already moved, derives nothing, and reports `Ok`
+/// while the dependents those flips would have moved never move. Re-walking the finished edges of
+/// the restored item is harmless: emission is absolute per pk.
+pub async fn propagate_with_retry(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    work: &mut VecDeque<(SubquerySig, Flip)>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+) -> Result<()> {
+    let mut backoff = FLIP_BACKOFF_START;
+    let mut attempt = 1u32;
+    loop {
+        let e = match propagate_flips(registry, work, txid.clone(), lsn.clone(), trace_tx).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        tracing::warn!(
+            "subquery flip propagation failed (attempt {attempt} of {FLIP_ATTEMPTS}, {} flip(s) left to walk): {e:#}",
+            work.len()
+        );
+        if attempt >= FLIP_ATTEMPTS {
+            return Err(e);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(FLIP_BACKOFF_MAX);
+        attempt += 1;
+    }
+}
+
+/// [`propagate_deferred_shape_work`], on the same retry schedule (and with the same fail-closed
+/// treatment by the caller) as the live walk: work queued during a create is exactly as
+/// unreproducible once dropped as work derived from a live flip, so it gets the same guarantees.
+pub async fn propagate_deferred_with_retry(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    shape_id: &str,
+    work: &mut VecDeque<DeferredShapeWork>,
+) -> Result<()> {
+    let mut backoff = FLIP_BACKOFF_START;
+    let mut attempt = 1u32;
+    loop {
+        let e = match propagate_deferred_shape_work(registry, shape_id, work).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        tracing::warn!(
+            "deferred propagation for shape '{shape_id}' failed (attempt {attempt} of {FLIP_ATTEMPTS}, {} item(s) left): {e:#}",
+            work.len()
+        );
+        if attempt >= FLIP_ATTEMPTS {
+            return Err(e);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(FLIP_BACKOFF_MAX);
+        attempt += 1;
+    }
+}
+
+/// Run the work that reached a shape while it was being created, now that it is installed.
+///
+/// Only that shape: the flip's walk already visited every other dependent of the flipped node at
+/// the time, so re-walking `edges_of` would redo their query-backs for nothing. Drained in place
+/// with the failed item restored at the front, exactly like [`propagate_flips`], so the retry
+/// resumes rather than restarts.
+///
+/// No trace is emitted. A flip trace lights the whole path — source `table:` → flipped `node:` →
+/// dependent — and a deferred item deliberately carries neither the flipped node's signature nor
+/// the table the change entered through; the walk that queued it already lit that path for the
+/// dependents it could move.
+pub async fn propagate_deferred_shape_work(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    shape_id: &str,
+    work: &mut VecDeque<DeferredShapeWork>,
+) -> Result<()> {
+    while let Some(item) = work.pop_front() {
+        let res = match &item {
+            DeferredShapeWork::Value { connecting_col, value, txid } => {
+                move_shape_for_value(registry, shape_id, *connecting_col, value, txid.clone())
+                    .await
+                    .map(|_| ())
+            }
+            DeferredShapeWork::Full { txid } => rederive_shape(registry, shape_id, txid.clone()).await,
+        };
+        if let Err(e) = res {
+            work.push_front(item);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Propagate a batch of inner-set flips up the dependency DAG (BFS), querying back affected rows.
+/// `work` is the walk's whole state and is drained IN PLACE: on failure the item being processed
+/// goes back at the front and the rest is untouched, so the caller's retry can resume (see
+/// [`propagate_with_retry`], which is what callers should use).
 pub async fn propagate_flips(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
-    mut work: VecDeque<(SubquerySig, Flip)>,
+    work: &mut VecDeque<(SubquerySig, Flip)>,
     txid: Option<String>,
     lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     while let Some((sig, flip)) = work.pop_front() {
-        // The flipped inner-set node's dependents, plus the table its change entered through: the
-        // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
-        // dependent). Fetched under one lock so a concurrent drop can't split them.
-        let (edges, source_table) = {
-            let reg = registry.lock().await;
-            (reg.edges_of(&sig), reg.nodes.get(&sig).map(|n| n.inner_table.clone()))
-        };
-        for edge in edges {
-            // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
-            // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
-            // negation turns into a membership change). It can shift *every* dependent row, so
-            // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
-            // monotone over FALSE < UNKNOWN < TRUE), so skip.
-            if matches!(flip.value, Value::Null) {
-                if edge.null_sensitive {
-                    rederive_dependent(registry, &edge, txid.clone(), &mut work).await?;
-                }
-                continue;
+        if let Err(e) = propagate_one(registry, &sig, &flip, &txid, &lsn, trace_tx, work).await {
+            work.push_front((sig, flip));
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// One flip's worth of the walk: move every dependent of the flipped node, pushing any parent-node
+/// flips it derives onto `work`. Split out of [`propagate_flips`] so a failure anywhere inside it
+/// unwinds to exactly one place — the caller that puts the flip back on the queue.
+async fn propagate_one(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    sig: &SubquerySig,
+    flip: &Flip,
+    txid: &Option<String>,
+    lsn: &Option<String>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    work: &mut VecDeque<(SubquerySig, Flip)>,
+) -> Result<()> {
+    // The flipped inner-set node's dependents, plus the table its change entered through: the
+    // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
+    // dependent). Fetched under one lock so a concurrent drop can't split them.
+    let (edges, source_table) = {
+        let reg = registry.lock().await;
+        (reg.edges_of(sig), reg.nodes.get(sig).map(|n| n.inner_table.clone()))
+    };
+    for edge in edges {
+        // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
+        // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
+        // negation turns into a membership change). It can shift *every* dependent row, so
+        // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
+        // monotone over FALSE < UNKNOWN < TRUE), so skip.
+        if matches!(flip.value, Value::Null) {
+            if edge.null_sensitive {
+                rederive_dependent(registry, &edge, txid.clone(), work).await?;
             }
-            match &edge.dependent {
-                Dependent::Shape(id) => {
-                    let moved =
-                        move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
-                    // Light the whole path only when the shape actually moved rows: source
-                    // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
-                    if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
+            continue;
+        }
+        match &edge.dependent {
+            Dependent::Shape(id) => {
+                let moved =
+                    move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                // Light the whole path only when the shape actually moved rows: source
+                // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
+                if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
+                    emit_flip_trace(
+                        trace_tx,
+                        &outer,
+                        src,
+                        sig,
+                        format!("shape:{id}"),
+                        vec![id.clone()],
+                        net,
+                        lsn.clone(),
+                        txid.clone(),
+                    );
+                }
+            }
+            Dependent::Node(parent_sig) => {
+                let new_flips =
+                    requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value))).await?;
+                if let Some((_inner, flips)) = new_flips {
+                    // A nested `IN`: connect the flipped child `node:<sig>` to the parent
+                    // `node:<parent_sig>` it re-derived, so the propagation reads through. The
+                    // parent's own downstream shape lights when its flips reach a shape edge.
+                    if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
                         emit_flip_trace(
                             trace_tx,
-                            &outer,
                             src,
-                            &sig,
-                            format!("shape:{id}"),
-                            vec![id.clone()],
-                            net,
+                            src,
+                            sig,
+                            format!("node:{parent_sig}"),
+                            Vec::new(),
+                            flip_net(&flips),
                             lsn.clone(),
                             txid.clone(),
                         );
                     }
-                }
-                Dependent::Node(parent_sig) => {
-                    let new_flips =
-                        requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value))).await?;
-                    if let Some((_inner, flips)) = new_flips {
-                        // A nested `IN`: connect the flipped child `node:<sig>` to the parent
-                        // `node:<parent_sig>` it re-derived, so the propagation reads through. The
-                        // parent's own downstream shape lights when its flips reach a shape edge.
-                        if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
-                            emit_flip_trace(
-                                trace_tx,
-                                src,
-                                src,
-                                &sig,
-                                format!("node:{parent_sig}"),
-                                Vec::new(),
-                                flip_net(&flips),
-                                lsn.clone(),
-                                txid.clone(),
-                            );
-                        }
-                        for f in flips {
-                            work.push_back((parent_sig.clone(), f));
-                        }
+                    for f in flips {
+                        work.push_back((parent_sig.clone(), f));
                     }
                 }
             }
@@ -1466,7 +1677,16 @@ async fn move_shape_for_value(
 ) -> Result<Option<(String, i64)>> {
     // Brief lock: snapshot what the query-back needs.
     let (ts, pg_url) = {
-        let reg = registry.lock().await;
+        let mut reg = registry.lock().await;
+        // A shape whose create is still in flight has edges (phase A) but no installed shape to
+        // move: the flip waits on its pending entry and runs at install, instead of falling through
+        // to a `shapes` miss that would silently drop it.
+        if reg.queue_deferred(
+            shape_id,
+            DeferredShapeWork::Value { connecting_col, value: value.clone(), txid: txid.clone() },
+        ) {
+            return Ok(None);
+        }
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
         (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone())
     };
@@ -1534,18 +1754,7 @@ async fn rederive_dependent(
     work: &mut VecDeque<(SubquerySig, Flip)>,
 ) -> Result<()> {
     match &edge.dependent {
-        Dependent::Shape(id) => {
-            let (ts, pg_url) = {
-                let reg = registry.lock().await;
-                let Some(s) = reg.shapes.get(id) else { return Ok(()) };
-                (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
-            };
-            let rows = query_all(&pg_url, &ts).await?;
-            // Full re-derive: every row is a candidate; the ONE emission tail decides.
-            let mut reg = registry.lock().await;
-            let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-            reg.emit_for_shapes(&ts, vec![(id.clone(), candidates)], txid).await?;
-        }
+        Dependent::Shape(id) => rederive_shape(registry, id, txid).await?,
         Dependent::Node(parent_sig) => {
             // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
             // every row instead of one connecting value's candidates.
@@ -1558,6 +1767,32 @@ async fn rederive_dependent(
             }
         }
     }
+    Ok(())
+}
+
+/// Re-derive an outer shape from scratch: re-query every candidate row of its table and let the
+/// emission tail decide each one's membership. Used for a NULL flip on a NULL-sensitive edge (which
+/// can move any row, whatever its connecting value) and to replay a `Full` deferred item.
+async fn rederive_shape(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    shape_id: &str,
+    txid: Option<String>,
+) -> Result<()> {
+    let (ts, pg_url) = {
+        let mut reg = registry.lock().await;
+        // Same as `move_shape_for_value`: a shape still being created is queued, not dropped — its
+        // edges are live but its `shapes` entry does not exist yet.
+        if reg.queue_deferred(shape_id, DeferredShapeWork::Full { txid: txid.clone() }) {
+            return Ok(());
+        }
+        let Some(s) = reg.shapes.get(shape_id) else { return Ok(()) };
+        (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
+    };
+    let rows = query_all(&pg_url, &ts).await?;
+    // Full re-derive: every row is a candidate; the ONE emission tail decides.
+    let mut reg = registry.lock().await;
+    let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
+    reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid).await?;
     Ok(())
 }
 
@@ -1898,6 +2133,195 @@ mod tests {
         assert_eq!(ev["delta"][0]["w"], -103, "the dot carries the real net −103 leave, not 0");
     }
 
+    /// **A failed walk keeps its own remains.** The DAG walk is not restartable from its roots:
+    /// reconciling a parent node consumes the transition that produced its flips, so a retry from
+    /// the roots finds the parent already moved, derives nothing, and reports success while the
+    /// dependents those flips would have moved never move — lost effects that also bypass the
+    /// fail-closed path, because nothing errored the second time.
+    ///
+    /// What makes the retry sound is that the queue survives the failure: whatever the attempt did
+    /// not finish, including the item that failed, is still there for the next attempt. Asserted
+    /// here directly, since a partial walk through a nested DAG needs a live Postgres to reach.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_propagation_leaves_its_work_for_the_retry() {
+        let ts = issues_ts();
+        // No `pg_url`: the first query-back fails, as an outage makes it fail.
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        insert_membership_shape(&mut reg, "s1", &sig, 1);
+        reg.add_edge(Edge {
+            node_sig: sig.clone(),
+            dependent: Dependent::Shape("s1".into()),
+            connecting_col: 1,
+            negated: false,
+            null_sensitive: false,
+        });
+        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let mut work: VecDeque<(SubquerySig, Flip)> = [
+            (sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter }),
+            (sig.clone(), Flip { value: Value::Int(200), dir: FlipDir::Enter }),
+        ]
+        .into_iter()
+        .collect();
+        let err = propagate_flips(&registry, &mut work, None, None, &trace_tx).await;
+
+        assert!(err.is_err(), "the query-back cannot succeed without Postgres");
+        assert_eq!(work.len(), 2, "a failed attempt must not consume the work it did not finish");
+        assert_eq!(work[0].1.value, Value::Int(100), "the failed item goes back at the front");
+        assert_eq!(work[1].1.value, Value::Int(200), "and the untouched item keeps its place");
+    }
+
+    /// The same, through the retrying entry point every caller uses: exhausting the attempts still
+    /// hands the whole unfinished walk back, so the caller can report exactly what was lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exhausted_retry_still_returns_the_unfinished_work() {
+        let ts = issues_ts();
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        insert_membership_shape(&mut reg, "s1", &sig, 1);
+        reg.add_edge(Edge {
+            node_sig: sig.clone(),
+            dependent: Dependent::Shape("s1".into()),
+            connecting_col: 1,
+            negated: false,
+            null_sensitive: false,
+        });
+        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let mut work: VecDeque<(SubquerySig, Flip)> =
+            [(sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
+        let err = propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await;
+
+        assert!(err.is_err(), "postgres never comes back; every attempt fails");
+        assert_eq!(work.len(), 1, "the abandoned flip is still on the queue for the report");
+    }
+
+    /// `outer_t(gid, id)` + `inner_t(gid, id)`: enough for `begin_create` to compile
+    /// `gid IN (SELECT gid FROM inner_t)` and register a pending shape.
+    fn creating_schemas() -> HashMap<String, TableSchema> {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            TableSchema::from_def(name, &def).unwrap()
+        };
+        [("outer_t".to_string(), mk("outer_t")), ("inner_t".to_string(), mk("inner_t"))]
+            .into_iter()
+            .collect()
+    }
+
+    fn in_inner_t() -> PredicateJson {
+        serde_json::from_value(serde_json::json!({
+            "col":"gid","in":{"table":"inner_t","project":"gid"}
+        }))
+        .unwrap()
+    }
+
+    /// A registry parked exactly where phase B runs: edges committed, shape not installed.
+    fn registry_mid_create() -> (SubqueryRegistry, BeginCreate) {
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        reg.set_schemas(Arc::new(creating_schemas()));
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &in_inner_t(), None, false).unwrap();
+        (reg, begin)
+    }
+
+    /// **A flip that arrives mid-create waits, it is not dropped.** Phase A commits the shape's
+    /// edges, so a flip on a node the shape SHARES with a live sibling reaches this shape while
+    /// phase B is still backfilling — and the backfill's snapshot may predate the inner change.
+    /// Finding no installed shape and moving on would lose those rows for the life of the shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flip_reaching_a_shape_mid_create_waits_on_its_pending_entry() {
+        let (reg, _begin) = registry_mid_create();
+        let registry = tokio::sync::Mutex::new(reg);
+
+        // No `pg_url`: had the flip fallen through to its query-back instead of being queued, this
+        // would be an error rather than "nothing moved".
+        let moved = move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
+        assert!(moved.is_none(), "nothing moves: the shape is not installed yet");
+        // A hot inner table flips the same value repeatedly; the replay is absolute, so once is enough.
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(8), None).await.unwrap();
+        {
+            let reg = registry.lock().await;
+            assert!(reg.shapes.is_empty(), "the create has not installed anything");
+            let queued = &reg.pending_shapes[0].deferred;
+            assert_eq!(queued.len(), 2, "both distinct values queued; the repeat deduped");
+            assert!(matches!(queued[0], DeferredShapeWork::Value { value: Value::Int(7), .. }));
+            assert!(matches!(queued[1], DeferredShapeWork::Value { value: Value::Int(8), .. }));
+        }
+
+        // A NULL flip re-derives every row, so it subsumes anything queued before it.
+        rederive_shape(&registry, "s1", None).await.unwrap();
+        let reg = registry.lock().await;
+        let queued = &reg.pending_shapes[0].deferred;
+        assert_eq!(queued.len(), 1, "the full re-derive replaced the per-value work");
+        assert!(matches!(queued[0], DeferredShapeWork::Full { .. }));
+    }
+
+    /// `finish_create` hands the queue back with the pending entry removed and the shape installed,
+    /// all in one `&mut self` step: after it, a flip finds the shape and runs straight through, and
+    /// the caller has the only copy of what arrived while it could not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finish_create_hands_back_the_queued_work() {
+        let (reg, begin) = registry_mid_create();
+        let seeds: Vec<(SubquerySig, Vec<Row>, crate::pg::SnapshotGate)> = begin
+            .seeds
+            .iter()
+            .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        let registry = tokio::sync::Mutex::new(reg);
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
+
+        let mut reg = registry.into_inner();
+        let (work, deferred) = reg
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+
+        assert!(work.is_empty(), "no buffered inner deltas to replay");
+        assert_eq!(deferred.len(), 1, "the queued flip comes back for the caller to run");
+        assert!(reg.pending_shapes.is_empty(), "the pending entry is gone, and its queue with it");
+        assert!(reg.shapes.contains_key("s1"), "the shape is installed: later flips run straight through");
+    }
+
+    /// The deferred replay is resumable for the same reason the live walk is: a failed item goes
+    /// back at the front, so the retry redoes exactly what did not land and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_deferred_item_is_restored_for_the_retry() {
+        let ts = issues_ts();
+        // No `pg_url`: the first query-back fails, as an outage makes it fail.
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        insert_membership_shape(&mut reg, "s1", &sig, 1);
+        reg.set_schemas(Arc::new([("issues".to_string(), ts)].into_iter().collect()));
+        let registry = tokio::sync::Mutex::new(reg);
+
+        let mut work: VecDeque<DeferredShapeWork> = [
+            DeferredShapeWork::Value { connecting_col: 1, value: Value::Int(100), txid: None },
+            DeferredShapeWork::Full { txid: None },
+        ]
+        .into_iter()
+        .collect();
+        let res = propagate_deferred_shape_work(&registry, "s1", &mut work).await;
+
+        assert!(res.is_err(), "the query-back cannot succeed without Postgres");
+        assert_eq!(work.len(), 2, "a failed replay must not consume the work it did not finish");
+        assert!(
+            matches!(work[0], DeferredShapeWork::Value { value: Value::Int(100), .. }),
+            "the failed item goes back at the front"
+        );
+    }
+
     /// Gating: a flip that changes no dependent membership emits nothing. Here a NULL flip reaches a
     /// plain (non-negated) `IN` dependent, which NULL can't move — `propagate_flips` skips it, so no
     /// path lights and the visualizer fades nothing spuriously.
@@ -1916,7 +2340,7 @@ mod tests {
 
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         work.push_back(("sig1".into(), Flip { value: Value::Null, dir: FlipDir::Enter }));
-        propagate_flips(&reg, work, None, None, &trace_tx).await.unwrap();
+        propagate_flips(&reg, &mut work, None, None, &trace_tx).await.unwrap();
         assert!(trace_rx.try_recv().is_err(), "a NULL flip on a non-null-sensitive dependent emits nothing");
     }
 
@@ -2064,7 +2488,7 @@ mod tests {
         assert_eq!(reg.nodes.len(), 1);
         assert!(reg.nodes.values().all(|n| n.seed_buffer.is_some()), "fresh node buffers");
         assert!(reg.touches("outer_t"), "pending shape routes its outer table");
-        reg.abort_create("s1");
+        reg.abort_create("s1").await;
         assert_eq!(reg.nodes.len(), 0, "aborted create left an orphaned node");
         assert_eq!(reg.edges_count(), 0, "aborted create left orphaned edges");
         assert_eq!(reg.pending_seed.len(), 0, "aborted create left a pending seed");

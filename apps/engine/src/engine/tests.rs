@@ -68,7 +68,7 @@ fn test_subq() -> SubqueryHandle {
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
-    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), trace_tx);
+    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), DegradeState::new(), trace_tx);
     SubqueryHandle { registry, flip_tx, pending_flips }
 }
 
@@ -1097,4 +1097,88 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
     let merged = card.with_bytes(bytes);
     assert_eq!(merged.bytes_shape_records, merged.bytes_shape_records); // shape carried through
     assert!(merged.bytes_shape_records > 0);
+}
+
+/// **A flip batch that cannot be delivered must never look delivered.**
+///
+/// The inner-set node is reconciled under the registry lock, before the batch's Postgres
+/// query-backs run. If those query-backs keep failing, the effects the batch was carrying are lost
+/// for good — nothing re-derives them. So the engine must NOT decrement `pendingFlips` for that
+/// batch (the barrier a consumer aligns on would otherwise say "everything landed" over a
+/// revocation that never reached a stream), must count the failure, and must latch itself degraded
+/// so its membership-bearing routes refuse rather than serve what it knows is wrong.
+///
+/// Library mode (no `pg_url`) makes the query-back fail deterministically and identically to an
+/// outage: `membership query-back requires postgres`, every attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
+    let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+    let schema: Schema = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },
+            "inner_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" }
+        }
+    }))
+    .unwrap();
+    let compiled = compile_schema(&schema).unwrap();
+    let inner_ts = compiled.get("inner_t").cloned().unwrap();
+    engine.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
+    engine.state.lock().await.tables = compiled;
+    let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
+        "col": "gid", "in": { "table": "inner_t", "project": "gid" }
+    }))
+    .unwrap();
+
+    // Register the shape the way the three-phase create does, seeding the node with gid 7 present
+    // (the seed's own flips are discarded, so the shape is quiet until a live delta moves it).
+    let begin = {
+        let mut reg = engine.subqueries.lock().await;
+        reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, true).unwrap()
+    };
+    let seeds: Vec<_> = begin
+        .seeds
+        .iter()
+        // `TableSchema` orders columns alphabetically: (gid, id).
+        .map(|(sig, _, _)| {
+            (sig.clone(), vec![Row(vec![Value::Int(7), Value::Int(1)])], crate::pg::SnapshotGate::passthrough())
+        })
+        .collect();
+    {
+        let mut reg = engine.subqueries.lock().await;
+        let (replay, deferred) =
+            reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default()).await.unwrap();
+        assert!(replay.is_empty(), "nothing was buffered mid-create");
+        assert!(deferred.is_empty(), "no flip reached the shape mid-create");
+    }
+
+    // Delete the only inner row carrying gid 7: the node loses the value (reconciled in memory,
+    // right now) and the dependent shape's rows must be re-derived by a query-back that cannot run.
+    let work = {
+        let mut reg = engine.subqueries.lock().await;
+        reg.on_table_delta(&inner_ts, &[Tup2(Row(vec![Value::Int(7), Value::Int(1)]), -1)], 0x10, None, None, None)
+            .await
+            .unwrap()
+    };
+    assert_eq!(work.len(), 1, "the delete flips gid 7 out of the inner set");
+
+    engine.pending_flips.fetch_add(1, Ordering::SeqCst);
+    engine.flip_tx.send(FlipWork::Walk { work, txid: None, lsn: None }).expect("propagator alive");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !engine.degraded() {
+        assert!(std::time::Instant::now() < deadline, "the abandoned batch never degraded the engine");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(engine.flip_failures(), 1, "the abandoned batch is counted");
+    assert_eq!(
+        engine.pending_flips(),
+        1,
+        "the barrier stays held: a consumer gating on pendingFlips == 0 must never align on lost work"
+    );
+    assert_eq!(engine.health_status(), "degraded", "degraded outranks the boot phase");
+    assert!(engine.ensure_not_degraded().is_err(), "every membership-bearing path must now refuse");
+    assert!(
+        engine.create_shape("outer_t", None, None, false, true).await.is_err(),
+        "a degraded engine must not create shapes"
+    );
 }

@@ -18,6 +18,9 @@ impl Engine {
         changes_only: bool,
         share: bool,
     ) -> Result<ShapeRecord> {
+        // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
+        // so it refuses to make one rather than backfill from state it knows is wrong.
+        self.ensure_not_degraded()?;
         // Whole shape-creation timer (backfill + registration); emitted by the creator on success only
         // (joiners return early before this fires) as `create_snapshot_task.stop.duration`.
         let created_at = std::time::Instant::now();
@@ -99,6 +102,9 @@ impl Engine {
             let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
             self.ensure_retention_sweeper();
+            // First subquery shape: from here on a lost flip is possible, so the stream reaper that
+            // fires on degradation needs to exist.
+            self.ensure_degrade_reaper();
             // Register this (first) subquery shape so later identical ones join it by ref-count.
             // Joiners wait on `ready_tx` — the shape isn't live until the registry has seeded its
             // nodes and backfilled the stream.
@@ -113,6 +119,7 @@ impl Engine {
             // shared pool) → finish (brief lock: install seeds, gated replay of buffered
             // deltas, register the shape). Replay flips propagate through the worker pool.
             drop(st);
+            let mut creating = CreateGuard::new(self, &id, table, &stream_path, Registration::Registry);
             let res = async {
                 self.ds.ensure_stream(&stream_path).await?;
                 self.create_subquery_three_phase(&id, table, &stream_path, &where_json, out_cols, changes_only)
@@ -121,6 +128,7 @@ impl Engine {
             .await;
             match res {
                 Ok(()) => {
+                    creating.complete();
                     let _ = ready_tx.send(Some(true));
                     trace_lifecycle(
                         &self.trace_tx,
@@ -130,18 +138,10 @@ impl Engine {
                     return Ok(rec);
                 }
                 Err(e) => {
-                    // Registration failed (the registry rolled its own state back). Remove the shape
-                    // record + share entries so later identical creates don't join a dead stream, and
-                    // wake any joiners with the failure.
-                    let mut st = self.state.lock().await;
-                    st.shapes.remove(&id);
-                    let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                    if let Some(share) = st.feed_shares.remove(&id) {
-                        st.feed_by_sig.remove(&share.sig);
-                    }
-                    drop(st);
+                    // Registration failed: wake any joiners with the failure, then undo everything
+                    // this create registered so later identical creates don't join a dead stream.
                     let _ = ready_tx.send(Some(false));
-                    let _ = self.ds.delete_stream(&stream_path).await;
+                    creating.rollback().await;
                     return Err(e);
                 }
             }
@@ -195,6 +195,7 @@ impl Engine {
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
         // The sequencer keeps processing all tables meanwhile, buffering this shape's deltas.
         drop(st);
+        let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
             Err(e) => Err(format!("creating shape stream: {e:#}")),
             Ok(()) => backfill_and_activate(
@@ -205,6 +206,7 @@ impl Engine {
         };
         match outcome {
             Ok(()) => {
+                creating.complete();
                 let _ = share_tx.send(Some(true));
                 trace_lifecycle(
                     &self.trace_tx,
@@ -214,22 +216,10 @@ impl Engine {
                 Ok(rec)
             }
             Err(e) => {
-                // Backfill/registration failed: remove the record + share entries (no zombie shape a
-                // later identical create would join) and surface the error to the caller.
-                let mut st = self.state.lock().await;
-                st.shapes.remove(&id);
-                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                if let Some(share) = st.feed_shares.remove(&id) {
-                    st.feed_by_sig.remove(&share.sig);
-                }
-                if let Some(seq) = st.sequencer.as_ref() {
-                    let _ = seq
-                        .cmd_tx
-                        .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.clone() });
-                }
-                drop(st);
+                // Backfill/registration failed: wake any joiners, then undo the whole registration
+                // (no zombie shape a later identical create would join) and surface the error.
                 let _ = share_tx.send(Some(false));
-                let _ = self.ds.delete_stream(&rec.stream_path).await;
+                creating.rollback().await;
                 bail!("shape '{id}' creation failed: {e}")
             }
         }
@@ -245,6 +235,9 @@ impl Engine {
         func: AggFn,
         col: Option<String>,
     ) -> Result<ShapeRecord> {
+        // Same refusal as `create_shape`: a degraded engine does not get to answer for a fold over
+        // rows whose membership it can no longer vouch for.
+        self.ensure_not_degraded()?;
         let mut st = self.state.lock().await;
         let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
         if where_.as_ref().is_some_and(predicate_has_subquery) {
@@ -326,11 +319,14 @@ impl Engine {
                         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
                         st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
                         drop(st);
+                        let mut creating =
+                            CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
                         return match ready_rx2
                             .await
                             .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
                         {
                             Ok(()) => {
+                                creating.complete();
                                 let _ = share_tx.send(Some(true));
                                 trace_lifecycle(
                                     &self.trace_tx,
@@ -342,22 +338,8 @@ impl Engine {
                                 Ok(rec)
                             }
                             Err(e) => {
-                                let mut st = self.state.lock().await;
-                                st.shapes.remove(&id);
-                                st.circuit_placement.remove(&id);
-                                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                                if let Some(share) = st.feed_shares.remove(&id) {
-                                    st.feed_by_sig.remove(&share.sig);
-                                }
-                                if let Some(seq) = st.sequencer.as_ref() {
-                                    let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape {
-                                        table: rec.table.clone(),
-                                        shape_id: id.clone(),
-                                    });
-                                }
-                                drop(st);
                                 let _ = share_tx.send(Some(false));
-                                let _ = self.ds.delete_stream(&rec.stream_path).await;
+                                creating.rollback().await;
                                 bail!("aggregate '{id}' creation failed: {e}")
                             }
                         };
@@ -402,6 +384,7 @@ impl Engine {
         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
         st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
         drop(st);
+        let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = backfill_and_activate(
             &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &stream_path_c, &pred,
             None, false, true, ack_rx,
@@ -409,6 +392,7 @@ impl Engine {
         .await;
         match outcome {
             Ok(()) => {
+                creating.complete();
                 let _ = share_tx.send(Some(true));
                 trace_lifecycle(
                     &self.trace_tx,
@@ -417,20 +401,8 @@ impl Engine {
                 Ok(rec)
             }
             Err(e) => {
-                let mut st = self.state.lock().await;
-                st.shapes.remove(&id);
-                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                if let Some(share) = st.feed_shares.remove(&id) {
-                    st.feed_by_sig.remove(&share.sig);
-                }
-                if let Some(seq) = st.sequencer.as_ref() {
-                    let _ = seq
-                        .cmd_tx
-                        .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.clone() });
-                }
-                drop(st);
                 let _ = share_tx.send(Some(false));
-                let _ = self.ds.delete_stream(&rec.stream_path).await;
+                creating.rollback().await;
                 bail!("aggregate '{id}' creation failed: {e}")
             }
         }
@@ -974,28 +946,274 @@ impl Engine {
             Ok::<_, anyhow::Error>((node_seeds, outer_gate, seeded, seeded_pks))
         }
         .await;
-        // Phase C (brief lock): install + gated replay, or exact rollback on a phase-B failure.
-        match phase_b {
-            Ok((node_seeds, outer_gate, seeded, seeded_pks)) => {
-                let work = self
-                    .subqueries
-                    .lock()
-                    .await
-                    .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
-                    .await?;
-                if !work.is_empty() {
-                    // Replay flips propagate exactly like live ones (barrier-covered).
-                    self.pending_flips.fetch_add(1, Ordering::SeqCst);
-                    if self.flip_tx.send(FlipWork { work, txid: None, lsn: None }).is_err() {
-                        self.pending_flips.fetch_sub(1, Ordering::SeqCst);
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.subqueries.lock().await.abort_create(id);
-                Err(e)
+        // Phase C (brief lock): install + gated replay. A failure in either phase unwinds through
+        // the caller's create rollback (which reaches the registry via `abort_create`), so there is
+        // exactly one undo path whether the create failed or was cancelled.
+        let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
+        let (work, deferred) = self
+            .subqueries
+            .lock()
+            .await
+            .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
+            .await?;
+        if !work.is_empty() {
+            // Replay flips propagate exactly like live ones (barrier-covered).
+            self.pending_flips.fetch_add(1, Ordering::SeqCst);
+            if self.flip_tx.send(FlipWork::Walk { work, txid: None, lsn: None }).is_err() {
+                self.pending_flips.fetch_sub(1, Ordering::SeqCst);
             }
         }
+        if !deferred.is_empty() {
+            // Flips that reached this shape's edges while it was still pending — a shared inner
+            // node's, since a fresh node's deltas buffer on the node itself. They carry membership
+            // the phase-B snapshot could not contain, so they are barrier-covered like any other
+            // effect: counted before the hand-off, released only once they land.
+            self.pending_flips.fetch_add(1, Ordering::SeqCst);
+            if self
+                .flip_tx
+                .send(FlipWork::Deferred { shape_id: id.to_string(), work: deferred })
+                .is_err()
+            {
+                self.pending_flips.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which per-kind registration a rolled-back create must undo alongside the engine-state entries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Registration {
+    /// Plain + aggregate shapes: the sequencer's entry for the shape, pending or live.
+    Sequencer,
+    /// Subquery shapes: the cross-table registry's entry, pending or installed.
+    Registry,
+}
+
+/// Everything a create has registered before its first storage/registry await, given back if the
+/// create never reaches its own end.
+///
+/// The create's future is awaited straight from the HTTP handler, so a client that disconnects
+/// takes it away mid-flight — during the backfill, a stream append, the subquery conflict retry, or
+/// phase C. Without this, the half-made shape stays in `feed_by_sig` forever: every later identical
+/// create joins it and waits on a creator that no longer exists (and bumps its refcount, so
+/// retention never evicts it either), while its sequencer/registry entry keeps buffering deltas for
+/// a shape nobody can read.
+struct CreateGuard {
+    engine: Engine,
+    shape_id: String,
+    table: String,
+    stream_path: String,
+    registration: Registration,
+    armed: bool,
+}
+
+impl CreateGuard {
+    fn new(
+        engine: &Engine,
+        shape_id: &str,
+        table: &str,
+        stream_path: &str,
+        registration: Registration,
+    ) -> Self {
+        Self {
+            engine: engine.clone(),
+            shape_id: shape_id.to_string(),
+            table: table.to_string(),
+            stream_path: stream_path.to_string(),
+            registration,
+            armed: true,
+        }
+    }
+
+    /// The create reached its end: everything it registered stays.
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+
+    /// The create failed and its caller is still there to be told: roll back in place, so the error
+    /// the caller returns is already true of the engine's state.
+    async fn rollback(&mut self) {
+        self.armed = false;
+        self.engine
+            .rollback_create(&self.shape_id, &self.table, &self.stream_path, self.registration)
+            .await;
+    }
+}
+
+impl Drop for CreateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancelled. The rollback needs the async engine/registry locks, which `drop` cannot await,
+        // so it runs DETACHED — the same shape as the reactivation path, and for the same reason.
+        tracing::warn!("create of shape '{}' was cancelled; rolling back", self.shape_id);
+        let (engine, shape_id, table, stream_path, registration) = (
+            self.engine.clone(),
+            self.shape_id.clone(),
+            self.table.clone(),
+            self.stream_path.clone(),
+            self.registration,
+        );
+        tokio::spawn(async move {
+            engine.rollback_create(&shape_id, &table, &stream_path, registration).await;
+        });
+    }
+}
+
+impl Engine {
+    /// Undo a create: the one implementation of "this shape was never made", shared by the explicit
+    /// error paths and by [`CreateGuard`]'s cancelled path.
+    ///
+    /// Engine state goes first: the share signature is what a retrying client contends on, and the
+    /// per-kind entry left behind for the extra moment only buffers deltas for a shape nobody can
+    /// reach. The sequencer command is `RemoveShape`, not `AbortShape`: a cancellation can land
+    /// after `ActivateShape` has already turned the pending buffer into live routing, and only
+    /// `RemoveShape` covers both states (it drops the pending buffer, the routed/standalone/
+    /// aggregate registration, and the emit counter); commands are FIFO, so one sent while
+    /// `BeginShape` is still queued still lands after it.
+    async fn rollback_create(&self, id: &str, table: &str, stream_path: &str, registration: Registration) {
+        let mut st = self.state.lock().await;
+        let existed = st.shapes.remove(id).is_some();
+        st.circuit_placement.remove(id);
+        if let Some(share) = st.feed_shares.remove(id) {
+            // Only if the signature still points HERE: a joiner woken by this create's failure may
+            // already have registered its own replacement under the same signature.
+            if st.feed_by_sig.get(&share.sig).is_some_and(|cur| cur == id) {
+                st.feed_by_sig.remove(&share.sig);
+            }
+        }
+        if registration == Registration::Sequencer
+            && let Some(seq) = st.sequencer.as_ref()
+        {
+            let _ = seq
+                .cmd_tx
+                .send(SequencerCmd::RemoveShape { table: table.to_string(), shape_id: id.to_string() });
+        }
+        drop(st);
+        self.lives.lock().unwrap().remove(id);
+        if existed {
+            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
+        }
+        if registration == Registration::Registry {
+            self.subqueries.lock().await.abort_create(id).await;
+        }
+        let _ = self.ds.delete_stream(stream_path).await;
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    /// A subquery-capable engine with no durable-streams server behind it: the rollback's stream
+    /// DELETE fails and is ignored, which leaves exactly the in-memory state these tests assert on.
+    async fn engine_with_subquery_tables() -> (Engine, PredicateJson) {
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "tables": {
+                "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },
+                "inner_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" }
+            }
+        }))
+        .unwrap();
+        let compiled = compile_schema(&schema).unwrap();
+        engine.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
+        *engine.tables_shared.write().unwrap() = compiled.clone();
+        engine.state.lock().await.tables = compiled;
+        let where_json = serde_json::from_value(serde_json::json!({
+            "col": "gid", "in": { "table": "inner_t", "project": "gid" }
+        }))
+        .unwrap();
+        (engine, where_json)
+    }
+
+    /// Everything `create_shape`'s subquery path registers before its first await, plus the guard
+    /// it arms there.
+    async fn register(engine: &Engine, id: &str, where_json: &PredicateJson) -> CreateGuard {
+        let mut st = engine.state.lock().await;
+        st.shapes.insert(id.to_string(), ShapeRecord {
+            id: id.to_string(),
+            table: "outer_t".into(),
+            stream_path: format!("shape/{id}"),
+            changes_only: false,
+            where_json: Some(where_json.clone()),
+            columns: None,
+            family_key: None,
+            is_subquery: true,
+            aggregate: None,
+        });
+        let (_ready_tx, ready) = tokio::sync::watch::channel(None);
+        st.feed_by_sig.insert("sig".into(), id.to_string());
+        st.feed_shares.insert(id.to_string(), FeedShare { sig: "sig".into(), refcount: 1, ready });
+        drop(st);
+        engine.lives.lock().unwrap().insert(id.to_string(), ShapeLife::active());
+        CreateGuard::new(engine, id, "outer_t", &format!("shape/{id}"), Registration::Registry)
+    }
+
+    /// The detached rollback must leave nothing a later identical create could join or conflict with.
+    async fn assert_rolled_back(engine: &Engine, id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.get_shape(id).await.is_some() || engine.subqueries.lock().await.touches("outer_t") {
+            assert!(std::time::Instant::now() < deadline, "the cancelled create was never rolled back");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let st = engine.state.lock().await;
+        assert!(st.feed_by_sig.is_empty(), "the share signature must not outlive the create");
+        assert!(st.feed_shares.is_empty());
+        assert!(engine.lives.lock().unwrap().is_empty(), "the retention entry must go too");
+        assert!(engine.subquery_stats().await.is_empty(), "no registry node may survive");
+    }
+
+    /// Cancelled between `begin_create` and `finish_create`: the registry holds a pending shape
+    /// buffering outer deltas and a fresh node buffering inner ones. Both must go, or the next
+    /// identical create conflicts on that half-seeded node until its retry budget runs out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_before_install_unwinds_the_pending_registry_state() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let guard = register(&engine, "s1", &where_json).await;
+        let begin = engine
+            .subqueries
+            .lock()
+            .await
+            .begin_create("s1", "outer_t", "shape/s1", &where_json, None, false)
+            .unwrap();
+        assert_eq!(begin.seeds.len(), 1, "one fresh node to seed");
+
+        drop(guard);
+        assert_rolled_back(&engine, "s1").await;
+    }
+
+    /// Cancelled after `finish_create` installed the shape (its phase-C replay awaits, and the HTTP
+    /// response is still one await away): the rollback must go through the ordinary drop path so the
+    /// installed shape, its index entry and its feed go with the engine-side state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_after_install_drops_the_registered_shape() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let guard = register(&engine, "s1", &where_json).await;
+        let begin = engine
+            .subqueries
+            .lock()
+            .await
+            .begin_create("s1", "outer_t", "shape/s1", &where_json, None, false)
+            .unwrap();
+        let seeds = begin
+            .seeds
+            .iter()
+            .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        engine
+            .subqueries
+            .lock()
+            .await
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, HashSet::new())
+            .await
+            .unwrap();
+        assert!(engine.subqueries.lock().await.shapes.contains_key("s1"), "installed before the drop");
+
+        drop(guard);
+        assert_rolled_back(&engine, "s1").await;
+        assert!(engine.graph().await.shapes.is_empty());
     }
 }

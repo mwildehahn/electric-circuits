@@ -70,7 +70,22 @@ unknown `ELECTRIC_*` var is accepted and logged once as "accepted (no-op)" — i
 **`GET /v1/health`** reports the boot state machine as an exact, whitespace-free JSON body:
 `{"status":"waiting"}` (202) until Postgres connects, `{"status":"starting"}` (202) through
 introspection/slot/ingest spawn, then `{"status":"active"}` (200). Library mode is `active` at once.
+`{"status":"degraded"}` (503) outranks all of them — see **Degraded** below.
 `GET /` → 200 empty; `OPTIONS /v1/shape` → 204 with `access-control-allow-methods`.
+
+**Degraded (fail-closed).** A subquery flip's Postgres query-back is retried (resuming the DAG walk
+where it stopped, not restarting it). If the retries are exhausted the effects that batch was
+carrying are lost — the inner-set node moved before the query-back ran, so nothing will re-derive
+them. The engine then refuses to pretend otherwise: the batch never decrements `pendingFlips` (so
+the convergence barrier `sync caught up + offsets at tail + pendingFlips == 0` now means *every
+computed effect has landed, or the engine is degraded and says so*), `GET /replication/lsn` reports
+a non-zero `flipFailures`, `/v1/health` turns `degraded` (503), and `POST /shapes`, `POST /aggregate`,
+`POST /query`, `GET /shapes/{id}(/rows|/log)` and `GET /v1/shape` answer 503 with
+`{"error":"degraded: …"}`. Every subquery shape's durable stream is deleted too — clients read
+durable-streams directly, past the HTTP surface, so that is the only way they learn. Observability
+(`/replication/lsn`, `/metrics*`, `/memory`, `/subqueries`, `/graph`, `/state`, `/trace`, `/tables/*`,
+`/health`) stays up. **Recovery is a restart**: it re-seeds every node from Postgres and recreates
+the streams, so nothing a restart would have kept is destroyed.
 
 **StatsD telemetry** (`statsd.rs`) is the fleet's only metrics channel — the datadog wire format
 (`name:value|type|#instance_id:<id>,...`), non-blocking (bounded channel → batched ≤1432-byte UDP
@@ -95,7 +110,7 @@ unchanged.
 | `GET /trace` | SSE: per-envelope pipeline traces (hops + outcomes) and `shapeAdded`/`shapeDropped` lifecycle events; lossy by design, zero cost with no subscribers |
 | `GET /tables/{name}/offset` · `GET /tables/{name}/families` | tailer position / routing-family stats |
 | `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…` | shared-node stats, pipeline graph, one node's live index |
-| `GET /replication/lsn` | ingestor LSN + sync status |
+| `GET /replication/lsn` | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) |
 | `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition |
 | `GET /v1/shape` | Electric protocol: snapshot (`offset=-1`), live long-poll, handles/offsets/`must-refetch` |
 

@@ -55,6 +55,53 @@ const HEALTH_WAITING: u8 = 0;
 const HEALTH_STARTING: u8 = 1;
 const HEALTH_ACTIVE: u8 = 2;
 
+/// The engine computed membership effects it could not deliver (see [`DegradeState`]), so what it
+/// serves is silently wrong. A typed error: the HTTP layer maps it to 503 by downcast, never by
+/// matching on message text.
+#[derive(Debug)]
+pub struct Degraded;
+
+impl std::fmt::Display for Degraded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("degraded: subquery membership effects were lost; restart required")
+    }
+}
+
+impl std::error::Error for Degraded {}
+
+/// Fail-closed degradation state, latched when a flip batch exhausts its retries.
+///
+/// The inner-set node was already reconciled under the registry lock before the batch's query-backs
+/// ran, so an abandoned batch's effects can never be re-derived — only a restart, which re-seeds
+/// every node from Postgres, makes the engine right again. Until then it refuses every read that
+/// would carry membership rather than serve the lie.
+pub(crate) struct DegradeState {
+    degraded: std::sync::atomic::AtomicBool,
+    /// Flip batches abandoned so far (`GET /replication/lsn` → `flipFailures`).
+    failures: std::sync::atomic::AtomicU64,
+    /// Wakes the stream reaper on the transition (see `Engine::ensure_degrade_reaper`).
+    wake: tokio::sync::watch::Sender<bool>,
+    reaper_started: std::sync::atomic::AtomicBool,
+}
+
+impl DegradeState {
+    fn new() -> Arc<Self> {
+        Arc::new(DegradeState {
+            degraded: std::sync::atomic::AtomicBool::new(false),
+            failures: std::sync::atomic::AtomicU64::new(0),
+            wake: tokio::sync::watch::channel(false).0,
+            reaper_started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Count one abandoned batch and latch the engine degraded (idempotent; never cleared).
+    fn mark(&self) {
+        self.failures.fetch_add(1, Ordering::SeqCst);
+        self.degraded.store(true, Ordering::SeqCst);
+        let _ = self.wake.send(true); // no reaper subscribed = no subquery shape to reap
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     ds: DsClient,
@@ -86,8 +133,12 @@ pub struct Engine {
     /// [`crate::subquery::propagate_flips`]).
     flip_tx: mpsc::UnboundedSender<FlipWork>,
     /// Flip batches enqueued but not yet fully propagated. Part of the convergence barrier:
-    /// drained change log + `pending_flips == 0` ⇒ all subquery effects have landed.
+    /// drained change log + `pending_flips == 0` ⇒ all subquery effects have landed. An abandoned
+    /// batch keeps its count forever, so the barrier can never report "everything landed" over
+    /// effects that were lost — the engine degrades instead (see [`DegradeState`]).
     pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
+    degrade: Arc<DegradeState>,
     /// Table schemas shared with the sequencer task (updated on `setup_postgres`/`define_schema`).
     tables_shared: SharedTables,
     /// Ordered writer for the durable shape catalog (see [`CATALOG_STREAM`]).
@@ -111,14 +162,23 @@ pub struct Engine {
     arr_gates: Arc<std::sync::RwLock<HashMap<String, crate::pg::SnapshotGate>>>,
 }
 
-/// One tailer envelope's worth of deferred subquery flips (see [`Engine::flip_tx`]).
-pub(crate) struct FlipWork {
-    work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
-    txid: Option<String>,
-    /// The originating write's commit lsn, threaded through to the deferred flip's trace event so
-    /// it carries the same lsn/txid as the direct-change event that triggered the propagation —
-    /// letting the activity log group them as one write (see `subquery::emit_flip_trace`).
-    lsn: Option<String>,
+/// A unit of deferred subquery propagation for the flip propagator (see [`Engine::flip_tx`]).
+pub(crate) enum FlipWork {
+    /// One tailer envelope's (or one create's replay's) worth of inner-set flips, walked up the
+    /// dependency DAG from the flipped nodes.
+    Walk {
+        work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
+        txid: Option<String>,
+        /// The originating write's commit lsn, threaded through to the deferred flip's trace event
+        /// so it carries the same lsn/txid as the direct-change event that triggered the
+        /// propagation — letting the activity log group them as one write (see
+        /// `subquery::emit_flip_trace`).
+        lsn: Option<String>,
+    },
+    /// Work that reached a shape while it was still being created, run against that one shape now
+    /// that it is installed (see `SubqueryRegistry::finish_create`). Its dependency walk already
+    /// happened, so there is nothing left to walk.
+    Deferred { shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
 }
 
 /// Everything a tailer needs to route deltas through the subquery layer: the shared registry for
@@ -143,6 +203,7 @@ fn spawn_flip_propagator(
     registry: Arc<Mutex<SubqueryRegistry>>,
     mut rx: mpsc::UnboundedReceiver<FlipWork>,
     pending: Arc<std::sync::atomic::AtomicI64>,
+    degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
     let workers: usize = std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS")
@@ -156,12 +217,41 @@ fn spawn_flip_propagator(
             let permit = sem.clone().acquire_owned().await.expect("flip semaphore");
             let registry = registry.clone();
             let pending = pending.clone();
+            let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::subquery::propagate_flips(&registry, fw.work, fw.txid, fw.lsn, &trace_tx).await
-                {
-                    tracing::error!("subquery flip propagation failed: {e:#}");
+                // Both arms report `(error, items the batch never got through)`; a deferred batch
+                // is treated exactly like a live one, because its effects are just as lost.
+                let failed = match fw {
+                    FlipWork::Walk { mut work, txid, lsn } => crate::subquery::propagate_with_retry(
+                        &registry, &mut work, txid, lsn, &trace_tx,
+                    )
+                    .await
+                    .err()
+                    .map(|e| (e, work.len())),
+                    FlipWork::Deferred { shape_id, mut work } => {
+                        crate::subquery::propagate_deferred_with_retry(&registry, &shape_id, &mut work)
+                            .await
+                            .err()
+                            .map(|e| (e, work.len()))
+                    }
+                };
+                if let Some((e, unfinished)) = failed {
+                    // Fail closed. The inner-set node was reconciled before these query-backs ran,
+                    // so nothing will ever re-derive the rows this batch was carrying: the effects
+                    // are lost, not delayed. Keep the batch's pending count held — a consumer
+                    // gating on `pendingFlips == 0` must never be told everything landed when it
+                    // did not — and latch the engine degraded so every membership-bearing route
+                    // refuses instead of serving membership the engine knows is wrong.
+                    tracing::error!(
+                        "subquery flip propagation ABANDONED after {} attempts ({} item(s) unfinished): {e:#}; \
+                         membership effects lost; engine degraded",
+                        crate::subquery::FLIP_ATTEMPTS,
+                        unfinished
+                    );
+                    degrade.mark();
+                    drop(permit);
+                    return;
                 }
                 // Decremented only after propagation finished enqueueing every resulting
                 // batch — each batch carries its own pending increment until it lands, so
@@ -322,7 +412,14 @@ impl Engine {
             pending_flips.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
-        spawn_flip_propagator(subqueries.clone(), flip_rx, pending_flips.clone(), trace_tx.clone());
+        let degrade = DegradeState::new();
+        spawn_flip_propagator(
+            subqueries.clone(),
+            flip_rx,
+            pending_flips.clone(),
+            degrade.clone(),
+            trace_tx.clone(),
+        );
         let (catalog_tx, catalog_rx) = mpsc::unbounded_channel();
         spawn_catalog_writer(ds.clone(), catalog_rx);
         Engine {
@@ -346,6 +443,7 @@ impl Engine {
             trace_tx,
             flip_tx,
             pending_flips,
+            degrade,
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
             seq_start: Arc::new(std::sync::Mutex::new("-1".to_string())),
@@ -438,6 +536,80 @@ impl Engine {
         self.pending_flips.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Flip batches abandoned after exhausting their retries — membership effects the engine
+    /// computed and could not deliver. Reported as `flipFailures`; non-zero means degraded.
+    pub fn flip_failures(&self) -> u64 {
+        self.degrade.failures.load(Ordering::SeqCst)
+    }
+
+    /// True once membership effects have been lost (see [`DegradeState`]). Latched until restart.
+    pub fn degraded(&self) -> bool {
+        self.degrade.degraded.load(Ordering::SeqCst)
+    }
+
+    /// The guard every membership-bearing create/read path takes: once degraded, refuse rather than
+    /// answer with membership the engine knows is wrong.
+    pub fn ensure_not_degraded(&self) -> Result<()> {
+        if self.degraded() {
+            return Err(anyhow::Error::new(Degraded));
+        }
+        Ok(())
+    }
+
+    /// Latch the engine degraded. Exposed for tests that drive the refusal surface without a lost
+    /// flip to cause it; the engine itself degrades only from the propagator's abandonment path.
+    #[doc(hidden)]
+    pub fn force_degraded(&self) {
+        self.degrade.mark();
+    }
+
+    /// Start the stream reaper, once, for an engine that now has subquery shapes to reap. Lazy for
+    /// the same reason the retention sweeper is: an engine that never serves a subquery can never
+    /// lose a flip, so it never needs the task.
+    pub(crate) fn ensure_degrade_reaper(&self) {
+        if self.degrade.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let engine = self.clone();
+        let mut wake = self.degrade.wake.subscribe();
+        tokio::spawn(async move {
+            while !engine.degraded() {
+                if wake.changed().await.is_err() {
+                    return; // engine gone
+                }
+            }
+            engine.reap_subquery_streams().await;
+        });
+    }
+
+    /// Delete every registered subquery shape's durable stream. Clients read durable-streams
+    /// directly, past the HTTP surface that now answers 503, so a deleted stream is the only way
+    /// they learn their shape is no longer maintained. The shape RECORDS stay registered (the
+    /// engine answers 503, not 404), and a restart re-seeds every node from Postgres and recreates
+    /// the streams — so this destroys nothing a restart would have kept.
+    async fn reap_subquery_streams(&self) {
+        let paths: Vec<String> = {
+            let st = self.state.lock().await;
+            st.shapes.values().filter(|r| r.is_subquery).map(|r| r.stream_path.clone()).collect()
+        };
+        tracing::error!("degraded: deleting {} subquery shape stream(s); clients must recreate against a restarted engine", paths.len());
+        for path in paths {
+            // Retried until storage accepts the delete (`delete_stream` counts a 404 as done): a
+            // stream left behind keeps serving rows the engine can no longer maintain.
+            let mut attempt = 0u32;
+            while let Err(e) = self.ds.delete_stream(&path).await {
+                attempt += 1;
+                let backoff = std::time::Duration::from_millis(
+                    100u64.saturating_mul(1 << attempt.min(5)).min(2000),
+                );
+                tracing::warn!(
+                    "degraded: deleting stream {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+
     fn subquery_handle(&self) -> SubqueryHandle {
         SubqueryHandle {
             registry: self.subqueries.clone(),
@@ -469,8 +641,13 @@ impl Engine {
         self.state.lock().await.tables.len()
     }
 
-    /// The `/v1/health` status string: `waiting` | `starting` | `active` (exact, no whitespace).
+    /// The `/v1/health` status string: `degraded` | `waiting` | `starting` | `active` (exact, no
+    /// whitespace). `degraded` outranks every boot phase — an engine that has lost membership
+    /// effects is not healthy however far along its boot got.
     pub fn health_status(&self) -> &'static str {
+        if self.degraded() {
+            return "degraded";
+        }
         match self.health.load(std::sync::atomic::Ordering::Relaxed) {
             HEALTH_WAITING => "waiting",
             HEALTH_STARTING => "starting",

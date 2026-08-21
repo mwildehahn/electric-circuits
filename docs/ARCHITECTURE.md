@@ -257,7 +257,15 @@ sequencer feeds every table's deltas into:
   so per-shape append order equals evaluation order — a stale move can never land after a fresher
   emission — without network under the lock. The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
-  undrained flips and enqueued-but-unlanded lane batches.
+  undrained flips and enqueued-but-unlanded lane batches. A failed query-back is **retried**, and
+  the retry resumes the DAG walk where the failure stopped (the walk consumes transitions, so
+  restarting it from the roots would derive nothing and silently lose the dependents' moves). If
+  the retries are exhausted the batch's effects are gone for good — the node already moved — so
+  the engine **fails closed**: the batch never decrements `pendingFlips` (the barrier can only
+  reach zero when every computed effect really landed), `flipFailures` counts it, `/v1/health`
+  turns `degraded` (503), every membership-bearing route answers 503, and every subquery shape's
+  durable stream is deleted so clients reading storage directly learn it too. Recovery is a
+  **restart**, which re-seeds every node from Postgres and recreates the streams.
 - **Absolute emission via the per-feed key set** — the correctness rule that keeps deferred
   flips convergent: for each touched pk the registry asserts the row's *current* membership into
   the shape's **feed set** (`subq_feed::FeedSet`, one host-side Roaring bitmap per feed), never a
@@ -272,6 +280,11 @@ sequencer feeds every table's deltas into:
   any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and
   UNKNOWN, and AND/OR are monotone over FALSE < UNKNOWN < TRUE, so inclusion can't change).
 - **Atomicity** — node creation/refcounts/edges roll back exactly on a failed shape create (§5.4).
+- **The creation window** — a subquery create registers its edges before it backfills, so a flip on
+  an inner node it *shares* with an already-live shape reaches it while there is no shape to move
+  yet. Such work is **queued on the pending create** and replayed once the shape is installed (both
+  in one registry step, so a flip either queues or finds the shape), which is what keeps an inner
+  change committed after the backfill's snapshot from being lost for the new shape.
 
 ---
 

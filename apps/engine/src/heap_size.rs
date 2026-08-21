@@ -8,7 +8,7 @@
 //! non-uniquely-owned data (`Arc<T>` payloads, `DsClient` handles, channel senders) is
 //! deliberately not counted — undercounting shared refs keeps this a lower bound, never an
 //! over-count from double-attribution.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub trait HeapSize {
     fn heap_bytes(&self) -> usize;
@@ -20,6 +20,12 @@ impl HeapSize for String {
     }
 }
 impl<T: HeapSize> HeapSize for Vec<T> {
+    fn heap_bytes(&self) -> usize {
+        self.capacity() * std::mem::size_of::<T>() + self.iter().map(HeapSize::heap_bytes).sum::<usize>()
+    }
+}
+/// A `VecDeque`'s ring buffer is one allocation of `capacity()` slots, exactly like a `Vec`'s.
+impl<T: HeapSize> HeapSize for VecDeque<T> {
     fn heap_bytes(&self) -> usize {
         self.capacity() * std::mem::size_of::<T>() + self.iter().map(HeapSize::heap_bytes).sum::<usize>()
     }
