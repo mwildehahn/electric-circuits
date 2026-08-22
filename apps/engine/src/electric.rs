@@ -372,6 +372,17 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // Matched by TYPE, exactly as the native surface does (`http.rs`): a create that kept losing
+        // the same race is not a server fault — the request is valid and the engine is busy retiring
+        // things underneath it — so an Electric client is told to come back rather than to treat the
+        // shape as broken.
+        if e.downcast_ref::<crate::engine::CreateRaced>().is_some() {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("{e:#}"),
+                retry_after: Some(1),
+            };
+        }
         ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:#}"), retry_after: None }
     }
 }

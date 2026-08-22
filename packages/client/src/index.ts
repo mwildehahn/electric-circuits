@@ -21,12 +21,12 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { z } from 'zod'
 
 import { createSubset, deleteShapeWithRetry, type SubsetSubscription } from './subset.js'
-import { resolveTableDef } from './tables.js'
+import { canonicalTableIndex, resolveTableDef, tableSpellings } from './tables.js'
 
 export type { SubsetSubscription } from './subset.js'
 // Table-spelling resolution (ADR-0002): exported so an app that keeps its own schema map can key it
 // the same way the client does.
-export { lookupTableDef, resolveTableDef } from './tables.js'
+export { canonicalTableIndex, lookupTableDef, resolveTableDef, tableSpellings } from './tables.js'
 // LSN-positioning primitives (also unit-tested in subset.test.ts) — exported so integration tests can
 // exercise the real merge logic against the live engine.
 export { lsnToU64, mergeFeedDelta, type SubsetView, type MergeAction } from './subset.js'
@@ -111,7 +111,17 @@ function zodRowSchema(def: TableDef, cols?: string[]): z.ZodType {
     const c = def.columns[col]
     if (!c) continue
     // pk is validated as its declared type here, then the dispatcher stringifies it on the row.
-    const base = c.type === 'bool' ? z.boolean() : c.type === 'text' ? z.string() : z.number()
+    // `int` accepts `number | string`: a PostgreSQL bigint outside the 2^53 range a JSON number
+    // round-trips arrives as an exact decimal STRING rather than a silently rounded number
+    // (`docs/ARCHITECTURE.md` §2) — `BigInt(v)` it when you need arithmetic at that scale.
+    const base =
+      c.type === 'bool'
+        ? z.boolean()
+        : c.type === 'text'
+          ? z.string()
+          : c.type === 'int'
+            ? z.union([z.number(), z.string()])
+            : z.number()
     // Non-pk columns are nullable (the pk is never null); allow null cells to materialize.
     shape[col] = col === def.primaryKey ? base : base.nullable()
   }
@@ -151,15 +161,20 @@ export function createClient(opts: {
   const write = (input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }) =>
     trpc.ingest.write.mutate(input)
 
-  // Derive a typed ingestion helper per table from the schema.
+  // Derive a typed ingestion helper per table from the schema. The schema is canonicalised ONCE
+  // here (ADR-0002), which is also where a canonical conflict — the same table under two spellings —
+  // is refused: constructing a client whose validation depends on which alias a call used is not a
+  // state worth entering. Each table is then exposed under every spelling it answers to (`items`
+  // and `public.items` are one entry reachable by two names, never two entries).
   const tables: Record<string, TableApi> = {}
-  for (const [table, tdef] of Object.entries(opts.schema.tables)) {
+  for (const [table, tdef] of canonicalTableIndex(opts.schema)) {
     const pkCol = tdef.primaryKey
-    tables[table] = {
+    const api: TableApi = {
       insert: (row, txid) => write({ table, op: 'insert', pk: row[pkCol] ?? null, row, txid }),
       update: (row, txid) => write({ table, op: 'update', pk: row[pkCol] ?? null, row, txid }),
       delete: (pk, txid) => write({ table, op: 'delete', pk, txid }),
     }
+    for (const spelling of tableSpellings(table)) tables[spelling] = api
   }
 
   return {

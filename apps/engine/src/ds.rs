@@ -207,10 +207,35 @@ enum AppendError {
     Other(anyhow::Error),
 }
 
+/// What the engine decides about a shape stream whose append came back **terminal** (404, 410, or
+/// 409 + `stream-closed`) — see [`DsClient::set_gone_reconciler`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoneVerdict {
+    /// The engine does not hold this stream any more (retired, evicted, purged, or never a shape
+    /// stream at all): discarding the batch is correct and complete.
+    Discard,
+    /// The shape is still registered AND storage still has its stream: the terminal answer was
+    /// FALSE — a proxy, a router or a failover said 404 about a stream that is right there. Retry
+    /// the append; the batch belongs to a live shape and dropping it is permanent divergence.
+    Retry,
+}
+
+/// Reconcile a terminal-looking append answer against engine state. Installed once by the engine
+/// (see `Engine::install_gone_reconciler`); absent in the tests/tools that use a bare `DsClient`,
+/// where a terminal answer is taken at face value exactly as before.
+pub type GoneReconciler = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = GoneVerdict> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct DsClient {
     base: String,
     http: reqwest::Client,
+    /// Shared across clones (installed after the engine exists, seen by every copy of the client
+    /// from then on). See [`Self::set_gone_reconciler`].
+    reconcile: std::sync::Arc<std::sync::OnceLock<GoneReconciler>>,
     /// Bytes appended per stream path since this process started (serialized request bodies).
     /// The durable-streams server exposes no per-stream sizes, so this engine-side accounting is
     /// what the retention disk-budget layer works from. It undercounts streams that already
@@ -223,8 +248,17 @@ impl DsClient {
         DsClient {
             base: base.into(),
             http: reqwest::Client::new(),
+            reconcile: std::sync::Arc::new(std::sync::OnceLock::new()),
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Install the reconciler [`Self::append_reliable`] consults before believing a terminal
+    /// append answer (see [`GoneVerdict`]). Shared by every clone of this client, including the ones
+    /// already handed to the sequencer, the emission lanes and the subquery registry — which is why
+    /// it can be installed after construction. Idempotent: a second install is ignored.
+    pub fn set_gone_reconciler(&self, reconciler: GoneReconciler) {
+        let _ = self.reconcile.set(reconciler);
     }
 
     /// Tracked bytes appended to `path` since process start (0 if never appended).
@@ -331,6 +365,81 @@ impl DsClient {
         }
     }
 
+    /// How long [`Self::append_retrying`] keeps trying a transient failure before giving up. Long
+    /// enough to ride out a storage restart or a failover, short enough that a boot does not hang
+    /// on a dependency that is not coming back.
+    pub const RESTORE_APPEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Append on a path where **failing costs the shape**: activation, the catalog restore's
+    /// re-seed, a dormant shape's replay. Transient storage failures (`ds::is_unavailable`:
+    /// transport, timeout, 5xx) are retried with capped backoff until `budget` runs out or the
+    /// shutdown token fires.
+    ///
+    /// The plain [`Self::append`] propagates the first error, and these callers turn an error into
+    /// a **retirement** — so one 503 during a boot used to permanently delete an acknowledged
+    /// subscription and its stream. Permanent removal is for records that are genuinely
+    /// unrecoverable: a definite refusal (a 4xx, an unserialisable event), a stream storage confirms
+    /// is gone (`HEAD` → 404/410/closed), or an exhausted budget. A service that is merely
+    /// unavailable is backpressure, not loss.
+    ///
+    /// A **terminal** answer (404/410/`stream-closed`) gets the same reconciliation
+    /// [`Self::append_reliable`] gives it, and for the same reason: it is what a proxy, a storage
+    /// router or a failover says just as readily as a real deletion, and believing one here retires
+    /// an acknowledged shape. `HEAD` decides — the stream is there and open ⇒ the status was false,
+    /// keep retrying within the budget; storage agrees it is gone (or a `HEAD` that itself fails
+    /// cannot say) ⇒ only the first of those is terminal.
+    pub async fn append_retrying(
+        &self,
+        path: &str,
+        envelopes: &[Envelope],
+        budget: std::time::Duration,
+        shutdown: &crate::shutdown::ShutdownToken,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + budget;
+        let mut attempt = 0u32;
+        loop {
+            let e = match self.append_checked(path, envelopes).await {
+                Ok(Appended::Ok { .. }) => return Ok(()),
+                Ok(Appended::Retired(status)) => match self.head(path).await {
+                    // There and appendable: the terminal status did not come from storage.
+                    Ok(Some(head)) if !head.closed => anyhow::anyhow!(
+                        "POST {path} -> {status}, contradicted by HEAD (the stream is there): treating it as transient"
+                    ),
+                    // Storage agrees: this one really is terminal, and the caller retires the record.
+                    Ok(_) => bail!("POST {path} -> {status} (stream retired)"),
+                    // Cannot tell. Retrying costs a stale append at worst; retiring on a guess costs
+                    // an acknowledged subscription.
+                    Err(he) => anyhow::anyhow!("POST {path} -> {status}; HEAD could not confirm it ({he:#})"),
+                },
+                Err(e) => {
+                    if !is_unavailable(&e) {
+                        return Err(e);
+                    }
+                    // Storage answering "no such stream" to a HEAD is the one transient-looking case
+                    // that is really terminal: stop waiting and let the caller retire the record.
+                    if let Ok(None) = self.head(path).await {
+                        return Err(e.context(format!("stream '{path}' is gone")));
+                    }
+                    e
+                }
+            };
+            attempt += 1;
+            if std::time::Instant::now() >= deadline {
+                return Err(e.context(format!(
+                    "appending to {path} kept failing for {budget:?} ({attempt} attempts)"
+                )));
+            }
+            let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+            tracing::warn!("append to {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = shutdown.wait() => {
+                    return Err(e.context(format!("appending to {path} abandoned: shutting down")));
+                }
+            }
+        }
+    }
+
     /// Append, reporting a retired stream as an outcome instead of an error, and handing back the
     /// stream's tail offset on success.
     ///
@@ -398,14 +507,41 @@ impl DsClient {
     /// absolute per-pk and the stream is about to be deleted, so the discarded batch has no reader
     /// left to diverge. The change log must keep using [`Self::append`] (which propagates): a closed
     /// `changes/*` segment is a routing signal, and silently dropping ingest there would lose data.
+    ///
+    /// **A terminal answer is reconciled, never taken on trust.** "404" is what a proxy, a storage
+    /// router or a failover says just as readily as a real deletion, and this method's `false` makes
+    /// the caller advance past the batch — leaving a still-registered shape permanently missing a
+    /// committed Postgres change, with nothing anywhere that remembers it. So when a reconciler is
+    /// installed ([`Self::set_gone_reconciler`]) the engine gets to answer: [`GoneVerdict::Retry`]
+    /// (the shape is registered and its stream is right there — the 404 was false) keeps retrying,
+    /// and [`GoneVerdict::Discard`] means the engine has confirmed the stream is gone and has retired
+    /// the shape, so the batch has no reader left. Either way the shape's batch is never silently
+    /// abandoned while the shape stays registered and stale.
     pub async fn append_reliable(&self, path: &str, envelopes: &[Envelope]) -> bool {
         let mut attempt = 0u32;
+        let mut false_gone = 0u32;
         loop {
             match self.append_once(path, envelopes).await {
                 Ok(_) => return true,
                 Err(AppendError::Gone(status)) => {
-                    tracing::debug!("append to {path}: stream retired ({status}); discarding {} envelopes", envelopes.len());
-                    return false;
+                    let verdict = match self.reconcile.get() {
+                        Some(reconcile) => reconcile(path.to_string()).await,
+                        None => GoneVerdict::Discard,
+                    };
+                    if verdict == GoneVerdict::Discard {
+                        tracing::debug!("append to {path}: stream retired ({status}); discarding {} envelopes", envelopes.len());
+                        return false;
+                    }
+                    false_gone += 1;
+                    if false_gone == 1 {
+                        tracing::warn!(
+                            "append to {path} answered {status}, but the shape is still registered and its \
+                             stream is still there: treating the terminal status as transient and retrying"
+                        );
+                    }
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+                    tokio::time::sleep(backoff).await;
                 }
                 Err(AppendError::Other(e)) => {
                     attempt += 1;

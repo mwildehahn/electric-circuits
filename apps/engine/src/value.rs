@@ -38,14 +38,28 @@ pub enum Value {
     Float(OrderedFloat<f64>),
 }
 
+/// Integers a JSON **number** round-trips through IEEE-754 double without loss: `2^53 - 1`. Beyond
+/// it every JSON parser that decodes numbers as doubles (every JavaScript one) silently drops the
+/// low digits, so an exact value has to leave the number space — the same rule the aggregate `SUM`
+/// encoding already follows (`engine::executors::AggSum::to_json`).
+pub const JSON_EXACT_INT_MAX: u64 = 9_007_199_254_740_991;
+
 impl Value {
     /// Parse a JSON scalar into a `Value` of the given column type. `null` -> `Null`.
+    ///
+    /// An `int` column also accepts a **decimal string** — that is what
+    /// [`to_json`](Self::to_json) emits beyond [`JSON_EXACT_INT_MAX`], so the encoding round-trips.
     pub fn from_json(j: &serde_json::Value, ty: ColumnType) -> Result<Value> {
         if j.is_null() {
             return Ok(Value::Null);
         }
         Ok(match ty {
-            ColumnType::Int => Value::Int(j.as_i64().context("expected an integer")?),
+            ColumnType::Int => match j {
+                serde_json::Value::String(s) => {
+                    Value::Int(s.parse().with_context(|| format!("expected an integer, got '{s}'"))?)
+                }
+                _ => Value::Int(j.as_i64().context("expected an integer")?),
+            },
             ColumnType::Float => Value::Float(OrderedFloat(j.as_f64().context("expected a float")?)),
             ColumnType::Text => Value::Text(j.as_str().context("expected a string")?.to_string()),
             ColumnType::Bool => Value::Bool(j.as_bool().context("expected a bool")?),
@@ -85,10 +99,19 @@ impl Value {
         })
     }
 
+    /// The wire encoding of a cell: everything a JSON number can carry exactly stays a number, and
+    /// an integer outside that range (`|v| > `[`JSON_EXACT_INT_MAX`]) becomes a decimal **string**.
+    ///
+    /// Postgres `bigint` reaches `2^63-1`, so a single cell can already exceed what a JavaScript
+    /// JSON parser reproduces — and the engine does not hand back a silently rounded number. This is
+    /// the same rule the aggregate `SUM` encoding follows; it applies to every row value the engine
+    /// serialises (shape-stream envelopes, `/query` pages, subset pages, MIN/MAX of an int column).
+    /// [`from_json`](Self::from_json) accepts the string form back, so the encoding round-trips.
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             Value::Null => serde_json::Value::Null,
-            Value::Int(i) => (*i).into(),
+            Value::Int(i) if i.unsigned_abs() <= JSON_EXACT_INT_MAX => (*i).into(),
+            Value::Int(i) => serde_json::Value::String(i.to_string()),
             Value::Float(f) => serde_json::json!(f.0),
             Value::Text(s) => s.clone().into(),
             Value::Bool(b) => (*b).into(),
@@ -145,6 +168,40 @@ impl HeapSize for Row {
 impl HeapSize for Tup2<Row, ZWeight> {
     fn heap_bytes(&self) -> usize {
         self.0.heap_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire rule for `int` cells: a JSON number while it round-trips through a double, an exact
+    /// decimal string beyond — and `from_json` accepts the string back, so a value survives a
+    /// serialise/parse cycle unchanged.
+    #[test]
+    fn an_int_beyond_2_53_keeps_its_exact_wire_form() {
+        let exact = |v: i64| Value::Int(v).to_json();
+        assert_eq!(exact(0), serde_json::json!(0));
+        assert_eq!(exact(JSON_EXACT_INT_MAX as i64), serde_json::json!(9_007_199_254_740_991i64));
+        assert_eq!(exact(-(JSON_EXACT_INT_MAX as i64)), serde_json::json!(-9_007_199_254_740_991i64));
+        // 2^53 + 1: the first value a JavaScript JSON parser cannot reproduce.
+        assert_eq!(exact(9_007_199_254_740_993), serde_json::json!("9007199254740993"));
+        assert_eq!(exact(i64::MIN), serde_json::json!("-9223372036854775808"));
+
+        for v in [0i64, 1, -1, JSON_EXACT_INT_MAX as i64, 9_007_199_254_740_993, i64::MAX, i64::MIN] {
+            let round = Value::from_json(&Value::Int(v).to_json(), ColumnType::Int).unwrap();
+            assert_eq!(round, Value::Int(v), "int {v} must survive the wire encoding");
+        }
+        // Only integers change form; the other types are unaffected.
+        assert_eq!(Value::Float(OrderedFloat(1.5)).to_json(), serde_json::json!(1.5));
+        assert_eq!(Value::Text("9007199254740993".into()).to_json(), serde_json::json!("9007199254740993"));
+    }
+
+    /// A non-numeric string against an int column is still an error — the string form is an exact
+    /// integer encoding, not a lenient cast.
+    #[test]
+    fn a_non_numeric_string_is_not_an_int() {
+        assert!(Value::from_json(&serde_json::json!("nope"), ColumnType::Int).is_err());
     }
 }
 

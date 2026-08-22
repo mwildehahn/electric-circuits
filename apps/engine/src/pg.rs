@@ -1277,6 +1277,24 @@ pub async fn query_subset_where(
     result
 }
 
+/// One `ORDER BY` term for a subset page.
+///
+/// A text column is ordered `COLLATE "C"` — **code-point order** — because the subset client
+/// classifies live rows against the loaded page's boundary itself, and it can only compare the
+/// strings it received. Ordering by the database's default collation (`en_US.UTF-8` sorts
+/// case-insensitively-ish, `C.UTF-8` by bytes) would put the page in an order the client cannot
+/// reproduce, and a row on the wrong side of the boundary silently enters or leaves the window.
+/// `COLLATE "C"` is also the order the engine's own predicate evaluation uses, so all three agree.
+/// Documented in `docs/ARCHITECTURE.md` §7 and `packages/client/README.md`.
+fn order_term(ts: &TableSchema, col: usize, dir: &str) -> String {
+    let ident = quote_ident(&ts.columns[col].0);
+    if ts.is_collatable_text(col) {
+        format!("{ident} collate \"C\" {dir}")
+    } else {
+        format!("{ident} {dir}")
+    }
+}
+
 async fn query_subset_in_txn(
     client: &Client,
     ts: &TableSchema,
@@ -1294,13 +1312,16 @@ async fn query_subset_in_txn(
         params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
     // ORDER BY <col> <dir>, <pk> <dir> for a total order; a limit/offset without an explicit order
     // falls back to pk order so the page is deterministic. Idents are quoted; limit/offset are
-    // non-negative integer literals — no injection surface.
+    // non-negative integer literals — no injection surface. Text terms carry an explicit
+    // `COLLATE "C"` — see `order_term`.
     let order_sql = match order {
         Some((col, desc)) => {
             let d = if desc { "desc" } else { "asc" };
-            format!(" order by {} {d}, {} {d}", quote_ident(&ts.columns[col].0), quote_ident(&ts.pk_name))
+            format!(" order by {}, {}", order_term(ts, col, d), order_term(ts, ts.pk_index, d))
         }
-        None if limit.is_some() || offset.is_some() => format!(" order by {} asc", quote_ident(&ts.pk_name)),
+        None if limit.is_some() || offset.is_some() => {
+            format!(" order by {}", order_term(ts, ts.pk_index, "asc"))
+        }
         None => String::new(),
     };
     let limit_sql = limit.map(|n| format!(" limit {}", n.max(0))).unwrap_or_default();

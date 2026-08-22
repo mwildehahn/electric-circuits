@@ -242,7 +242,46 @@ pub struct TableSchema {
 
 /// Separator joining composite-key column values into the durable-stream `key` string. Chosen to not
 /// collide with real id text (the standard schema's ids are `l1-1` etc.).
-const PK_SEP: char = '\u{1f}';
+pub const PK_SEP: char = '\u{1f}';
+
+/// Escape one component of a **composite** key so the joined string is an injective encoding of the
+/// tuple: `\` becomes `\\` and the separator itself becomes `\x1f`. An escaped component therefore
+/// contains no bare separator and no bare backslash, so splitting the result on U+001F recovers
+/// exactly the original components — and two distinct Postgres key tuples can never spell the same
+/// native key. (`(x, "y\u{1f}z")` and `("x\u{1f}y", z)` used to collide, and `translate_output`
+/// de-duplicates by this string, so one of the two rows was lost.)
+///
+/// Single-column keys are NOT escaped: their key string is the value itself, which is what every
+/// client-visible key, `Value::from_key_string`, and the routing/dedup paths already assume. The
+/// encoding is greenfield — clients resync at cutover, so there is no legacy form to accept.
+pub fn escape_key_component(part: &str) -> String {
+    if !part.contains('\\') && !part.contains(PK_SEP) {
+        return part.to_string();
+    }
+    let mut out = String::with_capacity(part.len() + 8);
+    for c in part.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            PK_SEP => out.push_str("\\x1f"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Join already-stringified key components into the composite key string (escaping each). The one
+/// implementation, shared by [`TableSchema::key_string`] and the replication decoder's
+/// `key_from_obj`, so the backfill and the live path spell an identical key for the same row.
+pub fn join_key_components<I: IntoIterator<Item = S>, S: AsRef<str>>(parts: I) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            out.push(PK_SEP);
+        }
+        out.push_str(&escape_key_component(part.as_ref()));
+    }
+    out
+}
 
 impl TableSchema {
     pub fn from_def(table: &TableRef, def: &TableDef) -> Result<Self> {
@@ -276,15 +315,45 @@ impl TableSchema {
         })
     }
 
+    /// Is this column a **collation-dependent text** column — one whose SQL ordering depends on the
+    /// database's collation AND whose value reaches a client as its own text?
+    ///
+    /// The engine compares text in **code-point order** everywhere it evaluates a predicate itself
+    /// (Rust `String` ordering), and the subset client can only compare the strings it received. So
+    /// every SQL site that ORDERS or RANGE-COMPARES such a column spells `COLLATE "C"` explicitly,
+    /// making Postgres, the engine and the client agree whatever the database's default collation
+    /// is (`pg::order_term`, `sql::build`).
+    ///
+    /// Only genuinely collatable types qualify, and only when the Postgres type is **known**: our
+    /// coarse `Text` also covers `uuid`, `timestamptz` and friends, whose order is
+    /// collation-independent and which REFUSE a collation outright (`collations are not supported by
+    /// type uuid`). `None` — a schema declared through `POST /schema` rather than introspected, which
+    /// is possible in every mode because that route overwrites introspected schemas — is therefore
+    /// NOT collated: the declaration says "text", but the column underneath may be a `uuid`, and
+    /// emitting `COLLATE "C"` for it would turn every subset page on that table into an error.
+    /// The consequence is worth stating plainly: **the code-point ordering guarantee needs
+    /// introspection.** A JSON-declared text column is ordered and range-compared in the database's
+    /// default collation, which the subset client cannot reproduce.
+    pub fn is_collatable_text(&self, col: usize) -> bool {
+        if self.columns.get(col).map(|(_, ty)| *ty) != Some(ColumnType::Text) {
+            return false;
+        }
+        match self.pg_types.get(col).and_then(|o| o.as_deref()) {
+            None => false,
+            Some(t) => matches!(t, "text" | "varchar" | "bpchar" | "char" | "name" | "citext"),
+        }
+    }
+
     /// The raw Postgres type name of a column by name (for casting bound params to the native type).
     /// `None` in library mode or for an unknown column.
     pub fn pg_type_of(&self, col: &str) -> Option<&str> {
         self.index.get(col).and_then(|&i| self.pg_types.get(i)).and_then(|o| o.as_deref())
     }
 
-    /// The durable-stream event `key` for a row: the single PK value's key-string, or composite PK column
-    /// values joined by [`PK_SEP`]. This is the row identity used for routing, dedup, and subquery
-    /// contributor ref-counting.
+    /// The durable-stream event `key` for a row: the single PK value's key-string, or composite PK
+    /// column values ESCAPED ([`escape_key_component`]) and joined by [`PK_SEP`]. This is the row
+    /// identity used for routing, dedup, and subquery contributor ref-counting — so the encoding has
+    /// to be injective, or two legal Postgres tuples fold into one row.
     pub fn key_string(&self, row: &Row) -> Result<String> {
         if self.pk_cols.len() == 1 {
             return Ok(row.get(self.pk_cols[0])?.to_key_string());
@@ -294,7 +363,7 @@ impl TableSchema {
             .iter()
             .map(|&i| row.get(i).map(Value::to_key_string))
             .collect::<Result<_>>()?;
-        Ok(parts.join(&PK_SEP.to_string()))
+        Ok(join_key_components(parts))
     }
 
     pub fn column_index(&self, col: &str) -> Result<usize> {
@@ -497,6 +566,50 @@ mod tests {
         assert_eq!(describe_drift(&catalog, &wire), ["column 'secret' dropped"]);
         // Stable: re-reading the catalog changes nothing.
         assert!(!catalog.still_serves(&wire));
+    }
+
+    /// Composite key identity must be INJECTIVE. The two tuples below are distinct in Postgres and
+    /// used to spell the same native key (`x\u{1f}y\u{1f}z`), so `translate_output`'s per-key
+    /// de-duplication silently dropped one of the rows.
+    #[test]
+    fn a_composite_key_encodes_the_tuple_unambiguously() {
+        let json = serde_json::json!({
+            "columns": { "a": {"type":"text"}, "b": {"type":"text"}, "payload": {"type":"text"} },
+            "primaryKey": ["a", "b"]
+        });
+        let def: TableDef = serde_json::from_value(json).unwrap();
+        let ts = TableSchema::from_def(&TableRef::parse("items").unwrap(), &def).unwrap();
+        // columns sort to (a, b, payload); pk_cols = [0, 1]
+        let row = |a: &str, b: &str| {
+            Row(vec![Value::Text(a.into()), Value::Text(b.into()), Value::Text("p".into())])
+        };
+        let first = ts.key_string(&row("x", "y\u{1f}z")).unwrap();
+        let second = ts.key_string(&row("x\u{1f}y", "z")).unwrap();
+        assert_ne!(first, second, "distinct key tuples must not collide");
+        assert_eq!(first, "x\u{1f}y\\x1fz");
+        assert_eq!(second, "x\\x1fy\u{1f}z");
+
+        // A backslash in a component is escaped too, so the escape itself cannot be forged: a
+        // literal `\x1f` and a real separator stay distinct.
+        let literal = ts.key_string(&row("x", "y\\x1fz")).unwrap();
+        assert_eq!(literal, "x\u{1f}y\\\\x1fz");
+        assert_ne!(literal, first);
+
+        // Single-column keys are untouched — the value IS the key string.
+        let single = serde_json::json!({
+            "columns": { "id": {"type":"text"} }, "primaryKey": "id"
+        });
+        let sdef: TableDef = serde_json::from_value(single).unwrap();
+        let sts = TableSchema::from_def(&TableRef::parse("one").unwrap(), &sdef).unwrap();
+        assert_eq!(sts.key_string(&Row(vec![Value::Text("a\u{1f}b".into())])).unwrap(), "a\u{1f}b");
+    }
+
+    /// The replication decoder builds envelope keys from the parsed row object, not from a `Row`;
+    /// both paths must spell the same key or a live update would never retract its backfilled row.
+    #[test]
+    fn the_replication_decoder_agrees_with_key_string() {
+        assert_eq!(join_key_components(["x", "y\u{1f}z"]), "x\u{1f}y\\x1fz");
+        assert_eq!(join_key_components(["x\u{1f}y", "z"]), "x\\x1fy\u{1f}z");
     }
 
     /// The durable audit record spells the identity as Postgres does.

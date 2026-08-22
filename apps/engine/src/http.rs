@@ -739,6 +739,9 @@ impl From<anyhow::Error> for AppError {
         let status = if e.downcast_ref::<crate::engine::Degraded>().is_some()
             || e.downcast_ref::<crate::engine::EpochBroken>().is_some()
             || e.downcast_ref::<crate::engine::EpochResetting>().is_some()
+            // A create that kept losing the same race is not a server fault either: the request is
+            // valid, the engine is busy retiring things underneath it (`CreateRaced`).
+            || e.downcast_ref::<crate::engine::CreateRaced>().is_some()
         {
             StatusCode::SERVICE_UNAVAILABLE
         } else {

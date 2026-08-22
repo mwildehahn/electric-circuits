@@ -7,7 +7,16 @@
 
 import type { AppRouter } from '@electric-circuits/api'
 import { canonicalTable } from '@electric-circuits/protocol'
-import type { Predicate, Row, Schema, StreamEnvelope, SubsetDef, SubsetResult, Value } from '@electric-circuits/protocol'
+import type {
+  ColumnType,
+  Predicate,
+  Row,
+  Schema,
+  StreamEnvelope,
+  SubsetDef,
+  SubsetResult,
+  Value,
+} from '@electric-circuits/protocol'
 import { stream } from '@durable-streams/client'
 import { createCollection, type Collection } from '@tanstack/db'
 import type { createTRPCClient } from '@trpc/client'
@@ -36,31 +45,74 @@ export interface SubsetDeps {
 }
 
 /**
- * Compare two cell values (numbers numerically, everything else lexically). NULL sorts **last**,
- * which is PostgreSQL's default for an ascending `ORDER BY`; `makeCmp` multiplies by the order's
- * direction, so a descending order gets NULLS FIRST — Postgres's other default. The engine's page
- * query uses a plain `ORDER BY <col> <dir>`, so this is the same order the page arrives in.
+ * Compare two strings by Unicode **code point**, which is the order the engine's subset page arrives
+ * in (`ORDER BY <col> COLLATE "C"`) and the order the engine's own predicate evaluation uses.
+ *
+ * JavaScript's `<` compares UTF-16 **code units**, which is a different order: a supplementary
+ * character (U+1F600 → surrogates D83D DE00) sorts before the private-use area (U+E000) under `<`,
+ * and after it by code point — so a live row could be admitted to, or dropped from, a loaded window
+ * PostgreSQL puts on the other side of the boundary. Iterating with `for…of` yields code points.
  */
-function cmpVal(a: Value, b: Value): number {
+export function cmpCodePoints(a: string, b: string): number {
+  if (a === b) return 0
+  const ai = a[Symbol.iterator]()
+  const bi = b[Symbol.iterator]()
+  for (;;) {
+    const x = ai.next()
+    const y = bi.next()
+    if (x.done) return y.done ? 0 : -1
+    if (y.done) return 1
+    const ax = x.value.codePointAt(0) as number
+    const bx = y.value.codePointAt(0) as number
+    if (ax !== bx) return ax < bx ? -1 : 1
+  }
+}
+
+/**
+ * Compare two cell values of a column of type `ty`. NULL sorts **last**, which is PostgreSQL's
+ * default for an ascending `ORDER BY`; `makeCmp` multiplies by the order's direction, so a
+ * descending order gets NULLS FIRST — Postgres's other default. The engine's page query uses
+ * `ORDER BY <col> COLLATE "C" <dir>` for text, so this is the same order the page arrives in — see
+ * `packages/client/README.md` and `docs/ARCHITECTURE.md` §7.
+ *
+ * The column TYPE decides the comparison, never the runtime shape of the value: an `int` cell is
+ * `number | string` on the wire (a bigint beyond 2^53 arrives as an exact decimal string), so
+ * comparing "whatever looks numeric" numerically would order a **text** column's `'10'` before
+ * `'9'`, which PostgreSQL does not.
+ */
+function cmpVal(a: Value, b: Value, ty?: ColumnType): number {
   if (a === b) return 0
   if (a == null) return b == null ? 0 : 1
   if (b == null) return -1
+  if (ty === 'int') {
+    const ai = BigInt(a as number | string)
+    const bi = BigInt(b as number | string)
+    return ai < bi ? -1 : ai > bi ? 1 : 0
+  }
   if (typeof a === 'number' && typeof b === 'number') return a - b
-  const as = String(a)
-  const bs = String(b)
-  return as < bs ? -1 : as > bs ? 1 : 0
+  return cmpCodePoints(String(a), String(b))
 }
 
-/** Row comparator matching the engine's `ORDER BY <col> <dir>, <pk> <dir>` (pk tiebreaker, same dir). */
-function makeCmp(pk: string, orderBy?: { col: string; desc?: boolean }): (a: Row, b: Row) => number {
+/**
+ * Row comparator matching the engine's `ORDER BY <col> <dir>, <pk> <dir>` (pk tiebreaker, same
+ * dir). `types` resolves a column's declared type so each comparison uses the column's own order
+ * (see [`cmpVal`]); an unknown column falls back to the value-shape rules.
+ */
+export function makeCmp(
+  pk: string,
+  orderBy?: { col: string; desc?: boolean },
+  types?: (col: string) => ColumnType | undefined,
+): (a: Row, b: Row) => number {
   const dir = orderBy?.desc ? -1 : 1
   const col = orderBy?.col
+  const colType = col ? types?.(col) : undefined
+  const pkType = types?.(pk)
   return (a, b) => {
     if (col) {
-      const d = cmpVal(a[col], b[col])
+      const d = cmpVal(a[col], b[col], colType)
       if (d !== 0) return dir * d
     }
-    return dir * cmpVal(a[pk], b[pk])
+    return dir * cmpVal(a[pk], b[pk], pkType)
   }
 }
 
@@ -225,7 +277,7 @@ export async function createSubset<T extends Row = Row>(
   // caller used, so the envelope filter below must compare against the canonical form.
   const feedType = canonicalTable(def.table)
   const pk = tableDef.primaryKey
-  const cmp = makeCmp(pk, def.orderBy)
+  const cmp = makeCmp(pk, def.orderBy, (col) => tableDef.columns[col]?.type)
   const limit = def.limit ?? 100
   // The order column + pk must be present on every row so membership/cursoring can be evaluated, even
   // when the caller projects a narrower column set.

@@ -11,6 +11,22 @@ dependencies. Four modules, re-exported from the package root:
 | `sql.ts` | predicate → SQL compiler (`predicateToSql`), DDL (`tableDDL`), DML (`changeEventToDML`), `shapeSelectSql` |
 | `envelope.ts` | `StreamEnvelope` — the State-Protocol change envelope on every table/shape durable stream (`type`, `key`, `value`, `headers.operation/txid/lsn/seq`) |
 
+## Scalar values on the wire
+
+`Value` is `number | string | boolean | null`, and the shape of an **`int`** cell is deliberately two
+of those. Postgres `bigint` reaches `2^63-1` while every JavaScript JSON parser decodes numbers as
+doubles, so the engine emits a JSON **number** while `|v| <= 2^53 - 1` and an exact decimal **string**
+beyond it — a number that large would be silently rounded, and the engine does not hand back a wrong
+value that looks right. The rule holds wherever a row value is serialised: shape-stream envelopes,
+`query()` pages, subset pages, and MIN/MAX over an int column (the aggregate `SUM` encoding it
+generalises is older). `String(v)` is always the exact decimal; `BigInt(v)` is the arithmetic form.
+Consumers that assumed `typeof row.<intcol> === 'number'` must widen.
+
+The envelope **`key`** is the stringified primary key. A composite key is its components escaped
+(`\` -> `\\`, U+001F -> `\x1f`) and joined with U+001F, so distinct key tuples can never spell the
+same key (`docs/ARCHITECTURE.md` §2). This package's `toTableEnvelope` covers the single-column case
+only: `TableDef.primaryKey` is one column name, and the native write API takes one `pk` value.
+
 ## The Predicate AST
 
 A restricted boolean expression over one table's columns, plus single-column subqueries as the one

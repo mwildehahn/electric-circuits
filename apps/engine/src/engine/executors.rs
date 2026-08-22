@@ -264,8 +264,9 @@ pub(crate) fn value_f64(v: &Value) -> f64 {
 
 /// Integers a JSON number round-trips through IEEE-754 double without loss: `2^53 - 1`. Beyond it
 /// every JSON parser that decodes numbers as doubles (every JavaScript one) silently drops the low
-/// digits, so the sum has to leave the number space to stay exact.
-const JSON_EXACT_INT_MAX: u128 = 9_007_199_254_740_991;
+/// digits, so the sum has to leave the number space to stay exact. The same threshold governs every
+/// row value the engine serialises ([`crate::value::Value::to_json`]) — one rule, one constant.
+const JSON_EXACT_INT_MAX: u128 = crate::value::JSON_EXACT_INT_MAX as u128;
 
 /// The running SUM/AVG accumulator.
 ///

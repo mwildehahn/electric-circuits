@@ -108,6 +108,24 @@ Three ideas carry the whole design:
   `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), `seq` (the change's position
   within its transaction) and `last` (the transaction-end marker, on its final envelope only —
   ADR-0003, §3).
+- **The envelope `key` is the row's primary key, and the encoding is injective.** A single-column
+  key is the value's own string. A **composite** key escapes each component (`\` → `\\`, U+001F →
+  `\x1f`) and joins them with U+001F (`schema.rs::key_string` / `join_key_components`, mirrored by
+  the replication decoder's `key_from_obj` so the backfill and the live path spell the same key).
+  Escaping is what makes the encoding a *function of the tuple*: with raw components, the legal
+  Postgres tuples `('x', 'y␟z')` and `('x␟y', 'z')` both spell `x␟y␟z`, and `translate_output`
+  de-duplicates positive rows by exactly this string — so one of the two rows vanished from every
+  shape. Greenfield: there is no earlier encoding to accept (clients resync at cutovers).
+- **An `int` value beyond 2^53 keeps its exact form by leaving the number space.** Postgres `bigint`
+  reaches 2^63−1 and every JavaScript JSON parser decodes numbers as doubles, so `Value::to_json`
+  emits a JSON **number** while `|v| ≤ 2^53−1` and an exact decimal **string** beyond it —
+  the rule the aggregate `SUM` encoding already followed, now applied wherever a row value is
+  serialised: shape-stream envelopes, `POST /query`, subset pages, and MIN/MAX over an int column.
+  `Value::from_json` accepts the string form back, so the encoding round-trips. On the TypeScript
+  side an `int` cell is therefore `number | string` (`packages/protocol` `Value`, the client's zod
+  row schema); `String(v)` is always the exact decimal and `BigInt(v)` is the arithmetic form.
+  **Consumers of the envelope JSON (pgxsinkit included) see this on the wire**, so anything that
+  assumed `typeof value.<intcol> === 'number'` must widen.
 
 ---
 
@@ -362,11 +380,25 @@ Any two **equal** shapes share one maintained stream, ref-counted:
   shape id + stream. Joiners **wait for the creator's backfill to land** (a watch channel in the
   share entry) so no caller ever sees a stream whose snapshot isn't readable yet — and a *failed*
   creation propagates to every waiting joiner rather than handing them a dead stream.
+- **A join verifies the retained stream still exists** — one `HEAD` per join. The record is engine
+  state; the stream is storage's, and storage can lose it (an operator `DELETE`, a restore from an
+  older backup). Gone (404/410) or closed means the registry entry is stale: it is retired properly
+  (`Dropped` intent → close-then-delete → deregister) and the create falls through to minting a
+  fresh shape id and stream, instead of acknowledging a handle whose every read is 404. Only a share
+  that has reported *Ready* is probed — a creator registers its signature before it PUTs its stream,
+  so probing a pending one would kill a create in flight. `GET /shapes/{id}` deliberately does NOT
+  do this: it is a metadata read on every polling client's hot path, and joining is where a dead
+  handle actually gets handed out.
 - **Drop.** Deletes decrement; the shape, its routing/registry entries, **and its durable stream**
   are torn down when the last subscriber leaves (a dropped shape must not leave an orphaned stream
   on the storage server). N joiners hold the same id and must each delete exactly once; the client
   enforces one-shot `close()`.
-- The Electric `/v1/shape` adapter opts out (`share=false`) — its protocol needs per-request handles.
+- **Both public surfaces share.** The Electric `/v1/shape` adapter passes `share=true` as well and
+  keys its per-request live state by the SHARED shape id (`electric.rs`), so identical Electric
+  definitions collapse onto one maintained stream like everything else; `share=false` remains for a
+  caller that genuinely needs its own handle, and nothing in the tree currently is one. The join's
+  stream-liveness `HEAD` therefore applies to `/v1/shape` too — one storage round trip per join is
+  the cheaper half of that trade against handing a client a stream storage has already lost.
 
 ### 5.4 Creation is atomic; failures never leave zombies
 
@@ -377,6 +409,19 @@ rolled back, waiting joiners get the error, and the stream is deleted. This stru
 the "zombie shape" failure mode: a shape that is registered, streams nothing, and pins its
 signature so all future identical creates silently join a dead feed.
 
+**The closing check is taken again AFTER the catalog durability wait.** `Created`/`Joined` are
+durable-before-ack (§9), and that wait is unbounded external I/O — a whole interval, externally
+controllable by anyone who can make storage slow, in which a `TRUNCATE`, a schema drift, an epoch
+reset or a native purge can retire the very shape the request is about to acknowledge. So
+`Engine::recheck_after_durability` re-runs the degradation latch, the captured schema generations
+and the epoch generation, plus the one check they never needed: **is the record still registered, on
+the same stream?** (A purge removes the record without moving any generation.) One helper, six
+callers — the plain, subquery, aggregate and circuit-aggregate creates and both join paths. A
+mismatch unwinds through the ordinary rollback (`CreateGuard` for a create; giving the provisional
+refcount back for a join) and is typed `CreateRaced`, which the create **redoes** up to three times:
+the definition is still valid, only the attempt lost a race, and every client would otherwise have
+to implement that loop. Exhausting the retries answers 503.
+
 ### 5.5 Reliability: appends never drop silently
 
 A lost shape-stream append is a permanent divergence for every subscriber, so live-path appends use
@@ -386,6 +431,23 @@ stance as the ingestor's read-then-commit), and the only non-retried case is a *
 deleting it, §5.6) — i.e. the shape was dropped/evicted mid-flush; discard is correct. Because
 shape envelopes are absolute per-pk (`upsert`/`delete` by key), an ambiguous-failure double-append
 is idempotent for readers.
+
+**A terminal answer is reconciled, not taken on trust.** "404" is what a proxy, a storage router or
+a failover says just as readily as a real deletion, and discarding the batch makes the sequencer
+advance past a committed Postgres change — leaving a still-registered shape permanently, silently
+stale. So `append_reliable` asks the engine (`Engine::reconcile_gone_shape_stream`, installed on the
+streams client at construction): the shape is still registered on this stream and `HEAD` finds the
+stream ⇒ the status was false, keep retrying; storage really does not have it ⇒ **retire the shape**
+(`Dropped` intent, close-then-delete, deregister) so subscribers learn through 404/`stream-closed`
+and re-subscribe, and only then discard. The invariant: *a registered shape's batch is never
+abandoned without either landing it or retiring the shape.*
+
+**Restore-time appends retry instead of costing the shape.** Activation's aggregate re-seed, the
+circuit-aggregate seed and a dormant shape's replay are appends whose ERROR is what makes
+`apply_catalog` drop and retire an acknowledged subscription — so one transient 503 during a boot
+used to delete it for good. They use `append_retrying` (transient per `ds::is_unavailable`, capped
+backoff, 30 s budget, joined to the shutdown token); permanent removal is reserved for a definite
+refusal, a stream `HEAD` confirms is gone, or an exhausted budget.
 
 ### 5.6 Retirement closes the stream before deleting it
 
@@ -619,6 +681,28 @@ Paging is **keyset**, and the cursor has to agree with the page query's `ORDER B
   a non-zero page size, and a zero-size page never moves the cursor, so `hasMore()` would otherwise
   promise a next page that could never arrive. `loadMore(0)` is a no-op that reports 0 without
   claiming exhaustion.
+- **Text ordering in a subset is CODE-POINT order, not the database's collation.** Membership in the
+  loaded window is decided *client-side* — the engine holds no per-page state — so the client can
+  only compare the strings it received, and it cannot reproduce an arbitrary Postgres collation. The
+  page query therefore spells the order the client can reproduce: `ORDER BY <col> COLLATE "C" <dir>`
+  for genuinely collatable text columns (`text`/`varchar`/`bpchar`/`char`/`name`/`citext` — our
+  coarse `Text` also covers `uuid`/`timestamptz`, whose order is collation-independent and which
+  refuse a collation), and the keyset cursor's range comparisons carry the same `COLLATE "C"`, which
+  is also what the engine's own predicate evaluation does (Rust string comparison). All three sides
+  agree by construction whatever the database's default collation is. The client compares code
+  points, not UTF-16 code units: `<` puts U+1F600 (surrogates `D83D DE00`) *before* U+E000, where
+  every other side puts it after — enough to admit a row Postgres placed outside the window. Only
+  ordering comparisons are collated; `=`/`<>` are byte equality under any deterministic collation and
+  keep their index-eligible form.
+
+  Two limits worth knowing. **The guarantee needs introspection**: the collation is emitted only when
+  the column's Postgres type is KNOWN and collatable, so a table declared through `POST /schema`
+  rather than introspected (`pg_type: None`) is ordered in the database's default collation — the
+  declaration says "text", but the column underneath could be a `uuid`, and `COLLATE "C"` on one is
+  an error, not a mis-sort. And **`COLLATE "C"` on `<`/`>` defeats a default-collation btree index**:
+  on a `C`/`C.UTF-8` database the index already IS the "C" collation and nothing changes, but on
+  `en_US.UTF-8` a range scan over a large table falls back to a sequential scan. The remedy is an
+  expression index — `CREATE INDEX … ON t ((col COLLATE "C"))` — on the columns subsets order by.
 
 ---
 

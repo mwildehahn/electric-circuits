@@ -80,6 +80,26 @@ impl std::fmt::Display for Degraded {
 
 impl std::error::Error for Degraded {}
 
+/// A create or join finished its **catalog durability wait** only to find that the shape it was
+/// about to acknowledge is no longer the shape it made: retired by a schema drift / `TRUNCATE` /
+/// purge while the wait was in flight, or belonging to a superseded epoch.
+///
+/// `send_durable` is an unbounded wait on external storage, so it opens a whole new — externally
+/// controllable — interval between a create's last check and its answer. Typed, because the request
+/// itself is still perfectly valid: only this attempt lost a race, so the create is redone rather
+/// than making every client implement that retry (see `Engine::recheck_after_durability`). Reaching
+/// a caller at all means the retries were exhausted, which is a 503: come back.
+#[derive(Debug)]
+pub struct CreateRaced(pub String);
+
+impl std::fmt::Display for CreateRaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; retry", self.0)
+    }
+}
+
+impl std::error::Error for CreateRaced {}
+
 /// Fail-closed degradation state, latched when a flip batch exhausts its retries.
 ///
 /// The inner-set node was already reconciled under the registry lock before the batch's query-backs
@@ -441,6 +461,13 @@ pub(crate) enum ShareOutcome {
     Failed,
     /// The create overlapped a degradation and refused (see [`Engine::ensure_create_not_degraded`]).
     Degraded,
+    /// The creator's closing re-check after its catalog durability wait found the shape retired
+    /// underneath it (see [`Engine::recheck_after_durability`]). Distinct from [`Self::Failed`]
+    /// because the creator does not give up on that: it redoes the create. A joiner must reach the
+    /// same conclusion — it arrives typed [`CreateRaced`], so the joiner's own attempt is redone
+    /// too. Reported as `Failed` it would answer 500 while the creator quietly succeeded on its
+    /// next attempt, which is two identical requests disagreeing about the same outcome.
+    Raced,
 }
 
 /// Wait until a shared shape's creator reports the shape live (or failed). Joining before the
@@ -453,6 +480,12 @@ async fn await_share_ready(mut rx: tokio::sync::watch::Receiver<ShareOutcome>, i
             // The creator's own refusal, verbatim: the HTTP layer downcasts it to 503 exactly as
             // it does for the creator's error.
             ShareOutcome::Degraded => return Err(anyhow::Error::new(Degraded)),
+            // Likewise typed, so this joiner's attempt is redone exactly as the creator's is.
+            ShareOutcome::Raced => {
+                return Err(anyhow::Error::new(CreateRaced(format!(
+                    "shared shape '{id}' was retired during its creator's catalog durability wait"
+                ))));
+            }
             ShareOutcome::Failed => bail!("shared shape '{id}' failed to initialize; retry the create"),
             ShareOutcome::Pending => {
                 if rx.changed().await.is_err() {
@@ -591,7 +624,7 @@ impl Engine {
                 Arc::new(move |segment, at| catalog_tx.send(CatalogEvent::ChangesRotated { segment, at }))
             },
         );
-        Engine {
+        let engine = Engine {
             ds,
             state: Arc::new(Mutex::new(EngineState {
                 tables: HashMap::new(),
@@ -634,7 +667,11 @@ impl Engine {
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
             shutdown,
-        }
+        };
+        // The streams client must be able to ask the engine whether a terminal append answer is
+        // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
+        engine.install_gone_reconciler();
+        engine
     }
 
     /// The process's shutdown token — the binary flips it on `SIGTERM`/`SIGINT` and every

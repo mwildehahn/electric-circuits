@@ -403,6 +403,7 @@ pub(crate) async fn sequencer_loop(
                 Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, ready }) => {
                     let res = activate_shape(
                         &ds, &mut execs, &table, &shape_id, gate, agg_seed, emitted_seed, &mut emitted,
+                        &shutdown,
                     ).await;
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
@@ -491,6 +492,7 @@ pub(crate) async fn sequencer_loop(
                 Some(SequencerCmd::CreateCircuitAgg { table, shape_id, stream_path, constraints, ready }) => {
                     let res = create_circuit_agg(
                         &ds, arr.as_ref(), &mut execs, &tables, &table, &shape_id, &stream_path, constraints,
+                        &shutdown,
                     )
                     .await;
                     if res.is_ok() {
@@ -921,6 +923,7 @@ pub(crate) async fn activate_shape(
     agg_seed: Option<AggSeed>,
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
+    shutdown: &crate::shutdown::ShutdownToken,
 ) -> Result<()> {
     let exec = execs
         .get_mut(table.as_str())
@@ -1033,7 +1036,10 @@ pub(crate) async fn activate_shape(
                 }
             }
             *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
-            ds.append(&p.stream_path, &outs).await?;
+            // Retried, not propagated on the first failure: at RESTORE this append's error is what
+            // makes `apply_catalog` drop and retire an acknowledged aggregate, so one transient 503
+            // during a boot used to delete a live subscription permanently.
+            ds.append_retrying(&p.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await?;
             exec.agg_index.insert(shape_id, &agg.pred);
             exec.aggregates.insert(shape_id.to_string(), agg);
         }
@@ -1071,6 +1077,7 @@ pub(crate) async fn replay_changes_for_shape(
     stream_path: &str,
     from: &LogPosition,
     library_mode: bool,
+    shutdown: &crate::shutdown::ShutdownToken,
 ) -> Result<u64> {
     let mut pos = from.clone();
     let mut rotate_to: Option<u32> = None;
@@ -1123,7 +1130,11 @@ pub(crate) async fn replay_changes_for_shape(
         }
         if !outs.is_empty() {
             emitted += outs.len() as u64;
-            ds.append(stream_path, &outs).await.context("append replay to retained stream")?;
+            // A reactivation that fails is EVICTED (its subscribers lose the shape), so a transient
+            // storage failure is retried rather than propagated — same rule as the aggregate re-seed.
+            ds.append_retrying(stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown)
+                .await
+                .context("append replay to retained stream")?;
         }
         let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
         if let Some(n) = rr.next_offset {

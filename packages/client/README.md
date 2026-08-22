@@ -21,11 +21,18 @@ bare name is shorthand for `public.<name>` (ADR-0002), so `shape({ table: 'publi
 `shape({ table: 'issues' })` resolve to the same entry of a `Schema` keyed `issues` *or*
 `public.issues`. The keys of your `Schema` are local config — the engine never sees them — so the
 client resolves the caller's spelling against them rather than requiring the two to match
-(`lookupTableDef` / `resolveTableDef` are exported if you keep your own map). A returned
-`handle.table` is always the canonical form the engine answered with, and only `public` has a bare
-shorthand: `billing.issues` never resolves to `issues`. If your schema happens to carry **both**
-`issues` and `public.issues` as separate keys, each spelling resolves to its own entry — the key as
-given always wins — so don't write that schema.
+(`lookupTableDef` / `resolveTableDef` / `canonicalTableIndex` / `tableSpellings` are exported if you
+keep your own map). A returned `handle.table` is always the canonical form the engine answered with,
+and only `public` has a bare shorthand: `billing.issues` never resolves to `issues`. The same rule
+runs through `client.tables`: one entry per table, reachable under **both** spellings — with a
+schema keyed `issues`, `client.tables.issues` and `client.tables['public.issues']` are the same
+helper.
+
+**A canonical collision is refused at construction.** `createClient` canonicalises the schema keys
+once, so a `Schema` carrying both `issues` and `public.issues` **throws** — they are one Postgres
+table, and two entries would make column/primary-key validation depend on which alias a call
+happened to use. Identical definitions are refused as well: the rule is one entry per table, not
+"duplicates are fine when they agree".
 
 ## `shape(def)` — materialized, live
 
@@ -74,6 +81,24 @@ Postgres's `ORDER BY` defaults — ascending puts NULLs last, descending first; 
 false once a page comes back **shorter than requested**, so exhausting a set takes one final
 `loadMore()` that returns 0; and `limit: 0` is ended from the start (a zero-size page can never be
 short, and never moves the cursor).
+
+**Text ordering in a subset is CODE-POINT order, not your database's collation.** Membership in the
+loaded window is decided here, in the client, from the values it received — it cannot reproduce an
+arbitrary Postgres collation. So the page query orders text columns `COLLATE "C"` (and the keyset
+cursor's range comparisons match), and the client compares code points rather than JavaScript's
+UTF-16 code units — `'\u{1F600}' < '\uE000'` is `true` under `<` and false by code point, which is
+enough to pull a row into a window Postgres put outside it. If your ordering has to follow a locale
+collation, sort a materialized `shape()` yourself instead. Only ordering comparisons are collated;
+equality is unaffected. Two caveats: the guarantee applies to columns the engine **introspected**
+from PostgreSQL (a schema pushed with `defineSchema` has no PostgreSQL type to check, so it keeps the
+database's default ordering), and on a non-`C` database an ordered subset over a large table wants an
+expression index — `CREATE INDEX … ON t ((col COLLATE "C"))` — since `COLLATE "C"` cannot use the
+column's default-collation btree index.
+
+**An `int` cell can be a decimal string.** Postgres `bigint` outruns a JSON number, so a value
+outside `±(2^53 - 1)` arrives as an exact string rather than a rounded number (the same rule as
+`AggregateValue` below). `String(v)` is always the exact decimal, `BigInt(v)` the arithmetic form; a
+subset's comparator already treats an `int` column numerically whichever form it arrives in.
 
 ## `aggregate(def)` — live scalar
 

@@ -47,6 +47,7 @@ pub(crate) async fn create_circuit_agg(
     shape_id: &str,
     stream_path: &str,
     constraints: Vec<Option<std::collections::HashSet<Value>>>,
+    shutdown: &crate::shutdown::ShutdownToken,
 ) -> Result<()> {
     let arr = arr.context("circuit aggregates require the counts layer")?;
     let exec = exec_for(execs, tables, table.as_str())
@@ -55,7 +56,8 @@ pub(crate) async fn create_circuit_agg(
     let groups = arr.count_groups(table).context("counts pipeline not ready")?;
     agg.value = groups.iter().filter(|(g, _)| agg.group_matches(g)).map(|(_, c)| c).sum();
     let env = agg.envelope(&exec.ts.table, None, None);
-    ds.append(stream_path, &[env])
+    // Retried: this runs at RESTORE too, where an error retires the acknowledged aggregate.
+    ds.append_retrying(stream_path, &[env], DsClient::RESTORE_APPEND_BUDGET, shutdown)
         .await
         .map_err(|e| anyhow::anyhow!("append initial aggregate: {e:#}"))?;
     tracing::info!("circuit aggregate {shape_id}: serving COUNT('{table}') from the counts pipeline (initial {})", agg.value);

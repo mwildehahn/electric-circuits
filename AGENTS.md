@@ -219,10 +219,22 @@ canvas update, screenshot.
 - **Ingest is at-least-once; consumers restore exactly-once effect.** The ingestor stamps
   `(commit lsn, xid, seq)`; the sequencer de-duplicates by `(lsn, seq)`. Aggregates and subquery contributor
   weights are NOT idempotent under duplicates — never bypass the highwater.
-- **Live shape appends must not drop.** Use `ds.append_reliable` (retry/backoff; 404/410/`stream-closed`
-  = shape retired, discard). The sequencer's processed offset is published only after the whole batch
-  landed, and each source transaction's appends are flushed before the next transaction is processed
-  (per-transaction atomic emission).
+- **Live shape appends must not drop, and a registered shape's batch is never advanced past without
+  either LANDING it or RETIRING the shape.** Use `ds.append_reliable` (retry/backoff). A terminal
+  answer — 404/410/`stream-closed` — is *reconciled*, never taken on trust: `append_reliable` asks
+  the engine (`Engine::reconcile_gone_shape_stream`, installed on the `DsClient` at construction),
+  which retries when the shape is still registered AND `HEAD` finds its stream (the 404 was a proxy's,
+  not storage's), and otherwise retires the shape (`Dropped` + close-then-delete + deregister) before
+  discarding. Discarding while the shape stays registered is how a committed Postgres change goes
+  missing forever with nothing left that remembers it. The sequencer's processed offset is published
+  only after the whole batch landed, and each source transaction's appends are flushed before the next
+  transaction is processed (per-transaction atomic emission).
+- **An append whose FAILURE would retire an acknowledged shape retries first** (`ds.append_retrying`;
+  activation's aggregate re-seed, the circuit-aggregate seed, a dormant shape's replay). Those errors
+  reach `apply_catalog`/`ensure_active`, which drop and retire the record — so a plain `ds.append`
+  there turns one transient 503 during a boot into the permanent loss of a live subscription. Retry
+  transient (`ds::is_unavailable`) with backoff, bounded by a budget and the shutdown token; retire
+  only on a definite refusal, a `head` that confirms the stream is gone, or an exhausted budget.
 - **A transaction is one unit of visibility even when it is several appends** (ADR-0003). A commit
   larger than `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` reaches the change log as several appends, and
   durable-streams exposes each atomically — so splitting a read page into transactions by
@@ -322,6 +334,18 @@ canvas update, screenshot.
   delayed; waiting on them would make a slow `DELETE` time out and be retried, which is the
   double-delete hazard below. If you add a mutation whose acknowledgement CREATES something, use
   `send_durable`.
+- **A durability wait is an interval: re-check the closing conditions AFTER it, before answering**
+  (`Engine::recheck_after_durability`). `send_durable` is unbounded external I/O, so anyone who can
+  make storage slow can hold a create/join open while a `TRUNCATE`, a schema drift, an epoch reset or
+  a purge retires the very shape it is about to acknowledge — the pre-wait checks cannot see any of
+  it. Every `Created`/`Joined` await is therefore followed by the same closing check (degradation
+  latch, captured schema generations, epoch generation) **plus** "is the record still registered, on
+  the same stream?" — a purge moves no generation, so registration is checked directly. One helper,
+  six callers; a mismatch unwinds through the ordinary rollback (`CreateGuard`, or giving a join's
+  provisional refcount back) and is typed `CreateRaced`, which the create redoes up to
+  `CREATE_RACE_ATTEMPTS` times before answering 503. Never acknowledge a handle whose shape was
+  retired during the wait. The same rule governs a JOIN's target stream: one `HEAD` per join, and a
+  stale registry entry (storage lost the stream) is retired so the caller gets a fresh shape.
 - **A retirement completes, eventually — durable intent, durable completion** (ADR 0007;
   `engine/retirement.rs`). `Dropped { id }` is written BEFORE the retirement at every site and
   `Retired { id }` only after storage accepted the delete, so a `Dropped` with no `Retired` is exactly
@@ -407,8 +431,29 @@ canvas update, screenshot.
   snapshot predates a delete would resurrect the row (or insert a ghost for a never-seen pk) unless
   the per-pk watermark survives the delete. (`subset.ts` keeps LSN tombstones, pruned when no page
   is in flight.)
-- **Shape rows stringify the primary key** (TanStack DB keys are strings); non-pk ints stay numbers.
-  Normalize ids when cross-referencing shape rows against query-back rows.
+- **Shape rows stringify the primary key** (TanStack DB keys are strings); non-pk ints stay numbers
+  *unless they exceed 2^53* (see below). Normalize ids when cross-referencing shape rows against
+  query-back rows.
+- **The envelope `key` must be an injective encoding of the primary-key tuple.** Single-column keys
+  are the bare value string; composite keys escape each component (`\` → `\\`, U+001F → `\x1f`) before
+  joining with U+001F (`schema::key_string` / `join_key_components`, mirrored in `replication.rs`).
+  Raw joining made `('x','y␟z')` and `('x␟y','z')` the same key, and `translate_output` de-duplicates
+  by it — one legal row silently disappeared. If you add a key-building site, use the shared helper.
+- **An `int` beyond 2^53 is a decimal STRING on the wire, not a rounded number** (`Value::to_json`;
+  the rule aggregates' `SUM` already used). Postgres `bigint` outruns a JSON number in every
+  JavaScript parser. It applies to every serialised row value — envelopes, `/query`, subset pages,
+  MIN/MAX of an int column — so TypeScript sees `number | string` for `int` and `Value::from_json`
+  takes the string back. Consumers of the envelope JSON (pgxsinkit) must widen.
+- **Text ordering in subsets is code-point order, not the database collation.** The subset page's
+  `ORDER BY`, the keyset cursor's range comparisons and the client's window comparator must all
+  agree, and the client can only compare the strings it got — so collatable text columns carry an
+  explicit `COLLATE "C"` in SQL (`pg::order_term`, `sql::build`) and the client compares code points,
+  not UTF-16 code units (`cmpCodePoints`). Equality is never collated (byte equality under any
+  deterministic collation), which keeps it index-eligible. Two limits: the collation is emitted only
+  for a KNOWN collatable Postgres type (`TableSchema::is_collatable_text`) — a JSON-declared schema
+  has no type to check and `COLLATE "C"` on a uuid is an error, so the guarantee needs introspection
+  — and `COLLATE "C"` on `<`/`>` cannot use a default-collation btree index, so on a non-`C` database
+  an ordered subset over a large table wants an expression index `((col COLLATE "C"))`.
 - **A subset whose predicate folds in live UI filters re-creates the engine feed on every click.**
   Prefer per-facet feeds reused across filter changes + a client merge (identical predicates across
   users ⇒ shared engine families). LinearLite's browse list does this.

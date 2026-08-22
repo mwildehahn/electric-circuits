@@ -3,14 +3,87 @@
 
 use super::*;
 
+/// How many times a create/join is redone after losing a race during its catalog durability wait
+/// (see [`Engine::recheck_after_durability`]). Three: the race needs an *external* retirement to
+/// land inside the wait, so a second loss is already unusual and a third means something is
+/// retiring this table continuously — at which point the honest answer is the retryable error.
+pub(crate) const CREATE_RACE_ATTEMPTS: u32 = 3;
+
+/// A short, JITTERED pause between redo attempts.
+///
+/// The race that caused the redo is an external retirement landing inside the durability wait, and
+/// the resolution that drove it holds the table's resolve lock for a moment afterwards — redoing
+/// instantly would just walk into "schema of 'x' is being resolved after a change; retry", which is
+/// not retryable and would surface to the client. The jitter matters because the interesting case is
+/// N clients racing the SAME drift: redoing in lockstep puts all of them back on that lock together.
+/// 50-250 ms is well inside any client's create timeout.
+async fn redo_backoff() {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % 200)
+        .unwrap_or(0);
+    tokio::time::sleep(std::time::Duration::from_millis(50 + jitter)).await;
+}
+
+/// Decide what one create attempt's outcome means: `Ok(result)` to return it, `Err(())` to redo the
+/// attempt. Only a [`CreateRaced`] with attempts left is redone.
+fn retry_create(
+    res: Result<ShapeRecord>,
+    attempt: u32,
+    what: &str,
+    table: &TableRef,
+) -> std::result::Result<Result<ShapeRecord>, ()> {
+    match &res {
+        Err(e) if e.downcast_ref::<CreateRaced>().is_some() && attempt < CREATE_RACE_ATTEMPTS => {
+            tracing::warn!(
+                "{what} create on '{table}' lost a race during its catalog durability wait ({e:#}); \
+                 attempt {attempt}/{CREATE_RACE_ATTEMPTS}, redoing it"
+            );
+            Err(())
+        }
+        _ => Ok(res),
+    }
+}
 
 impl Engine {
     /// `share`: when true, an identical existing shape (same table, canonical predicate, and columns) is
     /// joined by ref-count instead of creating a second stream — so N app clients subscribing to the same
-    /// reference shape (e.g. `project_members WHERE user_id = me`) share one maintained output. The
-    /// Electric `/v1/shape` path passes `false`: it keys per-request live state by shape id, so each
-    /// request needs its own handle.
+    /// reference shape (e.g. `project_members WHERE user_id = me`) share one maintained output. Both
+    /// public surfaces pass `true` — the `/v1/shape` adapter included, which keys its per-request live
+    /// state by the SHARED shape id (`electric.rs`), so identical Electric definitions collapse onto one
+    /// maintained stream like any other. `false` exists for callers that genuinely need their own
+    /// handle; nothing in the tree currently does.
+    ///
+    /// A shared create therefore always pays the join path's stream-liveness `HEAD`
+    /// ([`Self::retire_join_target_if_stream_lost`]), `/v1/shape` requests included. That is the
+    /// intended trade: one storage round trip per join is cheaper than handing an Electric client a
+    /// handle whose stream storage has already lost, which it cannot detect except as an empty sync.
+    ///
+    /// An attempt that lost a race during its catalog durability wait ([`CreateRaced`], see
+    /// [`Self::recheck_after_durability`]) is **redone**, up to [`CREATE_RACE_ATTEMPTS`] times: the
+    /// definition is still valid, only the shape it made was retired underneath it, and every client
+    /// would otherwise have to implement this loop itself. Every other failure — including the
+    /// pre-durability drift check, which a client should see — propagates on the first attempt.
     pub async fn create_shape(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        changes_only: bool,
+        share: bool,
+    ) -> Result<ShapeRecord> {
+        for attempt in 1..=CREATE_RACE_ATTEMPTS {
+            let res =
+                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share).await;
+            match retry_create(res, attempt, "shape", table) {
+                Ok(out) => return out,
+                Err(()) => redo_backoff().await,
+            }
+        }
+        unreachable!("retry_create returns the error on the last attempt")
+    }
+
+    async fn create_shape_once(
         &self,
         table: &TableRef,
         where_: Option<PredicateJson>,
@@ -34,25 +107,46 @@ impl Engine {
         };
         let col_names = columns.clone();
         let out_cols = resolve_columns(&ts, columns)?;
+        // **`ts` and `gens` come from ONE critical section.** Everything this create derives from the
+        // schema — the compiled predicate's column indices, the family key, the record's fingerprint,
+        // the backfill's row expression — is built from the `ts` cloned just above, so the generations
+        // it is re-checked against must be the ones that were current when that clone was taken. The
+        // lock is released below (the join path's storage `HEAD`), and a drift resolution completing in
+        // that window would otherwise leave a pre-drift `ts` paired with post-bump generations: both
+        // closing checks pass and the shape is installed against a schema the table no longer has.
+        // Capturing here is also strictly safer than capturing later — it can only refuse more.
+        //
+        // The set is every table this create reads: the outer table plus every table a subquery
+        // predicate references (empty for a plain predicate, so the plain path captures exactly
+        // `[table]` as before).
+        let mut dep_tables = vec![table.clone()];
+        if let Some(w) = &where_ {
+            dep_tables.extend(referenced_tables(w));
+        }
+        let gens = st.capture_gens(&dep_tables);
 
         // Shape sharing: an identical shape (subset feed, materialized, OR subquery) that already exists
         // is joined (ref-count++), returning the same stream — no second stream, no per-subscriber append
         // fan-out. Subquery shapes share their inner-set nodes in the registry regardless; sharing the
         // *outer* shape here collapses identical subquery shapes fully.
         let feed_sig = if share { Some(shape_signature(table, &where_, &out_cols, changes_only)) } else { None };
+        // Storage may have lost the retained shape's stream since it was made; a stale entry is
+        // retired here so the join below falls through to a fresh create (see
+        // `retire_join_target_if_stream_lost`).
+        if let Some(sig) = &feed_sig {
+            drop(st);
+            self.retire_join_target_if_stream_lost(sig).await;
+            st = self.state.lock().await;
+        }
         if let Some(sig) = &feed_sig {
             if let Some(existing_id) = st.feed_by_sig.get(sig).cloned() {
                 if let Some(rec) = st.shapes.get(&existing_id).cloned() {
                     // Refuse BEFORE taking the refcount: a join that is going to be turned away must
                     // not leave a `Joined` in the durable catalog or a refcount for the caller to
-                    // give back. A joiner takes the same schema-generation snapshot a creator does —
-                    // the shape it ref-counts can be retired by a drift while it waits.
-                    let mut joined = vec![table.clone()];
-                    if let Some(w) = &where_ {
-                        joined.extend(referenced_tables(w));
-                    }
-                    self.ensure_schema_resolved(&st, &joined)?;
-                    let gens = st.capture_gens(&joined);
+                    // give back. A joiner is re-checked against the same `gens` a creator is — the
+                    // ones captured with `ts` above, so a drift that landed during the `HEAD` window
+                    // refuses this join instead of acknowledging a shape the drift retired.
+                    self.ensure_schema_resolved(&st, &dep_tables)?;
                     let share = st.feed_shares.get_mut(&existing_id).expect("share entry for live feed");
                     share.refcount += 1;
                     // Enqueued here (under the lock, so the log order matches the state order) and
@@ -93,6 +187,14 @@ impl Engine {
                         return Err(e);
                     }
                     joined_durable.await;
+                    // ...and the same check ONCE MORE, after the wait: the target may have been
+                    // purged or retired while this join was blocked on storage (see
+                    // `recheck_after_durability`). Give the provisional refcount back and answer
+                    // retryable rather than hand out a handle whose stream is already 404.
+                    if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
+                        self.release_shape(&existing_id).await;
+                        return Err(e);
+                    }
                     return Ok(rec);
                 }
             }
@@ -120,9 +222,8 @@ impl Engine {
                 }
             }
             self.ensure_schema_resolved(&st, &tables)?;
-            // Captured under the same lock hold that registers the shape below: outer + every inner
-            // table, all re-checked before this create returns a handle.
-            let gens = st.capture_gens(&tables);
+            // `gens` (outer + every inner table) was captured with `ts`, before the lock was released
+            // for the join path's `HEAD` — see the capture site for why the two must be one snapshot.
             // The sequencer feeds every table's deltas to the registry; just make sure it runs.
             self.ensure_sequencer(&mut st);
             let rec = ShapeRecord {
@@ -197,6 +298,14 @@ impl Engine {
                     // rollback's `Dropped`. With storage down this waits — the client's own timeout
                     // is the bound — and it never returns a shape the catalog lacks.
                     created.await;
+                    // The wait is an interval of its own: re-check before acknowledging.
+                    if let Err(e) = self.recheck_after_durability(&id, &stream_path, &gens).await {
+                        // `Raced`, not `Failed`: this creator is about to redo the create, and a
+                        // joiner parked on the share must redo too rather than answer 500.
+                        let _ = ready_tx.send(ShareOutcome::Raced);
+                        creating.rollback().await;
+                        return Err(e);
+                    }
                     creating.complete();
                     let _ = ready_tx.send(ShareOutcome::Ready);
                     trace_lifecycle(
@@ -217,7 +326,8 @@ impl Engine {
         }
 
         self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
-        let gens = st.capture_gens(std::slice::from_ref(table));
+        // `gens` was captured with `ts`, before the lock was released for the join path's `HEAD` —
+        // the predicate compiled on the next line uses that `ts`'s column indices.
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
         // Family placement (for graph introspection): an equality template routes by these key columns
         // via a shared family; otherwise it's a standalone filter.
@@ -298,6 +408,13 @@ impl Engine {
                 }
                 // Durable before the guard is disarmed — see the subquery path above.
                 created.await;
+                // The wait is an interval of its own: re-check before acknowledging.
+                if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
+                    // `Raced`, not `Failed` — see the subquery path.
+                    let _ = share_tx.send(ShareOutcome::Raced);
+                    creating.rollback().await;
+                    return Err(e);
+                }
                 creating.complete();
                 let _ = share_tx.send(ShareOutcome::Ready);
                 trace_lifecycle(
@@ -327,12 +444,32 @@ impl Engine {
         func: AggFn,
         col: Option<String>,
     ) -> Result<ShapeRecord> {
+        for attempt in 1..=CREATE_RACE_ATTEMPTS {
+            let res = self.create_aggregate_once(table, where_.clone(), func, col.clone()).await;
+            match retry_create(res, attempt, "aggregate", table) {
+                Ok(out) => return out,
+                Err(()) => redo_backoff().await,
+            }
+        }
+        unreachable!("retry_create returns the error on the last attempt")
+    }
+
+    async fn create_aggregate_once(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        func: AggFn,
+        col: Option<String>,
+    ) -> Result<ShapeRecord> {
         // Same refusal as `create_shape`: a degraded engine does not get to answer for a fold over
         // rows whose membership it can no longer vouch for.
         self.ensure_not_degraded()?;
         let mut st = self.state.lock().await;
         let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
         self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+        // Captured in the SAME critical section as `ts` — deliberately, not incidentally: the lock is
+        // released below for the join path's storage `HEAD`, and `ts` is what `col_idx`, the signature
+        // and the compiled predicate are all derived from (see `create_shape_once`'s capture site).
         let gens = st.capture_gens(std::slice::from_ref(table));
         if where_.as_ref().is_some_and(predicate_has_subquery) {
             bail!("aggregations over subquery predicates are not supported");
@@ -349,23 +486,32 @@ impl Engine {
         // by ref-count — one maintained fold feeds every subscriber (e.g. the same live COUNT opened by
         // many clients).
         let agg_sig = agg_signature(table, &where_, &func, col_idx);
+        // Same stream-liveness check as the row-shape join path.
+        drop(st);
+        self.retire_join_target_if_stream_lost(&agg_sig).await;
+        st = self.state.lock().await;
         if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned() {
             if let Some(rec) = st.shapes.get(&existing_id).cloned() {
-                // Refuse before taking the refcount — see the row-shape join path.
+                // Refuse before taking the refcount — see the row-shape join path. Re-checked against
+                // the `gens` captured with `ts`, so a drift inside the `HEAD` window refuses the join.
                 self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
-                let join_gens = st.capture_gens(std::slice::from_ref(table));
                 let share = st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate");
                 share.refcount += 1;
                 let joined = self.catalog_tx.send_durable(CatalogEvent::Joined { id: existing_id.clone() });
                 let ready = share.ready.clone();
                 drop(st);
                 await_share_ready(ready, &existing_id).await?;
-                if let Err(e) = self.ensure_schema_unchanged(&join_gens).await {
+                if let Err(e) = self.ensure_schema_unchanged(&gens).await {
                     self.release_shape(&existing_id).await;
                     return Err(e);
                 }
                 self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
                 joined.await;
+                // ...and again after the wait — see `recheck_after_durability`.
+                if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
+                    self.release_shape(&existing_id).await;
+                    return Err(e);
+                }
                 return Ok(rec);
             }
         }
@@ -448,6 +594,15 @@ impl Engine {
                                     return Err(e);
                                 }
                                 created.await;
+                                // The wait is an interval of its own: re-check before acknowledging.
+                                if let Err(e) =
+                                    self.recheck_after_durability(&id, &rec.stream_path, &gens).await
+                                {
+                                    // `Raced`, not `Failed` — see the subquery path.
+                                    let _ = share_tx.send(ShareOutcome::Raced);
+                                    creating.rollback().await;
+                                    return Err(e);
+                                }
                                 creating.complete();
                                 let _ = share_tx.send(ShareOutcome::Ready);
                                 trace_lifecycle(
@@ -533,6 +688,13 @@ impl Engine {
                     return Err(e);
                 }
                 created.await;
+                // The wait is an interval of its own: re-check before acknowledging.
+                if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
+                    // `Raced`, not `Failed` — see the subquery path.
+                    let _ = share_tx.send(ShareOutcome::Raced);
+                    creating.rollback().await;
+                    return Err(e);
+                }
                 creating.complete();
                 let _ = share_tx.send(ShareOutcome::Ready);
                 trace_lifecycle(
@@ -811,6 +973,7 @@ impl Engine {
             &rec.stream_path,
             &resume,
             self.pg_url.is_none(),
+            &self.shutdown_token(),
         )
         .await
         {
@@ -1527,6 +1690,187 @@ impl Engine {
         }
     }
 
+    /// Reconcile a terminal-looking shape-stream append answer against engine state
+    /// (`DsClient::append_reliable` → [`crate::ds::GoneVerdict`]).
+    ///
+    /// A 404/410/`stream-closed` on an append is normally the truth: the shape was purged, evicted
+    /// or retired mid-flush and its batch has no reader left. But it is also what an HTTP proxy, a
+    /// storage router or a failover answers about a stream that is right there — and believing that
+    /// makes the sequencer advance past a committed Postgres change for a shape that stays
+    /// registered and quietly stale for ever, which no client can detect or recover from.
+    ///
+    /// So the engine answers, and there are exactly two honest answers:
+    ///
+    /// * the shape is still registered on this stream **and** storage still has it (`HEAD` →
+    ///   `Some`, not closed) ⇒ the terminal status was false; [`GoneVerdict::Retry`];
+    /// * storage really does not have it ⇒ **retire the shape** (`Dropped` intent, close-then-delete,
+    ///   deregister) so its subscribers learn through 404/`stream-closed` and re-subscribe, and only
+    ///   then [`GoneVerdict::Discard`].
+    ///
+    /// The batch of a registered shape is therefore never abandoned without either landing it or
+    /// retiring the shape. A `HEAD` that itself fails cannot distinguish the two, so it retries —
+    /// bounded by the shutdown token, which discards (the process is going away; the change is
+    /// re-delivered at least once after a restart and the sequencer's highwater de-duplicates it).
+    ///
+    /// The retirement itself is **detached**. This runs inside `append_reliable`, and an append can
+    /// be awaited with the subquery-registry lock held (`subquery.rs`'s no-lane `deliver` fallback);
+    /// `purge_shape` takes that same lock. An append must never wait on a lock its own caller may be
+    /// holding, whatever today's lane configuration happens to make reachable.
+    async fn reconcile_gone_shape_stream(&self, path: &str) -> crate::ds::GoneVerdict {
+        use crate::ds::GoneVerdict;
+        // Only shape streams are reconciled: the change log uses `append`/`append_checked`, which
+        // never come through here, and anything else is not the engine's to retire.
+        let Some(id) = path.strip_prefix("shape/") else { return GoneVerdict::Discard };
+        let registered = {
+            let st = self.state.lock().await;
+            st.shapes.get(id).is_some_and(|rec| rec.stream_path == path)
+        };
+        if !registered {
+            return GoneVerdict::Discard;
+        }
+        if self.shutdown.is_shutting_down() {
+            tracing::warn!("append to {path} answered terminal during shutdown; not reconciling");
+            return GoneVerdict::Discard;
+        }
+        match self.ds.head(path).await {
+            // There, and appendable: the terminal answer was false.
+            Ok(Some(head)) if !head.closed => GoneVerdict::Retry,
+            // Closed or absent: storage really has retired this stream under a live shape. Retire
+            // the shape for real so nothing keeps serving it.
+            Ok(_) => {
+                tracing::error!(
+                    "shape {id}: its stream '{path}' is gone from storage while the shape was live; \
+                     retiring the shape so its subscribers re-subscribe"
+                );
+                let (engine, id) = (self.clone(), id.to_string());
+                tokio::spawn(async move {
+                    let _ = engine.purge_shape(&id).await;
+                });
+                GoneVerdict::Discard
+            }
+            Err(e) => {
+                tracing::warn!("shape {id}: HEAD {path} failed ({e:#}) after a terminal append; retrying the append");
+                GoneVerdict::Retry
+            }
+        }
+    }
+
+    /// Wire [`Self::reconcile_gone_shape_stream`] into the streams client, once, at construction.
+    ///
+    /// This is deliberately a cycle (the client holds a closure holding the engine holding the
+    /// client): the engine is a process singleton whose background tasks own clones of it anyway, so
+    /// nothing is reclaimed earlier without it, and the alternative — threading a reconciler through
+    /// the sequencer, the emission lanes and the subquery registry by hand — would leave every
+    /// future append site to remember the rule on its own.
+    ///
+    /// Two consequences, both accepted rather than accidental:
+    ///
+    /// * the cycle means **one `Engine` is never dropped per `Engine::new`**. In the binary that is
+    ///   one engine for the process lifetime; in tests and tools that construct many, it is a bounded
+    ///   leak of engine state (no task, no socket — the background tasks end when their channels
+    ///   close), which is why it is not worth a `Weak` indirection on the hot append path.
+    /// * the slot is a `OnceLock`, so if the SAME `DsClient` is handed to two engines, the first
+    ///   one's reconciler serves both. That is a test-only shape (each engine owns its client in the
+    ///   binary), and the alternative — last-writer-wins — would silently repoint a live client's
+    ///   reconciliation at a different engine's state, which is worse.
+    pub(crate) fn install_gone_reconciler(&self) {
+        let engine = self.clone();
+        self.ds.set_gone_reconciler(std::sync::Arc::new(move |path: String| {
+            let engine = engine.clone();
+            Box::pin(async move { engine.reconcile_gone_shape_stream(&path).await })
+        }));
+    }
+
+    /// Before joining a retained shape, make sure its durable stream is still THERE.
+    ///
+    /// The sharing fast path hands a joiner the stored record — id, stream URL — without ever
+    /// touching storage, and `ensure_active` cannot tell the difference for an *active* shape: it
+    /// only looks at the retention state machine. So a stream that storage lost (an operator
+    /// `DELETE`, a restore from an older backup, a storage-side failure) is handed out as a live
+    /// handle whose every read is 404 and whose every append is discarded.
+    ///
+    /// One `HEAD` per join answers it. Gone (404/410) or **closed** (a retirement already in flight)
+    /// means the registry entry is stale: retire it properly — `Dropped` intent, close-then-delete,
+    /// deregister (`purge_shape`) — and let the caller fall through to the create path, which mints a
+    /// fresh id and a fresh stream. A transient `HEAD` failure is NOT taken as loss: storage having a
+    /// moment must not cost every subscriber their shared shape.
+    ///
+    /// Only a share that has reported **Ready** is probed. A creator registers its record and
+    /// signature under the state lock and PUTs the stream after releasing it, so probing a `Pending`
+    /// share would see a stream that does not exist YET and purge a perfectly good create in flight;
+    /// joiners of a pending share already wait on `await_share_ready`.
+    ///
+    /// Deliberately NOT done on `GET /shapes/{id}`: that route is a metadata read on the hot path of
+    /// every polling client, and a storage round trip per poll would be a real cost for an answer
+    /// nobody acts on. Joining is where a dead handle actually gets handed out.
+    async fn retire_join_target_if_stream_lost(&self, sig: &str) {
+        let candidate = {
+            let st = self.state.lock().await;
+            let Some(id) = st.feed_by_sig.get(sig).cloned() else { return };
+            let ready = st.feed_shares.get(&id).is_some_and(|s| *s.ready.borrow() == ShareOutcome::Ready);
+            if !ready {
+                return;
+            }
+            st.shapes.get(&id).map(|r| (id, r.stream_path.clone()))
+        };
+        let Some((id, path)) = candidate else { return };
+        let lost = match self.ds.head(&path).await {
+            Ok(Some(head)) => head.closed,
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!("join: HEAD {path} failed ({e:#}); joining the retained shape anyway");
+                false
+            }
+        };
+        if lost {
+            tracing::warn!(
+                "shape {id}: its durable stream '{path}' is gone from storage; retiring the stale \
+                 registry entry so this create makes a fresh shape"
+            );
+            let _ = self.purge_shape(&id).await;
+        }
+    }
+
+    /// The closing re-check every create and every join runs **after** its catalog durability wait.
+    ///
+    /// The checks a create takes before `send_durable` cannot see anything that happens during it,
+    /// and that wait is unbounded external I/O: a `TRUNCATE`, a schema drift, an epoch reset or a
+    /// native purge can retire the very shape the request is about to acknowledge, and every one of
+    /// those is externally triggerable while storage is slow. So the same closing check is taken
+    /// again here — degradation latch, schema generations, epoch generation — plus the one it never
+    /// needed before: **is the record still registered, on the same stream?** A generation bump is
+    /// not always involved (a purge removes the record without touching any generation), so the
+    /// registration is checked directly rather than inferred.
+    ///
+    /// One implementation, six callers (plain / subquery / aggregate / circuit-aggregate creates,
+    /// and both join paths) — the ordering bug this fixes existed once per copy.
+    ///
+    /// Failures are typed [`CreateRaced`] so the caller can redo the whole attempt; a degradation
+    /// stays a typed [`Degraded`] (the HTTP layer answers 503 with the reason, and a joiner waiting
+    /// on the share must get the creator's reason verbatim).
+    pub(crate) async fn recheck_after_durability(
+        &self,
+        id: &str,
+        stream_path: &str,
+        gens: &SchemaGens,
+    ) -> Result<()> {
+        self.ensure_create_not_degraded()?;
+        self.ensure_schema_unchanged(gens)
+            .await
+            .map_err(|e| anyhow::Error::new(CreateRaced(format!("{e:#}").trim_end_matches("; retry").to_string())))?;
+        let st = self.state.lock().await;
+        match st.shapes.get(id) {
+            Some(rec) if rec.stream_path == stream_path => Ok(()),
+            Some(rec) => Err(anyhow::Error::new(CreateRaced(format!(
+                "shape '{id}' moved from stream '{stream_path}' to '{}' during its catalog durability wait",
+                rec.stream_path
+            )))),
+            None => Err(anyhow::Error::new(CreateRaced(format!(
+                "shape '{id}' was retired during its catalog durability wait"
+            )))),
+        }
+    }
+
     /// Undo a create: the one implementation of "this shape was never made", shared by the explicit
     /// error paths and by [`CreateGuard`]'s cancelled path.
     ///
@@ -1644,6 +1988,65 @@ mod cancellation_tests {
         assert!(st.feed_shares.is_empty());
         assert!(engine.lives.lock().unwrap().is_empty(), "the retention entry must go too");
         assert!(engine.subquery_stats().await.is_empty(), "no registry node may survive");
+    }
+
+    /// The post-durability re-check is the whole of item 1: run it on a shape that is still there,
+    /// unchanged, and it passes; run it on anything that moved during the wait and it refuses with a
+    /// RETRYABLE [`CreateRaced`], never a success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_post_durability_recheck_passes_only_for_an_unchanged_registration() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        let gens = engine.state.lock().await.capture_gens(&["outer_t".into(), "inner_t".into()]);
+
+        // Nothing moved during the wait.
+        engine.recheck_after_durability("s1", "shape/s1", &gens).await.expect("an unchanged shape passes");
+
+        // A table this create read drifted while it waited: retryable, and it names the reason.
+        engine.force_schema_generation_bump(&"inner_t".into()).await;
+        let e = engine.recheck_after_durability("s1", "shape/s1", &gens).await.unwrap_err();
+        assert!(e.downcast_ref::<CreateRaced>().is_some(), "a lost race must be retryable: {e:#}");
+        assert!(e.to_string().contains("inner_t"), "unexpected reason: {e}");
+
+        guard.complete();
+    }
+
+    /// The case a generation bump cannot express: a native purge removes the record outright while
+    /// the create is blocked on catalog durability. The generations are untouched, so ONLY the
+    /// registration check catches it — and it must, or the create acknowledges a handle whose stream
+    /// is already 404.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shape_purged_during_the_wait_is_not_acknowledged() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        let gens = engine.state.lock().await.capture_gens(&["outer_t".into()]);
+
+        engine.state.lock().await.shapes.remove("s1");
+        let e = engine.recheck_after_durability("s1", "shape/s1", &gens).await.unwrap_err();
+        assert!(e.downcast_ref::<CreateRaced>().is_some(), "a purge during the wait is retryable: {e:#}");
+        assert!(e.to_string().contains("retired during its catalog durability wait"), "unexpected reason: {e}");
+
+        guard.complete();
+    }
+
+    /// A record that is still there but now points at a DIFFERENT stream is not this create's shape
+    /// either — the id was re-registered by something else while the wait was in flight.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shape_whose_stream_moved_during_the_wait_is_not_acknowledged() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        let gens = engine.state.lock().await.capture_gens(&["outer_t".into()]);
+
+        {
+            let mut st = engine.state.lock().await;
+            let rec = st.shapes.get_mut("s1").unwrap();
+            rec.stream_path = "shape/s9".to_string();
+        }
+        let e = engine.recheck_after_durability("s1", "shape/s1", &gens).await.unwrap_err();
+        assert!(e.downcast_ref::<CreateRaced>().is_some(), "{e:#}");
+        assert!(e.to_string().contains("moved from stream"), "unexpected reason: {e}");
+
+        guard.complete();
     }
 
     /// Cancelled between `begin_create` and `finish_create`: the registry holds a pending shape
@@ -1792,6 +2195,26 @@ mod cancellation_tests {
         assert!(
             err.downcast_ref::<Degraded>().is_some(),
             "the joiner must get the creator's typed refusal, not a generic failure: {err:#}"
+        );
+    }
+
+    /// A creator whose closing re-check finds its shape retired during the catalog durability wait
+    /// does not give up — it redoes the create. Its joiner must reach the same conclusion, so the
+    /// outcome arrives typed [`CreateRaced`] rather than as a generic initialization failure:
+    /// otherwise two identical requests disagree, the creator succeeding on its next attempt while
+    /// the joiner answers 500.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_of_a_raced_create_gets_the_retryable_refusal() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let ready_tx = pending_share(&engine, "s1", &where_json).await;
+        let joining = join(&engine, &where_json);
+        await_joined(&engine, "s1").await;
+
+        let _ = ready_tx.send(ShareOutcome::Raced);
+        let err = joining.await.unwrap().expect_err("the joiner must be refused");
+        assert!(
+            err.downcast_ref::<CreateRaced>().is_some(),
+            "the joiner must get the creator's RETRYABLE refusal, not a generic failure: {err:#}"
         );
     }
 

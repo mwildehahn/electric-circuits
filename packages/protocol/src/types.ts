@@ -3,10 +3,24 @@
 // These JSON shapes are the single source of truth shared by the TS API/oracle/client
 // and the Rust dbsp engine (which mirrors them with serde). Keep them minimal and stable.
 
-/** Supported column types. Maps to a JS `Value` and a Postgres type. */
+/**
+ * Supported column types. Maps to a JS `Value` and a Postgres type.
+ *
+ * `int` covers Postgres `bigint`, whose range exceeds what a JSON number survives in JavaScript, so
+ * an `int` cell is `number | string` on the wire — see {@link Value}.
+ */
 export type ColumnType = 'int' | 'text' | 'bool' | 'float'
 
-/** A scalar cell value. `null` is permitted for absent values. */
+/**
+ * A scalar cell value. `null` is permitted for absent values.
+ *
+ * **An `int` cell is `number | string`.** The engine emits a JSON number while the value is exactly
+ * representable as one (`|v| <= 2^53 - 1`) and an exact **decimal string** beyond that — a Postgres
+ * `bigint` reaches `2^63-1`, and every JavaScript JSON parser would silently round it. The rule
+ * holds everywhere a row value is serialised: shape-stream envelopes, `query()` pages, subset pages,
+ * and MIN/MAX over an int column (`docs/ARCHITECTURE.md` §2). Use `BigInt(v)` for arithmetic at that
+ * scale; `String(v)` is always the exact decimal, whichever form arrived.
+ */
 export type Value = number | string | boolean | null
 
 export interface ColumnDef {

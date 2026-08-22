@@ -30,6 +30,17 @@ fn tref(name: &str) -> TableRef {
 struct FakeDs {
     /// While set, every stream PUT parks — the create under test blocks there instead of racing.
     park_puts: Arc<AtomicBool>,
+    /// While set, a HEAD on a `shape/*` stream parks. That is the window a JOIN opens when it
+    /// verifies the retained shape's stream still exists — the one place `create_shape` releases the
+    /// engine-state lock between cloning the table schema and registering against it. Scoped to
+    /// shape streams on purpose: the change log's own HEAD (`init_change_log`) must keep working, or
+    /// the test's drift injection would deadlock behind its own fault.
+    park_heads: Arc<AtomicBool>,
+    /// `shape/*` HEADs served (so a test can wait until the create has actually reached the window).
+    shape_heads: Arc<std::sync::atomic::AtomicUsize>,
+    /// While set, a `shape/*` HEAD answers 404 — storage has lost the retained stream, so the join
+    /// retires the stale entry and the create falls through to making a fresh shape.
+    head_404: Arc<AtomicBool>,
     deleted: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -47,7 +58,18 @@ async fn ds_handler(State(ds): State<FakeDs>, request: Request) -> Response {
         }
         Method::POST => StatusCode::OK.into_response(),
         // The change log's boot walk HEADs the current segment (ADR-0006): present, never closed.
-        Method::HEAD => ([("stream-next-offset", "tip")]).into_response(),
+        Method::HEAD => {
+            if request.uri().path().starts_with("/shape/") {
+                ds.shape_heads.fetch_add(1, Ordering::SeqCst);
+                while ds.park_heads.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                if ds.head_404.load(Ordering::SeqCst) {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+            }
+            ([("stream-next-offset", "tip")]).into_response()
+        }
         Method::GET => ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
@@ -244,4 +266,80 @@ async fn a_create_arriving_during_a_resolution_is_refused() {
         .create_shape(&tref("child"), Some(where_), None, false, true)
         .await
         .expect("the create succeeds once the resolution has finished");
+}
+
+/// **`ts` and `gens` must come from one critical section.** A join verifies that the retained
+/// shape's stream still exists, and that `HEAD` is the one point where `create_shape` releases the
+/// engine-state lock between cloning the table schema and registering against it. A drift resolution
+/// completing inside that window must not leave the create holding a pre-drift schema while its
+/// closing check compares post-drift generations: both checks would pass and the shape would be
+/// installed against a schema the table no longer has — a compiled predicate whose column indices
+/// belong to a layout that is gone.
+///
+/// The window is driven the way reality drives it: storage has also lost the retained stream, so the
+/// stale entry is retired and this create falls through to the CREATE path — the one that compiles
+/// the predicate from the cloned `ts`. The drift (compiled schema swapped so the predicate's column
+/// is DROPPED, generation bumped, exactly what a resolution does) lands while it is parked. With the
+/// generations captured alongside `ts` the closing check sees the bump and refuses; capturing them
+/// after the relock made both checks agree with each other and disagree with reality, and the create
+/// returned a handle for a shape filtering on a column that no longer exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drift_inside_the_join_head_window_is_not_installed_against_the_stale_schema() {
+    let (engine, ds) = engine_on_fake_ds().await;
+    let where_: PredicateJson =
+        serde_json::from_value(serde_json::json!({"col":"parent_id","op":"eq","value":1})).unwrap();
+
+    // A live, Ready shape under this signature — that is what makes the next identical create take
+    // the join path (and therefore the HEAD).
+    engine
+        .create_shape(&tref("child"), Some(where_.clone()), None, false, true)
+        .await
+        .expect("the first create must succeed in library mode");
+
+    // Park the identical create inside the join's stream-liveness HEAD.
+    let heads_before = ds.shape_heads.load(Ordering::SeqCst);
+    ds.head_404.store(true, Ordering::SeqCst);
+    ds.park_heads.store(true, Ordering::SeqCst);
+    let creating = tokio::spawn({
+        let engine = engine.clone();
+        let where_ = where_.clone();
+        async move { engine.create_shape(&tref("child"), Some(where_), None, false, true).await }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ds.shape_heads.load(Ordering::SeqCst) == heads_before {
+        assert!(std::time::Instant::now() < deadline, "the create never reached the HEAD window");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The drift, inside the window: new compiled schema in place, generation bumped.
+    let drifted: Schema = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "parent": { "columns": { "id": {"type":"int"}, "active": {"type":"bool"} }, "primaryKey": "id" },
+            "child": { "columns": { "id": {"type":"int"} }, "primaryKey": "id" }
+        }
+    }))
+    .unwrap();
+    engine.define_schema(&drifted).await.unwrap();
+    engine.force_schema_generation_bump(&tref("child")).await;
+    ds.park_heads.store(false, Ordering::SeqCst);
+
+    let err = creating
+        .await
+        .unwrap()
+        .expect_err("a create whose table drifted mid-flight must not be installed against the old schema")
+        .to_string();
+    assert!(err.contains("changed during creation"), "unexpected refusal: {err}");
+
+    // Nothing survives: the stale join target was retired by the HEAD, and the refused create rolled
+    // itself back rather than leaving a shape behind.
+    assert!(engine.graph().await.shapes.is_empty(), "no shape may survive the refusal");
+
+    // ...and this is what the stale `ts` was hiding: against the schema the table ACTUALLY has now,
+    // the definition does not even compile.
+    let err = engine
+        .create_shape(&tref("child"), Some(where_), None, false, true)
+        .await
+        .expect_err("the predicate names a column the drifted schema dropped")
+        .to_string();
+    assert!(err.contains("parent_id"), "unexpected failure on the current schema: {err}");
 }

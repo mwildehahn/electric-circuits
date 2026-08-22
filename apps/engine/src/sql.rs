@@ -71,8 +71,21 @@ fn build(p: &CompiledPredicate, ts: &TableSchema, params: &mut Vec<String>) -> S
                     // binding a Rust `String` against a uuid param is refused by tokio-postgres
                     // (`cannot convert String -> uuid`). `$n::text::uuid` sends the param as text and
                     // parses it to the native type (index-eligible); unknown type → `col::text` fallback.
+                    //
+                    // An ORDERING comparison on a collatable text column carries an explicit
+                    // `COLLATE "C"`: the engine's own evaluator compares Rust strings, i.e. by code
+                    // point, so a backfill (or a subset page's keyset cursor) run under a different
+                    // database collation would select a different set of rows than the live path
+                    // matches. Equality needs no collation — it is byte equality under every
+                    // deterministic collation — so `=`/`<>` keep the plain, index-eligible form.
                     params.push(s.clone());
-                    text_param_cmp(&name, o, params.len(), ts.pg_types.get(*col).and_then(|o| o.as_deref()))
+                    let ordering = matches!(op, LeafOp::Lt | LeafOp::Lte | LeafOp::Gt | LeafOp::Gte);
+                    let lhs = if ordering && ts.is_collatable_text(*col) {
+                        std::borrow::Cow::Owned(format!("{name} collate \"C\""))
+                    } else {
+                        std::borrow::Cow::Borrowed(name.as_str())
+                    };
+                    text_param_cmp(&lhs, o, params.len(), ts.pg_types.get(*col).and_then(|o| o.as_deref()))
                 }
             }
         }
@@ -131,6 +144,17 @@ fn build_json(
     table: &TableRef,
 ) -> String {
     let pg_type = |col: &str| schemas.get(table).and_then(|ts| ts.pg_type_of(col)).map(str::to_string);
+    // Same rule as the compiled emitter: an ORDERING comparison on a collatable text column is
+    // spelled `COLLATE "C"` so Postgres agrees with the engine's code-point comparison.
+    let lhs = |col: &str, op: LeafOp| {
+        let name = quote_ident(col);
+        let ordering = matches!(op, LeafOp::Lt | LeafOp::Lte | LeafOp::Gt | LeafOp::Gte);
+        let collatable = schemas
+            .get(table)
+            .and_then(|ts| ts.index.get(col).map(|&i| ts.is_collatable_text(i)))
+            .unwrap_or(false);
+        if ordering && collatable { format!("{name} collate \"C\"") } else { name }
+    };
     match p {
         PredicateJson::Leaf { col, op, value } => {
             let name = quote_ident(col);
@@ -142,12 +166,12 @@ fn build_json(
                 serde_json::Value::String(s) => {
                     // Bind as text, cast to the column's native type when known (see `text_param_cmp`).
                     params.push(s.clone());
-                    text_param_cmp(&name, o, start + params.len() - 1, pg_type(col).as_deref())
+                    text_param_cmp(&lhs(col, *op), o, start + params.len() - 1, pg_type(col).as_deref())
                 }
                 other => {
                     // Arrays/objects are not valid leaf literals; stringify defensively as a param.
                     params.push(other.to_string());
-                    text_param_cmp(&name, o, start + params.len() - 1, pg_type(col).as_deref())
+                    text_param_cmp(&lhs(col, *op), o, start + params.len() - 1, pg_type(col).as_deref())
                 }
             }
         }
@@ -215,6 +239,66 @@ mod tests {
         let pj: PredicateJson = serde_json::from_value(json).unwrap();
         let cp = CompiledPredicate::compile(&pj, &ts).unwrap();
         predicate_to_sql(&cp, &ts).unwrap()
+    }
+
+    /// A table whose Postgres types are KNOWN, for the collation tests below.
+    fn introspected(pg_type_of_label: &str) -> TableSchema {
+        let mut columns = BTreeMap::new();
+        columns.insert("id".to_string(), ColumnDef {
+            ty: ColumnType::Int,
+            pg_type: Some("int4".to_string()),
+            has_default: false,
+        });
+        columns.insert("label".to_string(), ColumnDef {
+            ty: ColumnType::Text,
+            pg_type: Some(pg_type_of_label.to_string()),
+            has_default: false,
+        });
+        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
+        TableSchema::from_def(&"users".into(), &def).unwrap()
+    }
+
+    fn sql_on(ts: &TableSchema, json: serde_json::Value) -> String {
+        let pj: PredicateJson = serde_json::from_value(json).unwrap();
+        let cp = CompiledPredicate::compile(&pj, ts).unwrap();
+        predicate_to_sql(&cp, ts).unwrap().0
+    }
+
+    /// An ORDERING comparison on a genuinely collatable text column carries `COLLATE "C"`, so
+    /// Postgres compares it the way the engine's own evaluator (Rust string ordering) and the subset
+    /// client (code points) do, whatever the database's default collation is.
+    #[test]
+    fn a_text_range_comparison_is_collated_c() {
+        let ts = introspected("text");
+        let w = sql_on(&ts, serde_json::json!({"col": "label", "op": "gt", "value": "m"}));
+        assert_eq!(w, r#""label" collate "C" > $1::text::"text""#);
+    }
+
+    /// Equality is byte equality under every deterministic collation, so it keeps the plain,
+    /// index-eligible form — collating it would defeat the column's btree index for nothing.
+    #[test]
+    fn text_equality_is_never_collated() {
+        let ts = introspected("text");
+        let w = sql_on(&ts, serde_json::json!({"col": "label", "op": "eq", "value": "m"}));
+        assert_eq!(w, r#""label" = $1::text::"text""#);
+    }
+
+    /// Our coarse `Text` also covers types whose order is collation-INDEPENDENT and which refuse a
+    /// collation outright; asking for one would make every query on the table an error.
+    #[test]
+    fn a_non_collatable_text_mapped_column_is_not_collated() {
+        let ts = introspected("uuid");
+        let w = sql_on(&ts, serde_json::json!({"col": "label", "op": "gt", "value": "m"}));
+        assert_eq!(w, r#""label" > $1::text::"uuid""#);
+    }
+
+    /// An UNKNOWN Postgres type is not collated either: the declaration says "text", but the column
+    /// underneath may be a uuid. The code-point ordering guarantee needs introspection.
+    #[test]
+    fn a_column_with_no_known_pg_type_is_not_collated() {
+        let ts = schema();
+        let w = sql_on(&ts, serde_json::json!({"col": "name", "op": "gt", "value": "m"}));
+        assert_eq!(w, r#""name"::text > $1"#);
     }
 
     #[test]

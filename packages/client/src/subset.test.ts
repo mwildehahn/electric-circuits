@@ -5,7 +5,16 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { Row, Schema } from '@electric-circuits/protocol'
-import { createSubset, deleteShapeWithRetry, lsnToU64, mergeFeedDelta, type SubsetDeps, type SubsetView } from './subset.js'
+import {
+  cmpCodePoints,
+  createSubset,
+  deleteShapeWithRetry,
+  lsnToU64,
+  makeCmp,
+  mergeFeedDelta,
+  type SubsetDeps,
+  type SubsetView,
+} from './subset.js'
 
 // The lifecycle tests never need a real durable stream; an empty tail is enough.
 vi.mock('@durable-streams/client', () => ({
@@ -263,5 +272,55 @@ describe('deleteShapeWithRetry', () => {
     }
     await deleteShapeWithRetry(trpc as never, 'x')
     expect(calls).toBe(2)
+  })
+})
+
+describe('window ordering agrees with the engine, not with UTF-16', () => {
+  it('compares strings by code point, where the page (COLLATE "C") puts them', () => {
+    // The reproduction: JavaScript's `<` compares UTF-16 code units, so the emoji's leading
+    // surrogate (D83D) sorts before U+E000 — while PostgreSQL, the engine's evaluator and this
+    // comparator all put U+1F600 after it.
+    expect('\u{1F600}' < '\uE000').toBe(true)
+    expect(cmpCodePoints('\uE000', '\u{1F600}')).toBeLessThan(0)
+    expect(cmpCodePoints('\u{1F600}', '\uE000')).toBeGreaterThan(0)
+  })
+
+  it('is a total order: equality, prefixes, and the ordinary ASCII case', () => {
+    expect(cmpCodePoints('', '')).toBe(0)
+    expect(cmpCodePoints('abc', 'abc')).toBe(0)
+    expect(cmpCodePoints('ab', 'abc')).toBeLessThan(0)
+    expect(cmpCodePoints('abc', 'ab')).toBeGreaterThan(0)
+    expect(cmpCodePoints('', 'a')).toBeLessThan(0)
+    expect(cmpCodePoints('a', 'b')).toBeLessThan(0)
+  })
+
+  it('orders rows by code point on a text column', () => {
+    const cmp = makeCmp('id', { col: 'label' }, () => 'text')
+    const first: Row = { id: 1, label: '\uE000' }
+    const second: Row = { id: 2, label: '\u{1F600}' }
+    expect(cmp(first, second)).toBeLessThan(0)
+    expect(cmp(second, first)).toBeGreaterThan(0)
+  })
+
+  it('orders an int column numerically whichever wire form each value arrived in', () => {
+    // An `int` cell is `number | string`: a bigint past 2^53 arrives as an exact decimal string.
+    // The COLUMN TYPE decides the comparison, so a mixed pair still compares numerically...
+    const cmp = makeCmp('id', { col: 'amount' }, () => 'int')
+    const small: Row = { id: 1, amount: 9 }
+    const big: Row = { id: 2, amount: '9007199254740993' }
+    const bigger: Row = { id: 3, amount: '9007199254740994' }
+    expect(cmp(small, big)).toBeLessThan(0)
+    expect(cmp(big, bigger)).toBeLessThan(0)
+    expect(cmp(bigger, big)).toBeGreaterThan(0)
+    // Same row identity and same value: a tie all the way through the pk tiebreaker.
+    expect(cmp(big, { id: 2, amount: '9007199254740993' })).toBe(0)
+
+    // ...where a code-point comparison would order '10' before '9'.
+    expect(cmp({ id: 5, amount: 10 }, { id: 6, amount: '9' })).toBeGreaterThan(0)
+  })
+
+  it('a text column holding digits is still text: "10" sorts before "9"', () => {
+    const cmp = makeCmp('id', { col: 'label' }, () => 'text')
+    expect(cmp({ id: 1, label: '10' }, { id: 2, label: '9' })).toBeLessThan(0)
   })
 })

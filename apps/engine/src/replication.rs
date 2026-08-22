@@ -768,8 +768,9 @@ fn tuple_to_map(tuple: &Tuple, columns: &[String], ts: &TableSchema) -> Map<Stri
     out
 }
 
-/// Extract the primary-key string from a parsed row object. For composite primary keys the column values
-/// are joined by the same separator [`TableSchema::key_string`] uses, so envelope keys match the engine's.
+/// Extract the primary-key string from a parsed row object. For composite primary keys the column
+/// values go through the same escape-and-join encoding [`TableSchema::key_string`] uses
+/// ([`crate::schema::join_key_components`]), so envelope keys match the engine's byte for byte.
 fn key_from_obj(obj: &Json, ts: &TableSchema) -> String {
     let one = |name: &str| -> String {
         match obj.get(name) {
@@ -790,7 +791,7 @@ fn key_from_obj(obj: &Json, ts: &TableSchema) -> String {
     if ts.pk_cols.len() == 1 {
         return one(&ts.pk_name);
     }
-    ts.pk_cols.iter().map(|&i| one(&ts.columns[i].0)).collect::<Vec<_>>().join("\u{1f}")
+    crate::schema::join_key_components(ts.pk_cols.iter().map(|&i| one(&ts.columns[i].0)))
 }
 
 /// Convert a pgoutput text-mode scalar to JSON per the column type (NULL arrives as its own cell

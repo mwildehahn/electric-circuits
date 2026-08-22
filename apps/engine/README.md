@@ -108,6 +108,33 @@ unchanged (always a number), and AVG stays a double. Exactness is for **integer*
 `f64` like any other float. Clients: `AggregateValue` is `number | string | boolean | null`;
 `BigInt(v)` a string sum.
 
+**And so is every other integer on the wire.** The same encoding governs ordinary row values
+(`Value::to_json`): a JSON number while `|v| ≤ 2^53 - 1`, an exact decimal **string** beyond it —
+shape-stream envelopes, `POST /query`, subset pages, MIN/MAX over an int column. `Value::from_json`
+takes the string form back, so it round-trips. TypeScript consumers see `number | string` for an
+`int` cell (`packages/protocol`'s `Value`, the client's zod row schema); `String(v)` is always the
+exact decimal.
+
+**A composite primary key encodes its tuple unambiguously.** The envelope `key` for a single-column
+key is the value's own string, unchanged. For a composite key each component is escaped (`\` →
+`\\`, U+001F → `\x1f`) before the components are joined with U+001F (`schema::key_string` /
+`join_key_components`; the replication decoder's `key_from_obj` uses the same helper, so the backfill
+and the live path spell identical keys). Without escaping, `('x', 'y␟z')` and `('x␟y', 'z')` both
+spell `x␟y␟z` — and `translate_output` de-duplicates positive rows by that string, so one legal row
+disappeared from every shape.
+
+**A subset page is ordered the way its client can reproduce.** Membership in a subset's loaded window
+is decided client-side, so `ORDER BY` on a collatable text column carries an explicit `COLLATE "C"`
+(code-point order), as do the keyset cursor's range comparisons — which is also how the engine's own
+predicate evaluation compares text. `uuid`/`timestamptz` and friends map to the protocol's `text` but
+have a collation-independent order (and refuse a collation), so they are left alone; `=`/`<>` are
+never collated, keeping them index-eligible. The collation is emitted only when the Postgres type is
+KNOWN, so a table declared through `POST /schema` instead of introspected keeps the database's
+default ordering — the guarantee needs introspection. On a non-`C` database, `COLLATE "C"` on `<`/`>`
+cannot use the column's default-collation btree index: add an expression index
+`CREATE INDEX … ON t ((col COLLATE "C"))` for the columns your subsets order by (on `C`/`C.UTF-8`,
+the common container default, the index already is that collation and nothing changes).
+
 **Library mode keeps the before-image the database would have supplied.** With no
 `ELECTRIC_CIRCUITS_PG_URL`, writes reach the change log through the native write API as
 `(table, op, pk, row)` — a delete or update carries no prior row, and without one the retraction
@@ -284,6 +311,18 @@ than handing back a shape a restart would forget; the client's own timeout is th
 that lands after the client gave up leaves a shape with no subscriber, which the retention sweeper
 evicts.
 
+**That wait is an interval, and the closing check is taken again after it.** Anyone who can make
+storage slow can hold a create or a join open while a `TRUNCATE`, a schema drift, an epoch reset or a
+`?purge=true` retires the very shape it is about to acknowledge — none of which the pre-wait checks
+can see. So every `Created`/`Joined` await is followed by `recheck_after_durability`: the degradation
+latch, the schema generations the create captured, the epoch generation, and "is the record still
+registered, on the same stream?" (a purge moves no generation, so registration is checked directly).
+A mismatch rolls the attempt back — the create's `CreateGuard`, or a join giving its provisional
+refcount back — and the create is simply **redone**, up to three times, before answering 503. A handle
+whose shape was retired during the wait is never returned. A join additionally `HEAD`s the retained
+stream: if storage has lost it, the stale registry entry is retired and the caller gets a fresh shape
+rather than a dead URL.
+
 Removals are the other way round: `DELETE /shapes/{id}`, with or without `?purge=true`, is answered
 as soon as the engine state is updated and its `Left`/`Dropped` lands behind it, in order. Losing one
 would be benign (a restored refcount too many, which retention resolves; a shape whose stream is
@@ -304,6 +343,22 @@ stream is retired and a `Retired` record only **after** storage accepted the del
 storage refused is retried in the background (500 ms → 5 s) and, if the process dies first, re-queued
 by the next boot straight out of the catalog — which is also how an orphaned `shape/*` stream is
 collected. `GET /shapes/{id}` answers 404 from the moment the record goes, pending retirement or not.
+
+**A terminal append answer is reconciled before a live shape's batch is discarded.** `404` is what a
+proxy, a storage router or a failover answers just as readily as a real deletion, and
+`append_reliable` reporting "retired" makes the sequencer advance past the batch — so believing a
+false one leaves a registered shape permanently missing a committed change, with nothing left that
+remembers it. The engine answers instead: still registered and `HEAD` finds the stream ⇒ the status
+was false, keep retrying; storage really has lost it ⇒ retire the shape (`Dropped`, close-then-delete,
+deregister) so subscribers re-subscribe, and only then discard. Symmetrically, an append whose
+*failure* would retire an acknowledged shape — activation's aggregate re-seed, the circuit-aggregate
+seed, a dormant shape's replay — uses `append_retrying` (transient retried with backoff, joined to
+the shutdown token), so one 503 during a boot no longer deletes a live subscription. Its budget is
+**30 s** (`DsClient::RESTORE_APPEND_BUDGET`): long enough to ride out a storage restart or a
+failover, short enough that a boot does not hang on a dependency that is not coming back. Note that
+restores are sequential, so N aggregates whose appends are all failing wait up to N × 30 s before the
+boot finishes — the budget is per append, not per boot, and a storage outage that long is an outage
+an operator should be seeing anyway.
 
 ### Boot: fatal vs retryable
 
