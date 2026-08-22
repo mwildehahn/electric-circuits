@@ -60,7 +60,10 @@ pub(crate) async fn create_circuit_agg(
     ds.append_retrying(stream_path, &[env], DsClient::RESTORE_APPEND_BUDGET, shutdown)
         .await
         .map_err(|e| anyhow::anyhow!("append initial aggregate: {e:#}"))?;
-    tracing::info!("circuit aggregate {shape_id}: serving COUNT('{table}') from the counts pipeline (initial {})", agg.value);
+    tracing::info!(
+        "circuit aggregate {shape_id}: serving COUNT('{table}') from the counts pipeline (initial {})",
+        agg.value
+    );
     exec.circuit_aggs.insert(shape_id.to_string(), agg);
     Ok(())
 }

@@ -10,11 +10,11 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
 use electric_circuits_engine::http::router;

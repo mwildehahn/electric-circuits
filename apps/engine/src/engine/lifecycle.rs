@@ -97,8 +97,7 @@ impl Engine {
         // the retry would take a second claim — the very thing the id exists to prevent.
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res =
-                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub).await;
+            let res = self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub).await;
             match retry_create(res, attempt, "shape", table) {
                 Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
@@ -199,11 +198,7 @@ impl Engine {
                     // lease moves.
                     let now = crate::changelog::now_secs();
                     let fresh = st.subscribe(&existing_id, sub.to_string(), now);
-                    let ev = CatalogEvent::Joined {
-                        id: existing_id.clone(),
-                        subscription: sub.to_string(),
-                        at: now,
-                    };
+                    let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
                     // A NEW claim is enqueued here (under the lock, so the log order matches the
                     // state order) and WAITED on immediately before the join is acknowledged: a
                     // subscription the durable record does not carry is one a restart forgets. A
@@ -216,12 +211,7 @@ impl Engine {
                         self.catalog_tx.send(ev);
                         None
                     };
-                    let ready = st
-                        .feed_shares
-                        .get(&existing_id)
-                        .expect("share entry for live feed")
-                        .ready
-                        .clone();
+                    let ready = st.feed_shares.get(&existing_id).expect("share entry for live feed").ready.clone();
                     // Release the lock, then wait for the creator's backfill to land: a joiner must not
                     // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
                     // failed creation.
@@ -284,7 +274,6 @@ impl Engine {
         // NOTE: the stream itself is created AFTER the state lock is released (per path below):
         // the PUT is a storage round-trip with a durability fsync, and holding the global lock
         // across it serializes concurrent shape creations.
-
 
         // Subquery shapes (`col IN (SELECT …)`) are maintained by the cross-table registry, not by a
         // tailer's local routing. Ensure a tailer exists for the outer table AND every referenced inner
@@ -353,8 +342,7 @@ impl Engine {
             let mut creating = CreateGuard::new(self, &id, table, &stream_path, Registration::Registry);
             let res = async {
                 self.ds.ensure_stream(&stream_path).await?;
-                self.create_subquery_three_phase(&id, table, &stream_path, &where_json, out_cols, changes_only)
-                    .await
+                self.create_subquery_three_phase(&id, table, &stream_path, &where_json, out_cols, changes_only).await
             }
             .await;
             match res {
@@ -473,11 +461,24 @@ impl Engine {
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
             Err(e) => Err(format!("creating shape stream: {e:#}")),
-            Ok(()) => backfill_and_activate(
-            &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &rec.stream_path, &pred,
-            out_cols.as_ref(), changes_only, None, &self.shutdown_token(), ack_rx,
-        )
-        .await,
+            Ok(()) => {
+                backfill_and_activate(
+                    &self.ds,
+                    &self.pg_url,
+                    &cmd_tx,
+                    &ts,
+                    table,
+                    &id,
+                    &rec.stream_path,
+                    &pred,
+                    out_cols.as_ref(),
+                    changes_only,
+                    None,
+                    &self.shutdown_token(),
+                    ack_rx,
+                )
+                .await
+            }
         };
         match outcome {
             Ok(()) => {
@@ -602,8 +603,7 @@ impl Engine {
                 ensure_subscription_free(&st, sub, &existing_id)?;
                 let now = crate::changelog::now_secs();
                 let fresh = st.subscribe(&existing_id, sub.to_string(), now);
-                let ev =
-                    CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
+                let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
                 // Durable for a new claim, queued for a renewal — see the row-shape join path.
                 let joined = if fresh {
                     Some(self.catalog_tx.send_durable(ev))
@@ -611,8 +611,7 @@ impl Engine {
                     self.catalog_tx.send(ev);
                     None
                 };
-                let ready =
-                    st.feed_shares.get(&existing_id).expect("share entry for aggregate").ready.clone();
+                let ready = st.feed_shares.get(&existing_id).expect("share entry for aggregate").ready.clone();
                 drop(st);
                 let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
                 if let Err(e) = await_share_ready(ready, &existing_id).await {
@@ -681,10 +680,8 @@ impl Engine {
                         // create's work are together sufficient.
                         self.ensure_not_degraded()?;
                         st.shapes.insert(id.clone(), rec.clone());
-                        st.circuit_placement.insert(
-                            id.clone(),
-                            CircuitPlacement { label: "counts".into(), col: None, counts: true },
-                        );
+                        st.circuit_placement
+                            .insert(id.clone(), CircuitPlacement { label: "counts".into(), col: None, counts: true });
                         // Durable before the create is acknowledged — see `create_shape`.
                         let created = self.catalog_tx.send_durable(CatalogEvent::Created {
                             rec: rec.clone(),
@@ -722,9 +719,7 @@ impl Engine {
                                 }
                                 created.await;
                                 // The wait is an interval of its own: re-check before acknowledging.
-                                if let Err(e) =
-                                    self.recheck_after_durability(&id, &rec.stream_path, &gens).await
-                                {
+                                if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
                                     // `Raced`, not `Failed` — see the subquery path.
                                     let _ = share_tx.send(ShareOutcome::Raced);
                                     creating.rollback().await;
@@ -801,8 +796,19 @@ impl Engine {
         drop(st);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = backfill_and_activate(
-            &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &stream_path_c, &pred,
-            None, false, Some((func, col_idx)), &self.shutdown_token(), ack_rx,
+            &self.ds,
+            &self.pg_url,
+            &cmd_tx,
+            &ts,
+            table,
+            &id,
+            &stream_path_c,
+            &pred,
+            None,
+            false,
+            Some((func, col_idx)),
+            &self.shutdown_token(),
+            ack_rx,
         )
         .await;
         match outcome {
@@ -953,9 +959,8 @@ impl Engine {
         });
         if let Some(rec) = &removed {
             if let Some(seq) = st.sequencer.as_ref() {
-                let _ = seq
-                    .cmd_tx
-                    .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
+                let _ =
+                    seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
             }
         }
         drop(st);
@@ -1108,9 +1113,7 @@ impl Engine {
                                                 gate: gate.clone(),
                                             };
                                         }
-                                        if let Err(e) =
-                                            engine.evict_shape(&id, EvictReason::ChangeLogRetention).await
-                                        {
+                                        if let Err(e) = engine.evict_shape(&id, EvictReason::ChangeLogRetention).await {
                                             tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
                                         }
                                         let _ = tx.send(Some(false));
@@ -1119,11 +1122,8 @@ impl Engine {
                                     tracing::warn!("reactivating shape {id} failed: {err:#}");
                                     // Restore the dormant resume state so a later touch retries.
                                     if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
-                                        life.state = LifeState::Dormant {
-                                            since: std::time::Instant::now(),
-                                            resume,
-                                            gate,
-                                        };
+                                        life.state =
+                                            LifeState::Dormant { since: std::time::Instant::now(), resume, gate };
                                     }
                                     let _ = tx.send(Some(false));
                                 });
@@ -1165,19 +1165,22 @@ impl Engine {
     /// shape and drain through the same gate at activation; any overlap between the replay and the
     /// buffer double-applies only absolute per-pk upserts/deletes — idempotent for stream readers.
     /// Split from [`ensure_active`] so the lifecycle bookkeeping stays in one place.
-    pub(crate) async fn resume_dormant(&self, id: &str, resume: LogPosition, gate: crate::pg::SnapshotGate) -> Result<()> {
+    pub(crate) async fn resume_dormant(
+        &self,
+        id: &str,
+        resume: LogPosition,
+        gate: crate::pg::SnapshotGate,
+    ) -> Result<()> {
         let (rec, ts, pred, out_cols, num_id, cmd_tx, gens) = {
             let mut st = self.state.lock().await;
             let rec =
                 st.shapes.get(id).cloned().with_context(|| format!("shape '{id}' vanished during reactivation"))?;
             self.ensure_schema_resolved(&st, std::slice::from_ref(&rec.table))?;
             let gens = st.capture_gens(std::slice::from_ref(&rec.table));
-            let ts =
-                st.tables.get(&rec.table).cloned().with_context(|| format!("unknown table '{}'", rec.table))?;
+            let ts = st.tables.get(&rec.table).cloned().with_context(|| format!("unknown table '{}'", rec.table))?;
             let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), &ts)?);
             let out_cols = resolve_columns(&ts, rec.columns.clone())?;
-            let num_id: u64 =
-                id.strip_prefix('s').and_then(|n| n.parse().ok()).context("unparseable shape id")?;
+            let num_id: u64 = id.strip_prefix('s').and_then(|n| n.parse().ok()).context("unparseable shape id")?;
             let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
             (rec, ts, pred, out_cols, num_id, cmd_tx, gens)
         };
@@ -1212,8 +1215,7 @@ impl Engine {
         {
             Ok(n) => n,
             Err(e) => {
-                let _ = cmd_tx
-                    .send(SequencerCmd::AbortShape { table: rec.table.clone(), shape_id: id.to_string() });
+                let _ = cmd_tx.send(SequencerCmd::AbortShape { table: rec.table.clone(), shape_id: id.to_string() });
                 return Err(e.context(format!("shape '{id}' reactivation replay failed")));
             }
         };
@@ -1271,9 +1273,7 @@ impl Engine {
         {
             let mut lives = self.lives.lock().unwrap();
             let Some(life) = lives.get_mut(id) else { return Ok(()) };
-            if !matches!(life.state, LifeState::Active)
-                || life.last_read.elapsed() < self.retention.idle_timeout
-            {
+            if !matches!(life.state, LifeState::Active) || life.last_read.elapsed() < self.retention.idle_timeout {
                 return Ok(()); // touched or already transitioning since the sweep snapshot
             }
             life.state = LifeState::Deactivating { done: done_rx };
@@ -1289,11 +1289,8 @@ impl Engine {
         let Some(life) = lives.get_mut(id) else { return Ok(()) };
         match resume {
             Some((resume, gate)) => {
-                life.state = LifeState::Dormant {
-                    since: std::time::Instant::now(),
-                    resume: resume.clone(),
-                    gate: gate.clone(),
-                };
+                life.state =
+                    LifeState::Dormant { since: std::time::Instant::now(), resume: resume.clone(), gate: gate.clone() };
                 drop(lives);
                 self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume, gate });
                 metrics().shapes_dormanted.fetch_add(1, Ordering::Relaxed);
@@ -1358,9 +1355,8 @@ impl Engine {
         // live and needs the full teardown (sequencer routing for aggregates, registry for subqueries).
         if !parkable {
             if let Some(seq) = st.sequencer.as_ref() {
-                let _ = seq
-                    .cmd_tx
-                    .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
+                let _ =
+                    seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
             }
         }
         drop(st);
@@ -1563,12 +1559,8 @@ impl Engine {
             std::time::Duration::ZERO,
             crate::changelog::now_secs(),
         );
-        let deactivating = self
-            .lives
-            .lock()
-            .unwrap()
-            .values()
-            .any(|l| matches!(l.state, LifeState::Deactivating { .. }));
+        let deactivating =
+            self.lives.lock().unwrap().values().any(|l| matches!(l.state, LifeState::Deactivating { .. }));
         if !evicted_all || deactivating {
             if !deletable.delete.is_empty() {
                 tracing::info!(
@@ -1642,7 +1634,6 @@ impl Engine {
             }
         });
     }
-
 }
 
 impl Engine {
@@ -1665,7 +1656,12 @@ impl Engine {
             let mut attempt = 0u32;
             loop {
                 let res = self.subqueries.lock().await.begin_create(
-                    id, table, stream_path, where_json, out_cols.clone(), changes_only,
+                    id,
+                    table,
+                    stream_path,
+                    where_json,
+                    out_cols.clone(),
+                    changes_only,
                 );
                 match res {
                     Ok(b) => break b,
@@ -1686,42 +1682,31 @@ impl Engine {
                     .get(inner_table)
                     .cloned()
                     .with_context(|| format!("seed: unknown inner table '{inner_table}'"))?;
-                let wsql = inner_where
-                    .as_ref()
-                    .map(|w| crate::sql::predicate_json_to_sql(w, 1, &begin.schemas, inner_table));
-                let client = crate::pg::pool_for(
-                    self.pg_url.as_deref().context("subquery work requires postgres")?,
-                )
-                .get()
-                .await?;
+                let wsql =
+                    inner_where.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1, &begin.schemas, inner_table));
+                let client = crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
+                    .get()
+                    .await?;
                 // `collect`: an inner-set node's seed IS engine state — the set it will maintain
                 // — so there is nothing to stream it to. It is read through the same streamed
                 // reader as every other backfill, so the transport (and the fences) are identical.
-                let (rows, fences) =
-                    crate::pg::backfill_where_reader(&client, &ts, wsql).await?.collect().await?;
+                let (rows, fences) = crate::pg::backfill_where_reader(&client, &ts, wsql).await?.collect().await?;
                 node_seeds.push((sig.clone(), rows, fences.gate));
             }
-            let outer_ts = begin
-                .schemas
-                .get(table)
-                .cloned()
-                .with_context(|| format!("unknown outer table '{table}'"))?;
+            let outer_ts =
+                begin.schemas.get(table).cloned().with_context(|| format!("unknown outer table '{table}'"))?;
             let (outer_gate, seeded, seeded_pks) = if changes_only {
                 (crate::pg::SnapshotGate::passthrough(), 0u64, HashSet::new())
             } else {
-                let (wsql, params) =
-                    crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
-                let client = crate::pg::pool_for(
-                    self.pg_url.as_deref().context("subquery work requires postgres")?,
-                )
-                .get()
-                .await?;
+                let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
+                let client = crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
+                    .get()
+                    .await?;
                 // The OUTER shape's backfill is streamed: each chunk is appended to the (not yet
                 // installed) shape stream and dropped, so a wide subquery shape costs one chunk of
                 // memory, not a table's worth. Only the pk SET is kept — it is what
                 // `finish_create`'s gated replay is fenced against, and keys are small.
-                let mut reader =
-                    crate::pg::backfill_where_reader(&client, &outer_ts, Some((wsql, params))).await?;
+                let mut reader = crate::pg::backfill_where_reader(&client, &outer_ts, Some((wsql, params))).await?;
                 let mut seeded_pks: HashSet<String> = HashSet::new();
                 let mut seeded = 0u64;
                 let mut appends = 0u64;
@@ -1735,13 +1720,7 @@ impl Engine {
                         seeded_pks.insert(outer_ts.key_string(r).unwrap_or_default());
                     }
                     let out: Vec<(Row, ZWeight)> = chunk.into_iter().map(|r| (r, 1)).collect();
-                    let envs = translate_output(
-                        &outer_ts,
-                        out,
-                        None,
-                        None,
-                        out_cols.as_deref().map(Vec::as_slice),
-                    );
+                    let envs = translate_output(&outer_ts, out, None, None, out_cols.as_deref().map(Vec::as_slice));
                     if envs.is_empty() {
                         continue;
                     }
@@ -1761,12 +1740,8 @@ impl Engine {
         // the caller's create rollback (which reaches the registry via `abort_create`), so there is
         // exactly one undo path whether the create failed or was cancelled.
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
-        let finished = self
-            .subqueries
-            .lock()
-            .await
-            .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
-            .await?;
+        let finished =
+            self.subqueries.lock().await.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
         let crate::subquery::FinishedCreate { work, deferred, node_work } = finished;
         if !node_work.is_empty() {
             // Re-derivations a child node's flip aimed at one of THIS create's fresh nodes while it
@@ -1794,11 +1769,7 @@ impl Engine {
             // the phase-B snapshot could not contain, so they are barrier-covered like any other
             // effect: counted before the hand-off, released only once they land.
             self.pending_flips.fetch_add(1, Ordering::SeqCst);
-            if self
-                .flip_tx
-                .send(FlipWork::Deferred { shape_id: id.to_string(), work: deferred })
-                .is_err()
-            {
+            if self.flip_tx.send(FlipWork::Deferred { shape_id: id.to_string(), work: deferred }).is_err() {
                 self.pending_flips.fetch_sub(1, Ordering::SeqCst);
             }
         }
@@ -1815,10 +1786,9 @@ impl Engine {
 /// critical section that takes the claim.
 fn ensure_subscription_free(st: &EngineState, sub: &str, shape: &str) -> Result<()> {
     match st.subscription_owner(sub) {
-        Some(owner) if owner != shape => Err(anyhow::Error::new(SubscriptionConflict {
-            subscription: sub.to_string(),
-            shape: owner.clone(),
-        })),
+        Some(owner) if owner != shape => {
+            Err(anyhow::Error::new(SubscriptionConflict { subscription: sub.to_string(), shape: owner.clone() }))
+        }
         _ => Ok(()),
     }
 }
@@ -1882,8 +1852,7 @@ impl Drop for JoinGuard {
             self.shape_id,
             self.subscription
         );
-        let (engine, shape_id, subscription) =
-            (self.engine.clone(), self.shape_id.clone(), self.subscription.clone());
+        let (engine, shape_id, subscription) = (self.engine.clone(), self.shape_id.clone(), self.subscription.clone());
         tokio::spawn(async move {
             engine.release_subscription(&shape_id, Some(&subscription)).await;
         });
@@ -1918,13 +1887,7 @@ struct CreateGuard {
 }
 
 impl CreateGuard {
-    fn new(
-        engine: &Engine,
-        shape_id: &str,
-        table: &TableRef,
-        stream_path: &str,
-        registration: Registration,
-    ) -> Self {
+    fn new(engine: &Engine, shape_id: &str, table: &TableRef, stream_path: &str, registration: Registration) -> Self {
         Self {
             engine: engine.clone(),
             shape_id: shape_id.to_string(),
@@ -1944,9 +1907,7 @@ impl CreateGuard {
     /// the caller returns is already true of the engine's state.
     async fn rollback(&mut self) {
         self.armed = false;
-        self.engine
-            .rollback_create(&self.shape_id, &self.table, &self.stream_path, self.registration)
-            .await;
+        self.engine.rollback_create(&self.shape_id, &self.table, &self.stream_path, self.registration).await;
     }
 }
 
@@ -2179,9 +2140,7 @@ impl Engine {
                         )));
                     }
                     let backoff = std::time::Duration::from_millis(100 * u64::from(attempt));
-                    tracing::warn!(
-                        "join: HEAD {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}"
-                    );
+                    tracing::warn!("join: HEAD {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -2213,12 +2172,7 @@ impl Engine {
     /// Failures are typed [`CreateRaced`] so the caller can redo the whole attempt; a degradation
     /// stays a typed [`Degraded`] (the HTTP layer answers 503 with the reason, and a joiner waiting
     /// on the share must get the creator's reason verbatim).
-    pub(crate) async fn recheck_after_durability(
-        &self,
-        id: &str,
-        stream_path: &str,
-        gens: &SchemaGens,
-    ) -> Result<()> {
+    pub(crate) async fn recheck_after_durability(&self, id: &str, stream_path: &str, gens: &SchemaGens) -> Result<()> {
         self.ensure_create_not_degraded()?;
         self.ensure_schema_unchanged(gens)
             .await
@@ -2263,9 +2217,7 @@ impl Engine {
         if registration == Registration::Sequencer
             && let Some(seq) = st.sequencer.as_ref()
         {
-            let _ = seq
-                .cmd_tx
-                .send(SequencerCmd::RemoveShape { table: table.clone(), shape_id: id.to_string() });
+            let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape { table: table.clone(), shape_id: id.to_string() });
         }
         drop(st);
         self.lives.lock().unwrap().remove(id);
@@ -2324,18 +2276,21 @@ mod cancellation_tests {
     /// it arms there.
     async fn register(engine: &Engine, id: &str, where_json: &PredicateJson) -> CreateGuard {
         let mut st = engine.state.lock().await;
-        st.shapes.insert(id.to_string(), ShapeRecord {
-            id: id.to_string(),
-            table: "outer_t".into(),
-            stream_path: format!("shape/{id}"),
-            changes_only: false,
-            where_json: Some(where_json.clone()),
-            columns: None,
-            family_key: None,
-            is_subquery: true,
-            aggregate: None,
-            fingerprint: None,
-        });
+        st.shapes.insert(
+            id.to_string(),
+            ShapeRecord {
+                id: id.to_string(),
+                table: "outer_t".into(),
+                stream_path: format!("shape/{id}"),
+                changes_only: false,
+                where_json: Some(where_json.clone()),
+                columns: None,
+                family_key: None,
+                is_subquery: true,
+                aggregate: None,
+                fingerprint: None,
+            },
+        );
         let (_ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Pending);
         st.feed_by_sig.insert("sig".into(), id.to_string());
         st.feed_shares.insert(id.to_string(), FeedShare { sig: "sig".into(), subs: Default::default(), ready });
@@ -2480,8 +2435,7 @@ mod cancellation_tests {
         let guard = register(&engine, "s1", &where_json).await;
         let node_id = {
             let mut reg = engine.subqueries.lock().await;
-            let begin =
-                reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
+            let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
             let sig = begin.seeds[0].0.clone();
             reg.assert_seed_row_for_test(&sig, "1", Value::Int(7)).await;
             let node_id = reg.nodes[&sig].node_id;
@@ -2511,18 +2465,21 @@ mod cancellation_tests {
         let sig = shape_signature(&"outer_t".into(), &Some(where_json.clone()), &None, false);
         let (tx, rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
         let mut st = engine.state.lock().await;
-        st.shapes.insert(id.to_string(), ShapeRecord {
-            id: id.to_string(),
-            table: "outer_t".into(),
-            stream_path: format!("shape/{id}"),
-            changes_only: false,
-            where_json: Some(where_json.clone()),
-            columns: None,
-            family_key: None,
-            is_subquery: true,
-            aggregate: None,
-            fingerprint: None,
-        });
+        st.shapes.insert(
+            id.to_string(),
+            ShapeRecord {
+                id: id.to_string(),
+                table: "outer_t".into(),
+                stream_path: format!("shape/{id}"),
+                changes_only: false,
+                where_json: Some(where_json.clone()),
+                columns: None,
+                family_key: None,
+                is_subquery: true,
+                aggregate: None,
+                fingerprint: None,
+            },
+        );
         st.feed_by_sig.insert(sig.clone(), id.to_string());
         st.feed_shares.insert(id.to_string(), FeedShare { sig, subs: Default::default(), ready: rx });
         st.subscribe(id, "sub-creator".to_string(), crate::changelog::now_secs());
@@ -2634,23 +2591,25 @@ mod subscription_tests {
     async fn engine_with_share(id: &str, subs: &[(&str, u64)]) -> Engine {
         let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
         let mut st = engine.state.lock().await;
-        st.shapes.insert(id.to_string(), ShapeRecord {
-            id: id.to_string(),
-            table: "items".into(),
-            stream_path: format!("shape/{id}"),
-            changes_only: false,
-            where_json: None,
-            columns: None,
-            family_key: None,
-            is_subquery: false,
-            aggregate: None,
-            fingerprint: None,
-        });
+        st.shapes.insert(
+            id.to_string(),
+            ShapeRecord {
+                id: id.to_string(),
+                table: "items".into(),
+                stream_path: format!("shape/{id}"),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+            },
+        );
         let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
         drop(ready_tx);
         st.feed_by_sig.insert(format!("sig-{id}"), id.to_string());
-        st.feed_shares
-            .insert(id.to_string(), FeedShare { sig: format!("sig-{id}"), subs: Default::default(), ready });
+        st.feed_shares.insert(id.to_string(), FeedShare { sig: format!("sig-{id}"), subs: Default::default(), ready });
         for (sub, at) in subs {
             st.subscribe(id, (*sub).to_string(), *at);
         }

@@ -52,18 +52,13 @@ impl RetirementQueue {
     pub(crate) fn enqueue(&self, stream_path: &str, shape_id: Option<&str>) {
         self.pending.fetch_add(1, Ordering::SeqCst);
         crate::metrics::metrics().retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
-        let item = Retirement {
-            stream_path: stream_path.to_string(),
-            shape_id: shape_id.map(str::to_string),
-            attempt: 0,
-        };
+        let item =
+            Retirement { stream_path: stream_path.to_string(), shape_id: shape_id.map(str::to_string), attempt: 0 };
         if self.tx.send(item).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             // Republish: the gauge is written from the counter, so an un-mirrored decrement would
             // leave it reading one retirement too many for the rest of the process.
-            crate::metrics::metrics()
-                .retirements_pending
-                .store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
+            crate::metrics::metrics().retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
         }
     }
 
@@ -118,10 +113,7 @@ pub(crate) fn spawn_retirement_queue(
                         catalog_tx.send(CatalogEvent::Retired { id: id.clone() });
                     }
                     if item.attempt > 0 {
-                        tracing::info!(
-                            "retired stream {} after {} retr(ies)",
-                            item.stream_path, item.attempt
-                        );
+                        tracing::info!("retired stream {} after {} retr(ies)", item.stream_path, item.attempt);
                     }
                     counter.fetch_sub(1, Ordering::SeqCst);
                     crate::metrics::metrics()
@@ -137,7 +129,8 @@ pub(crate) fn spawn_retirement_queue(
                     if item.attempt == 1 || item.attempt.is_multiple_of(20) {
                         tracing::warn!(
                             "retiring stream {} failed (attempt {}), retrying: {e:#}",
-                            item.stream_path, item.attempt
+                            item.stream_path,
+                            item.attempt
                         );
                     }
                     queue.push_back(item);

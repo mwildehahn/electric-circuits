@@ -102,11 +102,7 @@ async fn a_shape_parked_while_a_transaction_is_held_resumes_at_the_pinned_positi
         "-1".to_string(),
         (
             "01".to_string(),
-            format!(
-                "[{},{}]",
-                env_json(500, "0/50", "a1", 0, true),
-                env_json(501, "0/51", "b1", 0, false)
-            ),
+            format!("[{},{}]", env_json(500, "0/50", "a1", 0, true), env_json(501, "0/51", "b1", 0, false)),
         ),
     );
 

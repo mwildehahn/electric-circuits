@@ -78,9 +78,7 @@ async fn get_trace(State(engine): State<Engine>) -> impl IntoResponse {
     use tokio_stream::StreamExt;
     let rx = engine.trace_sender().subscribe();
     let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| match item {
-        Ok(json) => Some(Ok::<_, std::convert::Infallible>(
-            axum::response::sse::Event::default().data(json.as_str()),
-        )),
+        Ok(json) => Some(Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json.as_str()))),
         // Lagged: drop the gap marker; the consumer treats trace as best-effort animation.
         Err(_) => None,
     });
@@ -131,10 +129,7 @@ async fn ready(State(engine): State<Engine>) -> Response {
 /// `OPTIONS /v1/shape` — CORS preflight: 204 advertising the methods the adapter serves.
 async fn shape_options() -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, HEAD, DELETE, OPTIONS"),
-    );
+    headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, HEAD, DELETE, OPTIONS"));
     (StatusCode::NO_CONTENT, headers).into_response()
 }
 
@@ -174,14 +169,10 @@ struct QueryResp {
     lsn: String,
 }
 
-async fn query_subset(
-    State(engine): State<Engine>,
-    Json(req): Json<QueryReq>,
-) -> Result<Json<QueryResp>, AppError> {
+async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -> Result<Json<QueryResp>, AppError> {
     engine.ensure_not_degraded()?;
     let order_by = req.order_by.map(|o| (o.col, o.desc));
-    let (rows, lsn) =
-        engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
+    let (rows, lsn) = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
     Ok(Json(QueryResp { rows, lsn }))
 }
 
@@ -340,9 +331,8 @@ async fn create_shape(
 ) -> Result<Json<ShapeResp>, AppError> {
     let subscription = validate_new_subscription(req.subscription)?;
     // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
-    let (rec, sub) = engine
-        .create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription)
-        .await?;
+    let (rec, sub) =
+        engine.create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription).await?;
     Ok(Json(ShapeResp::created(&engine, rec, sub)))
 }
 
@@ -370,10 +360,7 @@ async fn create_aggregate(
     Ok(Json(ShapeResp::created(&engine, rec, sub)))
 }
 
-async fn get_shape(
-    State(engine): State<Engine>,
-    Path(id): Path<String>,
-) -> Result<Json<ShapeResp>, AppError> {
+async fn get_shape(State(engine): State<Engine>, Path(id): Path<String>) -> Result<Json<ShapeResp>, AppError> {
     engine.ensure_not_degraded()?;
     match engine.get_shape(&id).await {
         Some(rec) => {
@@ -533,8 +520,7 @@ async fn get_shape_rows(
     }
     let count = rows.len();
     let limit = q.limit.unwrap_or(200).min(2000);
-    let mut entries: Vec<ShapeRowEntry> =
-        rows.into_iter().map(|(key, value)| ShapeRowEntry { key, value }).collect();
+    let mut entries: Vec<ShapeRowEntry> = rows.into_iter().map(|(key, value)| ShapeRowEntry { key, value }).collect();
     // Deterministic order for a stable preview: by numeric key when possible, else lexicographic.
     entries.sort_by(|a, b| match (a.key.parse::<i64>(), b.key.parse::<i64>()) {
         (Ok(x), Ok(y)) => x.cmp(&y),
@@ -542,7 +528,14 @@ async fn get_shape_rows(
     });
     let truncated = entries.len() > limit;
     entries.truncate(limit);
-    Ok(Json(ShapeRowsResp { id: rec.id, table: rec.table, changes_only: rec.changes_only, count, truncated, rows: entries }))
+    Ok(Json(ShapeRowsResp {
+        id: rec.id,
+        table: rec.table,
+        changes_only: rec.changes_only,
+        count,
+        truncated,
+        rows: entries,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -592,10 +585,8 @@ async fn release_shape(
 /// `public.<name>` sugar, `schema.name` is taken as given, anything else is a 400 (never a
 /// mis-resolved lookup).
 fn path_table(raw: &str) -> Result<TableRef, AppError> {
-    TableRef::parse(raw).map_err(|e| AppError {
-        status: StatusCode::BAD_REQUEST,
-        msg: format!("invalid table '{raw}': {e:#}"),
-    })
+    TableRef::parse(raw)
+        .map_err(|e| AppError { status: StatusCode::BAD_REQUEST, msg: format!("invalid table '{raw}': {e:#}") })
 }
 
 /// `GET /tables/{name}/offset` — the sequencer's position in the (segmented) change log.
@@ -619,10 +610,7 @@ async fn table_offset(
     }
 }
 
-async fn table_families(
-    State(engine): State<Engine>,
-    Path(name): Path<String>,
-) -> Result<Json<TableStats>, AppError> {
+async fn table_families(State(engine): State<Engine>, Path(name): Path<String>) -> Result<Json<TableStats>, AppError> {
     let name = path_table(&name)?;
     match engine.table_stats(&name).await {
         Some(stats) => Ok(Json(stats)),
@@ -824,11 +812,7 @@ async fn get_dbsp_profile(State(engine): State<Engine>) -> Json<serde_json::Valu
 /// OpenTelemetry metrics in Prometheus exposition format (what an OTel collector's prometheus receiver
 /// scrapes). Reflects the last published sample (refreshed by the background sampler + every `/memory`).
 async fn get_prometheus() -> Response {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        crate::mem::prometheus_text(),
-    )
-        .into_response()
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], crate::mem::prometheus_text()).into_response()
 }
 
 struct AppError {

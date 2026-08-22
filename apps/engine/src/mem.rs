@@ -249,11 +249,7 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
 /// `electric.shapes.*` gauges without re-locking engine state on the poll path.
 pub fn published_shape_counts() -> (u64, u64, u64) {
     let g = gauges();
-    (
-        g.shapes.load(Ordering::Relaxed),
-        g.family_shapes.load(Ordering::Relaxed),
-        g.standalone.load(Ordering::Relaxed),
-    )
+    (g.shapes.load(Ordering::Relaxed), g.family_shapes.load(Ordering::Relaxed), g.standalone.load(Ordering::Relaxed))
 }
 
 /// Render the OTel/Prometheus exposition text for `GET /metrics/prometheus`.
@@ -288,7 +284,12 @@ pub fn init_otel() -> SdkMeterProvider {
     gauge!("engine_process_resident_memory", "Resident set size of the engine process", rss_bytes, "By");
     gauge!("engine_process_virtual_memory", "Virtual memory of the engine process", virtual_bytes, "By");
     gauge!("engine_shapes", "Registered shapes (all kinds)", shapes, "");
-    gauge!("engine_shapes_dormant", "Dormant shapes (retention: stream retained, engine state dropped)", shapes_dormant, "");
+    gauge!(
+        "engine_shapes_dormant",
+        "Dormant shapes (retention: stream retained, engine state dropped)",
+        shapes_dormant,
+        ""
+    );
     gauge!("engine_tailers", "Per-table replication tailers", tailers, "");
     gauge!("engine_tables", "Tables with a known schema", tables, "");
     gauge!("engine_family_circuits", "Shared equality family circuits (each holds the base table once)", families, "");
@@ -299,7 +300,12 @@ pub fn init_otel() -> SdkMeterProvider {
     gauge!("engine_subquery_distinct_values", "Distinct values across subquery nodes", subquery_distinct_values, "");
     gauge!("engine_subquery_shapes", "Subquery (cross-table) shapes", subquery_shapes, "");
     gauge!("engine_subquery_edges", "Subquery dependency edges", subquery_edges, "");
-    gauge!("engine_subquery_feed_entries", "Total pks delivered across subquery shapes' feed sets", subquery_feed_entries, "");
+    gauge!(
+        "engine_subquery_feed_entries",
+        "Total pks delivered across subquery shapes' feed sets",
+        subquery_feed_entries,
+        ""
+    );
 
     // The engine's own counters and gauges (`crate::metrics`, served as JSON at `GET /metrics`) are
     // exported here too, so `/metrics/prometheus` is a complete scrape target rather than the
@@ -317,16 +323,14 @@ pub fn init_otel() -> SdkMeterProvider {
         ($name:expr, $desc:expr, $field:ident, $unit:expr) => {{
             let b = meter.u64_observable_counter($name).with_description($desc);
             let b = if $unit.is_empty() { b } else { b.with_unit($unit) };
-            b.with_callback(|obs| obs.observe(crate::metrics::metrics().$field.load(Ordering::Relaxed), &[]))
-                .build();
+            b.with_callback(|obs| obs.observe(crate::metrics::metrics().$field.load(Ordering::Relaxed), &[])).build();
         }};
     }
     macro_rules! engine_gauge {
         ($name:expr, $desc:expr, $field:ident, $unit:expr) => {{
             let b = meter.u64_observable_gauge($name).with_description($desc);
             let b = if $unit.is_empty() { b } else { b.with_unit($unit) };
-            b.with_callback(|obs| obs.observe(crate::metrics::metrics().$field.load(Ordering::Relaxed), &[]))
-                .build();
+            b.with_callback(|obs| obs.observe(crate::metrics::metrics().$field.load(Ordering::Relaxed), &[])).build();
         }};
     }
     engine_counter!("engine_envelopes_processed", "Table change events fanned out", envelopes, "");
@@ -335,23 +339,73 @@ pub fn init_otel() -> SdkMeterProvider {
     engine_counter!("engine_shapes_dormanted", "Retention: active -> dormant transitions", shapes_dormanted, "");
     engine_counter!("engine_shapes_reactivated", "Retention: dormant -> active transitions", shapes_reactivated, "");
     engine_counter!("engine_shapes_evicted", "Retention: dormant shapes evicted (stream deleted)", shapes_evicted, "");
-    engine_counter!("engine_retention_pressure", "Sweeps where a cap was exceeded with nothing dormant to evict", retention_pressure, "");
+    engine_counter!(
+        "engine_retention_pressure",
+        "Sweeps where a cap was exceeded with nothing dormant to evict",
+        retention_pressure,
+        ""
+    );
     engine_counter!("engine_schema_drift", "Tables whose dependents were retired (ADR-0005)", schema_drift, "");
-    engine_counter!("engine_schema_unresolved", "Drifts that could not be resolved (table parked)", schema_unresolved, "");
+    engine_counter!(
+        "engine_schema_unresolved",
+        "Drifts that could not be resolved (table parked)",
+        schema_unresolved,
+        ""
+    );
     engine_counter!("engine_epoch_breaks", "Slots the engine could no longer vouch for (ADR-0004)", epoch_breaks, "");
     engine_counter!("engine_epoch_resets", "New epochs bound (every shape retired, fresh slot)", epoch_resets, "");
-    engine_counter!("engine_changes_rotations", "Change-log segments closed and succeeded (ADR-0006)", changes_rotations, "");
+    engine_counter!(
+        "engine_changes_rotations",
+        "Change-log segments closed and succeeded (ADR-0006)",
+        changes_rotations,
+        ""
+    );
     engine_counter!("engine_changes_segments_deleted", "Rotated-out segments retired", changes_segments_deleted, "");
     engine_counter!("engine_txn_spills", "Transactions whose buffer outgrew the memory cap (ADR-0003)", txn_spills, "");
     engine_counter!("engine_txn_spill", "Bytes ever written to transaction spill files", txn_spill_bytes, "By");
-    engine_counter!("engine_txn_chunked_appends", "Chunk appends made by commits too large for one append", txn_chunked_appends, "");
-    engine_counter!("engine_backfill_chunked_appends", "Chunk appends made by backfills too large for one append", backfill_chunked_appends, "");
-    engine_counter!("engine_sequencer_orphan_fragments", "Incomplete transaction fragments discarded by the sequencer", sequencer_orphan_fragments, "");
-    engine_gauge!("engine_changes_segments_retained", "Change-log segments that exist right now", changes_segments_retained, "");
-    engine_gauge!("engine_sequencer_held_run", "1 while the sequencer holds an incomplete transaction (ADR-0003)", sequencer_held_run, "");
+    engine_counter!(
+        "engine_txn_chunked_appends",
+        "Chunk appends made by commits too large for one append",
+        txn_chunked_appends,
+        ""
+    );
+    engine_counter!(
+        "engine_backfill_chunked_appends",
+        "Chunk appends made by backfills too large for one append",
+        backfill_chunked_appends,
+        ""
+    );
+    engine_counter!(
+        "engine_sequencer_orphan_fragments",
+        "Incomplete transaction fragments discarded by the sequencer",
+        sequencer_orphan_fragments,
+        ""
+    );
+    engine_gauge!(
+        "engine_changes_segments_retained",
+        "Change-log segments that exist right now",
+        changes_segments_retained,
+        ""
+    );
+    engine_gauge!(
+        "engine_sequencer_held_run",
+        "1 while the sequencer holds an incomplete transaction (ADR-0003)",
+        sequencer_held_run,
+        ""
+    );
     engine_gauge!("engine_shutdown_in_progress", "1 once a graceful shutdown has begun", shutdown_in_progress, "");
-    engine_gauge!("engine_replication_slot_retained_wal", "WAL Postgres retains for this engine's slot (pg_current_wal_lsn - restart_lsn)", replication_slot_retained_wal_bytes, "By");
-    engine_gauge!("engine_replication_confirmed_flush_lag", "Ingest lag in WAL bytes (pg_current_wal_lsn - confirmed_flush_lsn)", replication_confirmed_flush_lag_bytes, "By");
+    engine_gauge!(
+        "engine_replication_slot_retained_wal",
+        "WAL Postgres retains for this engine's slot (pg_current_wal_lsn - restart_lsn)",
+        replication_slot_retained_wal_bytes,
+        "By"
+    );
+    engine_gauge!(
+        "engine_replication_confirmed_flush_lag",
+        "Ingest lag in WAL bytes (pg_current_wal_lsn - confirmed_flush_lsn)",
+        replication_confirmed_flush_lag_bytes,
+        "By"
+    );
     engine_gauge!("engine_replication_slot_active", "1 while a walsender holds the slot", replication_slot_active, "");
 
     // Touch a KeyValue so the import is used even if labels are added later.

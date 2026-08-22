@@ -43,8 +43,7 @@ pub(crate) fn plan_circuit_agg(
                 let mut keys = std::collections::HashSet::new();
                 let mut idx: Option<usize> = None;
                 for c in or {
-                    let PredicateJson::Leaf { col, op: crate::predicate::LeafOp::Eq, value } = c
-                    else {
+                    let PredicateJson::Leaf { col, op: crate::predicate::LeafOp::Eq, value } = c else {
                         return None;
                     };
                     let i = *ts.index.get(col)?;

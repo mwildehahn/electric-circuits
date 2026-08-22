@@ -197,7 +197,8 @@ async fn a_small_commit_is_still_a_single_append() {
     let (ds, state) = recording_ds().await;
     let log = writer(ds);
 
-    let cfg = TxnBufferConfig { memory_bytes: 128 * 1024 * 1024, append_bytes: 64 * 1024 * 1024, spill_dir: dir.0.clone() };
+    let cfg =
+        TxnBufferConfig { memory_bytes: 128 * 1024 * 1024, append_bytes: 64 * 1024 * 1024, spill_dir: dir.0.clone() };
     let mut buf = TxnBuffer::new(7, cfg);
     for i in 0..25 {
         buf.push(env_of(&format!("k{i}"), 16), 32).unwrap();

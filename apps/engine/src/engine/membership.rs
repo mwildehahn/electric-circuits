@@ -65,8 +65,7 @@ pub(crate) async fn query_rows_by_col(
 ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
-    let where_sql =
-        value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
+    let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
     // `collect`, deliberately: a query-back's RESULT is the candidate set — there is no stream to
     // append it to, and it is one key's worth of rows, not a table's.
     let (rows, fences) = crate::pg::backfill_where_reader(&client, ts, Some(where_sql)).await?.collect().await?;
@@ -107,10 +106,7 @@ pub(crate) fn value_eq_sql(col: &str, value: &Value, pg_type: Option<&str>) -> (
 /// (insert/update — the row still exists), else the `-1` row (delete). The `bool` is
 /// "row still exists". This is the front half of every absolute membership evaluation: decide
 /// per touched pk from its latest row, never from history.
-pub(crate) fn latest_rows_by_pk(
-    ts: &TableSchema,
-    delta: &[Tup2<Row, ZWeight>],
-) -> Vec<(Row, bool)> {
+pub(crate) fn latest_rows_by_pk(ts: &TableSchema, delta: &[Tup2<Row, ZWeight>]) -> Vec<(Row, bool)> {
     let mut by_pk: HashMap<String, (Row, bool)> = HashMap::new();
     for Tup2(row, w) in delta {
         let pk = ts.key_string(row).unwrap_or_default();

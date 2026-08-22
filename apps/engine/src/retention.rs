@@ -366,7 +366,7 @@ mod tests {
             SweepShape { idle: Duration::from_secs(60), ..shape("s2") },   // recently read
             SweepShape { idle: Duration::from_secs(3600), refcount: 2, ..shape("s3") }, // subscribed
             SweepShape { idle: Duration::from_secs(3600), dormancy_eligible: false, ..shape("s4") }, // aggregate/subquery
-            SweepShape { idle: Duration::from_secs(3600), in_transition: true, ..shape("s5") }, // mid-transition
+            SweepShape { idle: Duration::from_secs(3600), in_transition: true, ..shape("s5") },      // mid-transition
         ];
         let plan = plan_sweep(&cfg(), &shapes);
         assert_eq!(plan.deactivate, vec!["s1"]);
@@ -442,10 +442,7 @@ mod tests {
         let plan = plan_sweep(&c, &shapes);
         assert_eq!(
             plan.evict,
-            vec![
-                ("cold".to_string(), EvictReason::DiskBudget),
-                ("warm".to_string(), EvictReason::DiskBudget)
-            ]
+            vec![("cold".to_string(), EvictReason::DiskBudget), ("warm".to_string(), EvictReason::DiskBudget)]
         );
         assert!(!plan.over_budget);
     }

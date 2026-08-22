@@ -72,9 +72,7 @@ async fn main() -> Result<()> {
     let Some(ds_url) = config.ds_url.clone() else {
         refuse_boot(
             "configuration",
-            &anyhow::anyhow!(
-                "ELECTRIC_CIRCUITS_DS_URL must be set to the durable-streams server base URL"
-            ),
+            &anyhow::anyhow!("ELECTRIC_CIRCUITS_DS_URL must be set to the durable-streams server base URL"),
         )
     };
 
@@ -328,9 +326,7 @@ async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Durat
     }
     // The sequencer's final `Offset` is queued, not written: draining is what makes the checkpoint
     // durable, and with it the restart point the next boot resumes from.
-    let catalog_budget = grace
-        .saturating_sub(shutdown.elapsed().unwrap_or_default())
-        .min(shutdown::CATALOG_DRAIN);
+    let catalog_budget = grace.saturating_sub(shutdown.elapsed().unwrap_or_default()).min(shutdown::CATALOG_DRAIN);
     if !engine.drain_catalog(catalog_budget).await {
         tracing::error!(
             "the durable catalog writer did not drain within {catalog_budget:?}; the final checkpoint may be \
@@ -347,7 +343,8 @@ async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Durat
 /// called fatal. `tracing` may not be initialised yet (the log filter is itself configuration), so
 /// this writes to stderr unconditionally as well as logging.
 fn refuse_boot(kind: &str, e: &anyhow::Error) -> ! {
-    let msg = format!("boot refused ({kind}): {e:#}. This will not be fixed by retrying — exiting {}.", pg::EXIT_CONFIG);
+    let msg =
+        format!("boot refused ({kind}): {e:#}. This will not be fixed by retrying — exiting {}.", pg::EXIT_CONFIG);
     if tracing::dispatcher::has_been_set() {
         tracing::error!("{msg}");
     } else {

@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
 use crate::value::{Tup2, ZWeight};
+use anyhow::{Context, Result, bail};
 use tokio::sync::{Mutex, mpsc};
 
 use std::sync::atomic::Ordering;
@@ -17,10 +17,10 @@ use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::heap_size::HeapSize;
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
-use crate::schema::{Schema, SharedTables, TableSchema, compile_schema};
-use crate::table_ref::{TableRef, TableSelector};
 use crate::retention::{EvictReason, Evicted, LifeState, RetentionConfig, ShapeLife, SweepShape};
+use crate::schema::{Schema, SharedTables, TableSchema, compile_schema};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
+use crate::table_ref::{TableRef, TableSelector};
 use crate::value::{Row, Value};
 
 mod catalog;
@@ -48,18 +48,18 @@ use planning::*;
 use retirement::*;
 use sequencer::*;
 
+pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
 pub use introspection::{
-    AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph,
-    FamilyStat, GraphEdge, GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue,
-    OpEdge, OpNode, ShapeRecord, StateSnapshot, TableColumnInfo, TableSchemaInfo, TableStats,
+    AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
+    GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue, OpEdge, OpNode, ShapeRecord, StateSnapshot,
+    TableColumnInfo, TableSchemaInfo, TableStats,
 };
-pub use drift::ResolveLock;
-pub use planning::CircuitPlacement;
 pub(crate) use output::{
     absolute_envelope, apply_envelope, delete_envelopes, needs_absolute_emission, translate_output,
 };
+pub use planning::CircuitPlacement;
 
 /// `GET /v1/health` phases (see [`Engine::health`]).
 const HEALTH_WAITING: u8 = 0;
@@ -314,11 +314,8 @@ fn spawn_flip_propagator(
     degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
-    let workers: usize = std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8)
-        .max(1);
+    let workers: usize =
+        std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1);
     tokio::spawn(async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(workers));
         while let Some(fw) = rx.recv().await {
@@ -331,12 +328,12 @@ fn spawn_flip_propagator(
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
                 // is treated exactly like a live one, because its effects are just as lost.
                 let failed = match fw {
-                    FlipWork::Walk { mut work, txid, lsn } => crate::subquery::propagate_with_retry(
-                        &registry, &mut work, txid, lsn, &trace_tx,
-                    )
-                    .await
-                    .err()
-                    .map(|e| (e, work.len())),
+                    FlipWork::Walk { mut work, txid, lsn } => {
+                        crate::subquery::propagate_with_retry(&registry, &mut work, txid, lsn, &trace_tx)
+                            .await
+                            .err()
+                            .map(|e| (e, work.len()))
+                    }
                     FlipWork::Deferred { shape_id, mut work } => {
                         crate::subquery::propagate_deferred_with_retry(&registry, &shape_id, &mut work)
                             .await
@@ -348,12 +345,10 @@ fn spawn_flip_propagator(
                         // retries with them, so an exhausted batch reports both halves of what it
                         // never got through.
                         let mut walk = std::collections::VecDeque::new();
-                        crate::subquery::propagate_deferred_node_with_retry(
-                            &registry, &mut work, &mut walk, &trace_tx,
-                        )
-                        .await
-                        .err()
-                        .map(|e| (e, work.len() + walk.len()))
+                        crate::subquery::propagate_deferred_node_with_retry(&registry, &mut work, &mut walk, &trace_tx)
+                            .await
+                            .err()
+                            .map(|e| (e, work.len() + walk.len()))
                     }
                 };
                 if let Some((e, unfinished)) = failed {
@@ -454,20 +449,14 @@ impl EngineState {
     /// the same critical section that registers the create.
     fn capture_gens(&self, tables: &[TableRef]) -> SchemaGens {
         SchemaGens {
-            tables: tables
-                .iter()
-                .map(|t| (t.clone(), self.schema_gen.get(t).copied().unwrap_or(0)))
-                .collect(),
+            tables: tables.iter().map(|t| (t.clone(), self.schema_gen.get(t).copied().unwrap_or(0))).collect(),
             epoch: self.epoch_gen,
         }
     }
 
     /// The first table whose generation moved since [`capture_gens`](Self::capture_gens), if any.
     fn drifted_since(&self, gens: &SchemaGens) -> Option<TableRef> {
-        gens.tables
-            .iter()
-            .find(|(t, g)| self.schema_gen.get(t).copied().unwrap_or(0) != *g)
-            .map(|(t, _)| t.clone())
+        gens.tables.iter().find(|(t, g)| self.schema_gen.get(t).copied().unwrap_or(0) != *g).map(|(t, _)| t.clone())
     }
 
     /// Did an epoch reset run since [`capture_gens`](Self::capture_gens)?
@@ -805,13 +794,7 @@ impl Engine {
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
         let degrade = DegradeState::new();
-        spawn_flip_propagator(
-            subqueries.clone(),
-            flip_rx,
-            pending_flips.clone(),
-            degrade.clone(),
-            trace_tx.clone(),
-        );
+        spawn_flip_propagator(subqueries.clone(), flip_rx, pending_flips.clone(), degrade.clone(), trace_tx.clone());
         // Created before the writer so the writer can register a shutdown party while it is
         // retrying an append (see `spawn_catalog_writer`).
         let shutdown = crate::shutdown::ShutdownToken::new();
@@ -935,12 +918,9 @@ impl Engine {
                 tracing::warn!("ELECTRIC_CIRCUITS_DBSP_COUNTS: unknown table {t}; skipping");
                 continue;
             };
-            let resolved: Option<Vec<usize>> =
-                cols.iter().map(|c| ts.index.get(c).copied()).collect();
+            let resolved: Option<Vec<usize>> = cols.iter().map(|c| ts.index.get(c).copied()).collect();
             match resolved {
-                Some(group_cols) => {
-                    counts.push(crate::arrangements::CountSpec { table: t.clone(), group_cols })
-                }
+                Some(group_cols) => counts.push(crate::arrangements::CountSpec { table: t.clone(), group_cols }),
                 None => tracing::warn!("ELECTRIC_CIRCUITS_DBSP_COUNTS: unknown column in {t}:{cols:?}; skipping"),
             }
         }
@@ -957,8 +937,7 @@ impl Engine {
         let mut gates = HashMap::new();
         for spec in &counts {
             let ts = schemas.get(&spec.table).expect("resolved above");
-            let (groups, gate) =
-                crate::pg::backfill_group_counts(&client, ts, &spec.group_cols).await?;
+            let (groups, gate) = crate::pg::backfill_group_counts(&client, ts, &spec.group_cols).await?;
             let total = groups.len();
             arr.seed_groups(&spec.table, groups).await?;
             gates.insert(spec.table.clone(), gate);
@@ -1055,7 +1034,10 @@ impl Engine {
             let st = self.state.lock().await;
             st.shapes.values().filter(|r| r.is_subquery).map(|r| r.stream_path.clone()).collect()
         };
-        tracing::error!("degraded: deleting {} subquery shape stream(s); clients must recreate against a restarted engine", paths.len());
+        tracing::error!(
+            "degraded: deleting {} subquery shape stream(s); clients must recreate against a restarted engine",
+            paths.len()
+        );
         for path in paths {
             // Retirement (close, then delete), retried until storage accepts the delete
             // (`delete_stream` counts a 404 as done): a stream left behind keeps serving rows the
@@ -1063,9 +1045,7 @@ impl Engine {
             let mut attempt = 0u32;
             while let Err(e) = self.ds.retire_stream(&path).await {
                 attempt += 1;
-                let backoff = std::time::Duration::from_millis(
-                    100u64.saturating_mul(1 << attempt.min(5)).min(2000),
-                );
+                let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
                 tracing::warn!(
                     "degraded: deleting stream {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}"
                 );
@@ -1264,9 +1244,7 @@ impl Engine {
         self.init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos()).await?;
         let restored = match self.verify_epoch_at_boot(&client, slot).await? {
             // Either the epoch is intact or this boot just started one. Restore as usual.
-            epoch::Verdict::FirstBoot | epoch::Verdict::Ok { .. } | epoch::Verdict::Busy { .. } => {
-                Some(fold)
-            }
+            epoch::Verdict::FirstBoot | epoch::Verdict::Ok { .. } | epoch::Verdict::Busy { .. } => Some(fold),
             epoch::Verdict::Break(reason) => {
                 // Park the records (see `RestoreMode::Park`): nothing is resumed, so no old-epoch
                 // shape is ever maintained, and the reset — now, or whenever the operator asks —
@@ -1387,11 +1365,10 @@ impl Engine {
             self.catalog_tx.send(CatalogEvent::ChangesRotated { segment: n, at });
         }
         // The sequencer resumes here; if that segment is gone it can never advance (see above).
-        let start_head = self
-            .ds
-            .head(&segment_path(seq_start.segment))
-            .await
-            .with_context(|| format!("checking the sequencer's start segment {}", segment_path(seq_start.segment)))?;
+        let start_head =
+            self.ds.head(&segment_path(seq_start.segment)).await.with_context(|| {
+                format!("checking the sequencer's start segment {}", segment_path(seq_start.segment))
+            })?;
         if start_head.is_none() {
             bail!(
                 "durable catalog resumes the change log at {seq_start}, but {} does not exist. A segment is \
@@ -1410,9 +1387,7 @@ impl Engine {
             self.ds.head(&segment_path(resolved)).await.ok().flatten().and_then(|h| h.next_offset)
         };
         self.changes.state().adopt(resolved, starts, tail);
-        crate::metrics::metrics()
-            .changes_segments_retained
-            .store(self.changes.state().retained(), Ordering::Relaxed);
+        crate::metrics::metrics().changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
         tracing::info!("change log: current segment is {}", segment_path(resolved));
         Ok(())
     }
@@ -1622,9 +1597,7 @@ impl Engine {
             }
             let mut conj: Vec<String> = Vec::with_capacity(pk_names.len());
             for &col in &pk_names {
-                let val = key
-                    .get(col)
-                    .ok_or_else(|| anyhow::anyhow!("key is missing primary-key column '{col}'"))?;
+                let val = key.get(col).ok_or_else(|| anyhow::anyhow!("key is missing primary-key column '{col}'"))?;
                 if val.is_null() {
                     bail!("primary-key column '{col}' must not be NULL");
                 }
@@ -1714,13 +1687,8 @@ impl Engine {
             let reg = self.subqueries.lock().await;
             reg.mem_totals()
         };
-        let shapes_dormant = self
-            .lives
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|l| matches!(l.state, LifeState::Dormant { .. }))
-            .count();
+        let shapes_dormant =
+            self.lives.lock().unwrap().values().filter(|l| matches!(l.state, LifeState::Dormant { .. })).count();
         crate::mem::Cardinalities {
             shapes,
             shapes_dormant,
@@ -1802,11 +1770,7 @@ impl Engine {
         let bytes_executors = match cmd_tx {
             Some(tx) => {
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                if tx.send(SequencerCmd::MemBytes { resp: resp_tx }).is_ok() {
-                    resp_rx.await.unwrap_or(0)
-                } else {
-                    0
-                }
+                if tx.send(SequencerCmd::MemBytes { resp: resp_tx }).is_ok() { resp_rx.await.unwrap_or(0) } else { 0 }
             }
             None => 0,
         };
@@ -1871,5 +1835,4 @@ impl Engine {
         let st = self.state.lock().await;
         st.sequencer.as_ref().and_then(|s| s.stats.lock().unwrap().get(table).cloned())
     }
-
 }

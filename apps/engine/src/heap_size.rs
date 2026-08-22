@@ -82,9 +82,7 @@ impl HeapSize for serde_json::Value {
                 a.capacity() * std::mem::size_of::<serde_json::Value>()
                     + a.iter().map(HeapSize::heap_bytes).sum::<usize>()
             }
-            serde_json::Value::Object(m) => {
-                m.iter().map(|(k, v)| k.heap_bytes() + v.heap_bytes()).sum()
-            }
+            serde_json::Value::Object(m) => m.iter().map(|(k, v)| k.heap_bytes() + v.heap_bytes()).sum(),
         }
     }
 }

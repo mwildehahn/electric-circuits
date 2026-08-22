@@ -65,7 +65,10 @@ async fn client_wire_format_parses_with_fleet_rules() {
     let client = Statsd::connect(&addr.to_string(), id).unwrap();
 
     // One of each of the four datadog metric shapes, with and without extra tags.
-    client.incr("electric.plug.serve_shape.requests.count", &[("status", "200"), ("known_error", "false"), ("live", "true")]);
+    client.incr(
+        "electric.plug.serve_shape.requests.count",
+        &[("status", "200"), ("known_error", "false"), ("live", "true")],
+    );
     client.count("electric.plug.serve_shape.bytes", 4096, &[]);
     client.gauge("system.cpu.utilization.total", 42.5, &[]);
     client.dist("plug.router_dispatch.stop.duration", 1.5, &[("route", "/v1/shape"), ("status", "200")]);

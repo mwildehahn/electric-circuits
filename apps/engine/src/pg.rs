@@ -277,10 +277,7 @@ pub fn set_pool_size(size: usize) {
 pub fn pool_for(url: &str) -> Pool {
     let pools = POOLS.get_or_init(Default::default);
     let mut pools = pools.lock().unwrap();
-    pools
-        .entry(url.to_string())
-        .or_insert_with(|| Pool::new(url.to_string(), *POOL_SIZE.get_or_init(|| 20)))
-        .clone()
+    pools.entry(url.to_string()).or_insert_with(|| Pool::new(url.to_string(), *POOL_SIZE.get_or_init(|| 20))).clone()
 }
 
 /// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
@@ -312,8 +309,7 @@ impl Pool {
     /// Check out a connection; waits if all `size` are in use. The checkout is returned to the
     /// pool (or discarded, if broken) when the guard drops.
     pub async fn get(&self) -> Result<PooledClient> {
-        let permit =
-            self.inner.sem.clone().acquire_owned().await.context("pg pool closed")?;
+        let permit = self.inner.sem.clone().acquire_owned().await.context("pg pool closed")?;
         // Reuse an idle connection if it is still healthy; otherwise dial a new one.
         let reused = self.inner.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
         let client = match reused {
@@ -417,10 +413,7 @@ pub async fn list_tables(client: &Client, schema: &str) -> Result<Vec<TableRef>>
 /// DROPped table is detected, by the reconciler and by the drift handler alike. The wanted set is
 /// two bound `text[]` params joined through `unnest`, so neither an odd schema name nor a large
 /// table set turns into interpolated SQL.
-pub async fn fingerprints(
-    client: &Client,
-    tables: &[TableRef],
-) -> Result<HashMap<TableRef, SchemaFingerprint>> {
+pub async fn fingerprints(client: &Client, tables: &[TableRef]) -> Result<HashMap<TableRef, SchemaFingerprint>> {
     if tables.is_empty() {
         return Ok(HashMap::new());
     }
@@ -496,9 +489,7 @@ pub async fn fingerprints(
 /// never cross. Errors when the table does not exist — see [`introspect_opt`] for the caller that
 /// treats "gone" as an outcome rather than a failure.
 pub async fn introspect(client: &Client, table: &TableRef) -> Result<TableDef> {
-    introspect_opt(client, table)
-        .await?
-        .with_context(|| format!("table '{table}' not found in postgres"))
+    introspect_opt(client, table).await?.with_context(|| format!("table '{table}' not found in postgres"))
 }
 
 /// [`introspect`], but a table Postgres no longer has yields `Ok(None)` instead of an error: the
@@ -606,10 +597,7 @@ pub async fn ensure_slot(client: &Client, slot: &str) -> Result<()> {
             return Ok(());
         }
         tracing::warn!("slot '{slot}' uses plugin '{plugin}'; dropping and recreating with pgoutput");
-        client
-            .execute("select pg_drop_replication_slot($1)", &[&slot])
-            .await
-            .context("drop stale slot")?;
+        client.execute("select pg_drop_replication_slot($1)", &[&slot]).await.context("drop stale slot")?;
     }
     create_slot(client, slot).await
 }
@@ -634,10 +622,7 @@ pub async fn recreate_slot(client: &Client, slot: &str) -> Result<()> {
         .await
         .context("check slot")?;
     if !existing.is_empty() {
-        client
-            .execute("select pg_drop_replication_slot($1)", &[&slot])
-            .await
-            .context("drop the old epoch's slot")?;
+        client.execute("select pg_drop_replication_slot($1)", &[&slot]).await.context("drop the old epoch's slot")?;
     }
     create_slot(client, slot).await
 }
@@ -712,15 +697,9 @@ pub async fn observe_slot(client: &Client, slot: &str) -> Result<SlotObservation
         let j: serde_json::Value = row.get(0);
         SlotRow {
             active: j.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false),
-            active_pid: j
-                .get("active_pid")
-                .and_then(serde_json::Value::as_i64)
-                .map(|v| v as i32),
+            active_pid: j.get("active_pid").and_then(serde_json::Value::as_i64).map(|v| v as i32),
             wal_status: j.get("wal_status").and_then(serde_json::Value::as_str).map(str::to_string),
-            confirmed_flush_lsn: j
-                .get("confirmed_flush_lsn")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+            confirmed_flush_lsn: j.get("confirmed_flush_lsn").and_then(serde_json::Value::as_str).map(str::to_string),
             plugin: j.get("plugin").and_then(serde_json::Value::as_str).map(str::to_string),
         }
     });
@@ -758,11 +737,7 @@ pub struct PublicationInfo {
 
 /// Check that the publication can deliver whole rows for every tracked table, and learn whether it
 /// publishes stored generated columns. Errors — fatally, at boot — on a per-table column list.
-pub async fn inspect_publication(
-    client: &Client,
-    publication: &str,
-    tables: &[TableRef],
-) -> Result<PublicationInfo> {
+pub async fn inspect_publication(client: &Client, publication: &str, tables: &[TableRef]) -> Result<PublicationInfo> {
     // One row-to-jsonb read rather than a version-guarded column list: `pubgencols` exists only on
     // PG18+, and asking jsonb for a missing key is simply `None`.
     let row = client
@@ -772,8 +747,7 @@ pub async fn inspect_publication(
         .with_context(|| format!("publication '{publication}' does not exist"))?;
     let pubrow: serde_json::Value = row.get(0);
     let all_tables = pubrow.get("puballtables").and_then(serde_json::Value::as_bool).unwrap_or(false);
-    let publish_generated =
-        pubrow.get("pubgencols").and_then(serde_json::Value::as_str) == Some("s");
+    let publish_generated = pubrow.get("pubgencols").and_then(serde_json::Value::as_str) == Some("s");
 
     // A `FOR ALL TABLES` publication cannot carry a column list at all, so only a hand-made one is
     // worth the second query.
@@ -794,10 +768,8 @@ pub async fn inspect_publication(
             .await
             .context("check publication column lists")?;
         if !listed.is_empty() {
-            let which: Vec<String> = listed
-                .iter()
-                .map(|r| format!("{}.{}", r.get::<_, String>(0), r.get::<_, String>(1)))
-                .collect();
+            let which: Vec<String> =
+                listed.iter().map(|r| format!("{}.{}", r.get::<_, String>(0), r.get::<_, String>(1))).collect();
             bail!(
                 "publication '{publication}' has a column list on {}; the engine requires whole rows \
                  (a partial row can never be reconciled with the table's schema). Drop the column \
@@ -1090,10 +1062,7 @@ pub async fn backfill_where_reader<'a>(
     ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
 ) -> Result<BackfillReader<'a>> {
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .context("begin backfill snapshot")?;
+    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin backfill snapshot")?;
     match backfill_open_in_txn(client, ts, where_sql).await {
         Ok(r) => Ok(r),
         Err(e) => {
@@ -1122,9 +1091,7 @@ async fn backfill_open_in_txn<'a>(
     }
     // One statement establishes the snapshot AND captures both fences (LSN + xid snapshot)
     // atomically with it.
-    let fence = client
-        .query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[])
-        .await?;
+    let fence = client.query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[]).await?;
     let seed_lsn: String = fence.get(0);
     let snap: String = fence.get(1);
     let gate = SnapshotGate::parse(&snap, &seed_lsn);
@@ -1174,9 +1141,7 @@ async fn group_counts_in_txn(
     ts: &TableSchema,
     group_cols: &[usize],
 ) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
-    let fence = client
-        .query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[])
-        .await?;
+    let fence = client.query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[]).await?;
     let seed_lsn: String = fence.get(0);
     let snap: String = fence.get(1);
     let gate = SnapshotGate::parse(&snap, &seed_lsn);
@@ -1268,10 +1233,7 @@ pub async fn query_subset_where(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .context("begin subset snapshot")?;
+    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin subset snapshot")?;
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
     client.batch_execute("COMMIT").await.ok();
     result
@@ -1288,11 +1250,7 @@ pub async fn query_subset_where(
 /// Documented in `docs/ARCHITECTURE.md` §7 and `packages/client/README.md`.
 fn order_term(ts: &TableSchema, col: usize, dir: &str) -> String {
     let ident = quote_ident(&ts.columns[col].0);
-    if ts.is_collatable_text(col) {
-        format!("{ident} collate \"C\" {dir}")
-    } else {
-        format!("{ident} {dir}")
-    }
+    if ts.is_collatable_text(col) { format!("{ident} collate \"C\" {dir}") } else { format!("{ident} {dir}") }
 }
 
 async fn query_subset_in_txn(

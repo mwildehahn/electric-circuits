@@ -1,0 +1,10 @@
+# Stable rustfmt options only (`cargo fmt` on the pinned toolchain; no nightly flags).
+#
+# The engine is written wide: 120 columns, with calls, struct literals, chains and closures kept on
+# one line whenever they fit ("Max" = every width heuristic is the full line). Measured against the
+# tree when this file was added: defaults (100 cols) would have rewritten ~1,500 hunks, 120 alone
+# ~1,050, this pair ~475 — the configuration that describes how the code is actually written rather
+# than the one that reformats the most of it. Upstream ships no rustfmt config and does not pass
+# the defaults either, so there is no upstream shape to preserve.
+max_width = 120
+use_small_heuristics = "Max"

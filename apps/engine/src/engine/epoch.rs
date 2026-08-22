@@ -360,11 +360,7 @@ impl Engine {
 
     /// Boot-time verification (ADR-0004 step B). Runs on the setup connection, before anything is
     /// restored, and — on the first-boot verdict — is what creates and records the slot.
-    pub(crate) async fn verify_epoch_at_boot(
-        &self,
-        client: &tokio_postgres::Client,
-        slot: &str,
-    ) -> Result<Verdict> {
+    pub(crate) async fn verify_epoch_at_boot(&self, client: &tokio_postgres::Client, slot: &str) -> Result<Verdict> {
         let obs = crate::pg::observe_slot(client, slot).await?;
         let v = verdict(&obs, self.epoch_binding().as_ref());
         match &v {
@@ -730,16 +726,10 @@ mod tests {
     fn a_different_cluster_breaks_the_epoch() {
         let mut obs = healthy();
         obs.system_identifier = "7300000000000000002".to_string();
-        assert_eq!(
-            verdict(&obs, Some(&binding())),
-            Verdict::Break(EpochBreakReason::SystemIdentifierMismatch)
-        );
+        assert_eq!(verdict(&obs, Some(&binding())), Verdict::Break(EpochBreakReason::SystemIdentifierMismatch));
         // Even when the slot itself is also gone, the cluster is the more informative cause.
         obs.slot = None;
-        assert_eq!(
-            verdict(&obs, Some(&binding())),
-            Verdict::Break(EpochBreakReason::SystemIdentifierMismatch)
-        );
+        assert_eq!(verdict(&obs, Some(&binding())), Verdict::Break(EpochBreakReason::SystemIdentifierMismatch));
     }
 
     /// Another walsender on the slot is NOT a break: postgres allows exactly one, and the second

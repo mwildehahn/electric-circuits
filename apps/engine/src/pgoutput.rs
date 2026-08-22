@@ -240,10 +240,7 @@ mod tests {
     }
 
     fn relation_msg() -> Vec<u8> {
-        encode_relation(42, "public", "users", b'f', &[
-            rel_col("id", 23, -1, true),
-            rel_col("name", 25, -1, false),
-        ])
+        encode_relation(42, "public", "users", b'f', &[rel_col("id", 23, -1, true), rel_col("name", 25, -1, false)])
     }
 
     /// The decode keeps everything drift detection needs: the replica identity and, per column, the
@@ -251,28 +248,37 @@ mod tests {
     #[test]
     fn decodes_relation_with_replident_and_column_types() {
         let msg = decode(&relation_msg()).unwrap();
-        assert_eq!(msg, Message::Relation {
-            rel_id: 42,
-            namespace: "public".into(),
-            name: "users".into(),
-            replident: b'f',
-            columns: vec![rel_col("id", 23, -1, true), rel_col("name", 25, -1, false)],
-        });
+        assert_eq!(
+            msg,
+            Message::Relation {
+                rel_id: 42,
+                namespace: "public".into(),
+                name: "users".into(),
+                replident: b'f',
+                columns: vec![rel_col("id", 23, -1, true), rel_col("name", 25, -1, false)],
+            }
+        );
 
         // A relation whose identity is no longer FULL decodes as such (not silently normalized),
         // and a length-qualified type carries its typmod.
-        let msg = decode(&encode_relation(7, "other", "items", b'd', &[
-            rel_col("id", 23, -1, true),
-            rel_col("label", 1043, 14, false),
-        ]))
+        let msg = decode(&encode_relation(
+            7,
+            "other",
+            "items",
+            b'd',
+            &[rel_col("id", 23, -1, true), rel_col("label", 1043, 14, false)],
+        ))
         .unwrap();
-        assert_eq!(msg, Message::Relation {
-            rel_id: 7,
-            namespace: "other".into(),
-            name: "items".into(),
-            replident: b'd',
-            columns: vec![rel_col("id", 23, -1, true), rel_col("label", 1043, 14, false)],
-        });
+        assert_eq!(
+            msg,
+            Message::Relation {
+                rel_id: 7,
+                namespace: "other".into(),
+                name: "items".into(),
+                replident: b'd',
+                columns: vec![rel_col("id", 23, -1, true), rel_col("label", 1043, 14, false)],
+            }
+        );
     }
 
     #[test]
@@ -286,15 +292,13 @@ mod tests {
         m.push(b'u');
         m.extend(text_cell("café ☃ 北京"));
         let msg = decode(&m).unwrap();
-        assert_eq!(msg, Message::Insert {
-            rel_id: 42,
-            new: vec![
-                Cell::Text("1".into()),
-                Cell::Null,
-                Cell::UnchangedToast,
-                Cell::Text("café ☃ 北京".into()),
-            ],
-        });
+        assert_eq!(
+            msg,
+            Message::Insert {
+                rel_id: 42,
+                new: vec![Cell::Text("1".into()), Cell::Null, Cell::UnchangedToast, Cell::Text("café ☃ 北京".into()),],
+            }
+        );
     }
 
     #[test]
@@ -308,11 +312,14 @@ mod tests {
         m.extend(1i16.to_be_bytes());
         m.extend(text_cell("new"));
         let msg = decode(&m).unwrap();
-        assert_eq!(msg, Message::Update {
-            rel_id: 42,
-            old: Some(OldTuple::Full(vec![Cell::Text("old".into())])),
-            new: vec![Cell::Text("new".into())],
-        });
+        assert_eq!(
+            msg,
+            Message::Update {
+                rel_id: 42,
+                old: Some(OldTuple::Full(vec![Cell::Text("old".into())])),
+                new: vec![Cell::Text("new".into())],
+            }
+        );
     }
 
     #[test]
@@ -322,21 +329,17 @@ mod tests {
         m.push(b'N');
         m.extend(1i16.to_be_bytes());
         m.extend(text_cell("new"));
-        assert_eq!(decode(&m).unwrap(), Message::Update {
-            rel_id: 42,
-            old: None,
-            new: vec![Cell::Text("new".into())],
-        });
+        assert_eq!(decode(&m).unwrap(), Message::Update { rel_id: 42, old: None, new: vec![Cell::Text("new".into())] });
 
         let mut d = vec![b'D'];
         d.extend(42u32.to_be_bytes());
         d.push(b'K');
         d.extend(1i16.to_be_bytes());
         d.extend(text_cell("1"));
-        assert_eq!(decode(&d).unwrap(), Message::Delete {
-            rel_id: 42,
-            old: OldTuple::Key(vec![Cell::Text("1".into())]),
-        });
+        assert_eq!(
+            decode(&d).unwrap(),
+            Message::Delete { rel_id: 42, old: OldTuple::Key(vec![Cell::Text("1".into())]) }
+        );
     }
 
     #[test]

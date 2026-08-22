@@ -27,11 +27,20 @@ pub(crate) enum CatalogEvent {
     /// A shape was created, with the **subscription** that created it (ADR-0008) and the wall-clock
     /// second it was taken at — the lease's start, restored by the fold so a restart does not hand
     /// every subscription a fresh window.
-    Created { rec: ShapeRecord, sig: Option<String>, subscription: String, at: u64 },
+    Created {
+        rec: ShapeRecord,
+        sig: Option<String>,
+        subscription: String,
+        at: u64,
+    },
     /// A subscription joined a shared feed, or RENEWED its lease (ADR-0008): the same subscription
     /// id twice is one claim, and the second one only moves `at`. The fold keeps a SET, so a
     /// duplicate is a no-op rather than a second count.
-    Joined { id: String, subscription: String, at: u64 },
+    Joined {
+        id: String,
+        subscription: String,
+        at: u64,
+    },
     /// A subscription left a shared feed. `Left` for an id the shape does not hold is a no-op (the
     /// release is idempotent — that is the point). With retention, an empty live set keeps the
     /// shape (it goes dormant later), so `Left` never implies teardown.
@@ -51,10 +60,18 @@ pub(crate) enum CatalogEvent {
     /// ADR-0006, because the offset alone is meaningless once the log has rotated; `gate` is its
     /// original backfill-snapshot fence. Restores as dormant (an improvement over the
     /// in-memory-only lifecycle: a restart no longer forgets dormant shapes).
-    Dormant { id: String, resume: LogPosition, gate: crate::pg::SnapshotGate },
+    Dormant {
+        id: String,
+        resume: LogPosition,
+        gate: crate::pg::SnapshotGate,
+    },
     /// A dormant shape was reactivated (replayed + re-registered).
-    Reactivated { id: String },
-    Dropped { id: String },
+    Reactivated {
+        id: String,
+    },
+    Dropped {
+        id: String,
+    },
     /// The shape's stream retirement COMPLETED: closed, then deleted (ADR-0007). Written only after
     /// storage accepted the delete — a 404/410 counts, deletion is idempotent — so a `Dropped` with
     /// no `Retired` after it is exactly "the engine promised to remove this stream and did not".
@@ -64,7 +81,9 @@ pub(crate) enum CatalogEvent {
     /// hands every unmatched intent to the retirement queue. Without it a stream whose delete was
     /// refused by storage would stay open forever, serving rows Postgres no longer has, with no
     /// record anywhere that it should be gone (the engine has already forgotten the shape).
-    Retired { id: String },
+    Retired {
+        id: String,
+    },
     /// The sequencer's checkpoint: the change-log position a restart replays from, plus the
     /// `(lsn, seq)` de-duplication highwater it had applied up to at that position (ADR-0003).
     ///
@@ -82,17 +101,25 @@ pub(crate) enum CatalogEvent {
     /// seconds). Written on the first creation of segment 0 too, so every segment's start time is
     /// in the log — segment `n` was closed when `n+1` began, which is what the retain window that
     /// governs deletion measures against. The fold's last one is the current segment.
-    ChangesRotated { segment: u32, at: u64 },
+    ChangesRotated {
+        segment: u32,
+        at: u64,
+    },
     /// The retention sweeper deleted a rotated-out change-log segment (ADR-0006). Without it the
     /// fold's segment set would keep every segment the log ever had, so every restart would re-plan
     /// retiring streams that are long gone (harmless — a delete of an absent stream is a no-op — but
     /// it would also make the `changes_segments_retained` gauge wrong until the first sweep).
-    ChangesSegmentDeleted { segment: u32 },
+    ChangesSegmentDeleted {
+        segment: u32,
+    },
     /// **Audit only**: a table's schema drifted and was re-introspected (ADR-0005). The restore
     /// ignores it — every dependent shape of the table was retired by the same handler, so it is
     /// already `Dropped` in the log. It is written so the durable record explains *why* a swathe of
     /// shapes disappeared at a given point.
-    SchemaChanged { table: TableRef, fingerprint: crate::schema::SchemaFingerprint },
+    SchemaChanged {
+        table: TableRef,
+        fingerprint: crate::schema::SchemaFingerprint,
+    },
     /// The engine created (or first adopted) its replication slot: the **epoch** every shape after
     /// this point in the log belongs to (ADR-0004). The LAST one wins — a reset appends a new one
     /// after the `Dropped` records of the epoch it ended, so a fold reads "these shapes, in this
@@ -400,10 +427,8 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
 /// has to differ between processes writing to the same catalog, and the pair (start time, address of
 /// a fresh allocation) does that on every platform the engine runs on.
 pub(crate) fn process_nonce() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
     let here = Box::new(0u8);
     let addr = std::ptr::addr_of!(*here) as usize as u64;
     format!("{:x}", secs ^ addr.rotate_left(17))
@@ -457,11 +482,7 @@ pub struct CatalogPredatesQualification {
 
 impl std::fmt::Display for CatalogPredatesQualification {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "durable catalog predates ADR-0002 ({}); reset the durable-streams data directory",
-            self.detail
-        )
+        write!(f, "durable catalog predates ADR-0002 ({}); reset the durable-streams data directory", self.detail)
     }
 }
 
@@ -483,11 +504,7 @@ pub struct CatalogPredatesSegmentation {
 
 impl std::fmt::Display for CatalogPredatesSegmentation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "durable catalog predates ADR-0006 ({}); reset the durable-streams data directory",
-            self.detail
-        )
+        write!(f, "durable catalog predates ADR-0006 ({}); reset the durable-streams data directory", self.detail)
     }
 }
 
@@ -510,11 +527,7 @@ pub struct CatalogPredatesSubscriptions {
 
 impl std::fmt::Display for CatalogPredatesSubscriptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "durable catalog predates ADR-0008 ({}); reset the durable-streams data directory",
-            self.detail
-        )
+        write!(f, "durable catalog predates ADR-0008 ({}); reset the durable-streams data directory", self.detail)
     }
 }
 
@@ -601,7 +614,6 @@ async fn ensure_catalog(ds: &DsClient, logged: &mut bool) -> bool {
     }
 }
 
-
 /// One shape as the fold reconstructed it: (record, sharing signature, **live subscriptions**,
 /// dormant resume state). The last `Dormant`/`Reactivated` event wins.
 ///
@@ -610,8 +622,12 @@ async fn ensure_catalog(ds: &DsClient, logged: &mut bool) -> bool {
 /// timestamp and nothing else; a `Left` for an id that is not in it does nothing at all. That is
 /// what makes a duplicated record — a retry after a lost response, an over-eager client — harmless
 /// where counter arithmetic was not.
-type Restored =
-    (ShapeRecord, Option<String>, std::collections::BTreeMap<String, u64>, Option<(LogPosition, crate::pg::SnapshotGate)>);
+type Restored = (
+    ShapeRecord,
+    Option<String>,
+    std::collections::BTreeMap<String, u64>,
+    Option<(LogPosition, crate::pg::SnapshotGate)>,
+);
 
 /// The durable catalog, folded — everything a boot needs before it decides what to *do* with it.
 ///
@@ -966,11 +982,7 @@ impl Engine {
                             id.clone(),
                             ShapeLife {
                                 last_read: std::time::Instant::now(),
-                                state: LifeState::Dormant {
-                                    since: std::time::Instant::now(),
-                                    resume: resume_at,
-                                    gate,
-                                },
+                                state: LifeState::Dormant { since: std::time::Instant::now(), resume: resume_at, gate },
                             },
                         );
                     }
@@ -1032,9 +1044,7 @@ impl Engine {
         rec: &ShapeRecord,
         compiled: &HashMap<TableRef, TableSchema>,
     ) -> Result<()> {
-        let ts = compiled
-            .get(&rec.table)
-            .with_context(|| format!("table '{}' no longer exists", rec.table))?;
+        let ts = compiled.get(&rec.table).with_context(|| format!("table '{}' no longer exists", rec.table))?;
         let out_cols: Option<Arc<Vec<usize>>> = match &rec.columns {
             Some(names) => {
                 let idx: Result<Vec<usize>> = names.iter().map(|n| ts.column_index(n)).collect();
@@ -1119,7 +1129,6 @@ impl Engine {
         .await
         .map_err(|e| anyhow::anyhow!(e))
     }
-
 }
 
 /// A minimal, faultable durable-streams stand-in for the catalog writer + retirement queue tests.
@@ -1246,10 +1255,7 @@ pub(crate) mod testing {
 
         /// Just the `t` tags of the events that landed — the order-and-once assertions.
         pub(crate) fn catalog_kinds(&self) -> Vec<String> {
-            self.catalog_events()
-                .iter()
-                .map(|e| e["t"].as_str().unwrap_or("?").to_string())
-                .collect()
+            self.catalog_events().iter().map(|e| e["t"].as_str().unwrap_or("?").to_string()).collect()
         }
     }
 }
@@ -1286,8 +1292,8 @@ mod tests {
     /// post-cutover create — two maintained streams for one table.
     #[test]
     fn catalog_records_must_be_canonically_spelled() {
-        let ok = serde_json::from_value::<CatalogEvent>(created_event("public.users"))
-            .expect("a canonical record restores");
+        let ok =
+            serde_json::from_value::<CatalogEvent>(created_event("public.users")).expect("a canonical record restores");
         match ok {
             CatalogEvent::Created { rec, .. } => {
                 assert_eq!(rec.table.to_string(), "public.users");
@@ -1500,12 +1506,8 @@ mod tests {
         let now = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9"), highwater: None }).unwrap();
         assert!(predates_segmentation(&now).is_none());
         let gate = crate::pg::SnapshotGate::passthrough();
-        let now = serde_json::to_value(CatalogEvent::Dormant {
-            id: "s7".to_string(),
-            resume: pos(2, "9"),
-            gate,
-        })
-        .unwrap();
+        let now =
+            serde_json::to_value(CatalogEvent::Dormant { id: "s7".to_string(), resume: pos(2, "9"), gate }).unwrap();
         assert!(predates_segmentation(&now).is_none());
         // ...and neither is an unrelated event.
         assert!(predates_segmentation(&created_event("public.users")).is_none());
@@ -1537,7 +1539,11 @@ mod tests {
             created,
             joined("s1", "sub-b", 100),
         ]);
-        assert_eq!(subs_of(&fold, "s1"), vec!["sub-a".to_string(), "sub-b".to_string()], "create + join = two subscriptions");
+        assert_eq!(
+            subs_of(&fold, "s1"),
+            vec!["sub-a".to_string(), "sub-b".to_string()],
+            "create + join = two subscriptions"
+        );
         assert_eq!(fold.binding.map(|b| b.slot), Some("s".to_string()));
     }
 
@@ -1563,11 +1569,8 @@ mod tests {
     /// or a dead transport is storage having a moment; a 4xx is an answer.
     #[test]
     fn a_5xx_retries_and_a_4xx_refuses() {
-        let five = anyhow::Error::new(crate::ds::DsUnavailable {
-            op: "POST",
-            path: CATALOG_STREAM.to_string(),
-            status: 503,
-        });
+        let five =
+            anyhow::Error::new(crate::ds::DsUnavailable { op: "POST", path: CATALOG_STREAM.to_string(), status: 503 });
         assert_eq!(classify_append(&five), AppendVerdict::Retry);
         let four = anyhow::anyhow!("POST meta/catalog -> 400 Bad Request: malformed event");
         assert_eq!(classify_append(&four), AppendVerdict::Refused);
@@ -1675,11 +1678,7 @@ mod tests {
             ev["rec"]["stream_path"] = serde_json::json!(format!("shape/{id}"));
             serde_json::from_value::<CatalogEvent>(ev).unwrap()
         };
-        let fold = fold_of(vec![
-            at("s3"),
-            CatalogEvent::Dropped { id: "s3".to_string() },
-            at("s1"),
-        ]);
+        let fold = fold_of(vec![at("s3"), CatalogEvent::Dropped { id: "s3".to_string() }, at("s1")]);
         assert_eq!(fold.max_shape_id, Some(3));
     }
 
@@ -1703,10 +1702,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn parking_a_broken_epoch_also_moves_the_id_counter() {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
-        let fold = fold_of(vec![
-            created,
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
-        ]);
+        let fold = fold_of(vec![created, CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }]);
         let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Park).await.unwrap();
         let st = engine.state.lock().await;
@@ -1728,7 +1724,7 @@ mod tests {
             joined("s1", "sub-b", 300), // a renewal, not a second subscriber
             joined("s1", "sub-c", 400),
             left("s1", "sub-b"),
-            left("s1", "sub-b"), // the client retried its DELETE; nothing more to release
+            left("s1", "sub-b"),   // the client retried its DELETE; nothing more to release
             left("s1", "sub-zzz"), // never held here at all
         ]);
         assert_eq!(subs_of(&fold, "s1"), vec!["sub-a".to_string(), "sub-c".to_string()]);
@@ -1745,11 +1741,7 @@ mod tests {
     #[test]
     fn a_lapsed_lease_folds_exactly_like_an_explicit_release() {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
-        let lapse = CatalogEvent::Left {
-            id: "s1".to_string(),
-            subscription: "sub-a".to_string(),
-            lapsed: true,
-        };
+        let lapse = CatalogEvent::Left { id: "s1".to_string(), subscription: "sub-a".to_string(), lapsed: true };
         let json = serde_json::to_value(&lapse).unwrap();
         assert_eq!(json["lapsed"], true);
         assert_eq!(json["subscription"], "sub-a");

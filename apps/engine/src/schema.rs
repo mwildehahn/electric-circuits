@@ -83,9 +83,7 @@ impl SchemaFingerprint {
     ///
     /// The primary key is compared only when both sides know it (see the type docs).
     pub fn still_serves(&self, observed: &SchemaFingerprint) -> bool {
-        self.columns == observed.columns
-            && observed.replident == REPLICA_IDENTITY_FULL
-            && self.pk_matches(observed)
+        self.columns == observed.columns && observed.replident == REPLICA_IDENTITY_FULL && self.pk_matches(observed)
     }
 
     /// The primary keys agree, or one of the two sides does not know its own.
@@ -108,10 +106,8 @@ impl SchemaFingerprint {
 /// replica identity, which is drift even when the columns match).
 pub fn describe_drift(compiled: &SchemaFingerprint, observed: &SchemaFingerprint) -> Vec<String> {
     let mut out = Vec::new();
-    let old: BTreeMap<&str, &FingerprintColumn> =
-        compiled.columns.iter().map(|c| (c.name.as_str(), c)).collect();
-    let new: BTreeMap<&str, &FingerprintColumn> =
-        observed.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    let old: BTreeMap<&str, &FingerprintColumn> = compiled.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    let new: BTreeMap<&str, &FingerprintColumn> = observed.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     for name in new.keys().filter(|n| !old.contains_key(*n)) {
         out.push(format!("column '{name}' added"));
     }
@@ -143,10 +139,7 @@ pub fn describe_drift(compiled: &SchemaFingerprint, observed: &SchemaFingerprint
         out.push(format!("primary key changed ({} -> {})", before.join(","), after.join(",")));
     }
     if observed.replident != REPLICA_IDENTITY_FULL {
-        out.push(format!(
-            "replica identity '{}' (expected 'f' = FULL)",
-            observed.replident as char
-        ));
+        out.push(format!("replica identity '{}' (expected 'f' = FULL)", observed.replident as char));
     }
     out
 }
@@ -285,12 +278,10 @@ pub fn join_key_components<I: IntoIterator<Item = S>, S: AsRef<str>>(parts: I) -
 
 impl TableSchema {
     pub fn from_def(table: &TableRef, def: &TableDef) -> Result<Self> {
-        let columns: Vec<(String, ColumnType)> =
-            def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
+        let columns: Vec<(String, ColumnType)> = def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
         let pg_types: Vec<Option<String>> = def.columns.values().map(|d| d.pg_type.clone()).collect();
         let has_defaults: Vec<bool> = def.columns.values().map(|d| d.has_default).collect();
-        let index: HashMap<String, usize> =
-            columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
+        let index: HashMap<String, usize> = columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
         if def.primary_key.is_empty() {
             anyhow::bail!("table '{table}' has no primary key");
         }
@@ -358,11 +349,8 @@ impl TableSchema {
         if self.pk_cols.len() == 1 {
             return Ok(row.get(self.pk_cols[0])?.to_key_string());
         }
-        let parts: Vec<String> = self
-            .pk_cols
-            .iter()
-            .map(|&i| row.get(i).map(Value::to_key_string))
-            .collect::<Result<_>>()?;
+        let parts: Vec<String> =
+            self.pk_cols.iter().map(|&i| row.get(i).map(Value::to_key_string)).collect::<Result<_>>()?;
         Ok(join_key_components(parts))
     }
 
@@ -506,9 +494,10 @@ mod tests {
         // text -> varchar(10): both the oid and the typmod move.
         let observed = fp(vec![col("id", 23, -1), col("name", 1043, 14)]);
         assert!(!base().still_serves(&observed));
-        assert_eq!(describe_drift(&base(), &observed), [
-            "column 'name' retyped (oid 25/typmod -1 -> oid 1043/typmod 14)"
-        ]);
+        assert_eq!(
+            describe_drift(&base(), &observed),
+            ["column 'name' retyped (oid 25/typmod -1 -> oid 1043/typmod 14)"]
+        );
         // A typmod-only change (varchar(10) -> varchar(20)) is drift too.
         let a = fp(vec![col("name", 1043, 14)]);
         let b = fp(vec![col("name", 1043, 24)]);
@@ -547,12 +536,9 @@ mod tests {
 
     #[test]
     fn a_replica_identity_regression_is_drift() {
-        let observed =
-            SchemaFingerprint { columns: base().columns, replident: b'd', pk: base().pk };
+        let observed = SchemaFingerprint { columns: base().columns, replident: b'd', pk: base().pk };
         assert!(!base().still_serves(&observed));
-        assert_eq!(describe_drift(&base(), &observed), [
-            "replica identity 'd' (expected 'f' = FULL)"
-        ]);
+        assert_eq!(describe_drift(&base(), &observed), ["replica identity 'd' (expected 'f' = FULL)"]);
     }
 
     /// Why a publication that does not deliver whole rows is refused at BOOT rather than handled at
@@ -580,9 +566,7 @@ mod tests {
         let def: TableDef = serde_json::from_value(json).unwrap();
         let ts = TableSchema::from_def(&TableRef::parse("items").unwrap(), &def).unwrap();
         // columns sort to (a, b, payload); pk_cols = [0, 1]
-        let row = |a: &str, b: &str| {
-            Row(vec![Value::Text(a.into()), Value::Text(b.into()), Value::Text("p".into())])
-        };
+        let row = |a: &str, b: &str| Row(vec![Value::Text(a.into()), Value::Text(b.into()), Value::Text("p".into())]);
         let first = ts.key_string(&row("x", "y\u{1f}z")).unwrap();
         let second = ts.key_string(&row("x\u{1f}y", "z")).unwrap();
         assert_ne!(first, second, "distinct key tuples must not collide");

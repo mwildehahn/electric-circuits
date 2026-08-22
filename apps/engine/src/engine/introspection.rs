@@ -54,9 +54,7 @@ fn de_canonical_table<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Re
     let raw = String::deserialize(d)?;
     let t = TableRef::parse(&raw).map_err(|e| D::Error::custom(format!("{e:#}")))?;
     if t.as_str() != raw {
-        return Err(D::Error::custom(format!(
-            "table '{raw}' is not the canonical 'schema.name' (expected '{t}')"
-        )));
+        return Err(D::Error::custom(format!("table '{raw}' is not the canonical 'schema.name' (expected '{t}')")));
     }
     Ok(t)
 }
@@ -404,7 +402,8 @@ pub(crate) fn circuit_ops(
         let snk_id = format!("snk:{sid}");
 
         if let Some(agg) = &s.aggregate {
-            let fn_label = format!("Σ {}({})", format!("{:?}", agg.func).to_uppercase(), agg.col.as_deref().unwrap_or("*"));
+            let fn_label =
+                format!("Σ {}({})", format!("{:?}", agg.func).to_uppercase(), agg.col.as_deref().unwrap_or("*"));
             if s.circuit.as_ref().is_some_and(|p| p.counts) {
                 // Counts-served: the fold's input is the counts pipeline's group deltas
                 // (`map_index(group) → weighted_count` in the circuit), NOT a σ over row
@@ -495,9 +494,15 @@ pub(crate) fn circuit_ops(
     for e in subquery_edges {
         let src = format!("dist:{}", e.node_sig);
         let (target, label) = if e.dependent_kind == "shape" {
-            (format!("sj:{}", e.dependent_id), format!("{} · {}", if e.negated { "NOT IN" } else { "IN" }, e.connecting_col))
+            (
+                format!("sj:{}", e.dependent_id),
+                format!("{} · {}", if e.negated { "NOT IN" } else { "IN" }, e.connecting_col),
+            )
         } else {
-            (format!("sqf:{}", e.dependent_id), format!("{} · {}", if e.negated { "NOT IN" } else { "IN" }, e.connecting_col))
+            (
+                format!("sqf:{}", e.dependent_id),
+                format!("{} · {}", if e.negated { "NOT IN" } else { "IN" }, e.connecting_col),
+            )
         };
         edges.push(OpEdge { source: src, target, kind: "subquery".into(), label: Some(label) });
     }
@@ -518,11 +523,7 @@ pub(crate) fn arrangement_graph(
     let count_specs = arr.count_specs(); // sorted: deterministic node order across snapshots
     let inputs: Vec<ArrInput> = count_specs
         .iter()
-        .map(|c| ArrInput {
-            id: input_id(&c.table),
-            table: c.table.clone(),
-            seeded: arr.is_seeded(&c.table),
-        })
+        .map(|c| ArrInput { id: input_id(&c.table), table: c.table.clone(), seeded: arr.is_seeded(&c.table) })
         .collect();
     let counts: Vec<ArrCounts> = count_specs
         .iter()
@@ -663,11 +664,8 @@ pub(crate) fn dump_aggregate_json(sid: &str, agg: &AggShape) -> serde_json::Valu
 }
 
 pub(crate) fn stats_of(exec: &TableExec) -> TableStats {
-    let mut fams: Vec<FamilyStat> = exec
-        .families
-        .iter()
-        .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() })
-        .collect();
+    let mut fams: Vec<FamilyStat> =
+        exec.families.iter().map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() }).collect();
     fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
     TableStats { families: fams, standalone: exec.shapes.len(), circuit: exec.circuit_aggs.len() }
 }
@@ -731,7 +729,6 @@ pub(crate) fn dump_node_json(
     None
 }
 
-
 impl Engine {
     /// Snapshot the whole maintained pipeline for the visualizer: tables, every registered shape with
     /// its routing placement (family key / standalone / subquery), the shared subquery node+edge DAG,
@@ -776,9 +773,7 @@ impl Engine {
             let placements: Vec<(String, TableRef, CircuitPlacement)> = st
                 .circuit_placement
                 .iter()
-                .filter_map(|(id, p)| {
-                    st.shapes.get(id).map(|r| (id.clone(), r.table.clone(), p.clone()))
-                })
+                .filter_map(|(id, p)| st.shapes.get(id).map(|r| (id.clone(), r.table.clone(), p.clone())))
                 .collect();
             (tables, shapes, schemas, placements)
         };
@@ -834,15 +829,12 @@ impl Engine {
             .collect();
         drop(reg);
         let mut subquery_edges = subquery_edges;
-        subquery_edges
-            .sort_by(|a, b| (&a.node_sig, &a.dependent_kind, &a.dependent_id).cmp(&(&b.node_sig, &b.dependent_kind, &b.dependent_id)));
+        subquery_edges.sort_by(|a, b| {
+            (&a.node_sig, &a.dependent_kind, &a.dependent_id).cmp(&(&b.node_sig, &b.dependent_kind, &b.dependent_id))
+        });
         let (operators, op_edges) = circuit_ops(&tables, &shapes, &subquery_nodes, &subquery_edges);
-        let arrangements = self
-            .arrangements
-            .lock()
-            .unwrap()
-            .clone()
-            .map(|arr| arrangement_graph(&arr, &placements, &col_name));
+        let arrangements =
+            self.arrangements.lock().unwrap().clone().map(|arr| arrangement_graph(&arr, &placements, &col_name));
         EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges, arrangements }
     }
 

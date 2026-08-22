@@ -25,8 +25,7 @@ pub use dbsp::utils::Tup2;
 /// A scalar cell value. `Float` wraps `OrderedFloat` because a bare `f64` is not
 /// `Eq`/`Ord`/`Hash` and so could not be a map key (aggregate multisets, routing indexes).
 #[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
-    Deserialize, IsNone,
+    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub enum Value {
@@ -132,8 +131,7 @@ impl Value {
 
 /// A row is a positional vector of cell values; the schema gives names to the positions.
 #[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
-    Deserialize, IsNone,
+    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub struct Row(pub Vec<Value>);
@@ -209,6 +207,6 @@ mod tests {
 pub fn ensure_object(j: &serde_json::Value) -> Result<&serde_json::Map<String, serde_json::Value>> {
     match j.as_object() {
         Some(m) => Ok(m),
-        None => bail!("expected a JSON object, got {j}")
+        None => bail!("expected a JSON object, got {j}"),
     }
 }

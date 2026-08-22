@@ -146,21 +146,10 @@ impl SubqueryShapeIndex {
         let bucket = self.tables.entry(table.clone()).or_default();
         match &leaf {
             Some(AccessLeaf::Eq { col, value }) => {
-                bucket
-                    .eq
-                    .entry(*col)
-                    .or_default()
-                    .entry(value.clone())
-                    .or_default()
-                    .insert(sid);
+                bucket.eq.entry(*col).or_default().entry(value.clone()).or_default().insert(sid);
             }
             Some(AccessLeaf::Lower { col, value, strict }) => {
-                let e = bucket
-                    .lower
-                    .entry(*col)
-                    .or_default()
-                    .entry(value.clone())
-                    .or_default();
+                let e = bucket.lower.entry(*col).or_default().entry(value.clone()).or_default();
                 if *strict {
                     e.strict.insert(sid)
                 } else {
@@ -168,12 +157,7 @@ impl SubqueryShapeIndex {
                 };
             }
             Some(AccessLeaf::Upper { col, value, strict }) => {
-                let e = bucket
-                    .upper
-                    .entry(*col)
-                    .or_default()
-                    .entry(value.clone())
-                    .or_default();
+                let e = bucket.upper.entry(*col).or_default().entry(value.clone()).or_default();
                 if *strict {
                     e.strict.insert(sid)
                 } else {
@@ -255,12 +239,7 @@ impl SubqueryShapeIndex {
 
     /// Drop `sid` from one bound's posting lists, reclaiming the literal's entry (and the column's
     /// map) when they empty. Mirrors `StandaloneIndex::remove_bound`, over bitmaps.
-    fn remove_bound(
-        m: &mut HashMap<usize, BTreeMap<Value, Bound>>,
-        col: usize,
-        value: &Value,
-        sid: u32,
-    ) {
+    fn remove_bound(m: &mut HashMap<usize, BTreeMap<Value, Bound>>, col: usize, value: &Value, sid: u32) {
         let Some(by_val) = m.get_mut(&col) else {
             return;
         };
@@ -365,34 +344,19 @@ impl HeapSize for SubqueryShapeIndex {
         // Each distinct shape id's `Arc<str>` allocation (control block + inline bytes), counted
         // ONCE even though both `forward`'s key and `reverse`'s entry point at it.
         let arc_control = 2 * std::mem::size_of::<usize>();
-        let names: usize = self
-            .reverse
-            .iter()
-            .flatten()
-            .map(|s| arc_control + s.len())
-            .sum();
+        let names: usize = self.reverse.iter().flatten().map(|s| arc_control + s.len()).sum();
         let reverse_buf = self.reverse.capacity() * std::mem::size_of::<Option<Arc<str>>>();
-        let forward_buf = self.forward.capacity()
-            * (std::mem::size_of::<Arc<str>>() + std::mem::size_of::<u32>() + 1);
+        let forward_buf = self.forward.capacity() * (std::mem::size_of::<Arc<str>>() + std::mem::size_of::<u32>() + 1);
         let free_buf = self.free.capacity() * std::mem::size_of::<u32>();
         let placed: usize = self.placed.capacity() * (std::mem::size_of::<(u32, Placement)>() + 1)
-            + self
-                .placed
-                .values()
-                .map(|p| p.leaf.heap_bytes())
-                .sum::<usize>();
+            + self.placed.values().map(|p| p.leaf.heap_bytes()).sum::<usize>();
         let tables: usize = self
             .tables
             .values()
             .map(|t| {
                 let eq: usize =
                     t.eq.values()
-                        .map(|by_val| {
-                            by_val
-                                .iter()
-                                .map(|(v, bm)| v.heap_bytes() + bm.serialized_size())
-                                .sum::<usize>()
-                        })
+                        .map(|by_val| by_val.iter().map(|(v, bm)| v.heap_bytes() + bm.serialized_size()).sum::<usize>())
                         .sum();
                 let bounds = |m: &HashMap<usize, BTreeMap<Value, Bound>>| -> usize {
                     m.values()
@@ -400,9 +364,7 @@ impl HeapSize for SubqueryShapeIndex {
                             by_val
                                 .iter()
                                 .map(|(v, b)| {
-                                    v.heap_bytes()
-                                        + b.strict.serialized_size()
-                                        + b.inclusive.serialized_size()
+                                    v.heap_bytes() + b.strict.serialized_size() + b.inclusive.serialized_size()
                                 })
                                 .sum::<usize>()
                         })
@@ -421,29 +383,17 @@ mod tests {
     use crate::predicate::LeafOp;
 
     fn eq_pred(col: usize, v: i64) -> CompiledPredicate {
-        CompiledPredicate::Cmp {
-            col,
-            op: LeafOp::Eq,
-            value: Value::Int(v),
-        }
+        CompiledPredicate::Cmp { col, op: LeafOp::Eq, value: Value::Int(v) }
     }
 
     fn cmp_pred(col: usize, op: LeafOp, v: i64) -> CompiledPredicate {
-        CompiledPredicate::Cmp {
-            col,
-            op,
-            value: Value::Int(v),
-        }
+        CompiledPredicate::Cmp { col, op, value: Value::Int(v) }
     }
 
     /// A stand-in subquery leaf: an `IN` whose truth depends on registry node state, never on the
     /// row alone.
     fn in_leaf(col: usize) -> CompiledPredicate {
-        CompiledPredicate::InSubquery {
-            col,
-            sig: "inner_t|gid|MatchAll".to_string(),
-            negated: false,
-        }
+        CompiledPredicate::InSubquery { col, sig: "inner_t|gid|MatchAll".to_string(), negated: false }
     }
 
     /// A realistic outer subquery predicate: `col0 = k AND col1 IN (SELECT …)`.
@@ -472,11 +422,7 @@ mod tests {
         assert_eq!(idx.len(), N as usize);
 
         let cands = idx.candidates("issue", &[Tup2(row2(7, 0), 1)]);
-        assert_eq!(
-            cands,
-            vec!["s7".to_string()],
-            "only the shape whose conjunct the row satisfies"
-        );
+        assert_eq!(cands, vec!["s7".to_string()], "only the shape whose conjunct the row satisfies");
     }
 
     /// **The correctness trap.** An update moves a row OUT of shape `s5`'s conjunct: the new image
@@ -517,18 +463,12 @@ mod tests {
         // WITHIN its own bucket.
         idx.insert("comment_scan", "comment", &CompiledPredicate::MatchAll);
 
-        assert_eq!(
-            idx.candidates("issue", &[Tup2(row2(1, 0), 1)]),
-            vec!["issue_shape".to_string()]
-        );
+        assert_eq!(idx.candidates("issue", &[Tup2(row2(1, 0), 1)]), vec!["issue_shape".to_string()]);
         assert_eq!(
             sorted(idx.candidates("comment", &[Tup2(row2(1, 0), 1)])),
             vec!["comment_scan".to_string(), "comment_shape".to_string()]
         );
-        assert!(
-            idx.candidates("unrelated", &[Tup2(row2(1, 0), 1)])
-                .is_empty()
-        );
+        assert!(idx.candidates("unrelated", &[Tup2(row2(1, 0), 1)]).is_empty());
     }
 
     /// Predicates with no indexable conjunct stay unconditional candidates: a bare subquery leaf,
@@ -538,17 +478,9 @@ mod tests {
         let mut idx = SubqueryShapeIndex::default();
         idx.insert("bare_in", "issue", &in_leaf(1));
         idx.insert("match_all", "issue", &CompiledPredicate::MatchAll);
-        idx.insert(
-            "or",
-            "issue",
-            &CompiledPredicate::Or(vec![eq_pred(0, 1), eq_pred(0, 2)]),
-        );
+        idx.insert("or", "issue", &CompiledPredicate::Or(vec![eq_pred(0, 1), eq_pred(0, 2)]));
         idx.insert("neq", "issue", &cmp_pred(0, LeafOp::Neq, 1));
-        idx.insert(
-            "negated",
-            "issue",
-            &CompiledPredicate::Not(Box::new(outer_pred(1))),
-        );
+        idx.insert("negated", "issue", &CompiledPredicate::Not(Box::new(outer_pred(1))));
         // …and one shape that IS indexed, to prove the scan list is unioned in, not exclusive.
         idx.insert("indexed", "issue", &outer_pred(1));
 
@@ -564,10 +496,7 @@ mod tests {
             ]
         );
         // A row matching the indexed conjunct visits the scan shapes AND it.
-        assert!(
-            idx.candidates("issue", &[Tup2(row2(1, 0), 1)])
-                .contains(&"indexed".to_string())
-        );
+        assert!(idx.candidates("issue", &[Tup2(row2(1, 0), 1)]).contains(&"indexed".to_string()));
     }
 
     /// `access_leaf` must never hand this index a key whose truth is not a function of the row
@@ -577,37 +506,20 @@ mod tests {
     ///    not a necessary conjunct at all.
     #[test]
     fn in_leaves_are_never_a_necessary_conjunct() {
-        assert_eq!(
-            in_leaf(1).access_leaf(),
-            None,
-            "a subquery IN leaf is not row-local"
-        );
-        let negated_in = CompiledPredicate::InSubquery {
-            col: 1,
-            sig: "inner_t|gid|MatchAll".to_string(),
-            negated: true,
-        };
-        assert_eq!(
-            negated_in.access_leaf(),
-            None,
-            "a NOT IN leaf is not row-local either"
-        );
+        assert_eq!(in_leaf(1).access_leaf(), None, "a subquery IN leaf is not row-local");
+        let negated_in =
+            CompiledPredicate::InSubquery { col: 1, sig: "inner_t|gid|MatchAll".to_string(), negated: true };
+        assert_eq!(negated_in.access_leaf(), None, "a NOT IN leaf is not row-local either");
         assert_eq!(
             CompiledPredicate::Not(Box::new(eq_pred(0, 5))).access_leaf(),
             None,
             "a Cmp under Not is NOT necessary — the predicate implies its negation"
         );
         // But a conjunct sitting BESIDE a negation is still necessary.
-        let mixed = CompiledPredicate::And(vec![
-            eq_pred(0, 5),
-            CompiledPredicate::Not(Box::new(in_leaf(1))),
-        ]);
+        let mixed = CompiledPredicate::And(vec![eq_pred(0, 5), CompiledPredicate::Not(Box::new(in_leaf(1)))]);
         assert_eq!(
             mixed.access_leaf(),
-            Some(AccessLeaf::Eq {
-                col: 0,
-                value: Value::Int(5)
-            }),
+            Some(AccessLeaf::Eq { col: 0, value: Value::Int(5) }),
             "`col0 = 5 AND col1 NOT IN (…)` still implies col0 = 5"
         );
     }
@@ -617,31 +529,11 @@ mod tests {
     #[test]
     fn range_bounds_union_the_ordered_prefix() {
         let mut idx = SubqueryShapeIndex::default();
-        idx.insert(
-            "gt10",
-            "issue",
-            &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gt, 10), in_leaf(1)]),
-        );
-        idx.insert(
-            "gte10",
-            "issue",
-            &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gte, 10), in_leaf(1)]),
-        );
-        idx.insert(
-            "gt20",
-            "issue",
-            &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gt, 20), in_leaf(1)]),
-        );
-        idx.insert(
-            "lt10",
-            "issue",
-            &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Lt, 10), in_leaf(1)]),
-        );
-        idx.insert(
-            "lte10",
-            "issue",
-            &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Lte, 10), in_leaf(1)]),
-        );
+        idx.insert("gt10", "issue", &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gt, 10), in_leaf(1)]));
+        idx.insert("gte10", "issue", &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gte, 10), in_leaf(1)]));
+        idx.insert("gt20", "issue", &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gt, 20), in_leaf(1)]));
+        idx.insert("lt10", "issue", &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Lt, 10), in_leaf(1)]));
+        idx.insert("lte10", "issue", &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Lte, 10), in_leaf(1)]));
 
         // Exactly at 10: `> 10` is false, `>= 10` true; `< 10` false, `<= 10` true.
         assert_eq!(
@@ -674,11 +566,7 @@ mod tests {
     fn remove_erases_every_posting_and_frees_the_id() {
         let mut idx = SubqueryShapeIndex::default();
         idx.insert("eq", "issue", &outer_pred(1));
-        idx.insert(
-            "bound",
-            "issue",
-            &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gt, 0), in_leaf(1)]),
-        );
+        idx.insert("bound", "issue", &CompiledPredicate::And(vec![cmp_pred(0, LeafOp::Gt, 0), in_leaf(1)]));
         idx.insert("scan", "issue", &CompiledPredicate::MatchAll);
         assert_eq!(idx.len(), 3);
 
@@ -686,14 +574,8 @@ mod tests {
         idx.remove("bound");
         idx.remove("scan");
         assert_eq!(idx.len(), 0);
-        assert!(
-            idx.candidates("issue", &[Tup2(row2(1, 0), 1)]).is_empty(),
-            "removal must be total"
-        );
-        assert!(
-            idx.tables.is_empty(),
-            "an emptied table bucket is reclaimed"
-        );
+        assert!(idx.candidates("issue", &[Tup2(row2(1, 0), 1)]).is_empty(), "removal must be total");
+        assert!(idx.tables.is_empty(), "an emptied table bucket is reclaimed");
         idx.remove("never_seen"); // no-op, must not panic
 
         // Re-mint into the freed ids: the new shapes must answer only for their own conjuncts.
@@ -702,10 +584,7 @@ mod tests {
             idx.candidates("issue", &[Tup2(row2(1, 0), 1)]).is_empty(),
             "a re-used id must not resurrect old postings"
         );
-        assert_eq!(
-            idx.candidates("issue", &[Tup2(row2(2, 0), 1)]),
-            vec!["fresh".to_string()]
-        );
+        assert_eq!(idx.candidates("issue", &[Tup2(row2(2, 0), 1)]), vec!["fresh".to_string()]);
     }
 
     /// Re-inserting a live shape id (defensive: a create that somehow re-registers) re-files it
@@ -716,14 +595,8 @@ mod tests {
         idx.insert("s", "issue", &outer_pred(1));
         idx.insert("s", "issue", &outer_pred(2));
         assert_eq!(idx.len(), 1);
-        assert!(
-            idx.candidates("issue", &[Tup2(row2(1, 0), 1)]).is_empty(),
-            "the stale posting is gone"
-        );
-        assert_eq!(
-            idx.candidates("issue", &[Tup2(row2(2, 0), 1)]),
-            vec!["s".to_string()]
-        );
+        assert!(idx.candidates("issue", &[Tup2(row2(1, 0), 1)]).is_empty(), "the stale posting is gone");
+        assert_eq!(idx.candidates("issue", &[Tup2(row2(2, 0), 1)]), vec!["s".to_string()]);
     }
 
     /// The `bytes_subquery_registry` term: zero when empty, non-zero once populated.
@@ -734,9 +607,6 @@ mod tests {
         for k in 0..200 {
             idx.insert(&format!("s{k}"), "issue", &outer_pred(k));
         }
-        assert!(
-            idx.heap_bytes() > 0,
-            "a populated index owns measurable heap"
-        );
+        assert!(idx.heap_bytes() > 0, "a populated index owns measurable heap");
     }
 }

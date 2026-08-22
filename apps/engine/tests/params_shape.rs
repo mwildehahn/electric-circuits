@@ -3,10 +3,10 @@
 //! mode (no Postgres needed) — correct-rows-with-a-real-subquery is covered by the TS conformance
 //! suite (packages/conformance/src/conformance-params.test.ts), which has a real PG.
 
+use axum::Router;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
 use electric_circuits_engine::http::router;
@@ -71,7 +71,8 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn valid_params_create_a_shape_bracket_form() {
     let app = boot().await;
-    let (status, handle) = get(&app, &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params[1]", "u-abc")])).await;
+    let (status, handle) =
+        get(&app, &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params[1]", "u-abc")])).await;
     assert_eq!(status, StatusCode::OK);
     assert!(handle.starts_with('s'), "expected a shape handle, got {handle}");
 }
@@ -79,8 +80,11 @@ async fn valid_params_create_a_shape_bracket_form() {
 #[tokio::test]
 async fn valid_params_json_form() {
     let app = boot().await;
-    let (status, handle) =
-        get(&app, &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params", r#"{"1":"u-abc"}"#)])).await;
+    let (status, handle) = get(
+        &app,
+        &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params", r#"{"1":"u-abc"}"#)]),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "json params: {handle}");
     assert!(handle.starts_with('s'));
 }
@@ -96,7 +100,8 @@ async fn missing_param_is_400() {
 #[tokio::test]
 async fn non_sequential_keys_is_400() {
     let app = boot().await;
-    let (status, body) = get(&app, &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params[2]", "x")])).await;
+    let (status, body) =
+        get(&app, &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params[2]", "x")])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("Parameters must be numbered sequentially"), "body: {body}");
 }
@@ -104,7 +109,8 @@ async fn non_sequential_keys_is_400() {
 #[tokio::test]
 async fn non_numeric_keys_is_400() {
     let app = boot().await;
-    let (status, body) = get(&app, &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params[a]", "x")])).await;
+    let (status, body) =
+        get(&app, &uri(&[("table", "t"), ("offset", "-1"), ("where", "owner_id = $1"), ("params[a]", "x")])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("Parameters can only use numbers as keys"), "body: {body}");
 }

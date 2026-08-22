@@ -41,7 +41,11 @@ pub struct SubqueryJson {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PredicateJson {
-    Leaf { col: String, op: LeafOp, value: serde_json::Value },
+    Leaf {
+        col: String,
+        op: LeafOp,
+        value: serde_json::Value,
+    },
     /// SQL null test: `col IS NULL` (`isNull: true`) / `col IS NOT NULL` (`isNull: false`). A separate
     /// form because it is the one predicate that is TRUE *on* a NULL cell — no comparison can express
     /// it under three-valued logic (every cmp over NULL is UNKNOWN, and NOT UNKNOWN stays UNKNOWN).
@@ -50,9 +54,15 @@ pub enum PredicateJson {
         #[serde(rename = "isNull")]
         is_null: bool,
     },
-    And { and: Vec<PredicateJson> },
-    Or { or: Vec<PredicateJson> },
-    Not { not: Box<PredicateJson> },
+    And {
+        and: Vec<PredicateJson>,
+    },
+    Or {
+        or: Vec<PredicateJson>,
+    },
+    Not {
+        not: Box<PredicateJson>,
+    },
     In {
         col: String,
         #[serde(rename = "in")]
@@ -237,15 +247,26 @@ impl HeapSize for AccessLeaf {
 #[derive(Debug, Clone)]
 pub enum CompiledPredicate {
     MatchAll,
-    Cmp { col: usize, op: LeafOp, value: Value },
+    Cmp {
+        col: usize,
+        op: LeafOp,
+        value: Value,
+    },
     /// SQL null test — the one leaf that is TRUE on a NULL cell (two-valued, never UNKNOWN).
-    IsNull { col: usize, is_null: bool },
+    IsNull {
+        col: usize,
+        is_null: bool,
+    },
     And(Vec<CompiledPredicate>),
     Or(Vec<CompiledPredicate>),
     Not(Box<CompiledPredicate>),
     /// `col IN (subquery)` (or `NOT IN` when `negated`). The inner predicate lives in the registry node
     /// keyed by `sig`; evaluation consults it via [`SubqueryEval`].
-    InSubquery { col: usize, sig: SubquerySig, negated: bool },
+    InSubquery {
+        col: usize,
+        sig: SubquerySig,
+        negated: bool,
+    },
 }
 
 impl CompiledPredicate {
@@ -256,11 +277,7 @@ impl CompiledPredicate {
 
     /// Compile against `ts`, registering any `IN (SELECT …)` subqueries via `collector` (which creates
     /// the maintained nodes). The compiled `InSubquery` leaves reference nodes by signature.
-    pub fn compile_with(
-        p: &PredicateJson,
-        ts: &TableSchema,
-        collector: &mut dyn SubqueryCollector,
-    ) -> Result<Self> {
+    pub fn compile_with(p: &PredicateJson, ts: &TableSchema, collector: &mut dyn SubqueryCollector) -> Result<Self> {
         Ok(match p {
             PredicateJson::Leaf { col, op, value } => {
                 let idx = ts.column_index(col)?;
@@ -273,15 +290,13 @@ impl CompiledPredicate {
                 let idx = ts.column_index(col)?;
                 CompiledPredicate::IsNull { col: idx, is_null: *is_null }
             }
-            PredicateJson::And { and } => CompiledPredicate::And(
-                and.iter().map(|p| Self::compile_with(p, ts, collector)).collect::<Result<_>>()?,
-            ),
-            PredicateJson::Or { or } => CompiledPredicate::Or(
-                or.iter().map(|p| Self::compile_with(p, ts, collector)).collect::<Result<_>>()?,
-            ),
-            PredicateJson::Not { not } => {
-                CompiledPredicate::Not(Box::new(Self::compile_with(not, ts, collector)?))
+            PredicateJson::And { and } => {
+                CompiledPredicate::And(and.iter().map(|p| Self::compile_with(p, ts, collector)).collect::<Result<_>>()?)
             }
+            PredicateJson::Or { or } => {
+                CompiledPredicate::Or(or.iter().map(|p| Self::compile_with(p, ts, collector)).collect::<Result<_>>()?)
+            }
+            PredicateJson::Not { not } => CompiledPredicate::Not(Box::new(Self::compile_with(not, ts, collector)?)),
             PredicateJson::In { col, subquery, negated } => {
                 let idx = ts.column_index(col)?;
                 let sig = collector.collect(&subquery.table, &subquery.project, subquery.where_.as_deref())?;
@@ -321,9 +336,7 @@ impl CompiledPredicate {
     pub fn equality_template(&self) -> Option<Vec<(usize, Value)>> {
         fn collect(p: &CompiledPredicate, acc: &mut Vec<(usize, Value)>) -> bool {
             match p {
-                CompiledPredicate::Cmp { col, op: LeafOp::Eq, value }
-                    if !matches!(value, Value::Null) =>
-                {
+                CompiledPredicate::Cmp { col, op: LeafOp::Eq, value } if !matches!(value, Value::Null) => {
                     acc.push((*col, value.clone()));
                     true
                 }
@@ -510,9 +523,21 @@ fn cmp(cell: &Value, op: LeafOp, value: &Value) -> Tri {
             let off_by_one = matches!(crate::fault::active(), crate::fault::Fault::OffByOneCmp);
             match op {
                 LeafOp::Lt => ord.is_lt(),
-                LeafOp::Lte => if off_by_one { ord.is_lt() } else { ord.is_le() },
+                LeafOp::Lte => {
+                    if off_by_one {
+                        ord.is_lt()
+                    } else {
+                        ord.is_le()
+                    }
+                }
                 LeafOp::Gt => ord.is_gt(),
-                LeafOp::Gte => if off_by_one { ord.is_gt() } else { ord.is_ge() },
+                LeafOp::Gte => {
+                    if off_by_one {
+                        ord.is_gt()
+                    } else {
+                        ord.is_ge()
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -636,7 +661,8 @@ mod tests {
         // an uncoercible string against an int column is a (400) error, not a silent mismatch
         assert!(
             CompiledPredicate::compile(
-                &serde_json::from_value::<PredicateJson>(serde_json::json!({"col":"age","op":"eq","value":"abc"})).unwrap(),
+                &serde_json::from_value::<PredicateJson>(serde_json::json!({"col":"age","op":"eq","value":"abc"}))
+                    .unwrap(),
                 &ts,
             )
             .is_err()
@@ -646,7 +672,8 @@ mod tests {
     #[test]
     fn equality_and_comparison() {
         let ts = users();
-        let p: PredicateJson = serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap();
+        let p: PredicateJson =
+            serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap();
         let cp = CompiledPredicate::compile(&p, &ts).unwrap();
         assert!(cp.matches(&row(&ts, serde_json::json!({"id":1,"name":"a","age":20,"active":true}))));
         assert!(!cp.matches(&row(&ts, serde_json::json!({"id":2,"name":"b","age":20,"active":false}))));
@@ -665,7 +692,8 @@ mod tests {
                 {"col":"active","op":"eq","value":true},
                 {"or": [ {"col":"age","op":"gt","value":30}, {"not": {"col":"name","op":"eq","value":"bob"}} ]}
             ]
-        })).unwrap();
+        }))
+        .unwrap();
         let cp = CompiledPredicate::compile(&p, &ts).unwrap();
         assert!(cp.matches(&row(&ts, serde_json::json!({"id":1,"name":"alice","age":20,"active":true}))));
         assert!(!cp.matches(&row(&ts, serde_json::json!({"id":2,"name":"bob","age":20,"active":true}))));
@@ -687,9 +715,8 @@ mod tests {
                 .unwrap()
                 .equality_template()
         };
-        let cols = |t: &TableSchema, names: &[&str]| {
-            names.iter().map(|n| t.column_index(n).unwrap()).collect::<Vec<_>>()
-        };
+        let cols =
+            |t: &TableSchema, names: &[&str]| names.iter().map(|n| t.column_index(n).unwrap()).collect::<Vec<_>>();
 
         // single equality qualifies
         let t = tpl(serde_json::json!({"col":"name","op":"eq","value":"alice"})).unwrap();
@@ -699,27 +726,37 @@ mod tests {
         // AND of equalities -> sorted by column index, distinct columns
         let t = tpl(serde_json::json!({"and":[
             {"col":"name","op":"eq","value":"a"}, {"col":"active","op":"eq","value":true}
-        ]})).unwrap();
+        ]}))
+        .unwrap();
         let mut want = cols(&ts, &["name", "active"]);
         want.sort();
         assert_eq!(t.iter().map(|(c, _)| *c).collect::<Vec<_>>(), want);
 
         // nested And flattens
-        assert!(tpl(serde_json::json!({"and":[
-            {"and":[{"col":"name","op":"eq","value":"a"}]}, {"col":"age","op":"eq","value":1}
-        ]})).is_some());
+        assert!(
+            tpl(serde_json::json!({"and":[
+                {"and":[{"col":"name","op":"eq","value":"a"}]}, {"col":"age","op":"eq","value":1}
+            ]}))
+            .is_some()
+        );
 
         // non-qualifying shapes -> None
         assert!(tpl(serde_json::json!({"col":"age","op":"gte","value":18})).is_none()); // range
         assert!(tpl(serde_json::json!({"col":"name","op":"neq","value":"a"})).is_none()); // neq
         assert!(tpl(serde_json::json!({"or":[{"col":"name","op":"eq","value":"a"}]})).is_none()); // or
         assert!(tpl(serde_json::json!({"not":{"col":"name","op":"eq","value":"a"}})).is_none()); // not
-        assert!(tpl(serde_json::json!({"and":[
-            {"col":"name","op":"eq","value":"a"}, {"col":"age","op":"gt","value":1}
-        ]})).is_none()); // mixed eq + range
-        assert!(tpl(serde_json::json!({"and":[
-            {"col":"age","op":"eq","value":1}, {"col":"age","op":"eq","value":2}
-        ]})).is_none()); // duplicate column
+        assert!(
+            tpl(serde_json::json!({"and":[
+                {"col":"name","op":"eq","value":"a"}, {"col":"age","op":"gt","value":1}
+            ]}))
+            .is_none()
+        ); // mixed eq + range
+        assert!(
+            tpl(serde_json::json!({"and":[
+                {"col":"age","op":"eq","value":1}, {"col":"age","op":"eq","value":2}
+            ]}))
+            .is_none()
+        ); // duplicate column
         // MatchAll
         assert!(CompiledPredicate::MatchAll.equality_template().is_none());
     }
@@ -767,13 +804,16 @@ mod tests {
         // AND child order does not change the sig
         let p1: PredicateJson = serde_json::from_value(serde_json::json!({"and":[
             {"col":"active","op":"eq","value":true}, {"col":"x","op":"gt","value":1}
-        ]})).unwrap();
+        ]}))
+        .unwrap();
         let p2: PredicateJson = serde_json::from_value(serde_json::json!({"and":[
             {"col":"x","op":"gt","value":1}, {"col":"active","op":"eq","value":true}
-        ]})).unwrap();
+        ]}))
+        .unwrap();
         assert_eq!(subquery_sig(&"t".into(), "id", Some(&p1)), subquery_sig(&"t".into(), "id", Some(&p2)));
         // a different inner where -> different sig
-        let p3: PredicateJson = serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":false})).unwrap();
+        let p3: PredicateJson =
+            serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":false})).unwrap();
         assert_ne!(subquery_sig(&"parent".into(), "id", Some(&p3)), a);
         // a different project / table -> different sig
         assert_ne!(subquery_sig(&"parent".into(), "name", None), subquery_sig(&"parent".into(), "id", None));
@@ -787,41 +827,70 @@ mod tests {
         let w = |j: serde_json::Value| serde_json::from_value::<PredicateJson>(j).unwrap();
 
         // Different literals, same shape -> same key, different binds.
-        let (k1, b1, _) = subquery_template(&"pm".into(), "project_id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":1}))));
-        let (k2, b2, _) = subquery_template(&"pm".into(), "project_id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":2}))));
+        let (k1, b1, _) = subquery_template(
+            &"pm".into(),
+            "project_id",
+            Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":1}))),
+        );
+        let (k2, b2, _) = subquery_template(
+            &"pm".into(),
+            "project_id",
+            Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":2}))),
+        );
         assert_eq!(k1, k2, "one template per shape");
         assert_ne!(b1, b2);
         assert_eq!(b1, vec![("user_id".to_string(), serde_json::json!(1))]);
 
         // Multi-column AND: binds sorted by column name; conjunct order irrelevant.
-        let (k3, b3, _) = subquery_template(&"pm".into(), "p", Some(&w(serde_json::json!({"and":[
-            {"col":"user_id","op":"eq","value":1}, {"col":"status","op":"eq","value":"active"}
-        ]}))));
-        let (k4, b4, _) = subquery_template(&"pm".into(), "p", Some(&w(serde_json::json!({"and":[
-            {"col":"status","op":"eq","value":"x"}, {"col":"user_id","op":"eq","value":9}
-        ]}))));
+        let (k3, b3, _) = subquery_template(
+            &"pm".into(),
+            "p",
+            Some(&w(serde_json::json!({"and":[
+                {"col":"user_id","op":"eq","value":1}, {"col":"status","op":"eq","value":"active"}
+            ]}))),
+        );
+        let (k4, b4, _) = subquery_template(
+            &"pm".into(),
+            "p",
+            Some(&w(serde_json::json!({"and":[
+                {"col":"status","op":"eq","value":"x"}, {"col":"user_id","op":"eq","value":9}
+            ]}))),
+        );
         assert_eq!(k3, k4);
         assert_eq!(b3.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), vec!["status", "user_id"]);
         assert_eq!(b4[0].1, serde_json::json!("x"));
 
         // Ranges / OR / NOT / IS NULL / nested IN stay residual (literals baked in) — a
         // different range literal is a DIFFERENT template.
-        let (k5, b5, r5) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
-            {"col":"user_id","op":"eq","value":1}, {"col":"age","op":"gt","value":18}
-        ]}))));
-        let (k6, _, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
-            {"col":"user_id","op":"eq","value":2}, {"col":"age","op":"gt","value":18}
-        ]}))));
-        let (k7, _, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
-            {"col":"user_id","op":"eq","value":1}, {"col":"age","op":"gt","value":21}
-        ]}))));
+        let (k5, b5, r5) = subquery_template(
+            &"t".into(),
+            "id",
+            Some(&w(serde_json::json!({"and":[
+                {"col":"user_id","op":"eq","value":1}, {"col":"age","op":"gt","value":18}
+            ]}))),
+        );
+        let (k6, _, _) = subquery_template(
+            &"t".into(),
+            "id",
+            Some(&w(serde_json::json!({"and":[
+                {"col":"user_id","op":"eq","value":2}, {"col":"age","op":"gt","value":18}
+            ]}))),
+        );
+        let (k7, _, _) = subquery_template(
+            &"t".into(),
+            "id",
+            Some(&w(serde_json::json!({"and":[
+                {"col":"user_id","op":"eq","value":1}, {"col":"age","op":"gt","value":21}
+            ]}))),
+        );
         assert_eq!(k5, k6, "same residual range literal -> same template");
         assert_ne!(k5, k7, "different residual literal -> different template");
         assert_eq!(b5.len(), 1, "only the equality lifts");
         assert_eq!(r5.len(), 1, "the range conjunct is the residual");
 
         // NULL equality literal never lifts (SQL `= NULL` is UNKNOWN, not a key).
-        let (_, b8, r8) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":null}))));
+        let (_, b8, r8) =
+            subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"col":"user_id","op":"eq","value":null}))));
         assert!(b8.is_empty());
         assert_eq!(r8.len(), 1, "the NULL equality stays residual");
 
@@ -834,12 +903,20 @@ mod tests {
 
         // Duplicate column (`a=1 AND a=2`, degenerate): one lift, the other residual —
         // deterministic regardless of author order.
-        let (k10, b10, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
-            {"col":"a","op":"eq","value":1}, {"col":"a","op":"eq","value":2}
-        ]}))));
-        let (k11, b11, _) = subquery_template(&"t".into(), "id", Some(&w(serde_json::json!({"and":[
-            {"col":"a","op":"eq","value":2}, {"col":"a","op":"eq","value":1}
-        ]}))));
+        let (k10, b10, _) = subquery_template(
+            &"t".into(),
+            "id",
+            Some(&w(serde_json::json!({"and":[
+                {"col":"a","op":"eq","value":1}, {"col":"a","op":"eq","value":2}
+            ]}))),
+        );
+        let (k11, b11, _) = subquery_template(
+            &"t".into(),
+            "id",
+            Some(&w(serde_json::json!({"and":[
+                {"col":"a","op":"eq","value":2}, {"col":"a","op":"eq","value":1}
+            ]}))),
+        );
         assert_eq!(k10, k11);
         assert_eq!(b10, b11);
         assert_eq!(b10.len(), 1);
@@ -852,7 +929,8 @@ mod tests {
             "col": "id",
             "in": { "table": "groups", "project": "gid", "where": {"col":"name","op":"eq","value":"a"} },
             "negated": true
-        })).unwrap();
+        }))
+        .unwrap();
         let mut c = RecordCollector { sigs: Vec::new() };
         let cp = CompiledPredicate::compile_with(&p, &ts, &mut c).unwrap();
         match cp {
@@ -885,12 +963,15 @@ mod tests {
             &serde_json::from_value(serde_json::json!({"col":"id","in":{"table":"g","project":"gid"}})).unwrap(),
             &ts,
             &mut c,
-        ).unwrap();
+        )
+        .unwrap();
         let not_in = CompiledPredicate::compile_with(
-            &serde_json::from_value(serde_json::json!({"col":"id","negated":true,"in":{"table":"g","project":"gid"}})).unwrap(),
+            &serde_json::from_value(serde_json::json!({"col":"id","negated":true,"in":{"table":"g","project":"gid"}}))
+                .unwrap(),
             &ts,
             &mut c,
-        ).unwrap();
+        )
+        .unwrap();
         let mk = |id: i64| row(&ts, serde_json::json!({"id":id,"name":"a","age":1,"active":true}));
         let null_row = row(&ts, serde_json::json!({"id":null,"name":"a","age":1,"active":true}));
 
@@ -931,12 +1012,16 @@ mod tests {
         assert!(not_eq.matches(&row(&ts, serde_json::json!({"id":9,"name":"bob","age":20,"active":true}))));
 
         // AND: TRUE AND UNKNOWN = UNKNOWN -> excluded; FALSE AND UNKNOWN = FALSE -> excluded.
-        let and = compile(serde_json::json!({"and":[{"col":"active","op":"eq","value":true},{"col":"age","op":"gt","value":18}]}));
+        let and = compile(
+            serde_json::json!({"and":[{"col":"active","op":"eq","value":true},{"col":"age","op":"gt","value":18}]}),
+        );
         assert!(!and.matches(&null_age_active));
         assert!(!and.matches(&null_age_inactive));
 
         // OR: TRUE OR UNKNOWN = TRUE -> included; FALSE OR UNKNOWN = UNKNOWN -> excluded.
-        let or = compile(serde_json::json!({"or":[{"col":"active","op":"eq","value":true},{"col":"age","op":"gt","value":100}]}));
+        let or = compile(
+            serde_json::json!({"or":[{"col":"active","op":"eq","value":true},{"col":"age","op":"gt","value":100}]}),
+        );
         assert!(or.matches(&null_age_active));
         assert!(!or.matches(&null_age_inactive));
     }

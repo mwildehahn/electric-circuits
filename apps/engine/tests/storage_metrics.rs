@@ -8,10 +8,10 @@ use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use electric_circuits_engine::config::{self, StatsdTarget};
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
@@ -52,8 +52,7 @@ async fn ds_handler(req: Request) -> Response {
             } else {
                 // Not ready yet, or already past the insert: park briefly like a real long-poll.
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                (StatusCode::NO_CONTENT, [("stream-next-offset", if at_start { "-1" } else { "01" })])
-                    .into_response()
+                (StatusCode::NO_CONTENT, [("stream-next-offset", if at_start { "-1" } else { "01" })]).into_response()
             }
         }
         Method::GET => {

@@ -177,10 +177,8 @@ pub(crate) async fn ttl_registry_heap_bytes() -> usize {
 fn live_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
-        let ms = std::env::var("ELECTRIC_LIVE_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(20_000);
+        let ms =
+            std::env::var("ELECTRIC_LIVE_TIMEOUT_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(20_000);
         Duration::from_millis(ms)
     })
 }
@@ -192,10 +190,7 @@ fn live_timeout() -> Duration {
 fn handle_ttl() -> Duration {
     static TTL: OnceLock<Duration> = OnceLock::new();
     *TTL.get_or_init(|| {
-        let secs = std::env::var("ELECTRIC_HANDLE_TTL")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(600);
+        let secs = std::env::var("ELECTRIC_HANDLE_TTL").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(600);
         Duration::from_secs(secs)
     })
 }
@@ -552,11 +547,8 @@ fn apply_changes(keys: &mut HashSet<String>, pk_name: &str, envelopes: Vec<Envel
                 if keys.remove(&env.key) {
                     // Electric's client requires a `value` on every change message (its parser matches
                     // on `"value"`). For a delete we carry the row's old value if present, else the key.
-                    let value = env
-                        .value
-                        .as_ref()
-                        .map(encode_value)
-                        .unwrap_or_else(|| serde_json::json!({ pk_name: env.key }));
+                    let value =
+                        env.value.as_ref().map(encode_value).unwrap_or_else(|| serde_json::json!({ pk_name: env.key }));
                     messages.push(change_msg("delete", &env.key, Some(value)));
                 }
             }
@@ -770,7 +762,13 @@ async fn positioned_read(
         let served_offset = st.offset.clone();
         drop(st);
         entry.touch();
-        return Ok(ReadOutcome { offset: served_offset, up_to_date: true, cursor: next_cursor(), body: None, retired: false });
+        return Ok(ReadOutcome {
+            offset: served_offset,
+            up_to_date: true,
+            cursor: next_cursor(),
+            body: None,
+            retired: false,
+        });
     }
 
     let mut messages = apply_changes(&mut st.keys, &entry.pk_name, r.envelopes);
@@ -833,11 +831,7 @@ pub async fn shape(
     // series, not one.
     let root_table = p.table.to_string();
 
-    let resp = if !crate::config::secret_ok(
-        crate::config::secret(),
-        p.secret.as_deref(),
-        p.api_secret.as_deref(),
-    ) {
+    let resp = if !crate::config::secret_ok(crate::config::secret(), p.secret.as_deref(), p.api_secret.as_deref()) {
         unauthorized()
     } else if let Err(e) = engine.ensure_not_degraded() {
         degraded(&e)
@@ -857,11 +851,7 @@ pub async fn shape(
     resp
 }
 
-async fn shape_inner(
-    engine: Engine,
-    p: ShapeParams,
-    raw_pairs: &[(String, String)],
-) -> Result<Response, ApiError> {
+async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, String)]) -> Result<Response, ApiError> {
     let offset = p.offset.clone().unwrap_or_else(|| "-1".into());
     let live = p.live.as_deref() == Some("true");
     // Checked first, before the table lookup: a draining engine's cheapest useful answer to a new
@@ -1059,10 +1049,7 @@ mod tests {
     }
 
     fn op_and_key(msg: &serde_json::Value) -> (String, String) {
-        (
-            msg["headers"]["operation"].as_str().unwrap().to_string(),
-            msg["key"].as_str().unwrap().to_string(),
-        )
+        (msg["headers"]["operation"].as_str().unwrap().to_string(), msg["key"].as_str().unwrap().to_string())
     }
 
     // M9: an empty non-up-to-date page mid-stream must not end the fold (that truncated snapshots);
@@ -1201,11 +1188,7 @@ mod tests {
         let mut fold = StreamFold::up_to("02");
         fold.apply_page(page(vec![env("upsert", "k1", "01"), env("upsert", "k2", "02")], "02", true));
         assert_eq!(fold.rows.len(), 2);
-        assert!(
-            fold.rows.values().all(|v| v.is_null()),
-            "a key-set fold must not retain row values: {:?}",
-            fold.rows
-        );
+        assert!(fold.rows.values().all(|v| v.is_null()), "a key-set fold must not retain row values: {:?}", fold.rows);
         // The snapshot fold, by contrast, keeps them — it IS the response body.
         let mut snap = StreamFold::to_tail();
         snap.apply_page(page(vec![env("upsert", "k1", "01")], "01", true));
@@ -1239,7 +1222,8 @@ mod tests {
         let mut keys: HashSet<String> = fold.rows.into_keys().collect();
 
         // ...then replay everything after it.
-        let replay: Vec<Envelope> = all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
+        let replay: Vec<Envelope> =
+            all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
         let msgs = apply_changes(&mut keys, "id", replay);
         assert_eq!(msgs.len(), 1);
         assert_eq!(op_and_key(&msgs[0]), ("delete".into(), "k2".into()));
@@ -1257,7 +1241,8 @@ mod tests {
         let mut keys: HashSet<String> = fold.rows.into_keys().collect();
         assert!(keys.is_empty(), "as of offset 02 the client holds no rows");
 
-        let replay: Vec<Envelope> = all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
+        let replay: Vec<Envelope> =
+            all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
         let msgs = apply_changes(&mut keys, "id", replay);
         assert_eq!(msgs.len(), 1);
         assert_eq!(op_and_key(&msgs[0]), ("insert".into(), "k1".into()));

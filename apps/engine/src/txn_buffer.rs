@@ -169,9 +169,7 @@ impl TxnBufferConfig {
         let wrote = f.write_all(b"{}\n").and_then(|()| f.flush());
         drop(f);
         let _ = std::fs::remove_file(&probe);
-        wrote.with_context(|| {
-            format!("writing to the transaction spill dir {} failed", self.spill_dir.display())
-        })?;
+        wrote.with_context(|| format!("writing to the transaction spill dir {} failed", self.spill_dir.display()))?;
         Ok(())
     }
 }
@@ -196,8 +194,7 @@ fn bytes_var(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> 
     if raw.is_empty() {
         return Ok(default);
     }
-    raw.parse::<u64>()
-        .with_context(|| format!("{name}='{raw}' is not a byte count (a plain non-negative integer)"))
+    raw.parse::<u64>().with_context(|| format!("{name}='{raw}' is not a byte count (a plain non-negative integer)"))
 }
 
 /// The transaction-level values every envelope of a commit is stamped with. `seq` and the
@@ -341,10 +338,7 @@ impl TxnBuffer {
     /// stated here so it is a decision rather than an oversight.
     fn begin_spill(&mut self) -> Result<()> {
         ensure_spill_dir(&self.cfg.spill_dir)?;
-        let path = self
-            .cfg
-            .spill_dir
-            .join(format!("{SPILL_PREFIX}{}-{}{SPILL_SUFFIX}", self.xid, std::process::id()));
+        let path = self.cfg.spill_dir.join(format!("{SPILL_PREFIX}{}-{}{SPILL_SUFFIX}", self.xid, std::process::id()));
         // A file already there is a leftover the boot sweep could not attribute (a recycled pid);
         // it cannot be a live buffer of ours, since one process buffers one transaction at a time.
         let file = match spill_open(&path) {
@@ -353,16 +347,14 @@ impl TxnBuffer {
                 tracing::warn!("transaction spill file {} already existed; replacing it", path.display());
                 std::fs::remove_file(&path)
                     .with_context(|| format!("removing the stale spill file {}", path.display()))?;
-                spill_open(&path)
-                    .with_context(|| format!("creating the transaction spill file {}", path.display()))?
+                spill_open(&path).with_context(|| format!("creating the transaction spill file {}", path.display()))?
             }
             Err(e) => {
                 return Err(anyhow::Error::new(e))
                     .with_context(|| format!("creating the transaction spill file {}", path.display()));
             }
         };
-        self.spill =
-            Some(Spill { path, writer: Some(BufWriter::with_capacity(SPILL_WRITE_BUFFER, file)), bytes: 0 });
+        self.spill = Some(Spill { path, writer: Some(BufWriter::with_capacity(SPILL_WRITE_BUFFER, file)), bytes: 0 });
         let buffered = std::mem::take(&mut self.mem);
         self.mem_bytes = 0;
         for env in &buffered {
@@ -403,9 +395,8 @@ impl TxnBuffer {
             None => None,
             Some(spill) => {
                 if let Some(mut w) = spill.writer.take() {
-                    w.flush().with_context(|| {
-                        format!("flushing the transaction spill file {}", spill.path.display())
-                    })?;
+                    w.flush()
+                        .with_context(|| format!("flushing the transaction spill file {}", spill.path.display()))?;
                 }
                 let f = std::fs::File::open(&spill.path)
                     .with_context(|| format!("reopening the transaction spill file {}", spill.path.display()))?;
@@ -539,9 +530,8 @@ impl TxnDrain<'_> {
             // A spilled envelope's serialized size is the line we just read; no second pass.
             Some(Raw::Line(line)) => {
                 let len = line.len() as u64;
-                let env: Envelope = serde_json::from_slice(&line).with_context(|| {
-                    format!("parsing a buffered change of transaction {} back", self.buf.xid)
-                })?;
+                let env: Envelope = serde_json::from_slice(&line)
+                    .with_context(|| format!("parsing a buffered change of transaction {} back", self.buf.xid))?;
                 (env, len)
             }
             // An in-memory envelope was never serialized; measure it without allocating.
@@ -763,7 +753,10 @@ mod tests {
         assert!(at < 39, "the cap was crossed well before the last push");
         // The one file, named for this transaction and process.
         let path = buf.spill_path().expect("spilled").to_path_buf();
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), format!("circuits-txn-7-{}.ndjson", std::process::id()));
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("circuits-txn-7-{}.ndjson", std::process::id())
+        );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "exactly one spill file");
         // Memory is released at the crossing and never grows again.
         assert!(buf.mem.is_empty(), "the buffered envelopes moved to the file");
@@ -1057,13 +1050,11 @@ mod tests {
         assert_eq!(d.spill_dir, default_spill_dir(), "a private per-uid subdir, not the shared temp dir");
         assert!(d.spill_dir.starts_with(std::env::temp_dir()));
 
-        let c = TxnBufferConfig::resolve(|k| {
-            match k {
-                "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES" => Some("4096".to_string()),
-                "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES" => Some("16384".to_string()),
-                "ELECTRIC_CIRCUITS_TXN_SPILL_DIR" => Some("/var/tmp/circuits".to_string()),
-                _ => None,
-            }
+        let c = TxnBufferConfig::resolve(|k| match k {
+            "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES" => Some("4096".to_string()),
+            "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES" => Some("16384".to_string()),
+            "ELECTRIC_CIRCUITS_TXN_SPILL_DIR" => Some("/var/tmp/circuits".to_string()),
+            _ => None,
         })
         .unwrap();
         assert_eq!(c.memory_bytes, 4096);
@@ -1083,22 +1074,19 @@ mod tests {
     #[test]
     fn an_unusable_append_budget_is_refused() {
         let too_big = (DS_MAX_BODY_BYTES + 1).to_string();
-        let err = TxnBufferConfig::resolve(|k| {
-            (k == "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES").then(|| too_big.clone())
-        })
-        .expect_err("above the durable-streams body cap");
+        let err =
+            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES").then(|| too_big.clone()))
+                .expect_err("above the durable-streams body cap");
         assert!(format!("{err:#}").contains("request-body cap"), "{err:#}");
 
-        let err = TxnBufferConfig::resolve(|k| {
-            (k == "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES").then(|| "0".to_string())
-        })
-        .expect_err("a zero budget cannot append anything");
+        let err =
+            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES").then(|| "0".to_string()))
+                .expect_err("a zero budget cannot append anything");
         assert!(format!("{err:#}").contains("positive byte count"), "{err:#}");
 
-        let err = TxnBufferConfig::resolve(|k| {
-            (k == "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES").then(|| "128MiB".to_string())
-        })
-        .expect_err("not a byte count");
+        let err =
+            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES").then(|| "128MiB".to_string()))
+                .expect_err("not a byte count");
         assert!(format!("{err:#}").contains("ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES"), "{err:#}");
     }
 }

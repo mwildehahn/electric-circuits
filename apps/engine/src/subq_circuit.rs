@@ -54,8 +54,7 @@ pub type Assert = dbsp::operator::Update<Value, Value>;
 /// the old `Row([Int(id), Text(pk)])` key: 12 inline bytes with NO per-entry heap string (the
 /// string lives once in the dictionary), which is the memory win driving Task 2.1.
 #[derive(
-    Clone, Copy, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
-    Deserialize, IsNone,
+    Clone, Copy, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub struct PkKey {
@@ -147,12 +146,9 @@ fn spill_config_from_env() -> Result<Option<SpillConfig>> {
     if std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE").is_ok_and(|v| v == "0") {
         return Ok(None);
     }
-    let min_kb: usize = std::env::var("ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128);
-    let cache_mib =
-        storage_cache_mib(std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
+    let min_kb: usize =
+        std::env::var("ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let cache_mib = storage_cache_mib(std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
     let (dir, auto) = match std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR") {
         Ok(d) if !d.is_empty() => (d, false),
         _ => (default_spill_dir(), true),
@@ -189,12 +185,19 @@ fn process_alive(pid: u32) -> bool {
 }
 
 enum Cmd {
-    Batch { asserts: Assertions, resp: oneshot::Sender<Vec<MemberDelta>> },
+    Batch {
+        asserts: Assertions,
+        resp: oneshot::Sender<Vec<MemberDelta>>,
+    },
     /// Diagnostic: totals plus the full per-operator profile as dbsp's own JSON
     /// (`DbspProfile::as_json` — worker profiles with per-node `used_memory_bytes` etc., plus
     /// the named operator graph). Heavy; on-demand only (`GET /debug/dbsp-profile`).
-    ProfileDump { resp: oneshot::Sender<(usize, usize, String)> },
-    Shutdown { resp: oneshot::Sender<()> },
+    ProfileDump {
+        resp: oneshot::Sender<(usize, usize, String)>,
+    },
+    Shutdown {
+        resp: oneshot::Sender<()>,
+    },
 }
 
 /// Measured byte sizes of the circuit's **published** `integrate_trace` snapshots — the only
@@ -278,33 +281,32 @@ impl MembershipCircuit {
             config = config.with_storage(Some(storage));
             tracing::info!(
                 "membership circuit: spilling to {} (min_storage_bytes={}, cache_mib={})",
-                sp.dir, sp.min_storage_bytes, sp.cache_mib
+                sp.dir,
+                sp.min_storage_bytes,
+                sp.cache_mib
             );
         }
-        let (dbsp, (contrib_in, flips_out)) =
-            Runtime::init_circuit(config, move |circuit| {
-                // Contributors are a key→value upsert MAP (the projected value is carried). The
-                // upsert patch function is unused (we only Insert/Delete, never Update), but the
-                // API requires one; assignment is the natural no-surprise choice.
-                let (contrib_stream, contrib_in) =
-                    circuit.add_input_map::<PkKey, Value, Value, _>(|v, u| *v = u.clone());
+        let (dbsp, (contrib_in, flips_out)) = Runtime::init_circuit(config, move |circuit| {
+            // Contributors are a key→value upsert MAP (the projected value is carried). The
+            // upsert patch function is unused (we only Insert/Delete, never Update), but the
+            // API requires one; assignment is the natural no-surprise choice.
+            let (contrib_stream, contrib_in) = circuit.add_input_map::<PkKey, Value, Value, _>(|v, u| *v = u.clone());
 
-                // Contributors: (node,pk_id)→value ⇒ (node,value) weighted by contributor count.
-                let member_counts =
-                    contrib_stream.map(|(k, v)| Row(vec![Value::Int(k.id), v.clone()]));
-                member_counts.integrate_trace().apply(move |spine| {
-                    *m_slot.write().expect("members slot") = Some(spine.ro_snapshot());
-                });
-                let flips_out = member_counts.distinct().accumulate_output();
+            // Contributors: (node,pk_id)→value ⇒ (node,value) weighted by contributor count.
+            let member_counts = contrib_stream.map(|(k, v)| Row(vec![Value::Int(k.id), v.clone()]));
+            member_counts.integrate_trace().apply(move |spine| {
+                *m_slot.write().expect("members slot") = Some(spine.ro_snapshot());
+            });
+            let flips_out = member_counts.distinct().accumulate_output();
 
-                // The contributor relation publishes its own integral for prefix enumeration (the
-                // node drop path).
-                contrib_stream.integrate_trace().apply(move |spine| {
-                    *c_slot.write().expect("contributors slot") = Some(spine.ro_snapshot());
-                });
-                Ok((contrib_in, flips_out))
-            })
-            .map_err(|e| anyhow::anyhow!("membership circuit: init_circuit: {e}"))?;
+            // The contributor relation publishes its own integral for prefix enumeration (the
+            // node drop path).
+            contrib_stream.integrate_trace().apply(move |spine| {
+                *c_slot.write().expect("contributors slot") = Some(spine.ro_snapshot());
+            });
+            Ok((contrib_in, flips_out))
+        })
+        .map_err(|e| anyhow::anyhow!("membership circuit: init_circuit: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<Cmd>(256);
         std::thread::Builder::new()
@@ -343,9 +345,7 @@ impl MembershipCircuit {
         let Some(snap) = guard.as_ref() else { return false };
         let mut cursor = snap.inner().cursor();
         seek(&mut cursor, &target);
-        cursor.key_valid()
-            && unsafe { cursor.key().downcast::<Row>() } == &target
-            && key_weight(&mut cursor) > 0
+        cursor.key_valid() && unsafe { cursor.key().downcast::<Row>() } == &target && key_weight(&mut cursor) > 0
     }
 
     /// The node's current distinct-value count and up to `cap` `(value, contributor count)`
@@ -459,18 +459,13 @@ fn map_slice(slot: &Slot<MapSnapshot>, id: i64) -> Vec<(u32, Value)> {
 
 /// Position a dynamic trace cursor at the first key ≥ `target` (a shorter `Row` is a strict
 /// prefix and orders before every same-prefix longer row).
-fn seek(
-    cursor: &mut impl Cursor<dbsp::dynamic::DynData, dbsp::dynamic::DynUnit, (), dbsp::DynZWeight>,
-    target: &Row,
-) {
+fn seek(cursor: &mut impl Cursor<dbsp::dynamic::DynData, dbsp::dynamic::DynUnit, (), dbsp::DynZWeight>, target: &Row) {
     use dbsp::dynamic::Erase;
     cursor.seek_key(target.erase());
 }
 
 /// Sum the current key's net weight (unit-valued zset cursor).
-fn key_weight(
-    cursor: &mut impl Cursor<dbsp::dynamic::DynData, dbsp::dynamic::DynUnit, (), dbsp::DynZWeight>,
-) -> i64 {
+fn key_weight(cursor: &mut impl Cursor<dbsp::dynamic::DynData, dbsp::dynamic::DynUnit, (), dbsp::DynZWeight>) -> i64 {
     let mut w: i64 = 0;
     while cursor.val_valid() {
         w += **cursor.weight();
@@ -524,8 +519,7 @@ fn circuit_thread(
                 let dump = match dbsp.retrieve_profile() {
                     Ok(p) => {
                         let used = p.total_used_bytes().map(|b| b.into_inner() as usize).unwrap_or(0);
-                        let stored =
-                            p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        let stored = p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
                         (used, stored, p.as_json())
                     }
                     Err(e) => {
@@ -682,9 +676,7 @@ mod tests {
         }))
         .unwrap();
         // Enough contributor entries to force at least one on-disk batch.
-        let contributors = (0..2000)
-            .map(|i| Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 50))))
-            .collect();
+        let contributors = (0..2000).map(|i| Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 50)))).collect();
         let flips = c.apply(Assertions { contributors }).await;
         assert_eq!(flips.len(), 50, "50 distinct values entered");
         assert!(c.contains(1, &Value::Int(7)));
@@ -742,16 +734,12 @@ mod tests {
         const LIVE: i64 = 400;
         const STEPS: i64 = 400;
         let c = MembershipCircuit::start_full(None).unwrap();
-        let seed = (0..LIVE)
-            .map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(0))))
-            .collect();
+        let seed = (0..LIVE).map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(0)))).collect();
         c.apply(Assertions { contributors: seed }).await;
 
         let mut max_contrib_len = 0usize;
         for step in 1..=STEPS {
-            let contributors = (0..LIVE)
-                .map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(step))))
-                .collect();
+            let contributors = (0..LIVE).map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(step)))).collect();
             c.apply(Assertions { contributors }).await;
             max_contrib_len = max_contrib_len.max(c.snapshot_bytes().contributors_len);
         }

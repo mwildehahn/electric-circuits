@@ -54,10 +54,7 @@ struct FakeLog {
 
 impl FakeLog {
     fn serve(&self, at: &str, next: &str, envs: &[String]) {
-        self.pages
-            .lock()
-            .unwrap()
-            .insert(at.to_string(), (next.to_string(), format!("[{}]", envs.join(","))));
+        self.pages.lock().unwrap().insert(at.to_string(), (next.to_string(), format!("[{}]", envs.join(","))));
     }
 
     fn shape_flushes(&self, path: &str) -> Vec<Vec<Envelope>> {
@@ -71,12 +68,7 @@ impl FakeLog {
             .unwrap()
             .iter()
             .filter(|e| e.get("t").and_then(|t| t.as_str()) == Some("offset"))
-            .map(|e| {
-                (
-                    e["pos"]["offset"].as_str().unwrap_or_default().to_string(),
-                    e.get("highwater").cloned(),
-                )
-            })
+            .map(|e| (e["pos"]["offset"].as_str().unwrap_or_default().to_string(), e.get("highwater").cloned()))
             .collect()
     }
 }
@@ -116,11 +108,7 @@ async fn ds_handler(State(log): State<FakeLog>, req: Request) -> Response {
             StatusCode::OK.into_response()
         }
         Method::GET if path.starts_with("changes") => {
-            let at = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("offset="))
-                .unwrap_or("-1")
-                .to_string();
+            let at = query.split('&').find_map(|kv| kv.strip_prefix("offset=")).unwrap_or("-1").to_string();
             let page = log.pages.lock().unwrap().get(&at).cloned();
             match page {
                 Some((next, body)) => ([("stream-next-offset", next.as_str())], body).into_response(),
@@ -213,11 +201,7 @@ async fn a_chunked_transaction_is_flushed_once_and_only_when_complete() {
 async fn complete_transactions_following_a_held_run_are_never_filtered_by_its_seqs() {
     let (_engine, log, stream, _t) = boot().await;
     // B is huge: its first chunk ends at seq 1001, unmarked.
-    log.serve(
-        "-1",
-        "01",
-        &[env_json(200, "0/20", "b1", 1000, false), env_json(200, "0/20", "b2", 1001, false)],
-    );
+    log.serve("-1", "01", &[env_json(200, "0/20", "b1", 1000, false), env_json(200, "0/20", "b2", 1001, false)]);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(log.shape_flushes(&stream).is_empty());
 
@@ -235,8 +219,7 @@ async fn complete_transactions_following_a_held_run_are_never_filtered_by_its_se
 
     let flushes = log.shape_flushes(&stream);
     assert_eq!(flushes.len(), 3, "three transactions, three flushes: {flushes:?}");
-    let per_txn: Vec<Vec<&str>> =
-        flushes.iter().map(|f| f.iter().map(|e| e.key.as_str()).collect()).collect();
+    let per_txn: Vec<Vec<&str>> = flushes.iter().map(|f| f.iter().map(|e| e.key.as_str()).collect()).collect();
     assert_eq!(per_txn, vec![vec!["b1", "b2", "b3"], vec!["c1"], vec!["d1"]], "each once, in order");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -256,11 +239,7 @@ async fn a_new_hold_after_a_completed_one_re_pins_to_its_own_page() {
     assert_eq!(engine.table_offset(&t).await.unwrap().offset, "-1");
 
     // A completes here, and B's first chunk starts a NEW hold.
-    log.serve(
-        "01",
-        "02",
-        &[env_json(300, "0/30", "a2", 1, true), env_json(301, "0/31", "b1", 0, false)],
-    );
+    log.serve("01", "02", &[env_json(300, "0/30", "a2", 1, true), env_json(301, "0/31", "b1", 0, false)]);
     wait_for(|| !log.shape_flushes(&stream).is_empty(), "A to be flushed").await;
 
     let flushes = log.shape_flushes(&stream);
@@ -289,11 +268,7 @@ async fn the_highwater_is_checkpointed_even_while_the_position_is_pinned() {
     let (engine, log, stream, t) = boot().await;
     // One complete transaction, then the first chunk of a large one — all in the very first page,
     // so the pin lands exactly on the position the sequencer started (and last checkpointed) at.
-    log.serve(
-        "-1",
-        "01",
-        &[env_json(400, "0/40", "a1", 0, true), env_json(401, "0/41", "b1", 0, false)],
-    );
+    log.serve("-1", "01", &[env_json(400, "0/40", "a1", 0, true), env_json(401, "0/41", "b1", 0, false)]);
     wait_for(|| !log.shape_flushes(&stream).is_empty(), "A to be flushed").await;
     assert_eq!(engine.table_offset(&t).await.unwrap().offset, "-1", "pinned at the start position");
 

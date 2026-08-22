@@ -191,10 +191,7 @@ async fn a_real_404_retires_the_shape_instead_of_leaving_it_stale() {
         }
     }
     until("retirement deletes the stream (ADR-0007)", &ds.deleted).await;
-    until(
-        "retirement closes before deleting (ADR-0007) — the close is attempted even on a lost stream",
-        &ds.closed,
-    )
-    .await;
+    until("retirement closes before deleting (ADR-0007) — the close is attempted even on a lost stream", &ds.closed)
+        .await;
     assert!(engine.graph().await.shapes.is_empty(), "no shape may survive its lost stream");
 }

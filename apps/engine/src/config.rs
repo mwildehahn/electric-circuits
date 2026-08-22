@@ -274,10 +274,8 @@ impl Config {
 
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
-        let db_pool_size = g("ELECTRIC_DB_POOL_SIZE")
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(20);
+        let db_pool_size =
+            g("ELECTRIC_DB_POOL_SIZE").and_then(|s| s.trim().parse::<usize>().ok()).filter(|n| *n >= 1).unwrap_or(20);
 
         let trace = g("ELECTRIC_CIRCUITS_TRACE")
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
@@ -296,15 +294,14 @@ impl Config {
             }),
             cache_mib: g("ELECTRIC_CIRCUITS_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
             min_storage_bytes: Some(
-                g("ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB")
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                    .unwrap_or(1024)
+                g("ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1024)
                     * 1024,
             ),
             max_rss_bytes: g("ELECTRIC_CIRCUITS_DBSP_MAX_RSS_MB")
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|mb| mb * 1024 * 1024),
-            checkpoint_every: match g("ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS").and_then(|s| s.trim().parse::<u64>().ok())
+            checkpoint_every: match g("ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS")
+                .and_then(|s| s.trim().parse::<u64>().ok())
             {
                 Some(0) => None,
                 Some(s) => Some(Duration::from_secs(s)),
@@ -325,11 +322,8 @@ impl Config {
                 .split(',')
                 .filter_map(|s| {
                     let (t, cols) = s.trim().split_once(':')?;
-                    let cols: Vec<String> = cols
-                        .split('+')
-                        .map(|c| c.trim().to_string())
-                        .filter(|c| !c.is_empty())
-                        .collect();
+                    let cols: Vec<String> =
+                        cols.split('+').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
                     if cols.is_empty() { None } else { Some((TableRef::parse(t.trim()).ok()?, cols)) }
                 })
                 .collect(),
@@ -345,10 +339,7 @@ impl Config {
         let append_bytes = match g("ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES") {
             None => d.append_bytes,
             Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
-                anyhow::anyhow!(
-                    "ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES must be a byte count, got '{}'",
-                    raw.trim()
-                )
+                anyhow::anyhow!("ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES must be a byte count, got '{}'", raw.trim())
             })?,
         };
         if append_bytes == 0 {
@@ -377,8 +368,7 @@ impl Config {
         let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms };
 
         let shutdown_grace = crate::shutdown::resolve_grace(&g).context("shutdown configuration")?;
-        let shutdown_ready_drain =
-            crate::shutdown::resolve_ready_drain(&g).context("shutdown configuration")?;
+        let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(&g).context("shutdown configuration")?;
         if shutdown_ready_drain >= shutdown_grace {
             bail!(
                 "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS ({}s) must be less than \
@@ -418,10 +408,7 @@ impl Config {
     /// Resolve from the real process environment, then scan it for accepted-no-op `ELECTRIC_*` vars.
     pub fn from_env() -> Result<Config> {
         let mut cfg = Config::resolve(|k| std::env::var(k).ok())?;
-        cfg.noop_vars = std::env::vars()
-            .map(|(k, _)| k)
-            .filter(|k| is_noop_var(k))
-            .collect();
+        cfg.noop_vars = std::env::vars().map(|(k, _)| k).filter(|k| is_noop_var(k)).collect();
         cfg.noop_vars.sort();
         Ok(cfg)
     }
@@ -584,10 +571,7 @@ mod tests {
         // DATABASE_URL present, no port -> 0.0.0.0:3000
         assert_eq!(cfg(&[("DATABASE_URL", "postgres://x")]).bind, "0.0.0.0:3000");
         // ELECTRIC_CIRCUITS_BIND always wins
-        assert_eq!(
-            cfg(&[("ELECTRIC_CIRCUITS_BIND", "127.0.0.1:9"), ("ELECTRIC_PORT", "3000")]).bind,
-            "127.0.0.1:9"
-        );
+        assert_eq!(cfg(&[("ELECTRIC_CIRCUITS_BIND", "127.0.0.1:9"), ("ELECTRIC_PORT", "3000")]).bind, "127.0.0.1:9");
     }
 
     #[test]
@@ -598,7 +582,8 @@ mod tests {
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "debug")]).log_filter, "debug");
         // ELECTRIC_CIRCUITS_LOG wins and passes through verbatim
         assert_eq!(
-            cfg(&[("ELECTRIC_CIRCUITS_LOG", "electric_circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")]).log_filter,
+            cfg(&[("ELECTRIC_CIRCUITS_LOG", "electric_circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")])
+                .log_filter,
             "electric_circuits_engine=debug"
         );
     }
@@ -645,8 +630,7 @@ mod tests {
         assert_eq!(cfg(&[("TELEMETRY_POLLER_PERIOD", "200")]).metrics_period, Duration::from_millis(200));
         // Electric's spelling wins even when both are set.
         assert_eq!(
-            cfg(&[("ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL", "2s"), ("TELEMETRY_POLLER_PERIOD", "200")])
-                .metrics_period,
+            cfg(&[("ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL", "2s"), ("TELEMETRY_POLLER_PERIOD", "200")]).metrics_period,
             Duration::from_secs(2)
         );
     }

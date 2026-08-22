@@ -535,10 +535,22 @@ mod tests {
     fn format_metric_all_types() {
         let id = "abc-123";
         assert_eq!(format_metric(id, "electric.x.count", "1", "c", &[]), "electric.x.count:1|c|#instance_id:abc-123");
-        assert_eq!(format_metric(id, "electric.x.bytes", "512", "c", &[]), "electric.x.bytes:512|c|#instance_id:abc-123");
-        assert_eq!(format_metric(id, "system.cpu.core_count", "8", "g", &[]), "system.cpu.core_count:8|g|#instance_id:abc-123");
         assert_eq!(
-            format_metric(id, "plug.router_dispatch.stop.duration", "1.5", "d", &[("route", "/v1/shape"), ("status", "200")]),
+            format_metric(id, "electric.x.bytes", "512", "c", &[]),
+            "electric.x.bytes:512|c|#instance_id:abc-123"
+        );
+        assert_eq!(
+            format_metric(id, "system.cpu.core_count", "8", "g", &[]),
+            "system.cpu.core_count:8|g|#instance_id:abc-123"
+        );
+        assert_eq!(
+            format_metric(
+                id,
+                "plug.router_dispatch.stop.duration",
+                "1.5",
+                "d",
+                &[("route", "/v1/shape"), ("status", "200")]
+            ),
             "plug.router_dispatch.stop.duration:1.5|d|#instance_id:abc-123,route:/v1/shape,status:200"
         );
     }
@@ -556,7 +568,9 @@ mod tests {
     fn batch_respects_1432_boundary() {
         // Build enough lines to overflow several datagrams.
         let lines: Vec<String> = (0..500)
-            .map(|i| format_metric("instance-abcdefgh", &format!("electric.metric.number_{i}"), "1", "c", &[("k", "v")]))
+            .map(|i| {
+                format_metric("instance-abcdefgh", &format!("electric.metric.number_{i}"), "1", "c", &[("k", "v")])
+            })
             .collect();
         let dgs = batch_lines(&lines, MAX_DATAGRAM);
         assert!(dgs.len() > 1, "should split into multiple datagrams");

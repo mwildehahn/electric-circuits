@@ -18,17 +18,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use crate::value::{Tup2, ZWeight};
+use anyhow::{Context, Result};
 
 use crate::ds::{DsClient, Envelope};
 use crate::heap_size::HeapSize;
 use crate::pk_dict::PkDict;
-use crate::subq_circuit::{Assert, Assertions, PkKey};
-use crate::predicate::{
-    CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
-};
+use crate::predicate::{CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig};
 use crate::schema::TableSchema;
+use crate::subq_circuit::{Assert, Assertions, PkKey};
 use crate::table_ref::TableRef;
 use crate::value::{Row, Value};
 
@@ -193,7 +191,10 @@ impl HeapSize for TemplateGroup {
     /// `residual` (`Arc<CompiledPredicate>`) is shared across every bind of this template —
     /// skipped, like other `Arc<...>` fields in this module.
     fn heap_bytes(&self) -> usize {
-        self.inner_table.heap_bytes() + self.param_cols.heap_bytes() + self.binds.heap_bytes() + self.pk_nodes.heap_bytes()
+        self.inner_table.heap_bytes()
+            + self.param_cols.heap_bytes()
+            + self.binds.heap_bytes()
+            + self.pk_nodes.heap_bytes()
     }
 }
 
@@ -577,8 +578,7 @@ impl SubqueryRegistry {
             staged_edges: Vec::new(),
             shapes: HashMap::new(),
             shape_index: crate::subq_index::SubqueryShapeIndex::default(),
-            circuit: crate::subq_circuit::MembershipCircuit::start()
-                .expect("membership circuit failed to start"),
+            circuit: crate::subq_circuit::MembershipCircuit::start().expect("membership circuit failed to start"),
             pk_dict: Arc::new(PkDict::new()),
             next_node_id: 1,
             node_by_id: HashMap::new(),
@@ -622,12 +622,7 @@ impl SubqueryRegistry {
     /// circuit's upsert map is the record of the value), so all presence transitions go
     /// through here. Inserts always assert (idempotent; a changed value must flow); absent
     /// stays quiet unless the node actually held the pk.
-    fn assert_node_row(
-        &mut self,
-        sig: &SubquerySig,
-        pk: &str,
-        present: Option<Value>,
-    ) -> Option<Tup2<PkKey, Assert>> {
+    fn assert_node_row(&mut self, sig: &SubquerySig, pk: &str, present: Option<Value>) -> Option<Tup2<PkKey, Assert>> {
         let (node_id, tkey) = {
             let node = self.nodes.get(sig)?;
             (node.node_id, node.template_key.clone())
@@ -662,11 +657,7 @@ impl SubqueryRegistry {
     /// Assert a batch of per-pk evaluations against ONE node and return the resulting flips
     /// (seeding replay and flip-driven parent re-derivations, where the caller already
     /// evaluated the node's full predicate per row).
-    async fn apply_node_evals(
-        &mut self,
-        sig: &SubquerySig,
-        evals: Vec<(String, Option<Value>)>,
-    ) -> Vec<Flip> {
+    async fn apply_node_evals(&mut self, sig: &SubquerySig, evals: Vec<(String, Option<Value>)>) -> Vec<Flip> {
         let mut asserts = Assertions::default();
         for (pk, pv) in evals {
             asserts.contributors.extend(self.assert_node_row(sig, &pk, pv));
@@ -738,8 +729,7 @@ impl SubqueryRegistry {
     ) -> Option<(usize, usize, Vec<(serde_json::Value, usize)>, bool)> {
         let n = self.nodes.get(sig)?;
         let (distinct, vals) = self.circuit.values_for_node(n.node_id, cap);
-        let vals: Vec<(serde_json::Value, usize)> =
-            vals.into_iter().map(|(v, c)| (v.to_json(), c)).collect();
+        let vals: Vec<(serde_json::Value, usize)> = vals.into_iter().map(|(v, c)| (v.to_json(), c)).collect();
         Some((distinct, n.refcount, vals, distinct > cap))
     }
 
@@ -913,8 +903,7 @@ impl SubqueryRegistry {
         out_cols: Option<Arc<Vec<usize>>>,
         changes_only: bool,
     ) -> Result<BeginCreate> {
-        let outer_ts =
-            self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
+        let outer_ts = self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
         // Conflict pre-check: compiling refs nodes; a referenced node mid-seed belongs to a
         // concurrent create. Compile on a scratch collector first so a conflict has no effects.
         self.staged_edges.clear();
@@ -930,10 +919,8 @@ impl SubqueryRegistry {
         let log = std::mem::take(&mut self.collect_log);
         // A shared (not fresh-this-create) node still seeding ⇒ conflict: roll back and retry.
         let fresh: Vec<SubquerySig> = std::mem::take(&mut self.pending_seed);
-        let conflicted = log.iter().any(|sig| {
-            !fresh.contains(sig)
-                && self.nodes.get(sig).is_some_and(|n| n.seed_buffer.is_some())
-        });
+        let conflicted =
+            log.iter().any(|sig| !fresh.contains(sig) && self.nodes.get(sig).is_some_and(|n| n.seed_buffer.is_some()));
         if conflicted {
             // Put fresh sigs back for the rollback's decref cascade bookkeeping.
             self.rollback_refs(log);
@@ -1091,10 +1078,7 @@ impl SubqueryRegistry {
         for (sig, rows, gate) in node_seeds {
             let (ts, proj_col) = {
                 let n = self.nodes.get(&sig).context("finish_create: node vanished")?;
-                (
-                    self.schemas.get(&n.inner_table).cloned().context("unknown inner table")?,
-                    n.proj_col,
-                )
+                (self.schemas.get(&n.inner_table).cloned().context("unknown inner table")?, n.proj_col)
             };
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.gate = gate;
@@ -1109,11 +1093,7 @@ impl SubqueryRegistry {
             // already reflects the seeded set), so this step's deltas are discarded — only
             // the replay below propagates.
             let _ = self.apply_asserts(seed).await;
-            let buffered = self
-                .nodes
-                .get_mut(&sig)
-                .and_then(|n| n.seed_buffer.take())
-                .unwrap_or_default();
+            let buffered = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.take()).unwrap_or_default();
             // Replayed one buffered delta at a time, in arrival order, so each keeps its own
             // commit stamp and is recorded as the live decision it is (the outer buffer's replay
             // below does the same). Membership is re-evaluated by identity per pk and is
@@ -1361,14 +1341,9 @@ impl SubqueryRegistry {
     /// The contributor slice comes from the circuit's own integral (prefix scan) — there is no host
     /// pk list to drain. Keys are pk ids; the retraction re-asserts the same id, so no dictionary
     /// round-trip is needed here.
-    fn remove_node_with_state(
-        &mut self,
-        sig: &SubquerySig,
-        asserts: &mut Assertions,
-    ) -> Vec<SubquerySig> {
+    fn remove_node_with_state(&mut self, sig: &SubquerySig, asserts: &mut Assertions) -> Vec<SubquerySig> {
         let Some(node) = self.nodes.remove(sig) else { return Vec::new() };
-        let child_sigs: Vec<SubquerySig> =
-            collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
+        let child_sigs: Vec<SubquerySig> = collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
         for (pk_id, _v) in self.circuit.contributor_entries(node.node_id) {
             if let Some(tpl) = self.templates.get_mut(&node.template_key) {
                 if let Some(set) = tpl.pk_nodes.get_mut(&pk_id) {
@@ -1422,12 +1397,8 @@ impl SubqueryRegistry {
         // 1. Templates whose inner table is this table: one residual eval + one bind lookup
         // per touched pk (instead of one full-predicate eval per literal-keyed node), then one
         // circuit step for the whole delta — the circuit's distinct reports the flips.
-        let tkeys: Vec<String> = self
-            .templates
-            .iter()
-            .filter(|(_, t)| t.inner_table == table)
-            .map(|(k, _)| k.clone())
-            .collect();
+        let tkeys: Vec<String> =
+            self.templates.iter().filter(|(_, t)| t.inner_table == table).map(|(k, _)| k.clone()).collect();
         let mut asserts = Assertions::default();
         let mut live_sigs: Vec<SubquerySig> = Vec::new();
         for tkey in &tkeys {
@@ -1472,11 +1443,7 @@ impl SubqueryRegistry {
         // docs of `subq_index` for the argument. With a trace subscriber attached the index is
         // bypassed (like the standalone/aggregate tiers) so every shape node still reports a hop.
         let shape_ids: Vec<String> = if trace.is_some() {
-            self.shapes
-                .iter()
-                .filter(|(_, s)| s.outer_table == table)
-                .map(|(id, _)| id.clone())
-                .collect()
+            self.shapes.iter().filter(|(_, s)| s.outer_table == table).map(|(id, _)| id.clone()).collect()
         } else {
             self.outer_candidates(&table, delta)
         };
@@ -1612,15 +1579,11 @@ impl SubqueryRegistry {
             .map(|(row, is_new)| {
                 let pk = ts.key_string(&row).unwrap_or_default();
                 let target = if is_new && tpl.residual.matches_ctx(&row, self) {
-                    let params = Row(
-                        tpl.param_cols
-                            .iter()
-                            .map(|&i| row.0.get(i).cloned().unwrap_or(Value::Null))
-                            .collect(),
-                    );
-                    tpl.binds.get(&params).map(|sig| {
-                        (sig.clone(), row.0.get(tpl.proj_col).cloned().unwrap_or(Value::Null))
-                    })
+                    let params =
+                        Row(tpl.param_cols.iter().map(|&i| row.0.get(i).cloned().unwrap_or(Value::Null)).collect());
+                    tpl.binds
+                        .get(&params)
+                        .map(|sig| (sig.clone(), row.0.get(tpl.proj_col).cloned().unwrap_or(Value::Null)))
                 } else {
                     None
                 };
@@ -1651,9 +1614,7 @@ impl SubqueryRegistry {
         xid: Option<u64>,
     ) -> Vec<Tup2<PkKey, Assert>> {
         let node_applies = |reg: &Self, sig: &SubquerySig| {
-            reg.nodes
-                .get(sig)
-                .is_some_and(|n| n.seed_buffer.is_none() && !n.gate.should_skip(lsn, xid))
+            reg.nodes.get(sig).is_some_and(|n| n.seed_buffer.is_none() && !n.gate.should_skip(lsn, xid))
         };
         // The binds whose decisions have an older read to beat. Empty in the steady state (no
         // node re-derivation outstanding), so the recording below costs nothing then.
@@ -1664,8 +1625,7 @@ impl SubqueryRegistry {
                 t.binds
                     .values()
                     .filter(|sig| {
-                        self.nodes.get(*sig).is_some_and(|n| n.inflight_querybacks > 0)
-                            && node_applies(self, sig)
+                        self.nodes.get(*sig).is_some_and(|n| n.inflight_querybacks > 0) && node_applies(self, sig)
                     })
                     .cloned()
                     .collect()
@@ -1831,9 +1791,7 @@ impl SubqueryRegistry {
         // The commit stamp a live/replayed decision records for the pks it evaluates; `None` for a
         // query-back, which reads this map instead of writing it.
         let live_stamp: Option<(u64, Option<u64>)> = match &source {
-            EmissionSource::Live { lsn, xid } | EmissionSource::Replay { lsn, xid } => {
-                Some((*lsn, *xid))
-            }
+            EmissionSource::Live { lsn, xid } | EmissionSource::Replay { lsn, xid } => Some((*lsn, *xid)),
             EmissionSource::QueryBack { .. } => None,
         };
         for (shape_id, candidates) in groups {
@@ -1868,9 +1826,9 @@ impl SubqueryRegistry {
                         })
                         .collect()
                 }
-                EmissionSource::QueryBack { .. }
-                | EmissionSource::Live { .. }
-                | EmissionSource::Replay { .. } => candidates,
+                EmissionSource::QueryBack { .. } | EmissionSource::Live { .. } | EmissionSource::Replay { .. } => {
+                    candidates
+                }
             };
             let mut members: Vec<Row> = Vec::new();
             let mut evaluated: Vec<u32> = Vec::new();
@@ -1980,10 +1938,8 @@ pub const FLIP_ATTEMPTS: u32 = 5;
 /// point is to sit out a transient Postgres fault (a killed backend, a failover, a lock timeout)
 /// long enough that the retry has a different answer. Shrunk under `cfg(test)` so the exhaustion
 /// test costs milliseconds instead of spending the production schedule's several seconds waiting.
-const FLIP_BACKOFF_START: std::time::Duration =
-    std::time::Duration::from_millis(if cfg!(test) { 1 } else { 50 });
-const FLIP_BACKOFF_MAX: std::time::Duration =
-    std::time::Duration::from_millis(if cfg!(test) { 8 } else { 2000 });
+const FLIP_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 1 } else { 50 });
+const FLIP_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 8 } else { 2000 });
 
 /// [`propagate_flips`], retried on failure — the only form callers should use.
 ///
@@ -2068,9 +2024,7 @@ pub async fn propagate_deferred_shape_work(
     while let Some(item) = work.pop_front() {
         let res = match &item {
             DeferredShapeWork::Value { connecting_col, value, txid } => {
-                move_shape_for_value(registry, shape_id, *connecting_col, value, txid.clone())
-                    .await
-                    .map(|_| ())
+                move_shape_for_value(registry, shape_id, *connecting_col, value, txid.clone()).await.map(|_| ())
             }
             DeferredShapeWork::Full { txid } => rederive_shape(registry, shape_id, txid.clone()).await,
         };
@@ -2206,8 +2160,7 @@ async fn propagate_one(
         }
         match &edge.dependent {
             Dependent::Shape(id) => {
-                let moved =
-                    move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                let moved = move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
                 // Light the whole path only when the shape actually moved rows: source
                 // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
                 if let (Some((outer, net)), Some(src)) = (moved, source_table.as_ref()) {
@@ -2229,7 +2182,8 @@ async fn propagate_one(
                 // seeding — in which case the re-derivation was queued on the node and runs when
                 // that create installs the seed (see `queue_node_deferred`).
                 let new_flips =
-                    requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value))).await?;
+                    requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value)))
+                        .await?;
                 if let Some((_inner, flips)) = new_flips {
                     // A nested `IN`: connect the flipped child `node:<sig>` to the parent
                     // `node:<parent_sig>` it re-derived, so the propagation reads through. The
@@ -2308,12 +2262,7 @@ async fn move_shape_for_value(
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
     let emitted = reg
-        .emit_for_shapes(
-            &ts,
-            vec![(shape_id.to_string(), candidates)],
-            txid,
-            EmissionSource::QueryBack { gate: &gate },
-        )
+        .emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, EmissionSource::QueryBack { gate: &gate })
         .await;
     reg.end_queryback(shape_id);
     Ok(match emitted?.first() {
@@ -2341,9 +2290,7 @@ async fn requery_and_reconcile_parent(
         if reg.queue_node_deferred(
             parent_sig,
             match filter {
-                Some((col, value)) => {
-                    DeferredNodeWork::Value { connecting_col: col, value: value.clone() }
-                }
+                Some((col, value)) => DeferredNodeWork::Value { connecting_col: col, value: value.clone() },
                 None => DeferredNodeWork::Full,
             },
         ) {
@@ -2393,9 +2340,7 @@ async fn rederive_dependent(
         Dependent::Node(parent_sig) => {
             // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
             // every row instead of one connecting value's candidates.
-            if let Some((_table, flips)) =
-                requery_and_reconcile_parent(registry, parent_sig, None).await?
-            {
+            if let Some((_table, flips)) = requery_and_reconcile_parent(registry, parent_sig, None).await? {
                 for f in flips {
                     work.push_back((parent_sig.clone(), f));
                 }
@@ -2438,12 +2383,7 @@ async fn rederive_shape(
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
     let emitted = reg
-        .emit_for_shapes(
-            &ts,
-            vec![(shape_id.to_string(), candidates)],
-            txid,
-            EmissionSource::QueryBack { gate: &gate },
-        )
+        .emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, EmissionSource::QueryBack { gate: &gate })
         .await;
     reg.end_queryback(shape_id);
     emitted?;
@@ -2543,8 +2483,7 @@ impl SubqueryCollector for SubqueryRegistry {
         self.next_node_id += 1;
         // Template registration: lift the equality literals into a bind (coerced to the
         // column types, same as leaf compilation) and share the residual across binds.
-        let (tkey, bind_literals, residual_json) =
-            crate::predicate::subquery_template(table, project, where_);
+        let (tkey, bind_literals, residual_json) = crate::predicate::subquery_template(table, project, where_);
         let mut param_cols = Vec::with_capacity(bind_literals.len());
         let mut bind_vals = Vec::with_capacity(bind_literals.len());
         for (col, lit) in &bind_literals {
@@ -2566,11 +2505,7 @@ impl SubqueryCollector for SubqueryRegistry {
             let residual = if residual_json.is_empty() {
                 CompiledPredicate::MatchAll
             } else {
-                CompiledPredicate::compile_with(
-                    &PredicateJson::And { and: residual_json },
-                    &inner_ts,
-                    &mut SigOnly,
-                )?
+                CompiledPredicate::compile_with(&PredicateJson::And { and: residual_json }, &inner_ts, &mut SigOnly)?
             };
             self.templates.insert(
                 tkey.clone(),
@@ -2587,9 +2522,8 @@ impl SubqueryCollector for SubqueryRegistry {
         if let Some(tpl) = self.templates.get_mut(&tkey) {
             tpl.binds.insert(bind.clone(), sig.clone());
         }
-        let mut node = SubqueryNode::new(
-            sig.clone(), table.clone(), proj_col, inner_ts.pk_index, Arc::new(inner_pred), node_id,
-        );
+        let mut node =
+            SubqueryNode::new(sig.clone(), table.clone(), proj_col, inner_ts.pk_index, Arc::new(inner_pred), node_id);
         node.where_json = where_.cloned();
         node.template_key = tkey;
         node.bind = bind;
@@ -2628,9 +2562,7 @@ pub fn collect_in_leaves(p: &CompiledPredicate) -> Vec<InLeaf> {
     let mut out = Vec::new();
     fn go(p: &CompiledPredicate, under_not: bool, out: &mut Vec<InLeaf>) {
         match p {
-            CompiledPredicate::And(v) | CompiledPredicate::Or(v) => {
-                v.iter().for_each(|c| go(c, under_not, out))
-            }
+            CompiledPredicate::And(v) | CompiledPredicate::Or(v) => v.iter().for_each(|c| go(c, under_not, out)),
             CompiledPredicate::Not(b) => go(b, true, out),
             CompiledPredicate::InSubquery { col, sig, negated } => out.push(InLeaf {
                 col: *col,
@@ -2695,9 +2627,7 @@ mod tests {
     fn insert_test_node(reg: &mut SubqueryRegistry, sig: &str) {
         let node_id = reg.next_node_id;
         reg.next_node_id += 1;
-        let mut node = SubqueryNode::new(
-            sig.into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), node_id,
-        );
+        let mut node = SubqueryNode::new(sig.into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), node_id);
         let tkey = format!("tpl:{sig}");
         node.template_key = tkey.clone();
         node.refcount = 1;
@@ -3009,10 +2939,7 @@ mod tests {
             let reg = registry.lock().await;
             let queued = &reg.nodes[&mid].deferred;
             assert_eq!(queued.len(), 1, "queued once on the parent node; the repeat deduped");
-            assert!(matches!(
-                queued[0],
-                DeferredNodeWork::Value { connecting_col: 0, value: Value::Int(7) }
-            ));
+            assert!(matches!(queued[0], DeferredNodeWork::Value { connecting_col: 0, value: Value::Int(7) }));
             assert_eq!(reg.circuit_distinct(mid_id), 0, "the seeding node's set is untouched");
             assert!(reg.nodes[&mid].seed_buffer.is_some(), "and it is still seeding");
         }
@@ -3126,8 +3053,6 @@ mod tests {
         propagate_flips(&reg, &mut work, None, None, &trace_tx).await.unwrap();
         assert!(trace_rx.try_recv().is_err(), "a NULL flip on a non-null-sensitive dependent emits nothing");
     }
-
-
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reconcile_enter_and_leave_on_first_and_last_contributor() {
@@ -3298,12 +3223,7 @@ mod tests {
         let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
         // A shape whose predicate never matches (Not(MatchAll)): every candidate verdict is
         // "not a member".
-        insert_outer_shape(
-            &mut reg,
-            "s1",
-            "t",
-            CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)),
-        );
+        insert_outer_shape(&mut reg, "s1", "t", CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
         let row = |id: i64| Row(vec![Value::Int(id), Value::Int(0)]);
 
         // A "leave" for a pk this feed never contained: nothing is emitted (no lanes are
@@ -3430,9 +3350,7 @@ mod tests {
                 }
                 StatusCode::OK.into_response()
             }
-            Method::GET => {
-                ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response()
-            }
+            Method::GET => ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response(),
             _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
         }
     }
@@ -3452,7 +3370,13 @@ mod tests {
 
     /// The operations (`"upsert"`/`"delete"`) delivered to one stream path so far, in append order.
     fn ops_for(store: &DsStore, path: &str) -> Vec<String> {
-        store.0.lock().unwrap().get(path).map(|v| v.iter().map(|e| e.headers.operation.clone()).collect()).unwrap_or_default()
+        store
+            .0
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|v| v.iter().map(|e| e.headers.operation.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// `issues(id, project_id)`, matching the brief's example shape:
@@ -3485,12 +3409,7 @@ mod tests {
     /// Register an outer shape with an arbitrary predicate through the SAME installation path
     /// production uses (`install_shape`), so the necessary-conjunct index is populated exactly as
     /// `finish_create` would populate it.
-    fn insert_outer_shape(
-        reg: &mut SubqueryRegistry,
-        shape_id: &str,
-        outer_table: &str,
-        pred: CompiledPredicate,
-    ) {
+    fn insert_outer_shape(reg: &mut SubqueryRegistry, shape_id: &str, outer_table: &str, pred: CompiledPredicate) {
         let feed_id = reg.next_feed_id;
         reg.next_feed_id += 1;
         reg.install_shape(SubqueryShape {
@@ -3512,11 +3431,7 @@ mod tests {
     /// and can never be one.
     fn keyed_membership_pred(project_id: i64, sig: &SubquerySig) -> CompiledPredicate {
         CompiledPredicate::And(vec![
-            CompiledPredicate::Cmp {
-                col: 1,
-                op: crate::predicate::LeafOp::Eq,
-                value: Value::Int(project_id),
-            },
+            CompiledPredicate::Cmp { col: 1, op: crate::predicate::LeafOp::Eq, value: Value::Int(project_id) },
             CompiledPredicate::InSubquery { col: 1, sig: sig.clone(), negated: false },
         ])
     }
@@ -3695,8 +3610,8 @@ mod tests {
         // exactly the "membership flip" exit path, distinct from a row delete.
         let flips = reg.apply_node_evals(&sig, vec![("pm-1".into(), None)]).await;
         assert_eq!(flips, vec![Flip { value: Value::Int(100), dir: FlipDir::Leave }]);
-        let results =
-            reg.emit_for_shapes(
+        let results = reg
+            .emit_for_shapes(
                 &ts,
                 vec![("s2".to_string(), vec![(issue(1, 100), true)])],
                 None,
@@ -3754,16 +3669,9 @@ mod tests {
         // Meanwhile the row moves out of project 100, in a transaction (xid 50) the read below
         // cannot see. Absolute verdict: not a member — and nothing is emitted, because the feed
         // never contained pk 1.
-        reg.on_table_delta(
-            &ts,
-            &[Tup2(issue(1, 100), -1), Tup2(issue(1, 999), 1)],
-            0x200,
-            Some(50),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1), Tup2(issue(1, 999), 1)], 0x200, Some(50), None, None)
+            .await
+            .unwrap();
         assert!(ops_for(&store, "shape/s1").is_empty(), "a never-member verdict emits nothing");
         let pk_id = reg.pk_dict.get("1").expect("the live decision must record recency for pk 1");
         assert_eq!(
@@ -3817,10 +3725,7 @@ mod tests {
         // No query-back in flight: an ordinary live delta records nothing.
         reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, Some(10), None, None).await.unwrap();
         assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert"]);
-        assert!(
-            reg.shapes["s1"].recent.is_empty(),
-            "with nothing to protect against, no per-pk state is kept"
-        );
+        assert!(reg.shapes["s1"].recent.is_empty(), "with nothing to protect against, no per-pk state is kept");
 
         // Two query-backs in flight; a live delta now records for the pks it evaluates.
         reg.begin_queryback("s1");
@@ -3855,9 +3760,7 @@ mod tests {
 
         reg.begin_queryback("s1");
         // The row is deleted in a newer transaction (xid 50): the feed retracts, a delete lands.
-        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x200, Some(50), None, None)
-            .await
-            .unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x200, Some(50), None, None).await.unwrap();
         assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert", "delete"]);
 
         // The in-flight read still has the row. Applying it would make "upsert" the last word.
@@ -3979,10 +3882,7 @@ mod tests {
         // Nothing in flight: an ordinary live delta records nothing.
         reg.on_table_delta(&ts, &[Tup2(inner_row(100, 1), 1)], 1, Some(10), None, None).await.unwrap();
         assert!(reg.contains(&sig, &Value::Int(100)));
-        assert!(
-            reg.nodes[&sig].recent.is_empty(),
-            "with nothing to protect against, no per-pk state is kept"
-        );
+        assert!(reg.nodes[&sig].recent.is_empty(), "with nothing to protect against, no per-pk state is kept");
 
         // Two re-derivations in flight; a live delta now records for the pks it decides.
         reg.begin_node_queryback(&sig);
@@ -4010,8 +3910,7 @@ mod tests {
     async fn registry_eval_reads_node_sets() {
         let sig: SubquerySig = "sig".into();
         let mut reg = registry_with_node(&sig);
-        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(1))), ("b".into(), Some(Value::Null))])
-            .await;
+        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(1))), ("b".into(), Some(Value::Null))]).await;
         assert!(reg.contains(&sig, &Value::Int(1)));
         assert!(!reg.contains(&sig, &Value::Int(2)));
         assert!(reg.has_null(&sig));

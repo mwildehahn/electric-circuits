@@ -273,11 +273,7 @@ impl Parser<'_> {
             };
             let right = self.parse_literal()?;
             let truth = eval_const(&left, &op, &right);
-            return Ok(if truth {
-                PredicateJson::And { and: vec![] }
-            } else {
-                PredicateJson::Or { or: vec![] }
-            });
+            return Ok(if truth { PredicateJson::And { and: vec![] } } else { PredicateJson::Or { or: vec![] } });
         }
         let col = self.parse_ident()?;
         let negated = if matches!(self.peek(), Some(Tok::Not)) {
@@ -368,11 +364,7 @@ impl Parser<'_> {
                     };
                     self.eat(&Tok::RParen)?;
                     // `negated` is carried by the subquery leaf itself; return early (skip the outer Not wrap).
-                    return Ok(PredicateJson::In {
-                        col,
-                        subquery: SubqueryJson { table, project, where_ },
-                        negated,
-                    });
+                    return Ok(PredicateJson::In { col, subquery: SubqueryJson { table, project, where_ }, negated });
                 } else {
                     // literal list: IN ('a','b',...) -> OR(=a,=b,...)
                     let mut vals = vec![self.parse_literal()?];
@@ -393,7 +385,6 @@ impl Parser<'_> {
         };
         Ok(if negated { PredicateJson::Not { not: Box::new(pred) } } else { pred })
     }
-
 }
 
 /// Parse a lexed numeric literal into a JSON number. The lexer guarantees shape, but range/finiteness

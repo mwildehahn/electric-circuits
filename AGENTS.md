@@ -76,6 +76,7 @@ The recipe for capturing an app's query set in one circuit:
 
 ```bash
 pnpm engine:build          # cargo build -p electric-circuits-engine
+cargo fmt --check          # rustfmt.toml at the root (120 cols, Max heuristics); CI enforces it
 pnpm engine:test           # cargo test  -p electric-circuits-engine   (fast)
 pnpm typecheck             # tsc --noEmit over the whole TS workspace (seconds; no PG, no engine)
 pnpm test                  # vitest run — full suite incl. conformance (~60s; boots its own PG)

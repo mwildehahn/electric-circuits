@@ -76,7 +76,10 @@ enum Cmd {
     /// Apply one change-log batch (any number of transactions) and step the circuit once.
     /// `resp` acknowledges completion with the step's count-group deltas — awaiting it is
     /// what gives the feeder read-your-writes over the snapshots.
-    Batch { deltas: Vec<StampedDelta>, resp: Option<oneshot::Sender<Vec<CountDelta>>> },
+    Batch {
+        deltas: Vec<StampedDelta>,
+        resp: Option<oneshot::Sender<Vec<CountDelta>>>,
+    },
     /// Seed a table's counts from pre-aggregated `(group, count)` pairs (one synthetic
     /// weighted row per group — O(groups), not O(rows)). Bypasses the highwater: seeding is
     /// fenced by the snapshot gate at the feed site, not by replication stamps.
@@ -87,8 +90,12 @@ enum Cmd {
     },
     /// Diagnostic: `(total_used_bytes, total_storage_size, per-operator profile JSON)` via
     /// dbsp's profiler (`DbspProfile::as_json`). Heavy; on-demand only (`GET /debug/dbsp-profile`).
-    ProfileDump { resp: oneshot::Sender<(usize, usize, String)> },
-    Shutdown { resp: oneshot::Sender<()> },
+    ProfileDump {
+        resp: oneshot::Sender<(usize, usize, String)>,
+    },
+    Shutdown {
+        resp: oneshot::Sender<()>,
+    },
 }
 
 /// Handle to the counts layer. Cheap to clone; readers and the feeder share it.
@@ -113,37 +120,33 @@ impl Arrangements {
             anyhow::ensure!(pair[0].table != pair[1].table, "arrangements: one counts spec per table");
         }
 
-        let count_slots: Arc<HashMap<TableRef, (Vec<usize>, CountSlot)>> = Arc::new(
-            counts.iter().map(|c| (c.table.clone(), (c.group_cols.clone(), CountSlot::default()))).collect(),
-        );
+        let count_slots: Arc<HashMap<TableRef, (Vec<usize>, CountSlot)>> =
+            Arc::new(counts.iter().map(|c| (c.table.clone(), (c.group_cols.clone(), CountSlot::default()))).collect());
         let seeded: Arc<HashMap<TableRef, AtomicBool>> =
             Arc::new(counts.iter().map(|c| (c.table.clone(), AtomicBool::new(false))).collect());
 
         let ctor_counts = count_slots.clone();
         let ctor_specs = counts.clone();
-        let (dbsp, (inputs, count_outputs)) =
-            Runtime::init_circuit(CircuitConfig::with_workers(1), move |circuit| {
-                let mut handles: HashMap<TableRef, ZSetHandle<Row>> = HashMap::new();
-                let mut count_handles: HashMap<TableRef, CountOutput> = HashMap::new();
-                for spec in &ctor_specs {
-                    let (stream, handle) = circuit.add_input_zset::<Row>();
-                    let (gcols, cslot) = ctor_counts.get(&spec.table).expect("count slot").clone();
-                    let counted = stream
-                        .map_index(move |row| (project(row, &gcols), ()))
-                        .weighted_count();
-                    // `apply`, not `inspect`: `inspect` re-emits the `Spine` downstream, which
-                    // clones it (unimplemented for spines). `apply` produces the snapshot only.
-                    counted.integrate_trace().apply(move |spine| {
-                        *cslot.write().expect("count slot lock") = Some(spine.ro_snapshot());
-                    });
-                    // `accumulate_output`, not `output`: a transaction can span several
-                    // microsteps, and the plain mailbox only holds the last one's delta.
-                    count_handles.insert(spec.table.clone(), counted.accumulate_output());
-                    handles.insert(spec.table.clone(), handle);
-                }
-                Ok((handles, count_handles))
-            })
-            .map_err(|e| anyhow::anyhow!("arrangements: init_circuit: {e}"))?;
+        let (dbsp, (inputs, count_outputs)) = Runtime::init_circuit(CircuitConfig::with_workers(1), move |circuit| {
+            let mut handles: HashMap<TableRef, ZSetHandle<Row>> = HashMap::new();
+            let mut count_handles: HashMap<TableRef, CountOutput> = HashMap::new();
+            for spec in &ctor_specs {
+                let (stream, handle) = circuit.add_input_zset::<Row>();
+                let (gcols, cslot) = ctor_counts.get(&spec.table).expect("count slot").clone();
+                let counted = stream.map_index(move |row| (project(row, &gcols), ())).weighted_count();
+                // `apply`, not `inspect`: `inspect` re-emits the `Spine` downstream, which
+                // clones it (unimplemented for spines). `apply` produces the snapshot only.
+                counted.integrate_trace().apply(move |spine| {
+                    *cslot.write().expect("count slot lock") = Some(spine.ro_snapshot());
+                });
+                // `accumulate_output`, not `output`: a transaction can span several
+                // microsteps, and the plain mailbox only holds the last one's delta.
+                count_handles.insert(spec.table.clone(), counted.accumulate_output());
+                handles.insert(spec.table.clone(), handle);
+            }
+            Ok((handles, count_handles))
+        })
+        .map_err(|e| anyhow::anyhow!("arrangements: init_circuit: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<Cmd>(256);
         std::thread::Builder::new()
@@ -200,11 +203,8 @@ impl Arrangements {
 
     /// The registered counts specs, in stable (sorted) order.
     pub fn count_specs(&self) -> Vec<CountSpec> {
-        let mut specs: Vec<CountSpec> = self
-            .counts
-            .iter()
-            .map(|(t, (cols, _))| CountSpec { table: t.clone(), group_cols: cols.clone() })
-            .collect();
+        let mut specs: Vec<CountSpec> =
+            self.counts.iter().map(|(t, (cols, _))| CountSpec { table: t.clone(), group_cols: cols.clone() }).collect();
         specs.sort();
         specs
     }
@@ -339,8 +339,7 @@ fn circuit_thread(
                         // identical to having fed every row individually.
                         let gcols_len = groups.first().map(|(g, _)| g.0.len()).unwrap_or(0);
                         let _ = gcols_len;
-                        let mut buf: Vec<Tup2<Row, ZWeight>> =
-                            groups.into_iter().map(|(g, n)| Tup2(g, n)).collect();
+                        let mut buf: Vec<Tup2<Row, ZWeight>> = groups.into_iter().map(|(g, n)| Tup2(g, n)).collect();
                         handle.append(&mut buf);
                         dbsp.transaction().map_err(|e| format!("seed transaction: {e}"))
                     }
@@ -354,8 +353,7 @@ fn circuit_thread(
                 let dump = match dbsp.retrieve_profile() {
                     Ok(p) => {
                         let used = p.total_used_bytes().map(|b| b.into_inner() as usize).unwrap_or(0);
-                        let stored =
-                            p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        let stored = p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
                         (used, stored, p.as_json())
                     }
                     Err(e) => {
@@ -420,11 +418,7 @@ mod tests {
         let mut deltas = arr
             .apply_batch(vec![StampedDelta {
                 table: tref("t"),
-                delta: vec![
-                    Tup2(row(&[2, 10]), -1),
-                    Tup2(row(&[2, 20]), 1),
-                    Tup2(row(&[3, 30]), -1),
-                ],
+                delta: vec![Tup2(row(&[2, 10]), -1), Tup2(row(&[2, 20]), 1), Tup2(row(&[3, 30]), -1)],
                 lsn: Some(50),
                 seq: Some(0),
             }])

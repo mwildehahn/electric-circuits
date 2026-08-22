@@ -15,9 +15,7 @@ fn standalone_index_candidates() {
     .unwrap();
     let ts = TableSchema::from_def(&"users".into(), &def).unwrap();
     let compile = |j: serde_json::Value| {
-        Arc::new(
-            CompiledPredicate::compile_opt(Some(&serde_json::from_value(j).unwrap()), &ts).unwrap(),
-        )
+        Arc::new(CompiledPredicate::compile_opt(Some(&serde_json::from_value(j).unwrap()), &ts).unwrap())
     };
     let mut idx = StandaloneIndex::default();
     idx.insert("eq_a", &compile(serde_json::json!({"col":"name","op":"eq","value":"a"})));
@@ -27,10 +25,7 @@ fn standalone_index_candidates() {
     idx.insert("neq_b", &compile(serde_json::json!({"col":"name","op":"neq","value":"b"}))); // fallback scan
 
     let row = |name: &str, age: i64| {
-        ts.row_from_json(
-            serde_json::json!({"id":1,"name":name,"age":age,"active":true}).as_object().unwrap(),
-        )
-        .unwrap()
+        ts.row_from_json(serde_json::json!({"id":1,"name":name,"age":age,"active":true}).as_object().unwrap()).unwrap()
     };
     fn cand(idx: &StandaloneIndex, delta: &[Tup2<Row, ZWeight>]) -> Vec<String> {
         let mut c = idx.candidates(delta);
@@ -46,9 +41,7 @@ fn standalone_index_candidates() {
     // age = 5 satisfies only the upper bound.
     assert_eq!(cand(&idx, &[Tup2(row("z", 5), 1)]), vec!["lt_10", "neq_b"]);
     // An update whose OLD row matches a shape must surface it (the retraction side).
-    assert_eq!(cand(&idx, &[Tup2(row("a", 18), -1), Tup2(row("z", 5), 1)]), vec![
-        "eq_a", "gte_18", "lt_10", "neq_b"
-    ]);
+    assert_eq!(cand(&idx, &[Tup2(row("a", 18), -1), Tup2(row("z", 5), 1)]), vec!["eq_a", "gte_18", "lt_10", "neq_b"]);
     // A NULL cell satisfies no comparison conjunct.
     let null_age = ts
         .row_from_json(serde_json::json!({"id":1,"name":null,"age":null,"active":true}).as_object().unwrap())
@@ -63,8 +56,7 @@ fn standalone_index_candidates() {
 
 /// A SubqueryHandle over a fresh registry, with a live propagator task (tests run in tokio).
 fn test_subq() -> SubqueryHandle {
-    let registry =
-        Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
+    let registry = Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
@@ -138,14 +130,9 @@ fn node_states_cover_every_node_kind() {
     emitted.insert("s2".to_string(), 7u64);
 
     let circuit_aggs = HashMap::new();
-    let m = build_node_states(
-        &ts, "12", 42, &shapes, &families, &family_of, &aggregates, &circuit_aggs, &emitted,
-    );
+    let m = build_node_states(&ts, "12", 42, &shapes, &families, &family_of, &aggregates, &circuit_aggs, &emitted);
 
-    assert_eq!(
-        m["table:public.users"],
-        NodeStateSummary::Table { processed_offset: "12".into(), envelopes: 42 }
-    );
+    assert_eq!(m["table:public.users"], NodeStateSummary::Table { processed_offset: "12".into(), envelopes: 42 });
     assert_eq!(m["filter:s1"], NodeStateSummary::Filter { emitted: 4 });
     assert_eq!(m["shape:s1"], NodeStateSummary::Shape { emitted: 4 });
     assert_eq!(m["family:public.users:active"], NodeStateSummary::Family { keys: 1, shapes: 1 });
@@ -182,11 +169,11 @@ fn circuit_ops_decompose_every_strategy() {
     let mut counts_agg = gs("s6", "users", None, false, Some(AggFn::Count)); // counts-served aggregate
     counts_agg.circuit = Some(CircuitPlacement { label: "counts".into(), col: None, counts: true });
     let shapes = vec![
-        gs("s1", "users", None, false, None),                    // standalone
-        gs("s2", "users", Some(vec!["active"]), false, None),    // family member 1
-        gs("s3", "users", Some(vec!["active"]), false, None),    // family member 2 (shared ops)
-        gs("s4", "users", None, true, None),                     // subquery shape
-        gs("s5", "users", None, false, Some(AggFn::Count)),      // aggregate (in-engine fold)
+        gs("s1", "users", None, false, None),                 // standalone
+        gs("s2", "users", Some(vec!["active"]), false, None), // family member 1
+        gs("s3", "users", Some(vec!["active"]), false, None), // family member 2 (shared ops)
+        gs("s4", "users", None, true, None),                  // subquery shape
+        gs("s5", "users", None, false, Some(AggFn::Count)),   // aggregate (in-engine fold)
         counts_agg,
     ];
     let nodes = vec![GraphNode {
@@ -213,13 +200,26 @@ fn circuit_ops_decompose_every_strategy() {
     }
     // Strategy decompositions.
     for want in [
-        "src:public.users", "d:public.users", // table
-        "sigma:s1", "pi:s1", "snk:s1", // standalone
-        "key:public.users:active", "arr:public.users:active", "rjoin:public.users:active", "snk:s2", "snk:s3", // family
-        "sj:s4", "feed:s4", "snk:s4", // subquery shape (feed set gates the deletes)
-        "sigma:s5", "fold:s5", "snk:s5", // aggregate
-        "fold:s6", "snk:s6", // counts-served aggregate (no σ — the circuit serves the fold)
-        "sqf:public.orders|user_id|", "dist:public.orders|user_id|", // inner set
+        "src:public.users",
+        "d:public.users", // table
+        "sigma:s1",
+        "pi:s1",
+        "snk:s1", // standalone
+        "key:public.users:active",
+        "arr:public.users:active",
+        "rjoin:public.users:active",
+        "snk:s2",
+        "snk:s3", // family
+        "sj:s4",
+        "feed:s4",
+        "snk:s4", // subquery shape (feed set gates the deletes)
+        "sigma:s5",
+        "fold:s5",
+        "snk:s5", // aggregate
+        "fold:s6",
+        "snk:s6", // counts-served aggregate (no σ — the circuit serves the fold)
+        "sqf:public.orders|user_id|",
+        "dist:public.orders|user_id|", // inner set
     ] {
         assert!(ids.contains(want), "missing operator {want}");
     }
@@ -247,7 +247,9 @@ fn circuit_ops_decompose_every_strategy() {
     assert_eq!(dep.target, "sj:s4");
     assert_eq!(dep.kind, "subquery");
     // The params arrangement feeds the route join as a state edge.
-    assert!(edges.iter().any(|e| e.source == "arr:public.users:active" && e.target == "rjoin:public.users:active" && e.kind == "state"));
+    assert!(edges.iter().any(|e| e.source == "arr:public.users:active"
+        && e.target == "rjoin:public.users:active"
+        && e.kind == "state"));
 }
 
 /// With the dbsp layer off, `/graph` omits the `arrangements` section entirely: no arr nodes
@@ -279,10 +281,12 @@ async fn graph_includes_counts_pipeline_and_consumers() {
     engine.state.lock().await.tables.insert("users".into(), ts.clone());
     *engine.arrangements.lock().unwrap() = Some(arr.clone());
     // A counts-served aggregate placement: the consumer edge for the visualizer.
-    engine.state.lock().await.circuit_placement.insert(
-        "s9".into(),
-        CircuitPlacement { label: "counts".into(), col: None, counts: true },
-    );
+    engine
+        .state
+        .lock()
+        .await
+        .circuit_placement
+        .insert("s9".into(), CircuitPlacement { label: "counts".into(), col: None, counts: true });
     engine.state.lock().await.shapes.insert(
         "s9".into(),
         ShapeRecord {
@@ -332,12 +336,7 @@ async fn graph_includes_counts_pipeline_and_consumers() {
 /// under `{"type":"state","nodes":{…}}` (the tag the visualizer switches on).
 #[test]
 fn state_summary_and_event_serialize_kind_tagged() {
-    let s = NodeStateSummary::Aggregate {
-        value: serde_json::json!(3.5),
-        count: 4,
-        nn_count: 2,
-        multiset_len: 2,
-    };
+    let s = NodeStateSummary::Aggregate { value: serde_json::json!(3.5), count: 4, nn_count: 2, multiset_len: 2 };
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["kind"], "aggregate");
     assert_eq!(v["nnCount"], 2);
@@ -405,25 +404,23 @@ fn circuit_agg_planner() {
             {"col":"active","op":"eq","value":true},
             {"or":[{"col":"name","op":"eq","value":"a"},{"col":"name","op":"eq","value":"b"}]}
         ]}))),
-        &ts, &group_cols,
+        &ts,
+        &group_cols,
     )
     .unwrap();
     assert_eq!(c[0].as_ref().unwrap().len(), 2); // name ∈ {a,b}
     assert!(c[1].as_ref().unwrap().contains(&Value::Bool(true)));
 
     // a non-group column → not servable
-    assert!(plan_circuit_agg(
-        Some(&p(serde_json::json!({"col":"id","op":"eq","value":1}))),
-        &ts, &group_cols,
-    )
-    .is_none());
+    assert!(
+        plan_circuit_agg(Some(&p(serde_json::json!({"col":"id","op":"eq","value":1}))), &ts, &group_cols,).is_none()
+    );
 
     // a non-decomposable op → not servable
-    assert!(plan_circuit_agg(
-        Some(&p(serde_json::json!({"col":"name","op":"like","value":"a%"}))),
-        &ts, &group_cols,
-    )
-    .is_none());
+    assert!(
+        plan_circuit_agg(Some(&p(serde_json::json!({"col":"name","op":"like","value":"a%"}))), &ts, &group_cols,)
+            .is_none()
+    );
 }
 
 fn users() -> TableSchema {
@@ -453,31 +450,54 @@ fn change_to_shape_envelope_enter_update_leave() {
     let pred = CompiledPredicate::compile_opt(
         Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
         &ts,
-    ).unwrap();
+    )
+    .unwrap();
 
     // enter: insert an active row -> upsert envelope
-    let (delta, _, _) = apply_envelope(&ts, &env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None)).unwrap();
+    let (delta, _, _) =
+        apply_envelope(&ts, &env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None))
+            .unwrap();
     let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].headers.operation, "upsert");
     assert_eq!(envs[0].key, "1");
 
     // update within shape (name change, still active) -> upsert with new value
-    let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":true})), Some(serde_json::json!({"id":1,"name":"a","active":true})))).unwrap();
+    let (delta, _, _) = apply_envelope(
+        &ts,
+        &env(
+            "update",
+            "1",
+            Some(serde_json::json!({"id":1,"name":"a2","active":true})),
+            Some(serde_json::json!({"id":1,"name":"a","active":true})),
+        ),
+    )
+    .unwrap();
     let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].headers.operation, "upsert");
     assert_eq!(envs[0].value.as_ref().unwrap()["name"], "a2");
 
     // leave: becomes inactive -> delete envelope
-    let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":false})), Some(serde_json::json!({"id":1,"name":"a2","active":true})))).unwrap();
+    let (delta, _, _) = apply_envelope(
+        &ts,
+        &env(
+            "update",
+            "1",
+            Some(serde_json::json!({"id":1,"name":"a2","active":false})),
+            Some(serde_json::json!({"id":1,"name":"a2","active":true})),
+        ),
+    )
+    .unwrap();
     let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].headers.operation, "delete");
     assert_eq!(envs[0].key, "1");
 
     // a non-matching insert produces no shape envelope
-    let (delta, _, _) = apply_envelope(&ts, &env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None)).unwrap();
+    let (delta, _, _) =
+        apply_envelope(&ts, &env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None))
+            .unwrap();
     let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
     assert_eq!(envs.len(), 0);
 }
@@ -491,7 +511,8 @@ fn library_mode_stamps_the_before_image_a_delete_needs_to_retract() {
     let pred = CompiledPredicate::compile_opt(
         Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
         &ts,
-    ).unwrap();
+    )
+    .unwrap();
     let mut exec = TableExec::new(ts.clone());
     let row1 = serde_json::json!({"id":1,"name":"a","active":true});
 
@@ -545,21 +566,30 @@ fn library_mode_stamps_the_before_image_a_delete_needs_to_retract() {
 fn translate_output_stamps_commit_lsn() {
     let ts = users();
     // upsert path: a positive-weight row carries the commit LSN.
-    let out = vec![(Row(vec![crate::value::Value::Int(1), crate::value::Value::Text("a".into()), crate::value::Value::Bool(true)]), 1)];
+    let out = vec![(
+        Row(vec![crate::value::Value::Int(1), crate::value::Value::Text("a".into()), crate::value::Value::Bool(true)]),
+        1,
+    )];
     let envs = translate_output(&ts, out, Some("tx1".into()), Some("0/2A".into()), None);
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].headers.operation, "upsert");
     assert_eq!(envs[0].headers.lsn.as_deref(), Some("0/2A"));
 
     // delete path (purely negative weight) also carries the LSN.
-    let out = vec![(Row(vec![crate::value::Value::Int(2), crate::value::Value::Text("b".into()), crate::value::Value::Bool(true)]), -1)];
+    let out = vec![(
+        Row(vec![crate::value::Value::Int(2), crate::value::Value::Text("b".into()), crate::value::Value::Bool(true)]),
+        -1,
+    )];
     let envs = translate_output(&ts, out, None, Some("0/2A".into()), None);
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].headers.operation, "delete");
     assert_eq!(envs[0].headers.lsn.as_deref(), Some("0/2A"));
 
     // no LSN (backfill / library mode) -> none stamped.
-    let out = vec![(Row(vec![crate::value::Value::Int(3), crate::value::Value::Text("c".into()), crate::value::Value::Bool(true)]), 1)];
+    let out = vec![(
+        Row(vec![crate::value::Value::Int(3), crate::value::Value::Text("c".into()), crate::value::Value::Bool(true)]),
+        1,
+    )];
     let envs = translate_output(&ts, out, None, None, None);
     assert_eq!(envs[0].headers.lsn, None);
 }
@@ -627,8 +657,17 @@ async fn library_mode_absolute_emission_retracts_without_an_old_row() {
     ) -> HashMap<String, Vec<Envelope>> {
         let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
         process_envelope(
-            ts, shapes, shape_index, families, aggregates, agg_index, e, &mut pending, subq,
-            trace_tx, true,
+            ts,
+            shapes,
+            shape_index,
+            families,
+            aggregates,
+            agg_index,
+            e,
+            &mut pending,
+            subq,
+            trace_tx,
+            true,
         )
         .await
         .unwrap();
@@ -636,11 +675,7 @@ async fn library_mode_absolute_emission_retracts_without_an_old_row() {
     }
     macro_rules! run {
         ($e:expr) => {
-            staged(
-                &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index, &subqueries,
-                &trace_tx, $e,
-            )
-            .await
+            staged(&ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index, &subqueries, &trace_tx, $e).await
         };
     }
 
@@ -677,8 +712,17 @@ async fn library_mode_absolute_emission_retracts_without_an_old_row() {
     //    old behaviour (an old-less delete produces nothing at all).
     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
-        env("delete", "1", None, None), &mut pending, &subqueries, &trace_tx, false,
+        &ts,
+        &shapes,
+        &shape_index,
+        &families,
+        &mut aggregates,
+        &agg_index,
+        env("delete", "1", None, None),
+        &mut pending,
+        &subqueries,
+        &trace_tx,
+        false,
     )
     .await
     .unwrap();
@@ -701,8 +745,7 @@ fn library_mode_insert_with_a_remembered_old_folds_as_an_update() {
     assert_eq!(delta[1].1, 1);
 
     // Retry with the IDENTICAL row: no delta at all, so a SUM cannot drift.
-    let (delta, _, _) =
-        apply_envelope(&ts, &env("insert", "1", Some(old.clone()), Some(old.clone()))).unwrap();
+    let (delta, _, _) = apply_envelope(&ts, &env("insert", "1", Some(old.clone()), Some(old.clone()))).unwrap();
     assert!(delta.is_empty());
 
     // A genuine first insert (no `old`) is unchanged.
@@ -763,16 +806,25 @@ async fn trace_family_route_and_filter_drop() {
 
     // Insert routed to key 'a' -> family hop routed with the key, shape s7 reached, filter s9 drops.
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
+        &ts,
+        &shapes,
+        &shape_index,
+        &families,
+        &mut aggregates,
+        &agg_index,
         env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
-        &mut pending, &subqueries, &trace_tx, false,
+        &mut pending,
+        &subqueries,
+        &trace_tx,
+        false,
     )
     .await
     .unwrap();
     let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
     assert_eq!(ev["table"], "public.users");
     let hops = ev["hops"].as_array().unwrap();
-    let hop = |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
+    let hop =
+        |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
     assert_eq!(hop("table:public.users")["outcome"], "passed");
     assert_eq!(hop("family:public.users:name")["outcome"], "routed");
     assert_eq!(hop("family:public.users:name")["key"][0], "a");
@@ -784,15 +836,24 @@ async fn trace_family_route_and_filter_drop() {
 
     // Insert whose key matches no routed shape -> family hop dropped, no shapes reached.
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
+        &ts,
+        &shapes,
+        &shape_index,
+        &families,
+        &mut aggregates,
+        &agg_index,
         env("insert", "2", Some(serde_json::json!({"id":2,"name":"zzz","active":true})), None),
-        &mut pending, &subqueries, &trace_tx, false,
+        &mut pending,
+        &subqueries,
+        &trace_tx,
+        false,
     )
     .await
     .unwrap();
     let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
     let hops = ev["hops"].as_array().unwrap();
-    let hop = |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
+    let hop =
+        |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
     assert_eq!(hop("family:public.users:name")["outcome"], "dropped");
     assert_eq!(hop("filter:s9")["outcome"], "dropped");
     assert!(ev["shapes"].as_array().unwrap().is_empty());
@@ -800,9 +861,17 @@ async fn trace_family_route_and_filter_drop() {
     // Nobody subscribed -> nothing is built or sent (receiver dropped).
     drop(trace_rx);
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
+        &ts,
+        &shapes,
+        &shape_index,
+        &families,
+        &mut aggregates,
+        &agg_index,
         env("insert", "3", Some(serde_json::json!({"id":3,"name":"a","active":true})), None),
-        &mut pending, &subqueries, &trace_tx, false,
+        &mut pending,
+        &subqueries,
+        &trace_tx,
+        false,
     )
     .await
     .unwrap();
@@ -825,9 +894,17 @@ async fn trace_aggregate_fold() {
     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
 
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
+        &ts,
+        &shapes,
+        &shape_index,
+        &families,
+        &mut aggregates,
+        &agg_index,
         env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
-        &mut pending, &subqueries, &trace_tx, false,
+        &mut pending,
+        &subqueries,
+        &trace_tx,
+        false,
     )
     .await
     .unwrap();
@@ -837,9 +914,17 @@ async fn trace_aggregate_fold() {
     assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s4")]);
 
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
+        &ts,
+        &shapes,
+        &shape_index,
+        &families,
+        &mut aggregates,
+        &agg_index,
         env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None),
-        &mut pending, &subqueries, &trace_tx, false,
+        &mut pending,
+        &subqueries,
+        &trace_tx,
+        false,
     )
     .await
     .unwrap();
@@ -873,7 +958,10 @@ fn count_delta_emits_fold_trace() {
     apply_count_deltas(
         &mut execs,
         vec![CountDelta { table: "users".into(), group: group("open"), delta: 1 }],
-        Some("7".into()), None, &mut pending, &trace_tx,
+        Some("7".into()),
+        None,
+        &mut pending,
+        &trace_tx,
     );
     assert_eq!(execs["public.users"].circuit_aggs["s4"].value, 1);
     assert!(pending.contains_key("shape/s4"), "aggregate envelope emitted");
@@ -889,7 +977,10 @@ fn count_delta_emits_fold_trace() {
     apply_count_deltas(
         &mut execs,
         vec![CountDelta { table: "users".into(), group: group("open"), delta: -1 }],
-        None, None, &mut pending, &trace_tx,
+        None,
+        None,
+        &mut pending,
+        &trace_tx,
     );
     assert_eq!(execs["public.users"].circuit_aggs["s4"].value, 0);
     let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
@@ -904,7 +995,10 @@ fn count_delta_emits_fold_trace() {
             CountDelta { table: "users".into(), group: group("a"), delta: 1 },
             CountDelta { table: "users".into(), group: group("b"), delta: -1 },
         ],
-        None, None, &mut pending, &trace_tx,
+        None,
+        None,
+        &mut pending,
+        &trace_tx,
     );
     assert_eq!(execs["public.users"].circuit_aggs["s4"].value, 0);
     assert!(trace_rx.try_recv().is_err(), "net-zero change emits no fold trace");
@@ -1095,8 +1189,7 @@ fn membership_fold_refcount_flips() {
     assert!(groups.is_empty());
     // A batched retract+insert of different values in one delta flips both.
     membership::fold_refcount_flips(&mut groups, [(Value::Int(1), 1)]);
-    let flips =
-        membership::fold_refcount_flips(&mut groups, [(Value::Int(1), -1), (Value::Int(2), 1)]);
+    let flips = membership::fold_refcount_flips(&mut groups, [(Value::Int(1), -1), (Value::Int(2), 1)]);
     assert_eq!(flips.len(), 2);
     assert_eq!((flips[0].value.clone(), flips[0].dir), (Value::Int(1), FlipDir::Leave));
     assert_eq!((flips[1].value.clone(), flips[1].dir), (Value::Int(2), FlipDir::Enter));
@@ -1115,9 +1208,7 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
     // circuit's distinct deltas are the flips.
     use crate::subq_circuit::{Assert, Assertions};
     let circuit = crate::subq_circuit::MembershipCircuit::start().unwrap();
-    let _ = SubqueryNode::new(
-        "sig".into(), "inner".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), 1,
-    );
+    let _ = SubqueryNode::new("sig".into(), "inner".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), 1);
     let mut reg_flips: Vec<Vec<Flip>> = Vec::new();
     // pk ids stand in for the pk strings a=0, b=1 (this test drives the bare circuit directly,
     // with no registry/dictionary in play).
@@ -1141,10 +1232,7 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
         let member_deltas = circuit.apply(asserts).await;
         let flips = member_deltas
             .into_iter()
-            .map(|d| Flip {
-                value: d.value,
-                dir: if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave },
-            })
+            .map(|d| Flip { value: d.value, dir: if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave } })
             .collect();
         reg_flips.push(flips);
     }
@@ -1153,8 +1241,7 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
     let mut ref_flips: Vec<Vec<Flip>> = Vec::new();
     ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), 1)]));
     ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), 1)]));
-    ref_flips
-        .push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), -1), (Value::Int(8), 1)]));
+    ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), -1), (Value::Int(8), 1)]));
     ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), -1)]));
     ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(8), -1)]));
     // Same flips at every step (order within a step normalized by value).
@@ -1176,15 +1263,14 @@ fn membership_latest_rows_by_pk() {
     let ts = users(); // cols sorted: active, id, name — pk = id (index 1)
     let row = |id: i64, name: &str| Row(vec![Value::Bool(true), Value::Int(id), Value::Text(name.into())]);
     // Update of pk 1 (retract old + insert new) + delete of pk 2, one delta.
-    let delta = vec![
-        Tup2(row(1, "old"), -1),
-        Tup2(row(1, "new"), 1),
-        Tup2(row(2, "gone"), -1),
-    ];
+    let delta = vec![Tup2(row(1, "old"), -1), Tup2(row(1, "new"), 1), Tup2(row(2, "gone"), -1)];
     let mut out = membership::latest_rows_by_pk(&ts, &delta);
-    out.sort_by_key(|(r, _)| match r.0[1] { Value::Int(i) => i, _ => 0 });
+    out.sort_by_key(|(r, _)| match r.0[1] {
+        Value::Int(i) => i,
+        _ => 0,
+    });
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0], (row(1, "new"), true));  // update → latest row, still exists
+    assert_eq!(out[0], (row(1, "new"), true)); // update → latest row, still exists
     assert_eq!(out[1], (row(2, "gone"), false)); // delete → old row, gone
 }
 
@@ -1219,8 +1305,7 @@ fn agg_index_candidates_prune() {
     let ts = users(); // cols sorted: active(0), id(1), name(2)
     let mut idx = StandaloneIndex::default();
     let eq_pred = CompiledPredicate::compile(
-        &serde_json::from_value(serde_json::json!({"col":"name","op":"eq","value":"alice"}))
-            .unwrap(),
+        &serde_json::from_value(serde_json::json!({"col":"name","op":"eq","value":"alice"})).unwrap(),
         &ts,
     )
     .unwrap();
@@ -1280,7 +1365,14 @@ async fn emission_lanes_order_and_barrier() {
         key: format!("{i}"),
         value: None,
         old: None,
-        headers: EnvelopeHeaders { operation: "upsert".into(), txid: None, offset: None, lsn: None, seq: None, last: None },
+        headers: EnvelopeHeaders {
+            operation: "upsert".into(),
+            txid: None,
+            offset: None,
+            lsn: None,
+            seq: None,
+            last: None,
+        },
     };
     // Interleave two streams; per-stream order must survive whatever lane assignment they get.
     for i in 0..50 {
@@ -1356,7 +1448,10 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
     assert_eq!(card.bytes_circuit_snapshots, 0, "sampler path must not measure the circuit snapshot bytes");
     assert_eq!(card.bytes_feed_sets, 0, "sampler path must not measure the host-side feed-set bytes");
     assert_eq!(card.bytes_pk_dict, 0, "sampler path must not measure the pk dictionary bytes");
-    assert_eq!(card.bytes_electric_adapter, 0, "sampler path must not walk the electric adapter TTL registry heap bytes");
+    assert_eq!(
+        card.bytes_electric_adapter, 0,
+        "sampler path must not walk the electric adapter TTL registry heap bytes"
+    );
 
     // `Engine::mem_bytes` — the on-demand-only counterpart — does populate them (proves the split
     // isn't just "the fields are dead code"; the walk still exists and works, just gated off the
@@ -1416,8 +1511,10 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
         .collect();
     {
         let mut reg = engine.subqueries.lock().await;
-        let finished =
-            reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default()).await.unwrap();
+        let finished = reg
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
         assert!(finished.work.is_empty(), "nothing was buffered mid-create");
         assert!(finished.deferred.is_empty(), "no flip reached the shape mid-create");
         assert!(finished.node_work.is_empty(), "no flip reached a node mid-seed");

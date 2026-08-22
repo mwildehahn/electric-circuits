@@ -119,8 +119,7 @@ impl PkDict {
         let strings: usize = rev.iter().map(|s| ARC_CONTROL_BYTES + s.len()).sum();
         let reverse_buf = rev.capacity() * std::mem::size_of::<Arc<str>>();
         // hashbrown: one control byte + the (key, value) slot per bucket.
-        let forward_buf = fwd.capacity()
-            * (std::mem::size_of::<Arc<str>>() + std::mem::size_of::<u32>() + 1);
+        let forward_buf = fwd.capacity() * (std::mem::size_of::<Arc<str>>() + std::mem::size_of::<u32>() + 1);
         strings + reverse_buf + forward_buf
     }
 }
@@ -192,8 +191,7 @@ mod tests {
             })
             .collect();
 
-        let results: Vec<Vec<(usize, u32)>> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let results: Vec<Vec<(usize, u32)>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         // Every thread must have observed the SAME id for a given pk (canonical mapping).
         let canonical = &results[0];

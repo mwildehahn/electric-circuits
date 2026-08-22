@@ -62,16 +62,16 @@ pub struct EnvelopeHeaders {
 
 impl crate::heap_size::HeapSize for EnvelopeHeaders {
     fn heap_bytes(&self) -> usize {
-        self.operation.heap_bytes()
-            + self.txid.heap_bytes()
-            + self.offset.heap_bytes()
-            + self.lsn.heap_bytes()
+        self.operation.heap_bytes() + self.txid.heap_bytes() + self.offset.heap_bytes() + self.lsn.heap_bytes()
     }
 }
 
 impl crate::heap_size::HeapSize for Envelope {
     fn heap_bytes(&self) -> usize {
-        self.type_.heap_bytes() + self.key.heap_bytes() + self.value.heap_bytes() + self.old.heap_bytes()
+        self.type_.heap_bytes()
+            + self.key.heap_bytes()
+            + self.value.heap_bytes()
+            + self.old.heap_bytes()
             + self.headers.heap_bytes()
     }
 }
@@ -224,9 +224,7 @@ pub enum GoneVerdict {
 /// (see `Engine::install_gone_reconciler`); absent in the tests/tools that use a bare `DsClient`,
 /// where a terminal answer is taken at face value exactly as before.
 pub type GoneReconciler = std::sync::Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = GoneVerdict> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = GoneVerdict> + Send>> + Send + Sync,
 >;
 
 #[derive(Clone)]
@@ -299,11 +297,7 @@ impl DsClient {
         // Drain the body so the connection returns to reqwest's pool. Skipping this leaks one socket
         // per call, which exhausts ephemeral ports when creating many shape streams.
         let body = res.text().await.unwrap_or_default();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(status_error("PUT", path, status, &body))
-        }
+        if status.is_success() { Ok(()) } else { Err(status_error("PUT", path, status, &body)) }
     }
 
     /// Append envelopes as a JSON array (the server flattens one array level into N messages).
@@ -329,11 +323,7 @@ impl DsClient {
     }
 
     /// Read raw JSON events (non-envelope streams). Returns `(events, next_offset, up_to_date)`.
-    pub async fn read_json(
-        &self,
-        path: &str,
-        offset: &str,
-    ) -> Result<(Vec<serde_json::Value>, Option<String>, bool)> {
+    pub async fn read_json(&self, path: &str, offset: &str) -> Result<(Vec<serde_json::Value>, Option<String>, bool)> {
         let url = format!("{}?offset={}", self.stream_url(path), offset);
         let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
         let status = res.status();
@@ -425,9 +415,7 @@ impl DsClient {
             };
             attempt += 1;
             if std::time::Instant::now() >= deadline {
-                return Err(e.context(format!(
-                    "appending to {path} kept failing for {budget:?} ({attempt} attempts)"
-                )));
+                return Err(e.context(format!("appending to {path} kept failing for {budget:?} ({attempt} attempts)")));
             }
             let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
             tracing::warn!("append to {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
@@ -529,7 +517,10 @@ impl DsClient {
                         None => GoneVerdict::Discard,
                     };
                     if verdict == GoneVerdict::Discard {
-                        tracing::debug!("append to {path}: stream retired ({status}); discarding {} envelopes", envelopes.len());
+                        tracing::debug!(
+                            "append to {path}: stream retired ({status}); discarding {} envelopes",
+                            envelopes.len()
+                        );
                         return false;
                     }
                     false_gone += 1;
@@ -540,12 +531,14 @@ impl DsClient {
                         );
                     }
                     attempt += 1;
-                    let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+                    let backoff =
+                        std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
                     tokio::time::sleep(backoff).await;
                 }
                 Err(AppendError::Other(e)) => {
                     attempt += 1;
-                    let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+                    let backoff =
+                        std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
                     if attempt.is_multiple_of(10) {
                         tracing::error!("append to {path} still failing after {attempt} attempts: {e:#}");
                     } else {
@@ -618,12 +611,7 @@ impl DsClient {
     /// (ADR-0006): a closed segment can be a gigabyte, and durable-streams offers no bounded tail
     /// read, so the successor is derived and *verified* rather than read back.
     pub async fn head(&self, path: &str) -> Result<Option<StreamHead>> {
-        let res = self
-            .http
-            .head(self.stream_url(path))
-            .send()
-            .await
-            .with_context(|| format!("HEAD {path}"))?;
+        let res = self.http.head(self.stream_url(path)).send().await.with_context(|| format!("HEAD {path}"))?;
         let status = res.status();
         if status.as_u16() == 404 || status.as_u16() == 410 {
             return Ok(None);
@@ -696,12 +684,8 @@ mod tests {
         assert!(is_unavailable(&refused), "a refused connection must retry: {refused:#}");
 
         // A 5xx: the server is there and not serving.
-        let five_oh_three = anyhow::Error::new(DsUnavailable {
-            op: "GET",
-            path: "meta/catalog".into(),
-            status: 503,
-        })
-        .context("folding the durable catalog");
+        let five_oh_three = anyhow::Error::new(DsUnavailable { op: "GET", path: "meta/catalog".into(), status: 503 })
+            .context("folding the durable catalog");
         assert!(is_unavailable(&five_oh_three));
         assert_eq!(
             crate::pg::boot_disposition(&five_oh_three),

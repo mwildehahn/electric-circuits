@@ -216,17 +216,13 @@ impl ChangeLogConfig {
 /// Is the current segment over budget? Pure, so the whole policy is a unit test: either criterion
 /// alone triggers, and `0` disables that criterion (both `0` = never rotate).
 pub fn should_rotate(cfg: &ChangeLogConfig, bytes: u64, age: Duration) -> bool {
-    (cfg.segment_bytes > 0 && bytes >= cfg.segment_bytes)
-        || (!cfg.segment_age.is_zero() && age >= cfg.segment_age)
+    (cfg.segment_bytes > 0 && bytes >= cfg.segment_bytes) || (!cfg.segment_age.is_zero() && age >= cfg.segment_age)
 }
 
 /// Unix seconds now (the wire form of a `ChangesRotated.at`). Wall clock on purpose: it must
 /// survive a restart, which an `Instant` cannot.
 pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Live state of the segmented change log, shared between the ingestor's writer, the retention
@@ -399,7 +395,10 @@ impl ChangeLogWriter {
             return;
         }
         if let Err(e) = self.rotate().await {
-            tracing::error!("change log: rotating {} failed: {e:#}; retrying at the next commit", segment_path(segment));
+            tracing::error!(
+                "change log: rotating {} failed: {e:#}; retrying at the next commit",
+                segment_path(segment)
+            );
         }
     }
 
@@ -596,8 +595,7 @@ pub fn plan_segment_deletion(
     for pin in pins {
         let stale = pin.evictable
             && !retain.is_zero()
-            && rotated_out_at(pin.segment)
-                .is_some_and(|at| Duration::from_secs(now.saturating_sub(at)) >= retain);
+            && rotated_out_at(pin.segment).is_some_and(|at| Duration::from_secs(now.saturating_sub(at)) >= retain);
         if stale {
             plan.evict.push(pin.shape_id.clone());
         } else {
@@ -605,11 +603,7 @@ pub fn plan_segment_deletion(
         }
     }
     let min_needed = alive.iter().map(|p| p.segment).chain(std::iter::once(checkpoint)).min().unwrap_or(checkpoint);
-    plan.delete = segments
-        .keys()
-        .copied()
-        .filter(|&n| n < min_needed && n < current)
-        .collect();
+    plan.delete = segments.keys().copied().filter(|&n| n < min_needed && n < current).collect();
     plan
 }
 
@@ -714,22 +708,20 @@ mod tests {
 
     #[test]
     fn the_pointer_is_found_anywhere_in_a_batch() {
-        let mut envs = vec![
-            Envelope {
-                type_: "public.items".into(),
-                key: "1".into(),
-                value: None,
-                old: None,
-                headers: EnvelopeHeaders {
-                    operation: "insert".into(),
-                    txid: None,
-                    offset: None,
-                    lsn: None,
-                    seq: None,
-                    last: None,
-                },
+        let mut envs = vec![Envelope {
+            type_: "public.items".into(),
+            key: "1".into(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "insert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
             },
-        ];
+        }];
         assert_eq!(rotation_target_in(&envs), None);
         envs.push(rotation_envelope(2));
         assert_eq!(rotation_target_in(&envs), Some(2));

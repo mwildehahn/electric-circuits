@@ -97,9 +97,9 @@ impl Drop for Timer<'_> {
 }
 
 pub struct Metrics {
-    pub envelopes: AtomicU64,    // table change events processed
-    pub shape_appends: AtomicU64, // appends to shape streams
-    pub family_steps: AtomicU64,  // family circuit transactions (write path)
+    pub envelopes: AtomicU64,          // table change events processed
+    pub shape_appends: AtomicU64,      // appends to shape streams
+    pub family_steps: AtomicU64,       // family circuit transactions (write path)
     pub shapes_dormanted: AtomicU64,   // retention: active -> dormant transitions
     pub shapes_reactivated: AtomicU64, // retention: dormant -> active (table-stream replay)
     pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
@@ -108,11 +108,11 @@ pub struct Metrics {
     /// within the idle window. A climbing value with healthy clients means the renewal cadence is
     /// longer than `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, not that anything crashed.
     pub subscriptions_lapsed: AtomicU64,
-    pub schema_drift: AtomicU64,       // ADR-0005: tables whose dependents were retired (drift / TRUNCATE / identity regression / drop)
-    pub schema_unresolved: AtomicU64,  // ADR-0005: drifts that could not be resolved (table parked, retrying)
-    pub epoch_breaks: AtomicU64,       // ADR-0004: slots the engine could no longer vouch for
-    pub epoch_resets: AtomicU64,       // ADR-0004: new epochs bound (every shape retired, fresh slot)
-    pub changes_rotations: AtomicU64,  // ADR-0006: change-log segments closed and succeeded
+    pub schema_drift: AtomicU64, // ADR-0005: tables whose dependents were retired (drift / TRUNCATE / identity regression / drop)
+    pub schema_unresolved: AtomicU64, // ADR-0005: drifts that could not be resolved (table parked, retrying)
+    pub epoch_breaks: AtomicU64, // ADR-0004: slots the engine could no longer vouch for
+    pub epoch_resets: AtomicU64, // ADR-0004: new epochs bound (every shape retired, fresh slot)
+    pub changes_rotations: AtomicU64, // ADR-0006: change-log segments closed and succeeded
     pub changes_segments_deleted: AtomicU64, // ADR-0006: rotated-out segments retired (nothing could resume inside)
     /// Catalog appends re-attempted because durable-streams was unavailable. Never a dropped event
     /// (the writer retries in place, forever) — this is the visible cost of that promise, and a
@@ -120,7 +120,7 @@ pub struct Metrics {
     pub catalog_append_retries: AtomicU64,
     /// ADR-0007: retirement attempts that failed and were re-queued.
     pub retirement_retries: AtomicU64,
-    pub txn_spills: AtomicU64,         // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
+    pub txn_spills: AtomicU64, // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
     /// COUNTER (cumulative), not a gauge: bytes ever written to transaction spill files. A gauge
     /// would be meaningless — a spill file exists only between one `Begin` and its `Commit`, so any
     /// sample would almost always read zero. `reset()` clears it with the other counters.
@@ -165,9 +165,9 @@ pub struct Metrics {
     /// GAUGE: 1 while a walsender holds the slot (i.e. this engine is streaming), 0 when it is not
     /// — and 0 when the slot does not exist at all, which is the epoch-break case.
     pub replication_slot_active: AtomicU64,
-    pub process_envelope: Hist,   // end-to-end fan-out latency per table envelope
-    pub family_step: Hist,        // one family circuit transaction
-    pub append: Hist,             // one shape-stream append (durable-streams round-trip)
+    pub process_envelope: Hist, // end-to-end fan-out latency per table envelope
+    pub family_step: Hist,      // one family circuit transaction
+    pub append: Hist,           // one shape-stream append (durable-streams round-trip)
 }
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
@@ -298,11 +298,7 @@ const SLOT_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1
 /// still see the number that fills the source database's disk (`replication_slot_retained_wal_bytes`)
 /// and how far behind ingest is (`replication_confirmed_flush_lag_bytes`). It stops when the
 /// process begins shutting down.
-pub fn spawn_replication_slot_sampler(
-    pg_url: String,
-    slot: String,
-    shutdown: crate::shutdown::ShutdownToken,
-) {
+pub fn spawn_replication_slot_sampler(pg_url: String, slot: String, shutdown: crate::shutdown::ShutdownToken) {
     tokio::spawn(async move {
         let mut logged_err = false;
         // Sample FIRST, then sleep. Sleeping first left the three gauges reading 0 for the first

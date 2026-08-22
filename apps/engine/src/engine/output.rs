@@ -89,14 +89,7 @@ pub(crate) fn absolute_envelope(
         key: key.to_string(),
         value,
         old: None,
-        headers: EnvelopeHeaders {
-            operation: operation.into(),
-            txid,
-            offset: None,
-            lsn,
-            seq: None,
-            last: None,
-        },
+        headers: EnvelopeHeaders { operation: operation.into(), txid, offset: None, lsn, seq: None, last: None },
     })
 }
 
@@ -138,7 +131,14 @@ pub(crate) fn translate_output(
             key: pk.clone(),
             value: Some(ts.row_to_json_cols(row, out_cols)),
             old: None,
-            headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None, lsn: lsn.clone(), seq: None, last: None },
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: txid.clone(),
+                offset: None,
+                lsn: lsn.clone(),
+                seq: None,
+                last: None,
+            },
         });
     }
     // TEST-ONLY: the `drop_deletes` fault suppresses "leave" envelopes so rows that exit a shape
@@ -153,7 +153,14 @@ pub(crate) fn translate_output(
             key: pk.clone(),
             value: None,
             old: None,
-            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: lsn.clone(), seq: None, last: None },
+            headers: EnvelopeHeaders {
+                operation: "delete".into(),
+                txid: txid.clone(),
+                offset: None,
+                lsn: lsn.clone(),
+                seq: None,
+                last: None,
+            },
         });
     }
     envs
@@ -173,7 +180,14 @@ pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<
             key: pk,
             value: None,
             old: None,
-            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: None, seq: None, last: None },
+            headers: EnvelopeHeaders {
+                operation: "delete".into(),
+                txid: txid.clone(),
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
         })
         .collect()
 }

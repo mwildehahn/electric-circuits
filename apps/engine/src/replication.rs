@@ -196,21 +196,14 @@ fn next_backoff(attempt: u32, connected: bool) -> (std::time::Duration, u32) {
 
 /// The sub-second clock noise the jitter is drawn from.
 pub fn clock_nanos() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
 }
 
 /// Wait out the backoff, cut short by an epoch rebind (so an operator's `/epoch/reset` is followed
 /// by a connect attempt at once rather than up to 30 s later) — or by a shutdown, so a pod that is
 /// terminating during an outage exits in milliseconds instead of sleeping out a 30 s ceiling inside
 /// the termination grace.
-async fn backoff_wait(
-    epoch: &dyn EpochEvents,
-    shutdown: &crate::shutdown::ShutdownToken,
-    d: std::time::Duration,
-) {
+async fn backoff_wait(epoch: &dyn EpochEvents, shutdown: &crate::shutdown::ShutdownToken, d: std::time::Duration) {
     tokio::select! {
         _ = tokio::time::sleep(d) => {}
         _ = epoch.epoch_rebound() => {}
@@ -290,7 +283,15 @@ pub async fn run(
         };
         let mut connected = false;
         match stream_loop(
-            cfg, &log, &tables, events.as_ref(), &last_lsn, &sync_seq, &txn_cfg, &shutdown, &mut connected,
+            cfg,
+            &log,
+            &tables,
+            events.as_ref(),
+            &last_lsn,
+            &sync_seq,
+            &txn_cfg,
+            &shutdown,
+            &mut connected,
         )
         .await
         {
@@ -575,11 +576,7 @@ fn observed_fingerprint(replident: u8, columns: &[RelColumn]) -> SchemaFingerpri
     SchemaFingerprint {
         columns: columns
             .iter()
-            .map(|c| crate::schema::FingerprintColumn {
-                name: c.name.clone(),
-                type_oid: c.type_oid,
-                typmod: c.typmod,
-            })
+            .map(|c| crate::schema::FingerprintColumn { name: c.name.clone(), type_oid: c.type_oid, typmod: c.typmod })
             .collect(),
         replident,
         pk: None,
@@ -652,9 +649,7 @@ impl Decoder {
 
     fn on_change(&self, msg: Message) -> Decoded {
         let rel_id = match &msg {
-            Message::Insert { rel_id, .. }
-            | Message::Update { rel_id, .. }
-            | Message::Delete { rel_id, .. } => *rel_id,
+            Message::Insert { rel_id, .. } | Message::Update { rel_id, .. } | Message::Delete { rel_id, .. } => *rel_id,
             _ => return Decoded::None,
         };
         let Some(rel) = self.rels.get(&rel_id) else {
@@ -696,7 +691,14 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
         key: key_from_obj(key_src, ts),
         value,
         old,
-        headers: EnvelopeHeaders { operation: operation.to_string(), txid: None, offset: None, lsn: None, seq: None, last: None },
+        headers: EnvelopeHeaders {
+            operation: operation.to_string(),
+            txid: None,
+            offset: None,
+            lsn: None,
+            seq: None,
+            last: None,
+        },
     };
     match msg {
         Message::Insert { new, .. } => {
@@ -779,9 +781,7 @@ fn key_from_obj(obj: &Json, ts: &TableSchema) -> String {
             // Canonicalize through f64 for float pk columns so the envelope key matches the
             // engine's `Value::to_key_string` (serde would print `1.0` where f64 prints `1`).
             Some(Json::Number(n)) => match n.as_f64() {
-                Some(f) if ts.index.get(name).is_some_and(|&i| ts.columns[i].1 == ColumnType::Float) => {
-                    f.to_string()
-                }
+                Some(f) if ts.index.get(name).is_some_and(|&i| ts.columns[i].1 == ColumnType::Float) => f.to_string(),
                 _ => n.to_string(),
             },
             Some(Json::Bool(b)) => b.to_string(),
@@ -948,12 +948,7 @@ mod tests {
         let ev = Arc::new(RecordingEvents::default());
         let mut d = Decoder::new(tables.clone());
         d.on_relation(users_rel(1, "public"), ev.as_ref(), None).await;
-        d.on_relation(
-            rel_msg(2, "public", sync_table().name(), &[("id", 23), ("n", 20)]),
-            ev.as_ref(),
-            None,
-        )
-        .await;
+        d.on_relation(rel_msg(2, "public", sync_table().name(), &[("id", 23), ("n", 20)]), ev.as_ref(), None).await;
         (d, ev)
     }
 
@@ -990,10 +985,7 @@ mod tests {
         assert_eq!(pubs.type_, "public.users");
 
         // rel 2 is `other.users` — untracked, so nothing is decoded for it.
-        assert!(matches!(
-            d.on_change(Message::Insert { rel_id: 2, new: vec![t("1"), t("7"), t("a")] }),
-            Decoded::None
-        ));
+        assert!(matches!(d.on_change(Message::Insert { rel_id: 2, new: vec![t("1"), t("7"), t("a")] }), Decoded::None));
     }
 
     /// With BOTH tracked, the two relations decode to distinct identities: the envelope `type` is the
@@ -1022,12 +1014,8 @@ mod tests {
         let ev = RecordingEvents::default();
         let mut d = Decoder::new(tables.clone());
         for (rel_id, name) in [(10u32, "odd.users"), (11, "od\"d")] {
-            d.on_relation(
-                rel_msg(rel_id, "public", name, &[("id", 23), ("tenant", 23), ("name", 25)]),
-                &ev,
-                None,
-            )
-            .await;
+            d.on_relation(rel_msg(rel_id, "public", name, &[("id", 23), ("tenant", 23), ("name", 25)]), &ev, None)
+                .await;
             assert!(d.rels[&rel_id].table.is_none(), "{name} must not resolve to a table identity");
             assert!(matches!(
                 d.on_change(Message::Insert { rel_id, new: vec![t("1"), t("7"), t("a")] }),
@@ -1062,10 +1050,7 @@ mod tests {
         assert_eq!(upd.old.as_ref().unwrap()["name"], "a");
         assert_eq!(upd.value.as_ref().unwrap()["name"], "b");
 
-        let del = env_of(d.on_change(Message::Delete {
-            rel_id: 1,
-            old: OldTuple::Full(vec![t("1"), t("7"), t("b")]),
-        }));
+        let del = env_of(d.on_change(Message::Delete { rel_id: 1, old: OldTuple::Full(vec![t("1"), t("7"), t("b")]) }));
         assert_eq!(del.headers.operation, "delete");
         assert_eq!(del.key, "1");
         assert_eq!(del.old.as_ref().unwrap()["tenant"], 7);
@@ -1076,10 +1061,10 @@ mod tests {
     async fn handles_null_and_utf8() {
         let tables = shared(users());
         let (d, _ev) = decoder(&tables).await;
-        let e = env_of(d.on_change(Message::Insert {
-            rel_id: 1,
-            new: vec![t("5"), Cell::Null, t("a b 'c' café ☃ 北京")],
-        }));
+        let e =
+            env_of(d.on_change(Message::Insert {
+                rel_id: 1, new: vec![t("5"), Cell::Null, t("a b 'c' café ☃ 北京")]
+            }));
         assert_eq!(e.value.as_ref().unwrap()["tenant"], Json::Null);
         assert_eq!(e.value.as_ref().unwrap()["name"], "a b 'c' café ☃ 北京");
     }
@@ -1103,10 +1088,7 @@ mod tests {
     async fn degraded_forms_are_skipped() {
         let tables = shared(users());
         let (d, _ev) = decoder(&tables).await;
-        assert!(matches!(
-            d.on_change(Message::Delete { rel_id: 1, old: OldTuple::Key(vec![t("1")]) }),
-            Decoded::None
-        ));
+        assert!(matches!(d.on_change(Message::Delete { rel_id: 1, old: OldTuple::Key(vec![t("1")]) }), Decoded::None));
         // Update with key-only old image still emits (new row is valid) but without `old`.
         let upd = env_of(d.on_change(Message::Update {
             rel_id: 1,
@@ -1129,12 +1111,7 @@ mod tests {
 
         // The sentinel is `public.__el_sync` SPECIFICALLY: a same-named table in another schema is
         // ordinary (here untracked) data, never a drain-barrier counter.
-        d.on_relation(
-            rel_msg(3, "other", sync_table().name(), &[("id", 23), ("n", 20)]),
-            ev.as_ref(),
-            None,
-        )
-        .await;
+        d.on_relation(rel_msg(3, "other", sync_table().name(), &[("id", 23), ("n", 20)]), ev.as_ref(), None).await;
         let s = d.on_change(Message::Update { rel_id: 3, old: None, new: vec![t("1"), t("999")] });
         assert!(matches!(s, Decoded::None), "other.__el_sync must not bump the drain barrier");
     }
@@ -1197,18 +1174,12 @@ mod tests {
             pk: None, // as observed off the wire
         };
         let mut def = users_def(Some(altered.clone()));
-        def.columns
-            .insert("extra".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
+        def.columns.insert("extra".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
         *ev.resolves_to.lock().unwrap() = Some(TableSchema::from_def(&t_ref, &def).unwrap());
         *ev.tables.lock().unwrap() = Some(tables.clone());
 
         let mut d = Decoder::new(tables.clone());
-        let altered_msg = rel_msg(1, "public", "users", &[
-            ("id", 23),
-            ("tenant", 23),
-            ("name", 25),
-            ("extra", 25),
-        ]);
+        let altered_msg = rel_msg(1, "public", "users", &[("id", 23), ("tenant", 23), ("name", 25), ("extra", 25)]);
         d.on_relation(altered_msg.clone(), ev.as_ref(), Some(TxnRef { xid: 7 })).await;
         assert_eq!(ev.drifted(), [t_ref.clone()]);
         assert_eq!(ev.drifts.lock().unwrap()[0].1, altered);
@@ -1222,10 +1193,7 @@ mod tests {
         assert_eq!(ev.drifted().len(), 1, "an identical re-send after the swap is not drift again");
 
         // The next change decodes against the NEW schema: the added column is in the envelope.
-        let e = env_of(d.on_change(Message::Insert {
-            rel_id: 1,
-            new: vec![t("1"), t("7"), t("a"), t("x")],
-        }));
+        let e = env_of(d.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t("a"), t("x")] }));
         assert_eq!(e.value.as_ref().unwrap()["extra"], "x");
     }
 

@@ -21,7 +21,12 @@ impl CircuitAgg {
     }
 
     /// The shared aggregate wire envelope (see [`super::output::agg_envelope`]).
-    pub(crate) fn envelope(&self, table: &crate::table_ref::TableRef, txid: Option<String>, lsn: Option<String>) -> Envelope {
+    pub(crate) fn envelope(
+        &self,
+        table: &crate::table_ref::TableRef,
+        txid: Option<String>,
+        lsn: Option<String>,
+    ) -> Envelope {
         super::output::agg_envelope(table, serde_json::json!(self.value), self.value, txid, lsn)
     }
 }
@@ -52,11 +57,7 @@ impl HeapSize for StandaloneShape {
 /// + a per-shape clone of the delta. `translate_output` downstream groups by primary key, so emitting
 /// the matching `(row, weight)` pairs here is equivalent to what the old per-shape filter circuit produced.
 pub(crate) fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Vec<(Row, ZWeight)> {
-    delta
-        .iter()
-        .filter(|t| pred.matches(&t.0))
-        .map(|t| (t.0.clone(), t.1))
-        .collect()
+    delta.iter().filter(|t| pred.matches(&t.0)).map(|t| (t.0.clone(), t.1)).collect()
 }
 
 /// Index over standalone shapes by a **necessary conjunct** (`(column, op)` — see
@@ -175,9 +176,7 @@ impl StandaloneIndex {
                 }
                 for (bound, sids) in bounds.range(..=cell) {
                     let at_bound = bound == cell;
-                    out.extend(
-                        sids.iter().filter(|(_, strict)| !(at_bound && *strict)).map(|(s, _)| s.as_str()),
-                    );
+                    out.extend(sids.iter().filter(|(_, strict)| !(at_bound && *strict)).map(|(s, _)| s.as_str()));
                 }
             }
             for (col, bounds) in &self.upper {
@@ -187,9 +186,7 @@ impl StandaloneIndex {
                 }
                 for (bound, sids) in bounds.range(cell..) {
                     let at_bound = bound == cell;
-                    out.extend(
-                        sids.iter().filter(|(_, strict)| !(at_bound && *strict)).map(|(s, _)| s.as_str()),
-                    );
+                    out.extend(sids.iter().filter(|(_, strict)| !(at_bound && *strict)).map(|(s, _)| s.as_str()));
                 }
             }
         }
@@ -371,13 +368,7 @@ impl AggSeed {
     /// Fold one chunk of backfill rows (each weight `+1`). Matching is the shape's own predicate —
     /// the SQL pushed into the backfill `SELECT` is only a sound superset filter, so `matches()`
     /// stays the authority here exactly as it is on the live path.
-    pub(crate) fn fold_rows(
-        &mut self,
-        pred: &CompiledPredicate,
-        func: AggFn,
-        col: Option<usize>,
-        rows: &[Row],
-    ) {
+    pub(crate) fn fold_rows(&mut self, pred: &CompiledPredicate, func: AggFn, col: Option<usize>, rows: &[Row]) {
         for row in rows {
             if !pred.matches(row) {
                 continue;
@@ -429,8 +420,14 @@ impl AggShape {
             }
             touched = true;
             fold_agg_row(
-                self.func, self.col, row, *w,
-                &mut self.count, &mut self.nn_count, &mut self.sum, &mut self.multiset,
+                self.func,
+                self.col,
+                row,
+                *w,
+                &mut self.count,
+                &mut self.nn_count,
+                &mut self.sum,
+                &mut self.multiset,
             );
         }
         touched

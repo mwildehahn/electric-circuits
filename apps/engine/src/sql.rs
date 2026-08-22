@@ -149,10 +149,8 @@ fn build_json(
     let lhs = |col: &str, op: LeafOp| {
         let name = quote_ident(col);
         let ordering = matches!(op, LeafOp::Lt | LeafOp::Lte | LeafOp::Gt | LeafOp::Gte);
-        let collatable = schemas
-            .get(table)
-            .and_then(|ts| ts.index.get(col).map(|&i| ts.is_collatable_text(i)))
-            .unwrap_or(false);
+        let collatable =
+            schemas.get(table).and_then(|ts| ts.index.get(col).map(|&i| ts.is_collatable_text(i))).unwrap_or(false);
         if ordering && collatable { format!("{name} collate \"C\"") } else { name }
     };
     match p {
@@ -183,8 +181,7 @@ fn build_json(
             if and.is_empty() {
                 "TRUE".to_string()
             } else {
-                let parts: Vec<String> =
-                    and.iter().map(|p| build_json(p, start, params, schemas, table)).collect();
+                let parts: Vec<String> = and.iter().map(|p| build_json(p, start, params, schemas, table)).collect();
                 format!("({})", parts.join(" AND "))
             }
         }
@@ -192,8 +189,7 @@ fn build_json(
             if or.is_empty() {
                 "FALSE".to_string()
             } else {
-                let parts: Vec<String> =
-                    or.iter().map(|p| build_json(p, start, params, schemas, table)).collect();
+                let parts: Vec<String> = or.iter().map(|p| build_json(p, start, params, schemas, table)).collect();
                 format!("({})", parts.join(" OR "))
             }
         }
@@ -244,16 +240,14 @@ mod tests {
     /// A table whose Postgres types are KNOWN, for the collation tests below.
     fn introspected(pg_type_of_label: &str) -> TableSchema {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef {
-            ty: ColumnType::Int,
-            pg_type: Some("int4".to_string()),
-            has_default: false,
-        });
-        columns.insert("label".to_string(), ColumnDef {
-            ty: ColumnType::Text,
-            pg_type: Some(pg_type_of_label.to_string()),
-            has_default: false,
-        });
+        columns.insert(
+            "id".to_string(),
+            ColumnDef { ty: ColumnType::Int, pg_type: Some("int4".to_string()), has_default: false },
+        );
+        columns.insert(
+            "label".to_string(),
+            ColumnDef { ty: ColumnType::Text, pg_type: Some(pg_type_of_label.to_string()), has_default: false },
+        );
         let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
         TableSchema::from_def(&"users".into(), &def).unwrap()
     }
@@ -350,7 +344,8 @@ mod tests {
     fn text_param_cast_to_native_type_when_known() {
         // uuid column -> `$n::text::uuid` (index-eligible), not `col::text = $n`.
         let ts = typed_schema("projects", &[("id", ColumnType::Text, "uuid"), ("owner_id", ColumnType::Text, "uuid")]);
-        let pj: PredicateJson = serde_json::from_value(serde_json::json!({"col":"owner_id","op":"eq","value":"u1"})).unwrap();
+        let pj: PredicateJson =
+            serde_json::from_value(serde_json::json!({"col":"owner_id","op":"eq","value":"u1"})).unwrap();
         let cp = CompiledPredicate::compile(&pj, &ts).unwrap();
         let (w, p) = predicate_to_sql(&cp, &ts).unwrap();
         assert_eq!(w, r#""owner_id" = $1::text::"uuid""#);
@@ -369,10 +364,7 @@ mod tests {
         }))
         .unwrap();
         let (w, p) = predicate_json_to_sql(&outer, 1, &schemas, &"issues".into());
-        assert_eq!(
-            w,
-            r#""project_id" IN (SELECT "id" FROM "public"."projects" WHERE "owner_id" = $1::text::"uuid")"#
-        );
+        assert_eq!(w, r#""project_id" IN (SELECT "id" FROM "public"."projects" WHERE "owner_id" = $1::text::"uuid")"#);
         assert_eq!(p, vec!["u1".to_string()]);
     }
 

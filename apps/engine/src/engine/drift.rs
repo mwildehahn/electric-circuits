@@ -90,14 +90,11 @@ fn reconcile_interval() -> std::time::Duration {
 /// Spread retries of many tables apart without pulling in an RNG: ±25% from the clock's sub-second
 /// noise. Precision is irrelevant here; only decorrelation matters.
 fn jitter(base: std::time::Duration) -> std::time::Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let spread = base.as_millis() as u64 / 2;
     let offset = if spread == 0 { 0 } else { nanos as u64 % spread };
-    base.saturating_sub(std::time::Duration::from_millis(spread / 2))
-        + std::time::Duration::from_millis(offset)
+    base.saturating_sub(std::time::Duration::from_millis(spread / 2)) + std::time::Duration::from_millis(offset)
 }
 
 /// Must the circuit be rebuilt (⇒ the process restarted) for a trigger observed in transaction
@@ -212,11 +209,7 @@ impl crate::replication::SchemaEvents for Engine {
         })
     }
 
-    fn on_truncate<'a>(
-        &'a self,
-        tables: Vec<TableRef>,
-        txn: Option<TxnRef>,
-    ) -> crate::replication::BoxFuture<'a, ()> {
+    fn on_truncate<'a>(&'a self, tables: Vec<TableRef>, txn: Option<TxnRef>) -> crate::replication::BoxFuture<'a, ()> {
         Box::pin(async move { self.handle_truncate(tables, txn).await })
     }
 }
@@ -238,12 +231,7 @@ impl Engine {
     }
 
     /// Handle drift on one table: re-introspect, retire every dependent, swap the compiled schema.
-    pub(crate) async fn handle_schema_drift(
-        &self,
-        table: &TableRef,
-        observed: DriftSource,
-        txn: Option<TxnRef>,
-    ) {
+    pub(crate) async fn handle_schema_drift(&self, table: &TableRef, observed: DriftSource, txn: Option<TxnRef>) {
         let Some(url) = self.pg_url.clone() else {
             // Library mode: no fingerprints exist, so nothing can call this.
             return;
@@ -254,10 +242,7 @@ impl Engine {
 
         let (compiled_before, was_unresolved) = {
             let st = self.state.lock().await;
-            (
-                st.tables.get(table).and_then(|ts| ts.fingerprint.clone()),
-                st.unresolved.contains(table),
-            )
+            (st.tables.get(table).and_then(|ts| ts.fingerprint.clone()), st.unresolved.contains(table))
         };
 
         // Postgres is the authority on what the table is now.
@@ -280,15 +265,12 @@ impl Engine {
         // that has long since been fixed.
         let mut identity_restored = false;
         if def.fingerprint.as_ref().is_some_and(|f| f.replident != REPLICA_IDENTITY_FULL) {
-            if let Err(e) =
-                crate::pg::ensure_replica_identity_full_bounded(&client, table, IDENTITY_LOCK_TIMEOUT).await
+            if let Err(e) = crate::pg::ensure_replica_identity_full_bounded(&client, table, IDENTITY_LOCK_TIMEOUT).await
             {
                 // Usually a lock wait that timed out (a long reader on the table) or a permissions
                 // problem. Either way the engine cannot serve the table, and blocking ingest until
                 // it can is not an option.
-                return self
-                    .unresolved(table, &format!("could not restore REPLICA IDENTITY FULL: {e:#}"))
-                    .await;
+                return self.unresolved(table, &format!("could not restore REPLICA IDENTITY FULL: {e:#}")).await;
             }
             tracing::warn!("restored REPLICA IDENTITY FULL on {table}");
             identity_restored = true;
@@ -309,9 +291,7 @@ impl Engine {
             Err(e) => {
                 // e.g. the migration dropped the primary key. Nothing can be served from it, and no
                 // amount of retrying changes that — treat it exactly like a drop.
-                tracing::error!(
-                    "schema drift on {table}: the new schema is unusable ({e:#}); untracking the table"
-                );
+                tracing::error!("schema drift on {table}: the new schema is unusable ({e:#}); untracking the table");
                 return self.handle_dropped_table(table).await;
             }
         };
@@ -366,8 +346,7 @@ impl Engine {
         if resolved_something {
             // Durable audit record: this is why those shapes went away.
             if let Some(fp) = ts.fingerprint.clone() {
-                self.catalog_tx
-                    .send(CatalogEvent::SchemaChanged { table: table.clone(), fingerprint: fp });
+                self.catalog_tx.send(CatalogEvent::SchemaChanged { table: table.clone(), fingerprint: fp });
             }
             // A wire observation that still disagrees with a FRESH catalog read should be
             // impossible: `pg::inspect_publication` refuses a column list at boot and folds
@@ -524,11 +503,7 @@ impl Engine {
                 .shapes
                 .values()
                 .filter(|rec| {
-                    rec.table == *table
-                        || rec
-                            .where_json
-                            .as_ref()
-                            .is_some_and(|w| referenced_tables(w).contains(table))
+                    rec.table == *table || rec.where_json.as_ref().is_some_and(|w| referenced_tables(w).contains(table))
                 })
                 .map(|rec| rec.id.clone())
                 .collect();
@@ -576,12 +551,8 @@ impl Engine {
     /// reflect the triggering transaction. Called only after the retirements and the catalog events
     /// have landed. See the module docs for why the xid gate is what makes this replay-safe.
     async fn exit_if_circuit_served(&self, table: &TableRef, why: &str, txn: Option<TxnRef>) {
-        let circuit_served = self
-            .arrangements
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|arr| arr.counts_group_cols(table).is_some());
+        let circuit_served =
+            self.arrangements.lock().unwrap().as_ref().is_some_and(|arr| arr.counts_group_cols(table).is_some());
         if !circuit_served {
             return;
         }
@@ -605,9 +576,7 @@ impl Engine {
              restores every other table's shapes from the durable catalog."
         );
         if !self.catalog_tx.drain(std::time::Duration::from_secs(5)).await {
-            tracing::error!(
-                "catalog writer did not drain before the restart; some drop records may be missing"
-            );
+            tracing::error!("catalog writer did not drain before the restart; some drop records may be missing");
         }
         std::process::exit(EXIT_CIRCUIT_REBUILD);
     }

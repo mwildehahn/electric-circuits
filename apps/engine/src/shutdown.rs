@@ -204,11 +204,7 @@ pub fn resolve_grace(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Dur
 /// Resolve the readiness-drain window (see [`DEFAULT_READY_DRAIN`]). `0` is legal and means "stop
 /// accepting at once" — correct when nothing in front of the engine polls `/ready`.
 pub fn resolve_ready_drain(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Duration> {
-    Ok(Duration::from_secs(secs_var(
-        &get,
-        "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS",
-        DEFAULT_READY_DRAIN.as_secs(),
-    )?))
+    Ok(Duration::from_secs(secs_var(&get, "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS", DEFAULT_READY_DRAIN.as_secs())?))
 }
 
 fn secs_var(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> anyhow::Result<u64> {
@@ -217,8 +213,7 @@ fn secs_var(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> a
     if raw.is_empty() {
         return Ok(default);
     }
-    raw.parse()
-        .map_err(|_| anyhow::anyhow!("{name} must be a whole number of seconds, got '{raw}'"))
+    raw.parse().map_err(|_| anyhow::anyhow!("{name} must be a whole number of seconds, got '{raw}'"))
 }
 
 /// The first of `SIGTERM` / `SIGINT`. On non-unix only `ctrl_c` exists.
