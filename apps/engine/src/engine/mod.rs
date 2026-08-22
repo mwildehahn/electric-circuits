@@ -55,7 +55,9 @@ pub use introspection::{
 };
 pub use drift::ResolveLock;
 pub use planning::CircuitPlacement;
-pub(crate) use output::{apply_envelope, delete_envelopes, translate_output};
+pub(crate) use output::{
+    absolute_envelope, apply_envelope, delete_envelopes, needs_absolute_emission, translate_output,
+};
 
 /// `GET /v1/health` phases (see [`Engine::health`]).
 const HEALTH_WAITING: u8 = 0;
@@ -840,6 +842,7 @@ impl Engine {
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
+                self.pg_url.is_none(),
                 self.shutdown.clone(),
             ));
         }

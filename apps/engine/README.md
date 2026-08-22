@@ -108,6 +108,32 @@ unchanged (always a number), and AVG stays a double. Exactness is for **integer*
 `f64` like any other float. Clients: `AggregateValue` is `number | string | boolean | null`;
 `BigInt(v)` a string sum.
 
+**Library mode keeps the before-image the database would have supplied.** With no
+`ELECTRIC_CIRCUITS_PG_URL`, writes reach the change log through the native write API as
+`(table, op, pk, row)` — a delete or update carries no prior row, and without one the retraction
+half of the Z-set delta is missing, so a deleted row could never leave a shape. Two mechanisms
+close that, and between them there is no gap:
+
+- **The sequencer's per-key view** (`TableExec::library_rows`): the current row per key, stamped
+  onto each envelope as its `old` before anything downstream reads it — after the de-duplication
+  highwater, ahead of the pending-shape buffers, the fan-out and the aggregate folds. It is in
+  memory and reported under `GET /memory`. It is **exact from boot**, not per-boot best-effort:
+  library mode has no catalog checkpoint to resume from, so a starting process replays the change
+  log from its origin and rebuilds the view in full before serving anything. (Postgres mode
+  allocates none of this — there the invariant that the hot path holds no table copy is intact.)
+- **Absolute emission** for the one reader that is not at the log's head: a shape reactivating out
+  of **dormancy** replays the log from *its* resume position, where the view does not apply. Each
+  old-less envelope there states the shape's membership outright — matches the predicate now →
+  `upsert`, otherwise → `delete <key>` (the rule the subquery registry uses, for the same reason).
+  A delete for a key the shape never held is a deliberate, tolerated no-op; on the live path the
+  same rule costs a visit to every shape on the table, which is why it is reserved for envelopes
+  that genuinely have no before-image.
+
+What library mode still does **not** do is backfill: a shape or aggregate created at time T holds
+only what changed after T, and a restart loses the shape catalog, so a re-created aggregate counts
+from its own creation rather than from the table. (Aggregates never go dormant, so the replay path
+above never applies to one.)
+
 **`GET /v1/health`** reports the boot state machine as an exact, whitespace-free JSON body:
 `{"status":"waiting"}` (202) until Postgres connects, `{"status":"starting"}` (202) through
 introspection/slot/ingest spawn, then `{"status":"active"}` (200). Library mode is `active` at once.

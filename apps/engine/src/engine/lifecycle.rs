@@ -768,6 +768,7 @@ impl Engine {
             &gate,
             &rec.stream_path,
             &resume,
+            self.pg_url.is_none(),
         )
         .await
         {

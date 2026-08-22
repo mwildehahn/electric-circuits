@@ -77,7 +77,25 @@ Three ideas carry the whole design:
   logic). **`Row`** = positional `Vec<Value>`; the schema names the positions.
 - **Z-set delta** — `Vec<Tup2<Row, ZWeight>>`, `ZWeight` a signed i64: insert = `(row,+1)`, delete =
   `(old,−1)`, update = `(old,−1),(new,+1)`. `old` comes from the replication envelope
-  (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. The delta algebra
+  (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. **Library mode
+  (no Postgres) is the one exception**: the native write API sends `(table, op, pk, row)` and a
+  delete/update has no prior row to carry, so the sequencer keeps the current row per key
+  (`TableExec::library_rows`) and stamps it as `old` on the way in — per envelope, after the
+  de-duplication highwater and ahead of the pending-shape buffers, the fan-out and the aggregate
+  folds, so everything downstream sees a change indistinguishable from a replicated one. In memory
+  and reported by `GET /memory`, and **exact from boot**: library mode has no catalog checkpoint to
+  resume from, so a starting process replays the change log from its origin and rebuilds the view
+  in full. Postgres mode allocates none of it.
+- **Absolute emission** covers the one reader that is not at the log's head. A shape reactivating
+  out of dormancy replays the change log from *its* resume position, where the per-key view does
+  not apply, so each old-less envelope states that shape's membership outright: matches the
+  predicate now ⇒ `upsert`, otherwise ⇒ `delete <key>` (`engine::output::absolute_envelope`; the
+  rule the subquery registry uses, §6, for the same reason — a delta with no `-1` half cannot
+  express a move-out). A delete for a key the shape never held is a deliberate no-op. On the live
+  path the rule costs a visit to every shape on the table, so it is reserved for envelopes that
+  genuinely have no before-image. What remains is library mode's lack of a **backfill**: a shape or
+  aggregate created at time T holds only what changed after T (aggregates never go dormant, so the
+  replay path never applies to one). The delta algebra
   is [`dbsp`](https://crates.io/crates/dbsp)'s — `Tup2` and `ZWeight` are dbsp's own, and
   `Value`/`Row` carry the `DBData` derive stack. Routing- and fallback-tier shapes are evaluated
   by plain Rust (key routing + stateless predicate evaluation; internals doc §1); the circuit

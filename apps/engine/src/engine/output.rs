@@ -18,12 +18,13 @@ pub(crate) fn apply_envelope(
     };
     let mut delta: Vec<Tup2<Row, ZWeight>> = Vec::new();
     match env.headers.operation.as_str() {
-        "insert" => {
-            let new = to_row(env.value.as_ref().context("insert envelope missing value")?)?;
-            delta.push(Tup2(new, 1));
-        }
-        "update" | "upsert" => {
-            let new = to_row(env.value.as_ref().context("update envelope missing value")?)?;
+        // `insert` is folded by the SAME rule as `update`, because a before-image on an insert is
+        // real: replication never produces one, but library mode's per-key view does (a client
+        // retrying an insert for a key the engine already holds). Ignoring it here would add the
+        // row a second time — idempotent for a row shape, a permanent double-count for an
+        // aggregate. With no `old` this is exactly the old insert path.
+        "insert" | "update" | "upsert" => {
+            let new = to_row(env.value.as_ref().context("insert/update envelope missing value")?)?;
             match env.old.as_ref() {
                 Some(old) => {
                     let old = to_row(old)?;
@@ -45,6 +46,58 @@ pub(crate) fn apply_envelope(
         other => bail!("unknown operation '{other}'"),
     }
     Ok((delta, txid, lsn))
+}
+
+/// Does this envelope's membership decision have to be taken **absolutely** (per pk, from the row's
+/// current value) rather than from the Z-set delta?
+///
+/// Yes exactly when it removes or replaces a row and carries **no before-image**. The delta then has
+/// no `-1` half, so a delete produces no delta at all and an update looks like a bare insert —
+/// nothing can leave a shape. Postgres mode never gets here (`REPLICA IDENTITY FULL` supplies the
+/// old row, and a replica-identity regression retires the table's shapes instead); library mode does,
+/// wherever the sequencer's per-key view cannot supply one: the first change to a key after a
+/// restart, and every change replayed for a shape reactivating out of dormancy.
+pub(crate) fn needs_absolute_emission(env: &Envelope) -> bool {
+    env.old.is_none() && matches!(env.headers.operation.as_str(), "delete" | "update" | "upsert")
+}
+
+/// ONE absolute per-pk envelope for a shape: `upsert` when `row` is the value the shape holds now,
+/// `delete` when the shape must not hold the key (the caller has already evaluated membership).
+///
+/// This is the emission rule the subquery registry uses for flip-driven query-backs, applied here
+/// for the same reason: with no before-image the delta cannot express a move-out, so membership is
+/// stated outright. A `delete` for a key the shape never held is a deliberate, tolerated no-op —
+/// stream-db and every fold consumer drop a delete for an unknown key.
+///
+/// Returns `None` when the TEST-ONLY `drop_deletes` fault suppresses the delete, exactly as
+/// [`translate_output`] and [`delete_envelopes`] do.
+pub(crate) fn absolute_envelope(
+    ts: &TableSchema,
+    key: &str,
+    row: Option<&Row>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    out_cols: Option<&[usize]>,
+) -> Option<Envelope> {
+    let (operation, value) = match row {
+        Some(r) => ("upsert", Some(ts.row_to_json_cols(r, out_cols))),
+        None if matches!(crate::fault::active(), crate::fault::Fault::DropDeletes) => return None,
+        None => ("delete", None),
+    };
+    Some(Envelope {
+        type_: ts.table.to_string(),
+        key: key.to_string(),
+        value,
+        old: None,
+        headers: EnvelopeHeaders {
+            operation: operation.into(),
+            txid,
+            offset: None,
+            lsn,
+            seq: None,
+            last: None,
+        },
+    })
 }
 
 /// Translate a shape circuit's output Z-set delta into State-Protocol envelopes. Grouped by pk:

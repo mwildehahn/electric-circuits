@@ -482,6 +482,63 @@ fn change_to_shape_envelope_enter_update_leave() {
     assert_eq!(envs.len(), 0);
 }
 
+/// Library mode has no Postgres to supply a `REPLICA IDENTITY FULL` before-image, so the sequencer
+/// keeps the current row per key and stamps it — otherwise a delete/update carries no `old`, the
+/// retraction half of the Z-set delta is missing, and a deleted row can never leave a shape.
+#[test]
+fn library_mode_stamps_the_before_image_a_delete_needs_to_retract() {
+    let ts = users();
+    let pred = CompiledPredicate::compile_opt(
+        Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
+        &ts,
+    ).unwrap();
+    let mut exec = TableExec::new(ts.clone());
+    let row1 = serde_json::json!({"id":1,"name":"a","active":true});
+
+    // The write API's insert: no `old`, nothing remembered yet — an insert needs neither.
+    let mut e = env("insert", "1", Some(row1.clone()), None);
+    exec.stamp_before_image(&mut e);
+    assert_eq!(e.old, None);
+    let (delta, _, _) = apply_envelope(&ts, &e).unwrap();
+    assert_eq!(translate_output(&ts, eval_standalone(&pred, &delta), None, None, None)[0].headers.operation, "upsert");
+
+    // The write API's update: the remembered row becomes the before-image, so the update is a
+    // retract+insert pair rather than a bare insert of the new row.
+    let row2 = serde_json::json!({"id":1,"name":"a2","active":true});
+    let mut e = env("update", "1", Some(row2.clone()), None);
+    exec.stamp_before_image(&mut e);
+    assert_eq!(e.old.as_ref(), Some(&row1));
+    let (delta, _, _) = apply_envelope(&ts, &e).unwrap();
+    assert_eq!(delta.len(), 2);
+    assert_eq!(delta[0].1, -1);
+    assert_eq!(delta[1].1, 1);
+
+    // The write API's delete: `{table, op, pk}` only. The stamped before-image is what retracts the
+    // row out of the shape.
+    let mut e = env("delete", "1", None, None);
+    exec.stamp_before_image(&mut e);
+    assert_eq!(e.old.as_ref(), Some(&row2));
+    let (delta, _, _) = apply_envelope(&ts, &e).unwrap();
+    let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].headers.operation, "delete");
+    assert_eq!(envs[0].key, "1");
+
+    // The key is forgotten on delete: a second delete has nothing to retract (no double retraction).
+    let mut e = env("delete", "1", None, None);
+    exec.stamp_before_image(&mut e);
+    assert_eq!(e.old, None);
+    assert!(exec.library_rows.is_empty());
+
+    // A producer that DOES carry the prior row is believed over the cache.
+    let mut e = env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":true})), None);
+    exec.stamp_before_image(&mut e);
+    let carried = serde_json::json!({"id":2,"name":"carried","active":true});
+    let mut e = env("update", "2", Some(serde_json::json!({"id":2,"name":"b2","active":true})), Some(carried.clone()));
+    exec.stamp_before_image(&mut e);
+    assert_eq!(e.old.as_ref(), Some(&carried));
+}
+
 /// The commit LSN is stamped onto output envelopes (upsert + delete) so a subset client can
 /// position its live tail at the page snapshot (see `docs/ARCHITECTURE.md` §7).
 #[test]
@@ -505,6 +562,153 @@ fn translate_output_stamps_commit_lsn() {
     let out = vec![(Row(vec![crate::value::Value::Int(3), crate::value::Value::Text("c".into()), crate::value::Value::Bool(true)]), 1)];
     let envs = translate_output(&ts, out, None, None, None);
     assert_eq!(envs[0].headers.lsn, None);
+}
+
+/// **Absolute emission**: in library mode an envelope with no before-image decides membership per
+/// pk from the row's CURRENT value — matches now → `upsert`, otherwise → `delete <key>`. This is the
+/// rule that lets a delete/predicate-leaving update retract at all when there is nothing to retract
+/// WITH (the first change to a key after a restart, and every change replayed for a shape coming
+/// out of dormancy).
+#[tokio::test]
+async fn library_mode_absolute_emission_retracts_without_an_old_row() {
+    let ts = users();
+    // Columns sorted: active(0), id(1), name(2).
+    let name_idx = 2usize;
+
+    // A standalone shape over `active = true`, and a family router on (name) holding key 'a'.
+    let mut shapes: HashMap<String, StandaloneShape> = HashMap::new();
+    shapes.insert(
+        "s1".into(),
+        StandaloneShape {
+            pred: Arc::new(
+                CompiledPredicate::compile_opt(
+                    Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
+                    &ts,
+                )
+                .unwrap(),
+            ),
+            stream_path: "shape/s1".into(),
+            gate: crate::pg::SnapshotGate::passthrough(),
+            out_cols: None,
+        },
+    );
+    let mut shape_index = StandaloneIndex::default();
+    shape_index.insert("s1", &shapes["s1"].pred);
+    let mut families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
+    let mut index: HashMap<Row, Vec<RoutedShape>> = HashMap::new();
+    index.insert(
+        Row(vec![Value::Text("a".into())]),
+        vec![RoutedShape {
+            num_id: 7,
+            stream_path: "shape/s7".into(),
+            gate: crate::pg::SnapshotGate::passthrough(),
+            out_cols: None,
+        }],
+    );
+    families.insert(vec![name_idx], KeyRouter { key_cols: vec![name_idx], index });
+
+    let agg_index = StandaloneIndex::default();
+    let mut aggregates: HashMap<String, AggShape> = HashMap::new();
+    let subqueries = test_subq();
+    let (trace_tx, _) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+
+    /// Run one envelope through the library-mode path and hand back what it staged per stream.
+    #[allow(clippy::too_many_arguments)]
+    async fn staged(
+        ts: &TableSchema,
+        shapes: &HashMap<String, StandaloneShape>,
+        shape_index: &StandaloneIndex,
+        families: &HashMap<Vec<usize>, KeyRouter>,
+        aggregates: &mut HashMap<String, AggShape>,
+        agg_index: &StandaloneIndex,
+        subq: &SubqueryHandle,
+        trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+        e: Envelope,
+    ) -> HashMap<String, Vec<Envelope>> {
+        let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+        process_envelope(
+            ts, shapes, shape_index, families, aggregates, agg_index, e, &mut pending, subq,
+            trace_tx, true,
+        )
+        .await
+        .unwrap();
+        pending
+    }
+    macro_rules! run {
+        ($e:expr) => {
+            staged(
+                &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index, &subqueries,
+                &trace_tx, $e,
+            )
+            .await
+        };
+    }
+
+    // 1. A DELETE with no `old` carries no delta at all, and still retracts from both tiers.
+    let pending = run!(env("delete", "1", None, None));
+    assert_eq!(pending["shape/s1"].len(), 1);
+    assert_eq!(pending["shape/s1"][0].headers.operation, "delete");
+    assert_eq!(pending["shape/s1"][0].key, "1");
+    assert_eq!(pending["shape/s7"][0].headers.operation, "delete");
+
+    // 2. An UPDATE that LEAVES the predicate retracts (a delta-based emission would have emitted a
+    //    bare insert of the new row and left the shape holding it for ever).
+    let leaves = serde_json::json!({"id":1,"name":"a","active":false});
+    let pending = run!(env("update", "1", Some(leaves), None));
+    assert_eq!(pending["shape/s1"][0].headers.operation, "delete");
+    // The routed shape's membership is the KEY match, and the key is unchanged, so it keeps the row.
+    assert_eq!(pending["shape/s7"][0].headers.operation, "upsert");
+
+    // 3. An UPDATE that stays in the predicate is an ordinary upsert; one whose key MOVES leaves the
+    //    old key group, which absolute emission expresses as a delete to the group it is not in.
+    let moved = serde_json::json!({"id":1,"name":"zzz","active":true});
+    let pending = run!(env("update", "1", Some(moved), None));
+    assert_eq!(pending["shape/s1"][0].headers.operation, "upsert");
+    assert_eq!(pending["shape/s7"][0].headers.operation, "delete");
+
+    // 4. A shape that never held the key is told to delete it anyway — a DELIBERATE, tolerated
+    //    no-op: without a before-image the engine cannot know who held it, and every consumer
+    //    (stream-db, the conformance `foldStream`) drops a delete for an unknown key.
+    let pending = run!(env("delete", "99", None, None));
+    assert_eq!(pending["shape/s1"][0].key, "99");
+    assert_eq!(pending["shape/s1"][0].headers.operation, "delete");
+
+    // 5. Postgres mode never takes this path: the same envelope with `library_mode = false` is the
+    //    old behaviour (an old-less delete produces nothing at all).
+    let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+    process_envelope(
+        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
+        env("delete", "1", None, None), &mut pending, &subqueries, &trace_tx, false,
+    )
+    .await
+    .unwrap();
+    assert!(pending.is_empty());
+}
+
+/// A library-mode `insert` for a key the engine already remembers (a client retry) folds like an
+/// UPDATE, not a second insert: replication never puts an `old` on an insert, but the sequencer's
+/// per-key view does, and ignoring it would permanently double-count the row in every aggregate.
+#[test]
+fn library_mode_insert_with_a_remembered_old_folds_as_an_update() {
+    let ts = users();
+    let old = serde_json::json!({"id":1,"name":"a","active":true});
+    let new = serde_json::json!({"id":1,"name":"a2","active":true});
+
+    // Retry with a changed row: retract the remembered one, insert the new one.
+    let (delta, _, _) = apply_envelope(&ts, &env("insert", "1", Some(new), Some(old.clone()))).unwrap();
+    assert_eq!(delta.len(), 2);
+    assert_eq!(delta[0].1, -1);
+    assert_eq!(delta[1].1, 1);
+
+    // Retry with the IDENTICAL row: no delta at all, so a SUM cannot drift.
+    let (delta, _, _) =
+        apply_envelope(&ts, &env("insert", "1", Some(old.clone()), Some(old.clone()))).unwrap();
+    assert!(delta.is_empty());
+
+    // A genuine first insert (no `old`) is unchanged.
+    let (delta, _, _) = apply_envelope(&ts, &env("insert", "1", Some(old), None)).unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].1, 1);
 }
 
 /// The per-envelope trace reports the actual route: a family router hop (with the key) + the
@@ -561,7 +765,7 @@ async fn trace_family_route_and_filter_drop() {
     process_envelope(
         &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
-        &mut pending, &subqueries, &trace_tx,
+        &mut pending, &subqueries, &trace_tx, false,
     )
     .await
     .unwrap();
@@ -582,7 +786,7 @@ async fn trace_family_route_and_filter_drop() {
     process_envelope(
         &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "2", Some(serde_json::json!({"id":2,"name":"zzz","active":true})), None),
-        &mut pending, &subqueries, &trace_tx,
+        &mut pending, &subqueries, &trace_tx, false,
     )
     .await
     .unwrap();
@@ -598,7 +802,7 @@ async fn trace_family_route_and_filter_drop() {
     process_envelope(
         &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "3", Some(serde_json::json!({"id":3,"name":"a","active":true})), None),
-        &mut pending, &subqueries, &trace_tx,
+        &mut pending, &subqueries, &trace_tx, false,
     )
     .await
     .unwrap();
@@ -623,7 +827,7 @@ async fn trace_aggregate_fold() {
     process_envelope(
         &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
-        &mut pending, &subqueries, &trace_tx,
+        &mut pending, &subqueries, &trace_tx, false,
     )
     .await
     .unwrap();
@@ -635,7 +839,7 @@ async fn trace_aggregate_fold() {
     process_envelope(
         &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None),
-        &mut pending, &subqueries, &trace_tx,
+        &mut pending, &subqueries, &trace_tx, false,
     )
     .await
     .unwrap();
@@ -800,6 +1004,71 @@ fn aggregate_min_with_retraction() {
     assert_eq!(mx.value(), serde_json::json!(8));
     mx.apply(&vec![Tup2(active(8), -1)]);
     assert_eq!(mx.value(), serde_json::json!(5));
+}
+
+/// SUM over an integer column is EXACT past `f64`'s 2^53 integer ceiling — a `bigint` cell can
+/// already exceed it, so a double accumulator would answer with a rounded sum. Above the ceiling
+/// the value leaves the JSON number space (a decimal string), because a JSON number that big is
+/// silently rounded by every parser that decodes into a double.
+#[test]
+fn aggregate_sum_of_big_integers_is_exact() {
+    let big = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())]);
+    let mut a = agg(AggFn::Sum, Some(1)); // col 1 = id
+    a.apply(&vec![Tup2(big(9_007_199_254_740_993), 1)]);
+    assert_eq!(a.value(), serde_json::json!("9007199254740993"));
+
+    // Still exact under retraction: adding then removing 1 returns the same odd value.
+    a.apply(&vec![Tup2(big(1), 1)]);
+    assert_eq!(a.value(), serde_json::json!("9007199254740994"));
+    a.apply(&vec![Tup2(big(1), -1)]);
+    assert_eq!(a.value(), serde_json::json!("9007199254740993"));
+
+    // Back inside the exactly-representable range it is a plain JSON number again.
+    a.apply(&vec![Tup2(big(9_007_199_254_740_993), -1), Tup2(big(7), 1)]);
+    assert_eq!(a.value(), serde_json::json!(7));
+
+    // Negative sums cross the same boundary symmetrically.
+    let mut neg = agg(AggFn::Sum, Some(1));
+    neg.apply(&vec![Tup2(big(-9_007_199_254_740_993), 1)]);
+    assert_eq!(neg.value(), serde_json::json!("-9007199254740993"));
+}
+
+/// A float column keeps folding in `f64` — the integer accumulator promotes on the first float
+/// value, so a float SUM is a JSON number exactly as before.
+#[test]
+fn aggregate_sum_of_floats_stays_floating() {
+    let row = |f: f64| Row(vec![Value::Bool(true), Value::Float(f.into()), Value::Text("n".into())]);
+    let mut a = agg(AggFn::Sum, Some(1));
+    a.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.25), 1)]);
+    assert_eq!(a.value(), serde_json::json!(3.75));
+    let mut avg = agg(AggFn::Avg, Some(1));
+    avg.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.5), 1)]);
+    assert_eq!(avg.value(), serde_json::json!(2.0));
+}
+
+/// The streamed-backfill seed and the live path must fold identically — they share
+/// `fold_agg_row`, and this pins that they agree on the big-integer accumulator too.
+#[test]
+fn aggregate_seed_and_live_fold_agree_on_big_integers() {
+    let ts = users();
+    let big = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())]);
+    let rows = vec![big(9_007_199_254_740_993), big(9_007_199_254_740_993), big(3)];
+
+    let pred = CompiledPredicate::compile_opt(
+        Some(&serde_json::from_value(serde_json::json!({ "col": "active", "op": "eq", "value": true })).unwrap()),
+        &ts,
+    )
+    .unwrap();
+    let mut seed = crate::engine::executors::AggSeed::default();
+    seed.fold_rows(&pred, AggFn::Sum, Some(1), &rows);
+
+    let mut live = agg(AggFn::Sum, Some(1));
+    live.apply(&rows.iter().map(|r| Tup2(r.clone(), 1)).collect::<Vec<_>>());
+
+    assert_eq!(seed.sum, live.sum);
+    assert_eq!(seed.count, live.count);
+    assert_eq!(seed.nn_count, live.nn_count);
+    assert_eq!(live.value(), serde_json::json!("18014398509481989"));
 }
 
 // --- membership kernel (shared by the subquery registry and circuit cohort serving) ---------
@@ -1005,71 +1274,6 @@ async fn emission_lanes_order_and_barrier() {
 
     // Same stream always hashes to the same lane (structural precondition for ordering).
     assert_eq!(lanes.lane_for("shape/a"), lanes.lane_for("shape/a"));
-
-/// SUM over an integer column is EXACT past `f64`'s 2^53 integer ceiling — a `bigint` cell can
-/// already exceed it, so a double accumulator would answer with a rounded sum. Above the ceiling
-/// the value leaves the JSON number space (a decimal string), because a JSON number that big is
-/// silently rounded by every parser that decodes into a double.
-#[test]
-fn aggregate_sum_of_big_integers_is_exact() {
-    let big = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())]);
-    let mut a = agg(AggFn::Sum, Some(1)); // col 1 = id
-    a.apply(&vec![Tup2(big(9_007_199_254_740_993), 1)]);
-    assert_eq!(a.value(), serde_json::json!("9007199254740993"));
-
-    // Still exact under retraction: adding then removing 1 returns the same odd value.
-    a.apply(&vec![Tup2(big(1), 1)]);
-    assert_eq!(a.value(), serde_json::json!("9007199254740994"));
-    a.apply(&vec![Tup2(big(1), -1)]);
-    assert_eq!(a.value(), serde_json::json!("9007199254740993"));
-
-    // Back inside the exactly-representable range it is a plain JSON number again.
-    a.apply(&vec![Tup2(big(9_007_199_254_740_993), -1), Tup2(big(7), 1)]);
-    assert_eq!(a.value(), serde_json::json!(7));
-
-    // Negative sums cross the same boundary symmetrically.
-    let mut neg = agg(AggFn::Sum, Some(1));
-    neg.apply(&vec![Tup2(big(-9_007_199_254_740_993), 1)]);
-    assert_eq!(neg.value(), serde_json::json!("-9007199254740993"));
-}
-
-/// A float column keeps folding in `f64` — the integer accumulator promotes on the first float
-/// value, so a float SUM is a JSON number exactly as before.
-#[test]
-fn aggregate_sum_of_floats_stays_floating() {
-    let row = |f: f64| Row(vec![Value::Bool(true), Value::Float(f.into()), Value::Text("n".into())]);
-    let mut a = agg(AggFn::Sum, Some(1));
-    a.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.25), 1)]);
-    assert_eq!(a.value(), serde_json::json!(3.75));
-    let mut avg = agg(AggFn::Avg, Some(1));
-    avg.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.5), 1)]);
-    assert_eq!(avg.value(), serde_json::json!(2.0));
-}
-
-/// The streamed-backfill seed and the live path must fold identically — they share
-/// `fold_agg_row`, and this pins that they agree on the big-integer accumulator too.
-#[test]
-fn aggregate_seed_and_live_fold_agree_on_big_integers() {
-    let ts = users();
-    let big = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())]);
-    let rows = vec![big(9_007_199_254_740_993), big(9_007_199_254_740_993), big(3)];
-
-    let pred = CompiledPredicate::compile_opt(
-        Some(&serde_json::from_value(serde_json::json!({ "col": "active", "op": "eq", "value": true })).unwrap()),
-        &ts,
-    )
-    .unwrap();
-    let mut seed = crate::engine::executors::AggSeed::default();
-    seed.fold_rows(&pred, AggFn::Sum, Some(1), &rows);
-
-    let mut live = agg(AggFn::Sum, Some(1));
-    live.apply(&rows.iter().map(|r| Tup2(r.clone(), 1)).collect::<Vec<_>>());
-
-    assert_eq!(seed.sum, live.sum);
-    assert_eq!(seed.count, live.count);
-    assert_eq!(seed.nn_count, live.nn_count);
-    assert_eq!(live.value(), serde_json::json!("18014398509481989"));
-}
 
     let env = |i: usize| Envelope {
         type_: "t".into(),

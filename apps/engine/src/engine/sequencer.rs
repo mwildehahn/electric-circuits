@@ -111,6 +111,10 @@ pub(crate) fn spawn_sequencer(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
+    // No Postgres behind the engine: writes arrive on the change log through the native write API
+    // and carry no replication old-image, so the sequencer keeps the current row per key itself
+    // (see `TableExec::library_rows`).
+    library_mode: bool,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -134,6 +138,7 @@ pub(crate) fn spawn_sequencer(
         trace_tx,
         arr,
         arr_gates,
+        library_mode,
         shutdown,
         party,
     ));
@@ -200,6 +205,25 @@ pub(crate) struct TableExec {
     pub(crate) circuit_aggs: HashMap<String, CircuitAgg>,
     pub(crate) pending: HashMap<String, PendingShape>,
     pub(crate) envelopes_total: u64,
+    /// **Library mode only** — the current row per primary key, as last seen on the change log.
+    ///
+    /// Stays empty (and unallocated) in Postgres mode, because only [`Self::stamp_before_image`]
+    /// ever writes to it and the sequencer calls that only when there is no Postgres. In Postgres
+    /// mode the system of record supplies the before-image on every envelope (`REPLICA IDENTITY
+    /// FULL`) — which is exactly why the engine's hot path holds no table copy. Library mode has
+    /// no such source: the native write API takes `(table, op, pk, row)` and a delete/update
+    /// carries no prior row, so the retraction half of every Z-set delta would be missing and a
+    /// deleted row could never leave a shape.
+    ///
+    /// Scope: this is the sequencer's view of the change log as it consumes it, and it is EXACT
+    /// from boot rather than best-effort. It is not persisted, but it does not need to be — library
+    /// mode has no catalog checkpoint to resume from (`apply_catalog` runs only on the Postgres
+    /// boot), so a starting process replays the log from `LogPosition::start()` and rebuilds the
+    /// whole view before it serves anything. The one reader this cannot serve is
+    /// `replay_changes_for_shape`, which reads the log at a DORMANT SHAPE's resume position while
+    /// the view is at the head; that path decides membership absolutely instead
+    /// (`output::absolute_envelope`).
+    pub(crate) library_rows: HashMap<String, serde_json::Value>,
 }
 
 impl TableExec {
@@ -215,6 +239,33 @@ impl TableExec {
             circuit_aggs: HashMap::new(),
             pending: HashMap::new(),
             envelopes_total: 0,
+            library_rows: HashMap::new(),
+        }
+    }
+
+    /// Give a library-mode envelope the before-image a replicated one would already carry, and
+    /// record its after-image for the next change to the same key. Called by the sequencer for
+    /// every change-log envelope **when the engine runs without Postgres**, before anything else
+    /// looks at it, so a library-mode change is indistinguishable from a replicated one from
+    /// `apply_envelope` downwards.
+    ///
+    /// An envelope that already carries an `old` keeps it — a producer that knows the prior row is
+    /// always believed over this cache.
+    pub(crate) fn stamp_before_image(&mut self, env: &mut Envelope) {
+        if env.old.is_none() {
+            env.old = self.library_rows.get(&env.key).cloned();
+        }
+        match env.headers.operation.as_str() {
+            "delete" => {
+                self.library_rows.remove(&env.key);
+            }
+            _ => {
+                // An insert/update with no row body says nothing about the key's current value;
+                // dropping the remembered one would only lose the next retraction.
+                if let Some(v) = env.value.as_ref() {
+                    self.library_rows.insert(env.key.clone(), v.clone());
+                }
+            }
         }
     }
 }
@@ -281,6 +332,7 @@ pub(crate) async fn sequencer_loop(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
+    library_mode: bool,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
@@ -619,9 +671,9 @@ pub(crate) async fn sequencer_loop(
                             Vec::new()
                         };
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                        for env in envs[i..j].iter() {
+                        for k in i..j {
                             // Skip redelivered changes (see `highwater` above).
-                            let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
+                            let pos = match (envs[k].headers.lsn.as_deref(), envs[k].headers.seq) {
                                 (Some(l), Some(seq)) => Some((crate::pg::lsn_to_u64(l), seq)),
                                 _ => None,
                             };
@@ -631,21 +683,36 @@ pub(crate) async fn sequencer_loop(
                                     continue;
                                 }
                             }
-                            let Some(exec) = exec_for(&mut execs, &tables, &env.type_) else {
-                                tracing::error!("sequencer: change for unknown table '{}'", env.type_);
+                            let Some(exec) = exec_for(&mut execs, &tables, &envs[k].type_) else {
+                                tracing::error!("sequencer: change for unknown table '{}'", envs[k].type_);
                                 if let Some(p) = pos { highwater = Some(p); }
                                 continue;
                             };
+                            // LIBRARY MODE: no Postgres wrote this change, so nothing stamped a
+                            // before-image on it. Fill it in from the sequencer's own per-key view
+                            // (`TableExec::library_rows`) HERE — after the de-duplication highwater
+                            // (a re-delivered duplicate must never fold into the view twice) and
+                            // ahead of everything downstream: the pending-shape buffers, the
+                            // fan-out, the aggregate folds. From this point the envelope is
+                            // indistinguishable from a replicated one.
+                            //
+                            // The counts pipelines were fed above, from the un-stamped page. That
+                            // is not a gap: the circuit tier seeds from a Postgres snapshot and
+                            // refuses to start without a `pg_url`, so `arr` is always `None` here
+                            // in library mode.
+                            if library_mode {
+                                exec.stamp_before_image(&mut envs[k]);
+                            }
                             // Buffer for in-flight creations on this table: their `BeginShape` was
                             // acknowledged before the creator's snapshot, so everything the
                             // snapshot cannot contain lands in the buffer.
                             for pending in exec.pending.values_mut() {
-                                pending.buffered.push(env.clone());
+                                pending.buffered.push(envs[k].clone());
                             }
                             if let Err(e) = process_envelope(
                                 &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
-                                &mut exec.aggregates, &exec.agg_index, env.clone(), &mut txn_pending,
-                                &subq, &trace_tx,
+                                &mut exec.aggregates, &exec.agg_index, envs[k].clone(), &mut txn_pending,
+                                &subq, &trace_tx, library_mode,
                             )
                             .await
                             {
@@ -1003,6 +1070,7 @@ pub(crate) async fn replay_changes_for_shape(
     gate: &crate::pg::SnapshotGate,
     stream_path: &str,
     from: &LogPosition,
+    library_mode: bool,
 ) -> Result<u64> {
     let mut pos = from.clone();
     let mut rotate_to: Option<u32> = None;
@@ -1024,12 +1092,27 @@ pub(crate) async fn replay_changes_for_shape(
                 continue;
             }
             let Ok((delta, txid, lsn)) = apply_envelope(ts, env) else { continue };
-            if delta.is_empty() {
+            // Library mode replays RAW change-log envelopes: nothing stamped a before-image on
+            // them (the sequencer's per-key view is the state at the log's HEAD, not at this
+            // replay position), so membership is decided ABSOLUTELY per pk — matches now ⇒
+            // `upsert`, otherwise ⇒ `delete <key>`. Without this a shape coming back from
+            // dormancy would never learn about the deletes it slept through.
+            let absolute = library_mode && needs_absolute_emission(env);
+            if delta.is_empty() && !absolute {
                 continue;
             }
             let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
             let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
             if gate.should_skip(lsn_u64, xid) {
+                continue;
+            }
+            if absolute {
+                let held = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| pred.matches(r));
+                if let Some(e) = absolute_envelope(
+                    ts, &env.key, held, txid, lsn, out_cols.map(|c| c.as_slice()),
+                ) {
+                    outs.push(e);
+                }
                 continue;
             }
             let matched = eval_standalone(pred, &delta);
@@ -1247,9 +1330,14 @@ pub(crate) async fn process_envelope(
     pending: &mut HashMap<String, Vec<Envelope>>,
     subq: &SubqueryHandle,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    library_mode: bool,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
-    if delta.is_empty() {
+    // No before-image (library mode only — see `needs_absolute_emission`): the plain tiers below
+    // decide membership ABSOLUTELY per pk instead of from the delta, so a delete with no delta at
+    // all still has work to do.
+    let absolute = library_mode && needs_absolute_emission(&env);
+    if delta.is_empty() && !absolute {
         return Ok(());
     }
     // Per-envelope trace collection (hops, reached shape ids). `None` when nobody is subscribed,
@@ -1273,8 +1361,69 @@ pub(crate) async fn process_envelope(
     // fallback for changes without a parseable xid). On the untraced hot path only the index's
     // candidates are visited (a non-candidate's necessary conjunct fails, so it cannot match);
     // with a trace subscriber the full scan is kept so every filter node still reports a hop.
+    //
+    // ABSOLUTE emission takes over both plain tiers when the envelope has no before-image: the
+    // row's current value (`row_now`, `None` for a delete) decides each shape's membership
+    // outright — matches ⇒ `upsert`, otherwise ⇒ `delete <key>`. It costs a visit to EVERY shape
+    // on the table (a shape the row no longer matches is exactly the one that must be told to drop
+    // the key, so an index of *candidates* cannot find it), which is the price of not having an
+    // old row. On the LIVE path that price is almost never paid: the per-key view is exact from
+    // boot, so an old-less delete/update here means a key the change log never carried.
+    let row_now: Option<&Row> = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r);
+    if absolute {
+        for (sid, shape) in shapes.iter() {
+            if shape.gate.should_skip(lsn_u64, xid) {
+                if let Some((hops, _)) = tr.as_mut() {
+                    hops.push(crate::trace::TraceHop::new(format!("filter:{sid}"), "dropped"));
+                }
+                continue;
+            }
+            let held = row_now.filter(|r| shape.pred.matches(r));
+            if let Some((hops, ids)) = tr.as_mut() {
+                hops.push(crate::trace::TraceHop::new(
+                    format!("filter:{sid}"),
+                    if held.is_some() { "passed" } else { "dropped" },
+                ));
+                hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "passed"));
+                ids.push(sid.clone());
+            }
+            if let Some(e) = absolute_envelope(
+                ts, &env.key, held, txid.clone(), lsn.clone(),
+                shape.out_cols.as_deref().map(Vec::as_slice),
+            ) {
+                pending.entry(shape.stream_path.clone()).or_default().push(e);
+            }
+        }
+        let _s = Timer::new(&metrics().family_step);
+        for router in families.values() {
+            // A routed shape's membership IS the key match, so the row belongs to exactly the one
+            // key group its CURRENT value names; every other group must drop it.
+            let new_key = row_now.map(|r| key_of(r, &router.key_cols));
+            for (key, routed) in router.index.iter() {
+                let held = if new_key.as_ref() == Some(key) { row_now } else { None };
+                for rs in routed {
+                    if rs.gate.should_skip(lsn_u64, xid) {
+                        continue;
+                    }
+                    if let Some((hops, ids)) = tr.as_mut() {
+                        let sid = format!("s{}", rs.num_id);
+                        hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "passed"));
+                        ids.push(sid);
+                    }
+                    if let Some(e) = absolute_envelope(
+                        ts, &env.key, held, txid.clone(), lsn.clone(),
+                        rs.out_cols.as_deref().map(Vec::as_slice),
+                    ) {
+                        pending.entry(rs.stream_path.clone()).or_default().push(e);
+                    }
+                }
+            }
+        }
+    }
     let candidate_ids;
-    let candidates: Box<dyn Iterator<Item = (&String, &StandaloneShape)>> = if tr.is_some() {
+    let candidates: Box<dyn Iterator<Item = (&String, &StandaloneShape)>> = if absolute {
+        Box::new(std::iter::empty())
+    } else if tr.is_some() {
         Box::new(shapes.iter())
     } else {
         candidate_ids = shape_index.candidates(&delta);
@@ -1308,7 +1457,7 @@ pub(crate) async fn process_envelope(
     // row iff its key equals the shape's constants). Each shape's own snapshot gate is applied, so
     // changes already in that shape's backfill are skipped.
     let _s = Timer::new(&metrics().family_step);
-    for router in families.values() {
+    for router in families.values().filter(|_| !absolute) {
         type ShapeOut<'a> = (&'a str, Option<&'a [usize]>, Vec<(Row, ZWeight)>);
         let mut by_shape: HashMap<u64, ShapeOut> = HashMap::new();
         let mut routed_keys: Vec<Row> = Vec::new();
@@ -1362,6 +1511,16 @@ pub(crate) async fn process_envelope(
                 pending.entry(stream_path.to_string()).or_default().extend(envs);
             }
         }
+    }
+    // A delete with no before-image carries no delta at all, so the subquery registry and the
+    // aggregate folds have nothing to apply — and nothing they COULD apply, since correcting them
+    // needs the old row. That is sound rather than a gap: the per-key view supplies the old row for
+    // every key the change log actually carried (so a real delete DOES reach the folds), an
+    // aggregate never goes dormant so the replay path never feeds one, and a delete for a key that
+    // was never inserted must move no aggregate anyway.
+    if delta.is_empty() {
+        publish_envelope_trace(trace_tx, tr, ts, &delta, &txid, &lsn);
+        return Ok(());
     }
     // Subquery shapes/nodes: route this delta through the cross-table registry. Under the lock it
     // updates the shared inner-set nodes (in-memory) and emits outer-shape deltas; the flip-driven
@@ -1436,25 +1595,36 @@ pub(crate) async fn process_envelope(
             }
         }
     }
-    // Publish the trace event (serialize once; lossy send — see `crate::trace`).
-    if let Some((hops, shape_ids)) = tr {
-        let ev = crate::trace::TraceEvent {
-            lsn: lsn.clone(),
-            txid: txid.clone(),
-            table: ts.table.clone(),
-            delta: delta
-                .iter()
-                .take(crate::trace::DELTA_CAP)
-                .map(|Tup2(row, w)| crate::trace::TraceDelta { row: ts.row_to_json(row), w: *w })
-                .collect(),
-            hops,
-            shapes: shape_ids,
-        };
-        if let Ok(json) = serde_json::to_string(&ev) {
-            let _ = trace_tx.send(Arc::new(json));
-        }
-    }
+    publish_envelope_trace(trace_tx, tr, ts, &delta, &txid, &lsn);
     Ok(())
+}
+
+/// Publish one envelope's trace event (serialize once; lossy send — see `crate::trace`). No-op when
+/// nothing was collected, i.e. when nobody is subscribed.
+fn publish_envelope_trace(
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    tr: Option<(Vec<crate::trace::TraceHop>, Vec<String>)>,
+    ts: &TableSchema,
+    delta: &[Tup2<Row, ZWeight>],
+    txid: &Option<String>,
+    lsn: &Option<String>,
+) {
+    let Some((hops, shape_ids)) = tr else { return };
+    let ev = crate::trace::TraceEvent {
+        lsn: lsn.clone(),
+        txid: txid.clone(),
+        table: ts.table.clone(),
+        delta: delta
+            .iter()
+            .take(crate::trace::DELTA_CAP)
+            .map(|Tup2(row, w)| crate::trace::TraceDelta { row: ts.row_to_json(row), w: *w })
+            .collect(),
+        hops,
+        shapes: shape_ids,
+    };
+    if let Ok(json) = serde_json::to_string(&ev) {
+        let _ = trace_tx.send(Arc::new(json));
+    }
 }
 
 /// Total serialized byte size of a set of output envelopes (for storage/snapshot byte metrics).
