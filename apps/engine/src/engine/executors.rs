@@ -479,8 +479,9 @@ pub(crate) fn key_of(row: &Row, cols: &[usize]) -> Row {
     Row(cols.iter().map(|&i| row.0.get(i).cloned().unwrap_or(Value::Null)).collect())
 }
 
-/// Resolve an optional column-name projection to sorted, pk-included column indices (the pk is always
-/// kept so the client can key rows). `None` => emit the full row. Shared by shapes and subset queries.
+/// Resolve an optional column-name projection to sorted, primary-key-included column indices (every
+/// component is always kept so the client can identify rows). `None` => emit the full row. Shared by
+/// shapes and subset queries.
 pub(crate) fn resolve_columns(ts: &TableSchema, columns: Option<Vec<String>>) -> Result<Option<Arc<Vec<usize>>>> {
     match columns {
         None => Ok(None),
@@ -489,8 +490,10 @@ pub(crate) fn resolve_columns(ts: &TableSchema, columns: Option<Vec<String>>) ->
             for name in &names {
                 idxs.push(ts.column_index(name)?);
             }
-            if !idxs.contains(&ts.pk_index) {
-                idxs.push(ts.pk_index);
+            for &pk in &ts.pk_cols {
+                if !idxs.contains(&pk) {
+                    idxs.push(pk);
+                }
             }
             idxs.sort_unstable();
             idxs.dedup();

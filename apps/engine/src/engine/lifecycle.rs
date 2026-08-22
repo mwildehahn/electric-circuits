@@ -178,7 +178,7 @@ impl Engine {
         // `retire_join_target_if_stream_lost`).
         if let Some(sig) = &feed_sig {
             drop(st);
-            self.retire_join_target_if_stream_lost(sig).await;
+            self.retire_join_target_if_stream_lost(sig).await?;
             st = self.state.lock().await;
         }
         if let Some(sig) = &feed_sig {
@@ -592,7 +592,7 @@ impl Engine {
         let agg_sig = agg_signature(table, &where_, &func, col_idx);
         // Same stream-liveness check as the row-shape join path.
         drop(st);
-        self.retire_join_target_if_stream_lost(&agg_sig).await;
+        self.retire_join_target_if_stream_lost(&agg_sig).await?;
         st = self.state.lock().await;
         if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned() {
             if let Some(rec) = st.shapes.get(&existing_id).cloned() {
@@ -865,24 +865,46 @@ impl Engine {
     /// records nothing, so a client whose success response was lost may simply ask again — the
     /// double-delete that used to steal another subscriber's claim is gone.
     ///
-    /// The `Left` is queued, never waited on — including for the client-facing `DELETE`.
-    /// Durable-before-ack exists for records whose LOSS would make an acknowledged subscription
-    /// vanish (`Created`, `Joined`). A lost `Left` fails the other way: a restart restores one
-    /// subscription too many, whose lease then lapses within one idle window and releases it exactly
-    /// as this call would have (ADR-0008). Waiting instead would make a `DELETE` block for the whole
-    /// of a storage outage — the client times out, retries, and gets no better answer — while the
-    /// lease already guarantees the outcome.
+    /// This engine-internal form queues `Left`. Native HTTP uses
+    /// [`Self::release_subscription_durable`] instead: an acknowledged release must survive even
+    /// when leases are disabled with `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`.
     pub async fn release_subscription(&self, id: &str, sub: Option<&str>) {
+        self.release_subscription_inner(id, sub, false).await;
+    }
+
+    /// Native client-facing release: do not acknowledge until `Left` is in the restart contract.
+    ///
+    /// Unlike the purge, this needs nothing spawned: the whole mutation is the in-memory unsubscribe
+    /// plus the record, both of which happen BEFORE the wait, and nothing runs after it. A client
+    /// that times out and drops this future therefore loses only its answer — the `Left` is the
+    /// writer's from the moment it was enqueued, and lands regardless.
+    pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) {
+        self.release_subscription_inner(id, sub, true).await;
+    }
+
+    async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) {
         let mut st = self.state.lock().await;
         let released = match sub {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
             None => st.unsubscribe_anonymous(id),
         };
-        if let Some(subscription) = released {
-            self.catalog_tx.send(CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false });
-        }
+        let wait = released.and_then(|subscription| {
+            let event = CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false };
+            if durable {
+                Some(self.catalog_tx.send_durable(event))
+            } else {
+                self.catalog_tx.send(event);
+                None
+            }
+        });
+        let needs_barrier = durable && wait.is_none();
         drop(st);
         self.touch_shape(id);
+        if let Some(wait) = wait {
+            wait.await;
+        } else if needs_barrier {
+            self.catalog_tx.wait_durable().await;
+        }
     }
 
     /// Force-drop a shape NOW, bypassing the retention lifecycle: full teardown (record, share
@@ -893,24 +915,23 @@ impl Engine {
     /// queue is FIFO, so a purge ordered after an in-flight resume removes whatever the resume
     /// registered.
     ///
-    /// The `Dropped` record is **queued, not waited on**, for every caller — the engine-initiated
-    /// ones (schema drift, `TRUNCATE`, the epoch reset, which drains the queue as an explicit
-    /// barrier of its own) and the client-facing `DELETE /shapes/{id}?purge=true` alike.
-    ///
-    /// ADR-0008 proposed making the client-facing purge durable-before-ack, and this is the one
-    /// place the implementation deviates from it, because that combination is not implementable:
-    /// a purge waiting on the catalog cannot be acknowledged at all while storage is down, and a
-    /// purge is exactly what a caller reaches for when it needs a shape gone NOW — including while a
-    /// concurrent create is parked on its own durability wait (the join-vs-purge race). Waiting
-    /// turns that into a deadlock in the caller's face rather than a promise kept. So a removal is
-    /// answered at once and its record lands in order, and the loss window is closed from the other
-    /// side: the restore brings a purged-but-unrecorded shape back **with its subscriptions' lease
-    /// ages**, so it is reclaimed within one idle window unless its clients are genuinely still
-    /// there — and a repeat purge is a no-op, so saying it again costs nothing.
+    /// This engine-internal form queues `Dropped`; schema drift, `TRUNCATE`, epoch reset and
+    /// retention already provide their own completion barriers. Native HTTP uses
+    /// [`Self::purge_shape_durable`] so its success response is a restart-safe promise, including
+    /// when leases are disabled.
     ///
     /// It does NOT wait on the retirement either: the stream may still be being deleted in the
     /// background when this returns, and `GET /shapes/{id}` is 404 from now on regardless.
     pub async fn purge_shape(&self, id: &str) -> Result<()> {
+        self.purge_shape_inner(id, false).await
+    }
+
+    /// Native client-facing purge: durably record `Dropped` before acknowledging or retiring.
+    pub async fn purge_shape_durable(&self, id: &str) -> Result<()> {
+        self.purge_shape_inner(id, true).await
+    }
+
+    async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
         self.lives.lock().unwrap().remove(id);
         st.forget_subscriptions(id);
@@ -921,9 +942,15 @@ impl Engine {
         st.circuit_placement.remove(id);
         // The `Dropped` INTENT goes first, always, and the retirement follows it (ADR-0007): a crash
         // between the two leaves a record the boot can act on, the other order leaves an orphan.
-        if removed.is_some() {
-            self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
-        }
+        let wait = removed.as_ref().and_then(|_| {
+            let event = CatalogEvent::Dropped { id: id.to_string() };
+            if durable {
+                Some(self.catalog_tx.send_durable(event))
+            } else {
+                self.catalog_tx.send(event);
+                None
+            }
+        });
         if let Some(rec) = &removed {
             if let Some(seq) = st.sequencer.as_ref() {
                 let _ = seq
@@ -932,6 +959,36 @@ impl Engine {
             }
         }
         drop(st);
+        if durable {
+            // The teardown this purge promised must NOT depend on the request that asked for it.
+            // Giving up on a `DELETE` while storage is down is exactly what a client does during an
+            // outage, and that drops this handler future — but the `Dropped` still lands, because
+            // the writer owns it. Left inline, the retirement and the subquery-registry removal
+            // would simply never run in this process: the stream would linger alive until the next
+            // boot's GC and a subquery shape would stay registered and maintained as a zombie. So
+            // the work after the durability wait is owned by the PROCESS, not by the request.
+            let (engine, owned) = (self.clone(), id.to_string());
+            tokio::spawn(async move {
+                // ADR-0007 order is preserved inside the task: `Dropped` durable, then close/delete.
+                if let Some(wait) = wait {
+                    wait.await;
+                }
+                engine.finish_purge(&owned, removed).await;
+            });
+            // The request waits only for the durability BARRIER — everything enqueued up to and
+            // including that `Dropped` is in the restart contract when this returns. A concurrent
+            // retry finds `removed == None`, enqueues nothing, and waits on the same barrier.
+            self.catalog_tx.wait_durable().await;
+        } else {
+            self.finish_purge(id, removed).await;
+        }
+        Ok(())
+    }
+
+    /// The half of a purge that must outlive the request that asked for it: registry cleanup, the
+    /// stream retirement, the trace. Ordered strictly AFTER the `Dropped` intent (ADR-0007) — a
+    /// crash between the two leaves a record the boot can act on, the other order leaves an orphan.
+    async fn finish_purge(&self, id: &str, removed: Option<ShapeRecord>) {
         // Subquery shapes live in the registry (a no-op for plain shapes).
         self.subqueries.lock().await.drop_subquery_shape(id).await;
         if let Some(rec) = removed {
@@ -941,7 +998,6 @@ impl Engine {
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("purged shape {id} (forced)");
         }
-        Ok(())
     }
 
     /// Renew a subscription's lease **in memory only** — no catalog event (ADR-0008).
@@ -2088,8 +2144,8 @@ impl Engine {
     /// One `HEAD` per join answers it. Gone (404/410) or **closed** (a retirement already in flight)
     /// means the registry entry is stale: retire it properly — `Dropped` intent, close-then-delete,
     /// deregister (`purge_shape`) — and let the caller fall through to the create path, which mints a
-    /// fresh id and a fresh stream. A transient `HEAD` failure is NOT taken as loss: storage having a
-    /// moment must not cost every subscriber their shared shape.
+    /// fresh id and a fresh stream. A transient `HEAD` failure is retried; if storage remains
+    /// uncertain, creation fails rather than returning a handle the engine could not verify.
     ///
     /// Only a share that has reported **Ready** is probed. A creator registers its record and
     /// signature under the state lock and PUTs the stream after releasing it, so probing a `Pending`
@@ -2099,23 +2155,35 @@ impl Engine {
     /// Deliberately NOT done on `GET /shapes/{id}`: that route is a metadata read on the hot path of
     /// every polling client, and a storage round trip per poll would be a real cost for an answer
     /// nobody acts on. Joining is where a dead handle actually gets handed out.
-    async fn retire_join_target_if_stream_lost(&self, sig: &str) {
+    async fn retire_join_target_if_stream_lost(&self, sig: &str) -> Result<()> {
         let candidate = {
             let st = self.state.lock().await;
-            let Some(id) = st.feed_by_sig.get(sig).cloned() else { return };
+            let Some(id) = st.feed_by_sig.get(sig).cloned() else { return Ok(()) };
             let ready = st.feed_shares.get(&id).is_some_and(|s| *s.ready.borrow() == ShareOutcome::Ready);
             if !ready {
-                return;
+                return Ok(());
             }
             st.shapes.get(&id).map(|r| (id, r.stream_path.clone()))
         };
-        let Some((id, path)) = candidate else { return };
-        let lost = match self.ds.head(&path).await {
-            Ok(Some(head)) => head.closed,
-            Ok(None) => true,
-            Err(e) => {
-                tracing::warn!("join: HEAD {path} failed ({e:#}); joining the retained shape anyway");
-                false
+        let Some((id, path)) = candidate else { return Ok(()) };
+        let mut attempt = 0u32;
+        let lost = loop {
+            match self.ds.head(&path).await {
+                Ok(Some(head)) => break head.closed,
+                Ok(None) => break true,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= 3 || !crate::ds::is_unavailable(&e) {
+                        return Err(e.context(format!(
+                            "cannot verify retained shape {id}'s stream '{path}' before joining it"
+                        )));
+                    }
+                    let backoff = std::time::Duration::from_millis(100 * u64::from(attempt));
+                    tracing::warn!(
+                        "join: HEAD {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
             }
         };
         if lost {
@@ -2125,6 +2193,7 @@ impl Engine {
             );
             let _ = self.purge_shape(&id).await;
         }
+        Ok(())
     }
 
     /// The closing re-check every create and every join runs **after** its catalog durability wait.

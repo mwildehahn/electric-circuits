@@ -214,14 +214,15 @@ export function createClient(opts: {
       // same id is a renewal, never a second subscriber — so a retry after an ambiguous failure
       // costs nothing, and it names exactly what `close()` releases.
       const subscription = newSubscriptionId()
-      const create = () =>
+      const requestHandle = () =>
         trpc.shapes.create.mutate({
           table: def.table,
           where: def.where as never,
           columns: def.columns,
           subscription,
         }) as Promise<ShapeHandle>
-      const handle = await create()
+      const handle = await requestHandle()
+      let claimedHandle = handle
 
       // The envelope `type` on a shape stream is the table's CANONICAL `schema.name` (ADR-0002),
       // whatever spelling the caller used — the collection must be registered under that or nothing
@@ -231,29 +232,67 @@ export function createClient(opts: {
       const state = createStateSchema({
         [table]: { schema: zodRowSchema(tableDef, def.columns), type: table, primaryKey: tableDef.primaryKey },
       })
-      const streamUrl = opts.dsBaseUrl
-        ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`
-        : handle.streamUrl
-      const db = createStreamDB({
-        streamOptions: { url: streamUrl, contentType: 'application/json' },
-        state,
-        live: opts.liveMode ?? true,
-      })
-      await db.preload()
-      const collection = db.collections[table]
+      const openDb = async (next: ShapeHandle) => {
+        const streamUrl = opts.dsBaseUrl
+          ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${next.streamPath}`
+          : next.streamUrl
+        const nextDb = createStreamDB({
+          streamOptions: { url: streamUrl, contentType: 'application/json' },
+          state,
+          live: opts.liveMode ?? true,
+        })
+        await nextDb.preload()
+        return nextDb
+      }
+      let db = await openDb(handle)
+      let collection = db.collections[table]
+      type Listener = {
+        cb: (changes: Array<{ type: string; key: unknown; value?: unknown }>) => void
+        unsubscribe: () => void
+      }
+      const listeners = new Set<Listener>()
+
+      const renew = async () => {
+        const next = await requestHandle()
+        claimedHandle = next
+        if (next.shapeId === handle.shapeId && next.streamPath === handle.streamPath) return
+
+        // A lease can lapse long enough for retention to evict the old shape. The same
+        // subscription then creates a replacement and the returned handle is authoritative: bind
+        // the new stream before publishing it, so callers never observe a half-swapped materialization.
+        const nextDb = await openDb(next)
+        const nextCollection = nextDb.collections[table]
+        const previousDb = db
+        db = nextDb
+        collection = nextCollection
+        Object.assign(handle, next)
+        for (const listener of listeners) {
+          listener.unsubscribe()
+          const sub = collection.subscribeChanges(listener.cb as never, { includeInitialState: true })
+          listener.unsubscribe = () => sub.unsubscribe()
+        }
+        await previousDb.close?.()
+      }
 
       // Renew for as long as the materialization is open: the engine cannot see reads that go
       // straight to durable-streams, so the renewal IS the liveness signal (ADR-0008).
-      const lease = startLeaseRenewal(handle.leaseSeconds, create)
+      const lease = startLeaseRenewal(handle.leaseSeconds, renew)
 
       const mat: ShapeMaterialization = {
         handle,
-        collection,
+        get collection() {
+          return collection
+        },
         currentRows: () => collection.toArray as Row[],
         awaitTxId: (txid, timeoutMs) => db.utils.awaitTxId(txid, timeoutMs),
         subscribe: (cb) => {
           const sub = collection.subscribeChanges(cb as never, { includeInitialState: false })
-          return () => sub.unsubscribe()
+          const listener: Listener = { cb, unsubscribe: () => sub.unsubscribe() }
+          listeners.add(listener)
+          return () => {
+            listener.unsubscribe()
+            listeners.delete(listener)
+          }
         },
         renew: () => lease.renew(),
         close: async () => {
@@ -265,7 +304,7 @@ export function createClient(opts: {
           // Release OUR subscription: shapes are shared server-side, so every shape() must release
           // exactly the claim it took — by id, which is also what makes the retry inside
           // `deleteShapeWithRetry` safe.
-          await deleteShapeWithRetry(trpc, handle.shapeId, subscription)
+          await deleteShapeWithRetry(trpc, claimedHandle.shapeId, subscription)
         },
       }
       return track(mat)
@@ -299,7 +338,7 @@ export function createClient(opts: {
 
     async aggregate(def) {
       const subscription = newSubscriptionId()
-      const create = () =>
+      const requestHandle = () =>
         trpc.aggregate.create.mutate({
           table: def.table,
           where: def.where as never,
@@ -307,43 +346,58 @@ export function createClient(opts: {
           col: def.col,
           subscription,
         }) as Promise<ShapeHandle>
-      const handle = await create()
-      const lease = startLeaseRenewal(handle.leaseSeconds, create)
-      const url = opts.dsBaseUrl
-        ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`
-        : handle.streamUrl
+      const handle = await requestHandle()
+      let boundHandle = handle
+      let claimedHandle = handle
       let current: AggregateValue = null
       let n = 0
       const subs = new Set<(v: AggregateValue) => void>()
-      const ac = new AbortController()
-      // The engine streams the running aggregate as `{ value, n }` envelopes (keyed "agg"); keep the latest.
-      void (async () => {
-        try {
-          const resp = await stream<StreamEnvelope>({
-            url,
-            offset: '-1',
-            live: opts.liveMode === true ? 'long-poll' : (opts.liveMode ?? 'long-poll'),
-            contentType: 'application/json',
-            signal: ac.signal,
-          })
-          for await (const env of resp.jsonStream()) {
-            // A close() aborts the fetch, but a batch already yielded keeps iterating — without
-            // this guard its callbacks can land AFTER a replacement subscription's state and pin a
-            // stale value (observed as a frozen count badge on aggregate-definition churn).
-            if (ac.signal.aborted) break
-            const v = env.value as { value?: AggregateValue; n?: number } | undefined
-            if (v && 'value' in v) {
-              current = v.value ?? null
-              n = v.n ?? 0
-              for (const cb of subs) cb(current)
+      let readerGeneration = 0
+      let reader: AbortController | undefined
+      const startReader = (next: ShapeHandle) => {
+        reader?.abort()
+        const ac = new AbortController()
+        reader = ac
+        const generation = ++readerGeneration
+        const url = opts.dsBaseUrl
+          ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${next.streamPath}`
+          : next.streamUrl
+        // The engine streams the running aggregate as `{ value, n }` envelopes (keyed "agg"); keep the latest.
+        void (async () => {
+          try {
+            const resp = await stream<StreamEnvelope>({
+              url,
+              offset: '-1',
+              live: opts.liveMode === true ? 'long-poll' : (opts.liveMode ?? 'long-poll'),
+              contentType: 'application/json',
+              signal: ac.signal,
+            })
+            for await (const env of resp.jsonStream()) {
+              // A retired reader can still yield a buffered batch after abort. Only the currently
+              // bound generation may publish aggregate state.
+              if (ac.signal.aborted || generation !== readerGeneration) break
+              const v = env.value as { value?: AggregateValue; n?: number } | undefined
+              if (v && 'value' in v) {
+                current = v.value ?? null
+                n = v.n ?? 0
+                for (const cb of subs) cb(current)
+              }
             }
+          } catch (e) {
+            // Retirement and explicit close abort the old fetch; only a live reader reports errors.
+            if (!ac.signal.aborted && generation === readerGeneration) console.error('aggregate stream error', e)
           }
-        } catch (e) {
-          // After close() the aggregate's durable stream may already be gone (the engine deletes it
-          // on the final drop), so a racing read 404s — normal termination, not an error.
-          if (!ac.signal.aborted) console.error('aggregate stream error', e)
-        }
-      })()
+        })()
+      }
+      startReader(handle)
+      const renew = async () => {
+        const next = await requestHandle()
+        claimedHandle = next
+        if (next.shapeId === boundHandle.shapeId && next.streamPath === boundHandle.streamPath) return
+        boundHandle = next
+        startReader(next)
+      }
+      const lease = startLeaseRenewal(handle.leaseSeconds, renew)
       const sub: AggregateSubscription = {
         value: () => current,
         count: () => n,
@@ -356,8 +410,8 @@ export function createClient(opts: {
         renew: () => lease.renew(),
         close: async () => {
           await lease.stop() // drain an in-flight renewal before releasing — see `shape()` above
-          ac.abort()
-          await deleteShapeWithRetry(trpc, handle.shapeId, subscription)
+          reader?.abort()
+          await deleteShapeWithRetry(trpc, claimedHandle.shapeId, subscription)
         },
       }
       return track(sub)

@@ -14,17 +14,23 @@ client-chosen `subscription` id on `POST /shapes`, echoed in the response and ca
 `Created`/`Joined`/`Left`), repeating a create or a release with the same id is a no-op rather than a
 second count, every catalog event carries an event id the fold de-duplicates, and the records that
 **create** something a client is promised — `Created`, and the `Joined` of a new claim — are durable
-before they are acknowledged. The removals (`Left`, `Dropped`, and a renewal's `Joined`) stay
-answered-at-once: making them wait would leave a caller unable to release or purge anything at all
-while storage is down — the purge that would free a shape a create is parked on included — and the
-lease below reconverges a record that never landed, within one idle window, which a wait cannot
-improve on. A subscription is also a **lease**: it counts as live only if it was created
-or renewed (the same `POST` with the same id) within the shape idle window
-(`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`), because on the native path reads go straight to
-durable-streams and the engine cannot see them — the refcount is the only liveness signal it has, and
-an unrenewed one is not a signal. Server-minted ids (no client idempotency on create) and refcounts
-without leases were considered and rejected: the first leaves the lost-create phantom unrecoverable,
-the second lets any dead client pin a shape forever.
+before they are acknowledged. So are the client-facing **removals**: a native `DELETE` does not answer
+until its `Left`/`Dropped` is in the restart contract, and a retry of one — idempotent by
+construction — waits on the same barrier instead of answering from memory. Engine-internal removals
+(schema drift, `TRUNCATE`, the epoch reset, retention) stay queued; they carry their own completion
+barriers and no client is being told anything. The earlier reasoning for answering client removals at
+once was wrong twice over: it argued that a purge waiting on storage would deadlock a create parked
+on its own durability wait, which it cannot — a purge does not unpark a create, and both are simply
+waiting for the same storage to come back — and it leaned entirely on the lease to reconverge a
+removal that never landed, when `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` is a supported production
+setting that disables lease expiry outright, leaving durable-before-ack the only restart-safe
+contract there is. A renewal's `Joined` does stay queued (see below). A subscription is also a
+**lease**: it counts as live only if it was created or renewed (the same `POST` with the same id)
+within the shape idle window (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`), because on the native path reads
+go straight to durable-streams and the engine cannot see them — the refcount is the only liveness
+signal it has, and an unrenewed one is not a signal. Server-minted ids (no client idempotency on
+create) and refcounts without leases were considered and rejected: the first leaves the lost-create
+phantom unrecoverable, the second lets any dead client pin a shape forever.
 
 ## Consequences
 
@@ -47,13 +53,22 @@ the second lets any dead client pin a shape forever.
   a `Left` for its own subscription id — idempotent, so it cannot steal anyone else's claim.
 - What this does not do: it does not observe reads. Liveness is the caller's renewal, full stop; a
   client that holds a handle and never renews is, after the idle window, a client that left.
-- **Removals are answered before their record is durable** (`Left`, `Dropped`). The loss window is
-  closed from the other side instead: the restore brings a subscription back with its **lease age**,
-  so a `Left` that never landed is re-applied by the sweeper within one idle window, and a `Dropped`
-  that never landed leaves a shape whose (stale) subscriptions lapse the same way — with a repeat
-  purge a no-op. What is genuinely given up is the *immediacy* of a purge across a crash: a shape
-  purged while the catalog was unavailable is back for at most one idle window after a restart,
-  before the leases reclaim it.
+- **Client-facing removals are durable before they are acknowledged** (`Left` and `Dropped` from the
+  native `DELETE`). The success response is a promise a restart keeps: a purged shape does not come
+  back, a released claim is not restored. A concurrent retry finds its in-memory mutation already
+  applied, enqueues nothing, and waits on the same durability barrier before answering, so the repeat
+  is exactly as strong as the first request rather than a weaker one. What is given up is
+  availability: a native `DELETE` blocks for as long as storage is down. A client that times out
+  learns nothing about the outcome and may safely ask again — and abandoning the request does not
+  abandon the work, because the record still lands (the writer owns it) and the teardown it promised
+  is completed by the engine rather than by the dropped request future.
+- **Engine-internal removals stay queued** — drift, `TRUNCATE`, the epoch reset, retention eviction —
+  as does the legacy anonymous `DELETE`, which cannot name what it released. For those the lease is
+  still the repair: the restore brings a subscription back with its **lease age**, so a `Left` that
+  never landed is re-applied by the sweeper within one idle window, and a `Dropped` that never landed
+  leaves a shape whose (stale) subscriptions lapse the same way — with a repeat purge a no-op. That
+  repair does not exist under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, which is precisely why the
+  client-facing path no longer relies on it.
 - **A lease RENEWAL's `Joined` is queued, not awaited.** Durable-before-ack exists for a record whose
   loss would make an acknowledged subscription vanish; a renewal's claim is already in the log, and
   making every renewal a storage round trip would put a client's heartbeat on the critical path of
@@ -62,9 +77,16 @@ the second lets any dead client pin a shape forever.
 - **The engine mints an id for a create that names none** (as decided) — and marks it, with a `~`
   prefix a caller may not invent. The legacy anonymous `DELETE` releases a minted claim before a
   named one, so a caller that never learned the protocol cannot take the claim of one that did. The
-  mark is not a wall: a `~` id the engine currently holds is the caller's own claim, and renewing or
-  releasing with it is ordinary — only an UNKNOWN `~` id is refused (400), because that one could
-  only have been forged.
+  mark is not a wall, and it is not tied to current ownership either: the catalog carries the
+  **provenance** of every `~` id this history has minted (restored by the fold from `Created` and
+  `Joined`), and any id in that set is accepted for renewal or release — after it lapses, after it is
+  released, and after a restart. That is what makes a minted id a returned capability rather than one
+  that expires the moment the engine forgets the claim. Only a `~` id the history has never minted is
+  refused (400), because that one could only have been forged.
+- **That provenance set only grows.** It holds one id per anonymous create for the lifetime of the
+  catalog — in memory, and re-derived by the fold on every boot — so it is bounded by the catalog's
+  length, not by the live subscription count. A deployment whose clients never name their own
+  subscriptions pays for that, and nothing compacts it today.
 - **The lease boundary belongs to the client**: the clock is wall-clock seconds, so a claim lapses
   once its age is strictly greater than the window. Lapsing at `>=` would end a one-second window
   after a millisecond.

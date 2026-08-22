@@ -325,16 +325,21 @@ canvas update, screenshot.
   re-fold at boot can reconcile them — but only **once the catalog stream exists in this process**:
   until the creating PUT has succeeded, an append failure can just as well be "the stream is not
   there yet", so every failure is retried (a permanently-4xx PUT is retried forever, and says so).
-  The rule for which records wait: **durable-before-ack = `Created`, and `Joined` for a
-  NEW claim** (`send_durable`, awaited before the HTTP answer, no timeout — a create while storage is
-  down waits rather than handing back a shape a restart would forget; a lease RENEWAL promises
-  nothing new and is queued); **queued-never-dropped = everything else, including `Left` and
-  `Dropped`** — a removal is answered at once and its record lands in order. Waiting on a removal
-  would block every `DELETE`/purge for the whole of a storage outage — including the purge that
-  unblocks a create parked on its own durability wait — and losing one is bounded from the other
-  side: the restore brings the shape back with its subscriptions' **lease ages**, so an unrenewed
-  claim is released within one sweep (ADR-0008). If you add a mutation whose acknowledgement CREATES
-  something, use `send_durable`.
+  The rule for which records wait: **durable-before-ack = every record a CLIENT is told about** —
+  `Created` and the `Joined` of a NEW claim (`send_durable`, awaited before the HTTP answer, no
+  timeout — a create while storage is down waits rather than handing back a shape a restart would
+  forget), and the `Left`/`Dropped` of a native `DELETE`, whose success response has to mean the
+  release or the purge survives a restart even under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, where no
+  lease will ever repair it. A retry of an idempotent removal finds its mutation already applied,
+  enqueues nothing and waits on the same barrier (`CatalogWriter::wait_durable`) rather than
+  answering from memory. **Queued-never-dropped = everything the engine does to itself**: a lease
+  RENEWAL's `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the
+  epoch reset, retention and the `/v1/shape` adapter — those have their own completion barriers, and
+  the lease still reconverges them (the restore brings the shape back with its subscriptions' **lease
+  ages**, so an unrenewed claim is released within one sweep — ADR-0008). If you add a mutation whose
+  acknowledgement PROMISES something — that a shape exists, or that it is gone — use `send_durable`,
+  and do the work that follows the wait in a spawned task: a client that times out drops the request
+  future, and the promise must not be dropped with it (`purge_shape_inner`).
 - **A durability wait is an interval: re-check the closing conditions AFTER it, before answering**
   (`Engine::recheck_after_durability`). `send_durable` is unbounded external I/O, so anyone who can
   make storage slow can hold a create/join open while a `TRUNCATE`, a schema drift, an epoch reset or
@@ -383,7 +388,12 @@ canvas update, screenshot.
   ambiguous outcomes of an HTTP mutation (a response lost after the server committed) stop being
   corruption. An id held by a different shape is refused 409; an omitted one is minted by the engine
   and returned, with no idempotency on that first create; a `DELETE` with no id is the legacy
-  anonymous decrement (not retry-safe, and it takes a minted claim before a named one). And because
+  anonymous decrement (not retry-safe, and it takes a minted claim before a named one). A minted `~`
+  id is validated against **provenance, not ownership** (`known_minted_subs`, restored by the fold
+  from `Created`/`Joined`): an id this history has ever minted stays usable after the claim lapses,
+  after it is released and across a restart — that is what makes it a returned capability — while an
+  id in the `~` namespace the engine never minted is a 400. The set only grows, one entry per
+  anonymous create for the catalog's lifetime. And because
   native reads go straight to durable-streams where the engine cannot see them, the renewal IS the
   liveness signal: a claim not renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` is released by the
   retention sweeper exactly as an explicit delete would release it (`Left { lapsed: true }`), and

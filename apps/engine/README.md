@@ -201,7 +201,7 @@ unchanged.
 | `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |
 | `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`, `subscription`) — identical definitions share one stream. Repeating the create with the same `subscription` **renews** it and returns the same handle (see "Subscriptions") |
 | `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`, `subscription`) |
-| `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…` | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash) |
+| `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…` | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash). Either form answers only once its catalog record is **durable**, so it blocks while storage is down and a timeout means "no answer", never "not done" — retry it (see *Durability of a create, and of a retirement*) |
 | `GET /shapes/{id}/rows` | current contents of an existing shape (folds its stream; visualizer preview) |
 | `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
@@ -317,7 +317,9 @@ the engine mints) — and every create response carries the `subscription` it wa
   which claim was meant), and it releases an engine-minted claim before an identified one so it
   cannot steal a named subscriber's. Omitting `subscription` on the create is the same trade — the
   engine mints and returns one, but that first create had no idempotency, because a repeat is
-  indistinguishable from a new subscriber.
+  indistinguishable from a new subscriber. A minted `~` id is a real capability: the catalog remembers
+  every one this history has issued, so the caller may renew or release with it after the claim has
+  lapsed, after it has been released, and after a restart. A `~` id the engine never minted is `400`.
 - **A subscription is a lease.** Native reads go straight to durable-streams, so the engine never
   sees them: a claim counts as live only while it is created or renewed within
   `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
@@ -355,17 +357,25 @@ whose shape was retired during the wait is never returned. A join additionally `
 stream: if storage has lost it, the stale registry entry is retired and the caller gets a fresh shape
 rather than a dead URL.
 
-Removals are the other way round: `DELETE /shapes/{id}`, with or without `?purge=true`, is answered
-as soon as the engine state is updated and its `Left`/`Dropped` lands behind it, in order. Waiting
-would block every removal for the whole of a storage outage — including the purge a caller reaches
-for precisely because something must go NOW, and which may itself be what unblocks a create parked on
-its own durability wait. Losing one is bounded instead: a `Left` that never landed comes back as a
-subscription whose **restored lease age** is already past the idle window, so the sweeper releases it
-within one sweep; a `Dropped` that never landed comes back as a shape whose subscriptions are equally
-stale, and a repeated purge is a no-op. Answer first, record after.
+**A native removal waits too.** `DELETE /shapes/{id}`, with or without `?purge=true`, is acknowledged
+only once its `Left`/`Dropped` has reached the durable catalog. A `200` therefore means the release or
+the purge survives a restart — including under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, where leases are
+disabled and nothing would ever repair a record that went missing. The removal is **retry-safe**: a
+second identical `DELETE` finds the engine state already updated, records nothing new, and waits on
+the same durability barrier before answering, so it is as strong an answer as the first.
 
-(ADR-0008 proposed making a client-facing purge durable-before-ack; the implementation deliberately
-does not — see `Engine::purge_shape` for why that combination is not implementable.)
+A `DELETE` that times out means only that the client stopped waiting for the answer. It does not
+cancel anything: the record is owned by the catalog writer and still lands, and for a purge the
+teardown that follows it — the subquery-registry removal and the stream's close-then-delete — runs in
+a task the engine owns, not in the abandoned request. Retrying after a timeout is always safe, and
+after storage recovers the outcome is the same either way.
+
+Engine-internal removals are the other way round, and stay queued: drift, `TRUNCATE`, the epoch reset,
+retention eviction and the `/v1/shape` adapter's release each have a completion barrier of their own,
+and the lease reconverges what a crash loses — a `Left` that never landed comes back as a subscription
+whose **restored lease age** is already past the idle window, so the sweeper releases it within one
+sweep; a `Dropped` that never landed comes back as a shape whose subscriptions are equally stale, and
+a repeated purge is a no-op.
 
 A *definite* refusal of a record (a 4xx, an event that will not serialize) is the pathological case —
 memory and storage disagree — and exits `74`. Note what that means for a storage front that accepts

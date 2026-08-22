@@ -141,5 +141,23 @@ the claim under that name and returns it on the handle together with `leaseSecon
   with `shape.renew()` / `subset.renew()` / `aggregate.renew()` — the same create with the same id,
   which the engine treats as "still here", never as a second subscriber. If a lease does lapse, the
   next create simply re-subscribes (possibly to a fresh shape — the ordinary re-subscribe contract).
+- **A renewal may hand back a REPLACEMENT, and the materialization rebinds itself to it.** A lease
+  that lapses long enough for retention to evict the shape means the next renewal creates a new one:
+  the handle it returns is authoritative, and `shape()`, `subset()` and `aggregate()` each move onto
+  it rather than keep reading a stream that is gone. `handle` is updated in place and `close()`
+  releases the claim on the shape it actually ended up holding, so a caller that kept a reference to
+  the handle stays correct.
+
+  What that costs each one is different, because a replacement stream carries no history:
+  - `shape()` re-preloads the whole new stream. Its `collection` object is REPLACED, so read it
+    through `mat.collection` / `mat.currentRows()` rather than caching it; every listener registered
+    with `mat.subscribe()` is re-subscribed to the new collection **with initial state**, i.e. it
+    receives the full contents again as inserts, not just the delta since the last change it saw.
+  - `aggregate()` seeds the full value from the new stream, so `value()`/`count()` simply continue.
+  - `subset()` re-runs its page query and installs the result as the loaded window in a single
+    commit. The replacement feed is changes-only from its own creation, so anything that changed
+    while the subscription was lapsed and its feed evicted exists in no feed at all — only re-reading
+    the page recovers it. Pages beyond the first that `loadMore()` had loaded are NOT restored: the
+    window is back to the initial `limit`, and `hasMore()` describes that window again.
 
 Design context: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).

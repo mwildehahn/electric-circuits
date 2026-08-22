@@ -235,7 +235,7 @@ describe('native catalog durability under a durable-streams status failure', () 
     }, 'the stale shape stream to be deleted after durable-streams recovers')
   }, 90000)
 
-  it('does not resurrect an acknowledged purge when its catalog intent and retirement are interrupted', async () => {
+  it('does not retire or acknowledge purge before its catalog intent is durable', async () => {
     let proxy: CatalogFaultProxy | undefined
     h = await bootHarness(schema, {
       wrapEngineDs: async (upstreamUrl) => {
@@ -254,43 +254,152 @@ describe('native catalog durability under a durable-streams status failure', () 
     const shape = await createShape(h, { table: 'items' })
     expect((await foldStream(shape.streamUrl)).has('1')).toBe(true)
 
-    // Keep both halves of the promised retirement from reaching storage. The only interactions are
-    // the native purge route and ordinary HTTP failures from the engine's storage dependency.
+    // Keep both halves of the promised retirement from reaching storage. The public request must
+    // wait at the Dropped intent before attempting stream retirement or acknowledging success.
     proxy!.failCatalogAppends(true)
     proxy!.failShapeRetirements(true)
-    const purged = await fetch(`${h.engineUrl}/shapes/${shape.shapeId}?purge=true`, { method: 'DELETE' })
-    expect(purged.ok, 'the native API acknowledged that the shape was purged').toBe(true)
+    let acknowledged = false
+    const deleting = fetch(`${h.engineUrl}/shapes/${shape.shapeId}?purge=true`, { method: 'DELETE' }).then((response) => {
+      acknowledged = true
+      return response
+    })
     await waitFor(
       () => Promise.resolve(proxy!.failedCatalogAppends() > 0),
       'the proxy to reject the Dropped catalog intent',
     )
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(acknowledged).toBe(false)
+    expect(proxy!.failedShapeRetirements()).toBe(0)
+
+    proxy!.failCatalogAppends(false)
+    const purged = await deleting
+    expect(purged.ok, 'the native API acknowledged the purge after Dropped became durable').toBe(true)
     await waitFor(
       () => Promise.resolve(proxy!.failedShapeRetirements() >= 2),
       'the proxy to reject both close and delete',
     )
     expect((await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status).toBe(404)
 
-    // Crash while the acknowledged Dropped event and retirement are both still retrying. Recovery
-    // happens only after the old process is gone, so it cannot flush its in-memory catalog queue.
+    // Crash with retirement still retrying. Dropped is already durable, so recovery has an explicit
+    // obligation to complete rather than relying on the subscription lease.
     await h.restartEngine(async () => {
-      proxy!.failCatalogAppends(false)
       proxy!.failShapeRetirements(false)
     })
 
-    // Under ADR-0008 a purge acknowledged while the durable catalog was unavailable is reconverged
-    // by the LEASE after a restart, within one idle window: the shape comes back from its `Created`
-    // record with its subscriptions' restored lease ages, nothing renews them, and the sweeper
-    // reclaims it. (Waiting for the `Dropped` before answering is not an option — it would leave a
-    // caller unable to purge anything at all during an outage, deadlocking against a create parked
-    // on its own durability wait.)
-    await waitFor(
-      async () => (await fetch(`${h!.engineUrl}/shapes/${shape.shapeId}`)).status === 404,
-      'the lease to reclaim the purged shape after restart',
-    )
+    expect((await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status).toBe(404)
     await waitFor(async () => {
       const response = await fetch(shape.streamUrl)
       return response.status === 404 || response.status === 410
     }, 'the purged stream to remain retired after restart')
+  }, 90000)
+
+  it('does not acknowledge purge before durability when leases are disabled', async () => {
+    let proxy: CatalogFaultProxy | undefined
+    h = await bootHarness(schema, {
+      wrapEngineDs: async (upstreamUrl) => {
+        proxy = await startCatalogFaultProxy(upstreamUrl)
+        return proxy
+      },
+      engineEnv: {
+        // Zero is a supported production setting: it disables dormancy and, under ADR-0008, lease
+        // expiry. A purge acknowledgement still has to survive a process boundary in this mode.
+        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '0',
+        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      },
+    })
+
+    const shape = await createShape(h, { table: 'items' })
+    proxy!.failCatalogAppends(true)
+    proxy!.failShapeRetirements(true)
+    let acknowledged = false
+    const deleting = fetch(`${h.engineUrl}/shapes/${shape.shapeId}?purge=true`, { method: 'DELETE' }).then((response) => {
+      acknowledged = true
+      return response
+    })
+    await waitFor(
+      () => Promise.resolve(proxy!.failedCatalogAppends() > 0),
+      'the proxy to reject the Dropped catalog intent',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(acknowledged, 'native purge must wait for its Dropped intent when leases cannot repair it').toBe(false)
+
+    let retryAcknowledged = false
+    const retrying = fetch(`${h.engineUrl}/shapes/${shape.shapeId}?purge=true`, { method: 'DELETE' }).then(
+      (response) => {
+        retryAcknowledged = true
+        return response
+      },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(retryAcknowledged, 'a concurrent purge retry must wait for the first request durability barrier').toBe(false)
+
+    proxy!.failCatalogAppends(false)
+    const [purged, retried] = await Promise.all([deleting, retrying])
+    expect(purged.ok, 'the native API acknowledged the purge after its intent became durable').toBe(true)
+    expect(retried.ok).toBe(true)
+    await waitFor(
+      () => Promise.resolve(proxy!.failedShapeRetirements() >= 2),
+      'the proxy to reject both close and delete',
+    )
+
+    await h.restartEngine(async () => {
+      proxy!.failShapeRetirements(false)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 2500))
+
+    expect(
+      (await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status,
+      'an acknowledged purge must not resurrect permanently when the supported zero-lease mode is configured',
+    ).toBe(404)
+    expect((await fetch(shape.streamUrl)).status).toBe(404)
+  }, 90000)
+
+  it('retires a purged stream after the client abandons its durability wait', async () => {
+    let proxy: CatalogFaultProxy | undefined
+    h = await bootHarness(schema, {
+      wrapEngineDs: async (upstreamUrl) => {
+        proxy = await startCatalogFaultProxy(upstreamUrl)
+        return proxy
+      },
+      engineEnv: {
+        // Zero disables lease repair, so the abandoned purge is the ONLY thing that can retire this
+        // stream: no background sweep can finish the job for it and hide the leak.
+        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '0',
+        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      },
+    })
+
+    const shape = await createShape(h, { table: 'items' })
+    expect((await fetch(shape.streamUrl)).status).toBe(200)
+
+    // Giving up on a request that is waiting for storage is what a client DOES during an outage.
+    // The engine has already taken the shape out of its state and owns a Dropped its writer will
+    // land regardless, so the retirement it promised is the engine's obligation alone from here.
+    proxy!.failCatalogAppends(true)
+    const abort = new AbortController()
+    const abandoned = fetch(`${h.engineUrl}/shapes/${shape.shapeId}?purge=true`, {
+      method: 'DELETE',
+      signal: abort.signal,
+    })
+    await waitFor(
+      () => Promise.resolve(proxy!.failedCatalogAppends() > 0),
+      'the proxy to reject the Dropped catalog intent',
+    )
+    abort.abort()
+    await expect(abandoned).rejects.toThrow()
+    proxy!.failCatalogAppends(false)
+
+    expect((await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status).toBe(404)
+    await waitFor(async () => {
+      const dropped = (await readCatalogEvents(h!.dsUrl)).filter(
+        (event) => event.t === 'dropped' && event.id === shape.shapeId,
+      )
+      return dropped.length === 1
+    }, 'the abandoned purge to still record exactly one Dropped intent')
+    await waitFor(async () => {
+      const response = await fetch(shape.streamUrl)
+      return response.status === 404 || response.status === 410
+    }, 'the abandoned purge to still retire its durable stream in this process')
   }, 90000)
 
   it('does not acknowledge a join whose shared shape was purged during its durability wait', async () => {
@@ -309,16 +418,16 @@ describe('native catalog durability under a durable-streams status failure', () 
 
     // The join has passed its lifecycle/schema checks and is waiting only for catalog durability.
     // Purge the shared shape through the native API while that external storage wait is in flight.
-    const purged = await fetch(`${h.engineUrl}/shapes/${first.shapeId}?purge=true`, { method: 'DELETE' })
-    expect(purged.ok).toBe(true)
+    const purging = fetch(`${h.engineUrl}/shapes/${first.shapeId}?purge=true`, { method: 'DELETE' })
     await waitFor(
       async () => (await fetch(`${h!.engineUrl}/shapes/${first.shapeId}`)).status === 404,
       'the shared shape to be purged',
     )
-    expect((await fetch(first.streamUrl)).status).toBe(404)
 
     proxy!.failCatalogAppends(false)
-    const joined = await joining
+    const [purged, joined] = await Promise.all([purging, joining])
+    expect(purged.ok).toBe(true)
+    expect((await fetch(first.streamUrl)).status).toBe(404)
     expect(
       (await fetch(`${h.engineUrl}/shapes/${joined.shapeId}`)).status,
       'a successful native join must return a shape that still exists',
@@ -524,7 +633,7 @@ describe('native catalog durability under a durable-streams status failure', () 
     ).toBe(404)
   }, 90000)
 
-  it('does not forget an acknowledged release when shutdown is forced during a catalog outage', async () => {
+  it('does not acknowledge a release discarded by forced shutdown during a catalog outage', async () => {
     let proxy: CatalogFaultProxy | undefined
     h = await bootHarness(schema, {
       wrapEngineDs: async (upstreamUrl) => {
@@ -540,12 +649,23 @@ describe('native catalog durability under a durable-streams status failure', () 
 
     const shape = await createShape(h, { table: 'items' })
     proxy!.failCatalogAppends(true)
-    const released = await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`, { method: 'DELETE' })
-    expect(released.ok, 'the native API acknowledged the subscription release').toBe(true)
+    let acknowledged = false
+    const releasing = fetch(
+      `${h.engineUrl}/shapes/${shape.shapeId}?subscription=${encodeURIComponent(shape.subscription!)}`,
+      { method: 'DELETE' },
+    ).then(
+      (response) => {
+        acknowledged = true
+        return { response }
+      },
+      (error: unknown) => ({ error }),
+    )
     await waitFor(() => Promise.resolve(proxy!.failedCatalogAppends() > 0), 'the Left event to be blocked')
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(acknowledged, 'a release whose only durable copy is still blocked must remain pending').toBe(false)
 
     // A normal SIGTERM cannot drain an unavailable catalog. A second signal is the documented
-    // external forced-shutdown path and discards the process's only copy of the acknowledged Left.
+    // external forced-shutdown path and discards the process's only copy of this unacknowledged Left.
     h.signalEngine('SIGTERM')
     await waitFor(async () => {
       try {
@@ -557,18 +677,94 @@ describe('native catalog durability under a durable-streams status failure', () 
     h.signalEngine('SIGTERM')
     const exit = await h.waitForEngineExit(20000)
     expect(exit.code).toBe(70)
+    expect(await releasing).toHaveProperty('error')
 
     proxy!.failCatalogAppends(false)
     await h.startEngine()
     expect(
       (await readCatalogEvents(h.dsUrl)).filter((event) => event.t === 'left' && event.id === shape.shapeId),
-      'the forced exit occurred before the queued release reached durable storage',
+      'the forced exit occurred before the unacknowledged release reached durable storage',
     ).toHaveLength(0)
+    const restored = await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)
+    expect(restored.status).toBe(200)
+    expect(((await restored.json()) as { subscriptions?: number }).subscriptions).toBe(1)
+
+    const retried = await fetch(
+      `${h.engineUrl}/shapes/${shape.shapeId}?subscription=${encodeURIComponent(shape.subscription!)}`,
+      { method: 'DELETE' },
+    )
+    expect(retried.ok).toBe(true)
     await new Promise((resolve) => setTimeout(resolve, 5000))
     expect(
       (await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status,
-      'the acknowledged release must remain effective after restart so retention can reclaim the shape',
+      'the caller can retry the unacknowledged identified release after restart',
     ).toBe(404)
     expect((await fetch(shape.streamUrl)).status).toBe(404)
+  }, 90000)
+
+  it('does not acknowledge release before durability when leases are disabled', async () => {
+    let proxy: CatalogFaultProxy | undefined
+    h = await bootHarness(schema, {
+      wrapEngineDs: async (upstreamUrl) => {
+        proxy = await startCatalogFaultProxy(upstreamUrl)
+        return proxy
+      },
+      engineEnv: {
+        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '0',
+        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      },
+    })
+
+    const shape = await createShape(h, { table: 'items', subscription: 'review-zero-lease' })
+    proxy!.failCatalogAppends(true)
+    let acknowledged = false
+    const deleting = fetch(
+      `${h.engineUrl}/shapes/${shape.shapeId}?subscription=${encodeURIComponent('review-zero-lease')}`,
+      { method: 'DELETE' },
+    ).then((response) => {
+      acknowledged = true
+      return response
+    })
+    await waitFor(() => Promise.resolve(proxy!.failedCatalogAppends() > 0), 'the Left event to be blocked')
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(acknowledged, 'native release must wait for its Left event when leases cannot repair it').toBe(false)
+
+    let retryAcknowledged = false
+    const retrying = fetch(
+      `${h.engineUrl}/shapes/${shape.shapeId}?subscription=${encodeURIComponent('review-zero-lease')}`,
+      { method: 'DELETE' },
+    ).then((response) => {
+      retryAcknowledged = true
+      return response
+    })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(retryAcknowledged, 'a concurrent release retry must wait for the first request durability barrier').toBe(
+      false,
+    )
+
+    proxy!.failCatalogAppends(false)
+    const [released, retried] = await Promise.all([deleting, retrying])
+    expect(released.ok, 'the identified native release was acknowledged after its event became durable').toBe(true)
+    expect(retried.ok).toBe(true)
+
+    h.signalEngine('SIGTERM')
+    await waitFor(async () => {
+      try {
+        return (await fetch(`${h!.engineUrl}/ready`)).status === 503
+      } catch {
+        return false
+      }
+    }, 'shutdown to enter its readiness drain')
+    h.signalEngine('SIGTERM')
+    expect((await h.waitForEngineExit(20000)).code).toBe(70)
+
+    await h.startEngine()
+    await new Promise((resolve) => setTimeout(resolve, 2500))
+    const info = await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)
+    expect(info.status).toBe(200)
+    expect(
+      ((await info.json()) as { subscriptions?: number }).subscriptions,
+      'the durable named release must still be reflected after restart even though zero disables eviction',
+    ).toBe(0)
   }, 90000)
 })

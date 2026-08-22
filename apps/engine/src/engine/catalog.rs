@@ -146,6 +146,9 @@ const CATALOG_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(
 /// One queued catalog event, plus the (optional) acknowledgement its sender is waiting on.
 struct CatalogSend {
     ev: CatalogEvent,
+    /// Monotonic queue position. A client retry that finds its in-memory mutation already applied
+    /// waits until this position has landed before acknowledging the apparent no-op.
+    seq: u64,
     /// The event id the fold de-duplicates on (ADR-0008). Assigned at ENQUEUE, so every append
     /// attempt of this event — the first and every retry after a lost response — carries the same
     /// one.
@@ -173,6 +176,9 @@ pub(crate) struct CatalogWriter {
     /// append attempt — no clock, no hashing of the payload (two identical `Left`s ARE two
     /// different events; only a retry of the same one must be de-duplicated).
     next_eid: Arc<std::sync::atomic::AtomicU64>,
+    /// Highest queue position that has landed, plus a wake-up for durability barriers.
+    landed_seq: Arc<std::sync::atomic::AtomicU64>,
+    landed_notify: Arc<tokio::sync::Notify>,
     /// The last `Offset` checkpoint that has actually **landed in storage** — what a restart would
     /// resume from, as opposed to what this process has processed in memory.
     ///
@@ -220,11 +226,24 @@ impl CatalogWriter {
     /// re-appends the same identity — the fold then applies it exactly once however many copies of
     /// the record a lost response left in the log (ADR-0008).
     fn enqueue(&self, ev: CatalogEvent, done: Option<tokio::sync::oneshot::Sender<()>>) {
-        let n = self.next_eid.fetch_add(1, Ordering::Relaxed);
+        let n = self.next_eid.fetch_add(1, Ordering::SeqCst);
         let eid = format!("{}-{n:x}", self.eid_nonce);
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        if self.tx.send(CatalogSend { ev, eid, done }).is_err() {
+        if self.tx.send(CatalogSend { ev, seq: n, eid, done }).is_err() {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Wait until every event enqueued before this call is durable. Used by an idempotent retry
+    /// whose first request already changed memory and is still waiting on its own catalog append.
+    pub(crate) async fn wait_durable(&self) {
+        let target = self.next_eid.load(Ordering::SeqCst).saturating_sub(1);
+        loop {
+            let notified = self.landed_notify.notified();
+            if self.landed_seq.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -271,13 +290,17 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
     let counter = in_flight.clone();
     let durable: Arc<std::sync::Mutex<Option<LogPosition>>> = Arc::new(std::sync::Mutex::new(None));
     let landed = durable.clone();
+    let landed_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer_landed_seq = landed_seq.clone();
+    let landed_notify = Arc::new(tokio::sync::Notify::new());
+    let writer_landed_notify = landed_notify.clone();
     tokio::spawn(async move {
         let mut ensured = false;
         // Latches the "catalog stream create failed" line to once per outage (see
         // `ensure_catalog_logged`); it outlives one event because the retry loop below runs per
         // attempt, and an outage spans many.
         let mut ensure_logged = false;
-        while let Some(CatalogSend { ev, eid, done }) = rx.recv().await {
+        while let Some(CatalogSend { ev, seq, eid, done }) = rx.recv().await {
             // Published only on a SUCCESSFUL append: an `Offset` whose write failed is not a
             // position a restart would resume from, and treating it as one would license deleting
             // the segment underneath it.
@@ -348,6 +371,8 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                     *g = Some(pos);
                 }
             }
+            writer_landed_seq.store(seq, Ordering::SeqCst);
+            writer_landed_notify.notify_waiters();
             if attempt > 0 {
                 tracing::info!("catalog append landed after {attempt} retr(ies); durable-streams is back");
                 drop(party.take());
@@ -364,7 +389,9 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
         in_flight,
         durable,
         eid_nonce: process_nonce(),
-        next_eid: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        next_eid: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        landed_seq,
+        landed_notify,
     }
 }
 
@@ -631,6 +658,9 @@ pub(crate) struct CatalogFold {
     /// Bounded by the catalog's length, like the fold itself — it lives only for the duration of
     /// one boot's read and is dropped with the fold.
     seen: HashSet<String>,
+    /// Every engine-minted subscription id ever observed, not only the currently live set. A
+    /// returned capability may be re-used after lapse/release and restart.
+    known_minted_subs: HashSet<String>,
 }
 
 impl Default for CatalogFold {
@@ -645,6 +675,7 @@ impl Default for CatalogFold {
             current_segment: 0,
             segment_starts: std::collections::BTreeMap::new(),
             seen: HashSet::new(),
+            known_minted_subs: HashSet::new(),
         }
     }
 }
@@ -674,12 +705,18 @@ impl CatalogFold {
                 if let Some(num) = shape_id_num(&rec.id) {
                     self.max_shape_id = Some(self.max_shape_id.map_or(num, |cur| cur.max(num)));
                 }
+                if subscription.starts_with(MINTED_SUB_PREFIX) {
+                    self.known_minted_subs.insert(subscription.clone());
+                }
                 self.recs.insert(rec.id.clone(), (rec, sig, [(subscription, at)].into_iter().collect(), None));
             }
             // A join and a lease RENEWAL are the same record: insert wins for a new id, and only
             // moves the lease for one already held (ADR-0008). The restored `at` is what stops a
             // restart from handing every subscription a fresh idle window.
             CatalogEvent::Joined { id, subscription, at } => {
+                if subscription.starts_with(MINTED_SUB_PREFIX) {
+                    self.known_minted_subs.insert(subscription.clone());
+                }
                 if let Some(e) = self.recs.get_mut(&id) {
                     let lease = e.2.entry(subscription).or_insert(at);
                     *lease = (*lease).max(at);
@@ -846,9 +883,12 @@ impl Engine {
         // A catalog of nothing but creates and drops folds to `is_empty()`, so this cannot wait for
         // the branches below — that is exactly the case where re-minting would collide with a
         // `shape/*` stream whose retirement is still pending.
-        if let Some(max) = fold.max_shape_id {
+        if fold.max_shape_id.is_some() || !fold.known_minted_subs.is_empty() {
             let mut st = self.state.lock().await;
-            st.next_shape_id = st.next_shape_id.max(max + 1);
+            if let Some(max) = fold.max_shape_id {
+                st.next_shape_id = st.next_shape_id.max(max + 1);
+            }
+            st.known_minted_subs.extend(fold.known_minted_subs.iter().cloned());
         }
         if fold.is_empty() {
             return Ok(());

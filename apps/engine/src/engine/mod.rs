@@ -429,6 +429,15 @@ struct EngineState {
     /// refused (409) rather than silently accepted, because the caller would then hold one name for
     /// two shapes and be unable to release either without ambiguity.
     subs_by_id: HashMap<String, String>,
+    /// Every engine-minted subscription id this catalog history has issued, including claims that
+    /// have lapsed or been released. A returned `~` capability remains valid after its live claim
+    /// ends, while unknown ids in that reserved namespace remain rejectable.
+    ///
+    /// It only GROWS: one entry per anonymous create for the lifetime of the catalog, in memory and
+    /// re-derived by the fold at every boot (so it is bounded by the catalog's length, not by the
+    /// live subscription count). Named subscriptions cost nothing here; a deployment whose clients
+    /// never name their own pays for it, and nothing compacts it today (ADR-0008).
+    known_minted_subs: HashSet<String>,
     /// Counter behind the ids the engine mints for creates that named no subscription. Combined
     /// with a per-process nonce (see [`Engine::mint_subscription`]), so a minted id is unique
     /// across restarts too — the catalog outlives the process that wrote it.
@@ -494,6 +503,9 @@ impl EngineState {
     /// `Joined` (a claim the client is about to be told about) and a queued one (a renewal, which
     /// promises nothing new).
     fn subscribe(&mut self, shape: &str, sub: String, at: u64) -> bool {
+        if sub.starts_with(MINTED_SUB_PREFIX) {
+            self.known_minted_subs.insert(sub.clone());
+        }
         let Some(share) = self.feed_shares.get_mut(shape) else { return false };
         let fresh = match share.subs.get_mut(&sub) {
             Some(lease) => {
@@ -838,6 +850,7 @@ impl Engine {
                 unresolved: HashSet::new(),
                 epoch_gen: 0,
                 subs_by_id: HashMap::new(),
+                known_minted_subs: HashSet::new(),
                 next_minted_sub: 1,
             })),
             pg_url,
@@ -1830,12 +1843,12 @@ impl Engine {
         self.state.lock().await.shapes.get(id).cloned()
     }
 
-    /// Does any shape currently hold this subscription id? (`http::validate_new_subscription`.)
+    /// Was this subscription id minted by this engine history? (`http::validate_new_subscription`.)
     ///
-    /// The one question the create path asks about an id it did not mint: an unknown `~` id is a
-    /// forgery, a known one is the caller renewing or releasing a claim the engine handed it.
-    pub async fn subscription_is_held(&self, sub: &str) -> bool {
-        self.state.lock().await.subscription_owner(sub).is_some()
+    /// Live, lapsed and explicitly released ids are all valid returned capabilities. Provenance is
+    /// retained separately from current ownership so restart or lapse does not revoke one.
+    pub async fn subscription_was_minted(&self, sub: &str) -> bool {
+        self.state.lock().await.known_minted_subs.contains(sub)
     }
 
     /// How many live subscriptions a shape has (`GET /shapes/{id}` — ADR-0008).

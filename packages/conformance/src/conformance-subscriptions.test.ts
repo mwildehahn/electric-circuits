@@ -195,6 +195,27 @@ describe('native subscriptions are identified, idempotent and leased', () => {
     expect((await shapeInfo(anonymous.shapeId)).subscriptions).toBe(0)
   }, 90000)
 
+  it('lets a caller re-subscribe with an engine-minted id after its lease lapses and the engine restarts', async () => {
+    h = await bootHarness(schema, { engineEnv: fastRetention })
+
+    const first = await createShape(h, { table: 'items' })
+    const minted = first.subscription!
+    expect(minted.startsWith('~')).toBe(true)
+    await waitFor(
+      async () => (await shapeInfo(first.shapeId)).subscriptions === 0,
+      'the engine-minted subscription lease to lapse',
+      20000,
+    )
+    await h.restartEngine()
+
+    // This id came from the native create response. Lapsing removes its claim, not the caller's
+    // right to use that returned identity to subscribe again as ADR-0008 documents; a restart does
+    // not revoke a capability whose origin is present in the durable catalog.
+    const renewed = await createShape(h, { table: 'items', subscription: minted })
+    expect(renewed.subscription).toBe(minted)
+    expect((await shapeInfo(renewed.shapeId)).subscriptions).toBe(1)
+  }, 90000)
+
   it('refuses a subscription id that already belongs to a different shape', async () => {
     h = await bootHarness(schema)
 

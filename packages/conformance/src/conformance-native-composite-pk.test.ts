@@ -44,4 +44,27 @@ describe('native composite primary-key identity', () => {
     expect(rows.size, 'two distinct PostgreSQL primary keys must emit two native rows').toBe(2)
     expect([...rows.values()].map((row) => row.payload).sort()).toEqual(['first', 'second'])
   })
+
+  it('includes every composite primary-key column in a projected native shape', async () => {
+    h = await bootHarness(schema, {
+      ddl: `
+        CREATE TABLE items (a text NOT NULL, b text NOT NULL, payload text NOT NULL, PRIMARY KEY (a, b));
+        ALTER TABLE items REPLICA IDENTITY FULL;
+      `,
+    })
+    await pgQuery(h, "INSERT INTO items (a, b, payload) VALUES ('same', 'one', 'first'), ('same', 'two', 'second')")
+
+    const shape = await createShape(h, { table: 'items', columns: ['payload'] })
+    const rows = await foldStream(shape.streamUrl)
+    expect(rows.size).toBe(2)
+    expect(
+      [...rows.values()]
+        .map((row) => ({ a: row.a, b: row.b, payload: row.payload }))
+        .sort((left, right) => String(left.payload).localeCompare(String(right.payload))),
+      'a projected native row must retain the complete PostgreSQL primary key',
+    ).toEqual([
+      { a: 'same', b: 'one', payload: 'first' },
+      { a: 'same', b: 'two', payload: 'second' },
+    ])
+  })
 })

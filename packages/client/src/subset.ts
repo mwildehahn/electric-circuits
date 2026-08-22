@@ -227,12 +227,16 @@ export interface LeaseKeeper {
  */
 export function startLeaseRenewal(leaseSeconds: number | undefined, renew: () => Promise<unknown>): LeaseKeeper {
   let stopped = false
-  let inFlight: Promise<unknown> = Promise.resolve()
-  const once = async (): Promise<void> => {
-    if (stopped) return
-    const attempt = renew()
-    inFlight = attempt.catch(() => {})
-    await attempt
+  // Serialize every attempt accepted before stop(). A single mutable "current promise" loses an
+  // older request when renewals overlap, allowing that request to land after close() has released
+  // the subscription. The caught tail keeps later attempts running after a transient failure while
+  // each caller still receives its own attempt's rejection.
+  let tail: Promise<unknown> = Promise.resolve()
+  const once = (): Promise<void> => {
+    if (stopped) return Promise.resolve()
+    const attempt = tail.then(() => renew())
+    tail = attempt.catch(() => {})
+    return attempt.then(() => undefined)
   }
   const timer =
     leaseSeconds && leaseSeconds > 0
@@ -254,7 +258,7 @@ export function startLeaseRenewal(leaseSeconds: number | undefined, renew: () =>
     stop: async () => {
       stopped = true
       if (timer) clearInterval(timer)
-      await inFlight
+      await tail
     },
   }
 }
@@ -367,51 +371,61 @@ export async function createSubset<T extends Row = Row>(
   // This subscription's own id: the feed may be SHARED with other subscriptions on the same
   // predicate, and the id is what lets this one be renewed and released without touching theirs.
   const subscription = newSubscriptionId()
-  const feed = await deps.trpc.subset.live.mutate({
-    table: def.table,
-    where: def.where as never,
-    columns: cols,
-    subscription,
-  })
-  const feedUrl = deps.resolveStreamUrl(feed)
-  const lease = startLeaseRenewal(feed.leaseSeconds, () =>
-    deps.trpc.subset.live.mutate({ table: def.table, where: def.where as never, columns: cols, subscription }),
-  )
+  const requestFeed = () =>
+    deps.trpc.subset.live.mutate({ table: def.table, where: def.where as never, columns: cols, subscription })
+  const feed = await requestFeed()
+  let boundFeed = feed
+  let claimedFeed = feed
+  let feedUrl = deps.resolveStreamUrl(feed)
+  let lease: LeaseKeeper | undefined
 
-  const ac = new AbortController()
+  let tail: AbortController | undefined
+  let tailGeneration = 0
   let closed = false
 
   // The feed above is the only server-side state we hold; if any of the remaining setup (offset
   // capture, page query-back, preload) throws, delete it before rethrowing — nobody else will.
   try {
-    // 1b. Capture the feed's current tail offset BEFORE the page snapshot. Reading the live tail from
-    //     here (rather than the stream origin) means a joiner to a SHARED, long-lived feed does not
-    //     replay the whole backlog — it starts at "≈now". Everything at/before this offset committed
-    //     before the snapshot LSN below and is already in the page; the `< snapshotLsn` drop covers the
-    //     small [thisOffset, snapshot] overlap. Falls back to the stream origin if HEAD is unavailable.
-    let feedOffset = '-1'
-    try {
-      const head = await fetch(feedUrl, { method: 'HEAD' })
-      feedOffset = head.headers.get('stream-next-offset') ?? '-1'
-    } catch {
-      /* proxy/env without HEAD support → read from origin; correctness unaffected (only backlog). */
+    // 1b+2. One page load: capture the feed's tail offset BEFORE the page snapshot, then query the
+    //     page back straight from Postgres (no stream, no materialization).
+    //
+    //     The offset comes first because reading the live tail from there (rather than the stream
+    //     origin) means a joiner to a SHARED, long-lived feed does not replay the whole backlog — it
+    //     starts at "≈now". Everything at/before this offset committed before the page's snapshot LSN
+    //     and is already in the page; the `< snapshotLsn` drop covers the small [thisOffset,
+    //     snapshot] overlap. Falls back to the stream origin if HEAD is unavailable.
+    //
+    //     `offset` applies to THIS page only: it is where the caller's window starts, and every
+    //     later page is reached by moving the keyset cursor past the boundary — re-applying the
+    //     offset there would skip that many rows again.
+    //
+    //     Factored because a renewal that hands back a REPLACEMENT feed has to run exactly this
+    //     again, in exactly this order (see `renew` below).
+    const loadPage = async (url: string): Promise<{ offset: string; page: SubsetResult }> => {
+      let offset = '-1'
+      try {
+        const head = await fetch(url, { method: 'HEAD' })
+        offset = head.headers.get('stream-next-offset') ?? '-1'
+      } catch {
+        /* proxy/env without HEAD support → read from origin; correctness unaffected (only backlog). */
+      }
+      const page = (await deps.trpc.subset.query.query({
+        table: def.table,
+        where: def.where as never,
+        columns: cols,
+        orderBy: def.orderBy,
+        limit,
+        offset: def.offset,
+      })) as SubsetResult
+      return { offset, page }
     }
+    const { offset: feedOffset, page: first } = await loadPage(feedUrl)
 
-    // 2. Query-back page 1 straight from Postgres (no stream, no materialization). `offset` applies
-    //    to THIS page only: it is where the caller's window starts, and every later page is reached
-    //    by moving the keyset cursor past the boundary — re-applying the offset there would skip
-    //    that many rows again.
-    const first = (await deps.trpc.subset.query.query({
-      table: def.table,
-      where: def.where as never,
-      columns: cols,
-      orderBy: def.orderBy,
-      limit,
-      offset: def.offset,
-    })) as SubsetResult
-
+    // Every field below is derived from the CURRENT page by `seedPage`, which is why they are `let`:
+    // a replacement feed re-runs the page load and re-derives the whole window from it.
+    //
     // `boundary` = the last (lowest-in-order) loaded row; the loaded window is everything sorting <= it.
-    let boundary: Row | null = first.rows.length ? first.rows[first.rows.length - 1]! : null
+    let boundary: Row | null = null
     // ...and, WITH AN OFFSET, everything sorting >= the first loaded row. Without this lower bound
     // the window is open at the bottom, so a live delta that moves a row into the region the offset
     // deliberately skipped would insert it — the subset would silently grow past the page the
@@ -419,18 +433,17 @@ export async function createSubset<T extends Row = Row>(
     // under keyset semantics, and under OFFSET semantics it would SHIFT the window, which no live
     // delta may do; "not in view" is the right answer either way. (An empty first page leaves no
     // lower bound to take — nothing was loaded to anchor it to.)
-    const lower: Row | null = def.offset && first.rows.length ? first.rows[0]! : null
+    let lower: Row | null = null
     // A page shorter than the page size means the set is fully loaded. A page size of ZERO is never
     // short, and can never move the cursor either, so it ends the subset outright rather than
     // promising a next page that could never arrive.
-    let ended = limit === 0 || first.rows.length < limit
+    let ended = false
     const present = new Set<string>()
-    // LSN positioning: `snapshotLsn` is the page's read point in the engine's replication timeline.
-    // `applied` is a per-present-row watermark — the snapshot LSN the row's current value was read at
-    // (page or loadMore), bumped to a feed delta's LSN when applied. A feed delta is accepted only if
-    // its commit LSN is at/after the relevant watermark, so deltas already reflected in the page (commit
-    // LSN < snapshotLsn) are dropped — exactly-once after the snapshot, no double-count.
-    const snapshotLsn = lsnToU64(first.lsn) ?? 0n
+    // LSN positioning: `view.snapshotLsn` is the CURRENT page's read point in the engine's replication
+    // timeline. `applied` is a per-present-row watermark — the snapshot LSN the row's current value was
+    // read at (page or loadMore), bumped to a feed delta's LSN when applied. A feed delta is accepted
+    // only if its commit LSN is at/after the relevant watermark, so deltas already reflected in the page
+    // (commit LSN < snapshotLsn) are dropped — exactly-once after the snapshot, no double-count.
     const applied = new Map<string, bigint>()
     const inView = (row: Row): boolean => {
       // The lower bound holds even once `ended`: "fully loaded" means the pages ran out, not that
@@ -442,7 +455,40 @@ export async function createSubset<T extends Row = Row>(
     let ctl: SyncCtl | null = null
     let loadsInFlight = 0
 
-    const view: SubsetView = { snapshotLsn, present, applied, inView }
+    const view: SubsetView = { snapshotLsn: 0n, present, applied, inView }
+    // Bumped by every `seedPage`. A `loadMore` page that was requested against the PREVIOUS window
+    // is meaningless once the window has been re-derived from a fresh page, so it is dropped rather
+    // than merged into rows it no longer describes.
+    let windowGeneration = 0
+
+    /**
+     * Install one query-back page as the entire loaded window. The collection writes happen in a
+     * SINGLE commit — rows the page no longer contains are deleted alongside the inserts/updates —
+     * so a `subscribeChanges` consumer never observes an empty intermediate collection.
+     *
+     * The initial load and a replacement feed's reload are the same operation; on the first call
+     * `present` is empty, so it degenerates to the plain seed it has always been.
+     */
+    const seedPage = (w: SyncCtl, page: SubsetResult): void => {
+      const rows = page.rows
+      const pageLsn = lsnToU64(page.lsn) ?? 0n
+      const keys = new Set(rows.map((r) => String(r[pk])))
+      w.begin()
+      for (const k of present) if (!keys.has(k)) w.write({ type: 'delete', key: k })
+      for (const r of rows) w.write({ type: present.has(String(r[pk])) ? 'update' : 'insert', value: r })
+      w.commit()
+      present.clear()
+      applied.clear()
+      for (const k of keys) {
+        present.add(k)
+        applied.set(k, pageLsn)
+      }
+      boundary = rows.length ? rows[rows.length - 1]! : null
+      lower = def.offset && rows.length ? rows[0]! : null
+      ended = limit === 0 || rows.length < limit
+      view.snapshotLsn = pageLsn
+      windowGeneration += 1
+    }
     const applyEnvelope = (env: StreamEnvelope): void => {
       if (!ctl || env.type !== feedType) return
       const action = mergeFeedDelta(view, env)
@@ -452,6 +498,50 @@ export async function createSubset<T extends Row = Row>(
       ctl.commit()
     }
 
+    const startTail = (url: string, offset: string): void => {
+      tail?.abort()
+      const ac = new AbortController()
+      tail = ac
+      const generation = ++tailGeneration
+      void (async () => {
+        try {
+          const resp = await stream<StreamEnvelope>({
+            url,
+            offset,
+            live: deps.liveMode ?? 'long-poll',
+            contentType: 'application/json',
+            signal: ac.signal,
+          })
+          for await (const env of resp.jsonStream()) {
+            if (ac.signal.aborted || generation !== tailGeneration) break
+            applyEnvelope(env)
+          }
+        } catch (e) {
+          if (!ac.signal.aborted && !closed && generation === tailGeneration) console.error('subset feed error', e)
+        }
+      })()
+    }
+
+    const renew = async () => {
+      const next = await requestFeed()
+      claimedFeed = next
+      if (next.shapeId === boundFeed.shapeId && next.streamPath === boundFeed.streamPath) return
+      boundFeed = next
+      feedUrl = deps.resolveStreamUrl(next)
+      // A replacement feed is CHANGES-ONLY from its own creation, so every insert/update/delete that
+      // happened while this subscription was lapsed and its old feed evicted — the gap — is in no
+      // feed at all: not the dead one, not the new one. Reading the replacement from its origin
+      // would therefore keep the pre-gap page forever. The page is re-read instead, exactly as the
+      // initial load reads it, and installed as the window; the tail then starts from the offset
+      // captured BEFORE that snapshot, so the [offset, snapshot] overlap is dropped by LSN
+      // positioning rather than double-counted (same capture order, same reason).
+      tail?.abort()
+      const { offset, page } = await loadPage(feedUrl)
+      if (closed || !ctl) return
+      seedPage(ctl, page)
+      startTail(feedUrl, offset)
+    }
+
     const collection = createCollection<T>({
       id: `subset:${def.table}:${feed.shapeId}`,
       getKey: (r) => String((r as Row)[pk]),
@@ -459,38 +549,19 @@ export async function createSubset<T extends Row = Row>(
         sync: (params: SyncCtl & { markReady: () => void }) => {
           ctl = params
           // Seed the query-back page.
-          params.begin()
-          for (const r of first.rows) {
-            const k = String(r[pk])
-            params.write({ type: 'insert', value: r })
-            present.add(k)
-            applied.set(k, snapshotLsn)
-          }
-          params.commit()
+          seedPage(params, first)
           params.markReady()
           // 3. Follow the raw live tail from the offset captured before the snapshot, applying each change
           //    filtered by membership + LSN positioning (deltas already in the page are dropped).
-          void (async () => {
-            try {
-              const resp = await stream<StreamEnvelope>({
-                url: feedUrl,
-                offset: feedOffset,
-                live: deps.liveMode ?? 'long-poll',
-                contentType: 'application/json',
-                signal: ac.signal,
-              })
-              for await (const env of resp.jsonStream()) applyEnvelope(env)
-            } catch (e) {
-              // After close() the feed's durable stream may already be gone (the engine deletes it on
-              // the final drop), so a racing read 404s — normal termination, not an error.
-              if (!ac.signal.aborted && !closed) console.error('subset feed error', e)
-            }
-          })()
-          return () => ac.abort()
+          startTail(feedUrl, feedOffset)
+          return () => tail?.abort()
         },
       },
     })
     await collection.preload()
+    // Started only now: a renewal that lands a replacement feed has to reseed through the sync
+    // handles, and those exist only once the collection has run its sync callback.
+    lease = startLeaseRenewal(feed.leaseSeconds, renew)
 
     return {
       collection: collection as Collection<T, string>,
@@ -501,6 +572,7 @@ export async function createSubset<T extends Row = Row>(
         // the set is exhausted (a zero-row answer to a zero-row request proves nothing about it).
         if (closed || ended || pageSize <= 0 || !boundary || !ctl) return 0
         const where = andPredicate(def.where, cursorPredicate(pk, def.orderBy, boundary))
+        const generation = windowGeneration
         loadsInFlight++
         try {
           const page = (await deps.trpc.subset.query.query({
@@ -510,13 +582,17 @@ export async function createSubset<T extends Row = Row>(
             orderBy: def.orderBy,
             limit: pageSize,
           })) as SubsetResult
+          // A replacement feed re-derived the whole window from a fresh page while this one was in
+          // flight: it describes a window that no longer exists, and merging it would resurrect rows
+          // the new page does not contain. Report nothing loaded, and leave `ended` to the new page.
+          if (generation !== windowGeneration) return 0
           if (page.rows.length) {
             // This page is a fresh Postgres snapshot at `pageLsn`; its rows are the authoritative state as
             // of that LSN. Don't let a stale page regress a row already advanced past `pageLsn` by the live
             // feed (the loadMore-vs-feed race), and set each row's watermark so older feed deltas drop.
             // Tombstoned rows (watermark without membership) are skipped the same way — a page older than
             // the delete must not resurrect the row.
-            const pageLsn = lsnToU64(page.lsn) ?? snapshotLsn
+            const pageLsn = lsnToU64(page.lsn) ?? view.snapshotLsn
             ctl.begin()
             for (const r of page.rows) {
               const k = String(r[pk])
@@ -542,7 +618,7 @@ export async function createSubset<T extends Row = Row>(
       },
 
       async renew() {
-        await lease.renew()
+        await lease!.renew()
       },
 
       async close() {
@@ -552,16 +628,16 @@ export async function createSubset<T extends Row = Row>(
         // land after the release and re-take the claim (see `startLeaseRenewal`).
         if (closed) return
         closed = true
-        await lease.stop()
-        ac.abort()
-        await deleteShapeWithRetry(deps.trpc, feed.shapeId, subscription)
+        await lease!.stop()
+        tail?.abort()
+        await deleteShapeWithRetry(deps.trpc, claimedFeed.shapeId, subscription)
       },
     }
   } catch (e) {
     closed = true
-    await lease.stop()
-    ac.abort()
-    await deleteShapeWithRetry(deps.trpc, feed.shapeId, subscription)
+    await lease?.stop()
+    tail?.abort()
+    await deleteShapeWithRetry(deps.trpc, claimedFeed.shapeId, subscription)
     throw e
   }
 }

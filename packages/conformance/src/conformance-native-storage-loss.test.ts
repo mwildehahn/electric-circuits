@@ -28,6 +28,9 @@ interface AppendFault {
   armed: boolean
   status: number
   hits: number
+  headArmed?: boolean
+  headStatus?: number
+  headHits?: number
 }
 
 function oneShotShapeAppendProxy(fault: AppendFault) {
@@ -35,6 +38,14 @@ function oneShotShapeAppendProxy(fault: AppendFault) {
     const upstream = new URL(upstreamUrl)
     const server = createServer((incoming, outgoing) => {
       const target = new URL(incoming.url ?? '/', upstream)
+      if (fault.headArmed && incoming.method === 'HEAD' && target.pathname.startsWith('/shape/')) {
+        fault.headArmed = false
+        fault.headHits = (fault.headHits ?? 0) + 1
+        incoming.resume()
+        outgoing.writeHead(fault.headStatus ?? 503, { 'content-type': 'text/plain' })
+        outgoing.end('one-shot HEAD failure')
+        return
+      }
       if (fault.armed && incoming.method === 'POST' && target.pathname.startsWith('/shape/')) {
         fault.armed = false
         fault.hits += 1
@@ -101,6 +112,23 @@ describe('native shape storage loss', () => {
 
     const replacement = await createShape(h, { table: 'items' })
     expect(replacement.shapeId, 'a new subscription must not reuse the known-dead handle').not.toBe(first.shapeId)
+    expect((await fetch(replacement.streamUrl)).status).toBe(200)
+  })
+
+  it('does not return a dead retained handle when its storage check is transiently unavailable', async () => {
+    const fault: AppendFault = { armed: false, status: 503, hits: 0 }
+    h = await bootHarness(schema, { wrapEngineDs: oneShotShapeAppendProxy(fault) })
+    const first = await createShape(h, { table: 'items' })
+    expect((await fetch(first.streamUrl, { method: 'DELETE' })).ok).toBe(true)
+    expect((await fetch(first.streamUrl)).status).toBe(404)
+
+    // The stream is really gone, but the engine sees one ordinary transient failure while checking
+    // that external service. Uncertainty must not be converted into a successful known-dead handle.
+    fault.headArmed = true
+    fault.headStatus = 503
+    const replacement = await createShape(h, { table: 'items' })
+    expect(fault.headHits).toBe(1)
+    expect(replacement.shapeId).not.toBe(first.shapeId)
     expect((await fetch(replacement.streamUrl)).status).toBe(200)
   })
 

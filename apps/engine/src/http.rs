@@ -242,17 +242,14 @@ fn validate_subscription(sub: Option<String>) -> Result<Option<String>, AppError
 /// [`validate_subscription`] for a CREATE, which is the only place an id can be brought into
 /// existence — and therefore the only place the engine's `~` namespace has to be defended.
 ///
-/// A `~` id the engine currently holds is a **renewal or release of a claim it minted itself**, and
-/// must be accepted: a caller that omitted `subscription` got that id back in the response, and the
-/// whole point of returning it is that the caller can then say "still here" or "done" with it. A `~`
-/// id nobody holds could only have been made up, and accepting it would let a caller forge a claim
-/// that the legacy anonymous `DELETE` treats as expendable (it releases minted claims first) — so
-/// that one is a `400`.
+/// A `~` id the catalog has ever seen the engine mint is a capability returned to a caller and must
+/// remain usable after lapse, release, and restart. An id absent from that provenance set was made
+/// up by the caller and is refused.
 async fn validate_new_subscription(engine: &Engine, sub: Option<String>) -> Result<Option<String>, AppError> {
     let sub = validate_subscription(sub)?;
     if let Some(id) = &sub
         && id.starts_with(crate::engine::MINTED_SUB_PREFIX)
-        && !engine.subscription_is_held(id).await
+        && !engine.subscription_was_minted(id).await
     {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
@@ -576,21 +573,24 @@ struct ReleaseShapeQuery {
 ///
 /// With `?purge=true` it instead force-drops the shape immediately (subscribed clients recreate via
 /// the normal 404 / must-refetch path).
+///
+/// Both forms are **durable before they are acknowledged** (ADR-0008): this answers only once the
+/// `Left`/`Dropped` is in the restart contract, because a `200` here is a promise that the release or
+/// the purge survives a restart — and `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` is a supported setting in
+/// which no lease will ever repair a record that went missing. So it blocks for as long as storage is
+/// down; a client timeout means "no answer", never "not done", and retrying is safe (a repeat finds
+/// the mutation applied and waits on the same barrier). Cancelling the request cancels nothing: the
+/// record is the writer's, and a purge's teardown runs in a task the engine owns.
 async fn release_shape(
     State(engine): State<Engine>,
     Path(id): Path<String>,
     Query(q): Query<ReleaseShapeQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if q.purge {
-        // Answered as soon as the engine state is updated, like the release below: see
-        // `Engine::purge_shape` for why the `Dropped` record is queued rather than waited on.
-        engine.purge_shape(&id).await?;
+        engine.purge_shape_durable(&id).await?;
     } else {
-        // Answered as soon as the engine state is updated: the `Left` is queued behind it and lands
-        // in order, and a lost one is reclaimed by the lease within one idle window (see
-        // `Engine::release_subscription`).
         let subscription = validate_subscription(q.subscription)?;
-        engine.release_subscription(&id, subscription.as_deref()).await;
+        engine.release_subscription_durable(&id, subscription.as_deref()).await;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
