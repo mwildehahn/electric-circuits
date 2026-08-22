@@ -42,7 +42,11 @@ export async function createShape(h: Harness, body: unknown, signal?: AbortSigna
   return (await res.json()) as ShapeResp
 }
 
-export async function waitFor(cond: () => Promise<boolean>, what: string, timeoutMs = 20000): Promise<void> {
+export async function waitFor(
+  cond: () => boolean | Promise<boolean>,
+  what: string,
+  timeoutMs = 20000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (await cond()) return

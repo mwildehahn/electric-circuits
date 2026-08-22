@@ -50,7 +50,7 @@ function statusShapeDef(userId: number, status: string): ShapeDef {
 /** COUNT aggregation over the user's visible issues — the app's top-of-list counter (non-subquery OR). */
 function visibleOr(projectIds: number[]): Predicate {
   return projectIds.length === 1
-    ? { col: 'project_id', op: 'eq', value: projectIds[0] }
+    ? { col: 'project_id', op: 'eq', value: projectIds[0]! }
     : { or: projectIds.map((p) => ({ col: 'project_id', op: 'eq', value: p })) }
 }
 

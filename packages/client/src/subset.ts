@@ -18,7 +18,7 @@ import type {
   Value,
 } from '@electric-circuits/protocol'
 import { stream } from '@durable-streams/client'
-import { createCollection, type Collection } from '@tanstack/db'
+import { createCollection, type ChangeMessageOrDeleteKeyMessage, type Collection } from '@tanstack/db'
 import type { createTRPCClient } from '@trpc/client'
 
 import { resolveTableDef } from './tables.js'
@@ -85,8 +85,11 @@ export function cmpCodePoints(a: string, b: string): number {
  * `number | string` on the wire (a bigint beyond 2^53 arrives as an exact decimal string), so
  * comparing "whatever looks numeric" numerically would order a **text** column's `'10'` before
  * `'9'`, which PostgreSQL does not.
+ *
+ * A cell the caller projected away is `undefined` rather than `null`; it sorts with the NULLs
+ * (`== null`), which is what the engine does with a column that is not in the row.
  */
-function cmpVal(a: Value, b: Value, ty?: ColumnType): number {
+function cmpVal(a: Value | undefined, b: Value | undefined, ty?: ColumnType): number {
   if (a === b) return 0
   if (a == null) return b == null ? 0 : 1
   if (b == null) return -1
@@ -133,10 +136,14 @@ export function makeCmp(
  */
 function cursorPredicate(pk: string, orderBy: { col: string; desc?: boolean } | undefined, b: Row): Predicate {
   const pkOp = orderBy?.desc ? 'lt' : 'gt'
-  if (!orderBy?.col) return { col: pk, op: pkOp, value: b[pk] }
+  // The pk is force-projected into every page (see `cols`), so a boundary row without it means the
+  // page and the schema disagree about the table's key — there is no cursor to build from it.
+  const bpk = b[pk]
+  if (bpk === undefined) throw new Error(`subset cursor row is missing its primary key column ${pk}`)
+  if (!orderBy?.col) return { col: pk, op: pkOp, value: bpk }
   const col = orderBy.col
   const colOp = orderBy.desc ? 'lt' : 'gt'
-  const nullBlockAfter: Predicate = { and: [{ col, isNull: true }, { col: pk, op: pkOp, value: b[pk] }] }
+  const nullBlockAfter: Predicate = { and: [{ col, isNull: true }, { col: pk, op: pkOp, value: bpk }] }
   if (b[col] == null) {
     // Inside the NULL block. Ascending (NULLS LAST): only later NULLs remain. Descending (NULLS
     // FIRST): later NULLs, and then the whole non-NULL body of the table.
@@ -145,7 +152,7 @@ function cursorPredicate(pk: string, orderBy: { col: string; desc?: boolean } | 
   const after: Predicate = {
     or: [
       { col, op: colOp, value: b[col] },
-      { and: [{ col, op: 'eq', value: b[col] }, { col: pk, op: pkOp, value: b[pk] }] },
+      { and: [{ col, op: 'eq', value: b[col] }, { col: pk, op: pkOp, value: bpk }] },
     ],
   }
   // Ascending: the NULL block still lies ahead of a non-NULL boundary and must be paged into.
@@ -341,10 +348,14 @@ export function mergeFeedDelta(view: SubsetView, env: StreamEnvelope): MergeActi
   return null
 }
 
-/** Manual-write handles captured from the collection's sync callback (used by load-more + the feed). */
+/**
+ * Manual-write handles captured from the collection's sync callback (used by load-more + the feed).
+ * The write message shape is TanStack DB's own — an insert/update carries the row, a delete carries
+ * only the key — so the captured handles keep their exact signature instead of a looser restatement.
+ */
 interface SyncCtl {
-  begin: () => void
-  write: (m: { type: 'insert' | 'update' | 'delete'; value?: Row; key?: string }) => void
+  begin: (options?: { immediate?: boolean }) => void
+  write: (m: ChangeMessageOrDeleteKeyMessage<Row, string>) => void
   commit: () => void
 }
 
@@ -509,7 +520,7 @@ export async function createSubset<T extends Row = Row>(
             url,
             offset,
             live: deps.liveMode ?? 'long-poll',
-            contentType: 'application/json',
+            json: true,
             signal: ac.signal,
           })
           for await (const env of resp.jsonStream()) {
@@ -542,11 +553,13 @@ export async function createSubset<T extends Row = Row>(
       startTail(feedUrl, offset)
     }
 
-    const collection = createCollection<T>({
+    // Built as a plain wire-`Row` collection — that is what the feed and the pages actually carry —
+    // and re-stated as the caller's `T` once, at the return below.
+    const collection = createCollection<Row>({
       id: `subset:${def.table}:${feed.shapeId}`,
-      getKey: (r) => String((r as Row)[pk]),
+      getKey: (r) => String(r[pk]),
       sync: {
-        sync: (params: SyncCtl & { markReady: () => void }) => {
+        sync: (params) => {
           ctl = params
           // Seed the query-back page.
           seedPage(params, first)
@@ -564,7 +577,11 @@ export async function createSubset<T extends Row = Row>(
     lease = startLeaseRenewal(feed.leaseSeconds, renew)
 
     return {
-      collection: collection as Collection<T, string>,
+      // The one place the caller's `T` is applied. `T` is an unverified claim about the wire row
+      // shape (nothing validates it), and the collection is genuinely built over `Row`, so this is
+      // a re-badge, not a conversion — hence the trip through `unknown`. Keys really are strings:
+      // `getKey` stringifies the pk.
+      collection: collection as unknown as Collection<T, string>,
       hasMore: () => !ended,
 
       async loadMore(pageSize = limit) {

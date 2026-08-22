@@ -77,6 +77,7 @@ The recipe for capturing an app's query set in one circuit:
 ```bash
 pnpm engine:build          # cargo build -p electric-circuits-engine
 pnpm engine:test           # cargo test  -p electric-circuits-engine   (fast)
+pnpm typecheck             # tsc --noEmit over the whole TS workspace (seconds; no PG, no engine)
 pnpm test                  # vitest run — full suite incl. conformance (~60s; boots its own PG)
 pnpm test:conformance      # just the conformance package
 pnpm test:fuzz             # random-predicate fuzz vs oracle
@@ -105,9 +106,11 @@ BENCH_OUT=docs/bench/electric-fleet-results-baseline.md pnpm bench:fleet
 Use a distinct `BENCH_OUT` per target and diff the reports; `BENCH_ONLY`/`BENCH_SCALE` apply the
 same way. (Our own image can also be the target — `pnpm docker:up`, then point at port 7010.)
 
-**There is no `tsc` typecheck gate** — CI is vitest (esbuild, transpile-only). To check TS: run
-`pnpm test`, or transpile-load a module with `npx tsx -e "import(...)"`. Always run
-`pnpm engine:test` + `pnpm test` before claiming done.
+**vitest does not typecheck** — it runs through esbuild, which strips types without reading them.
+`pnpm typecheck` is the gate (one root `tsconfig.json` over every server/node TS package + the test
+files; CI runs it right after install, before the suite). The browser/Vite apps — `apps/pipeline-viz`
+and `examples/**` — are excluded: they are React 18 / TS 5 trees with their own configs. Always run
+`pnpm typecheck` + `pnpm engine:test` + `pnpm test` before claiming done.
 
 ## Running the stack (sizes, explorer, load testing)
 
@@ -185,6 +188,7 @@ knobs (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=1 ELECTRIC_CIRCUITS_RETENTION_SWEEP_SE
 which ran and why the rest could not) before closing the task.**
 
 ```bash
+pnpm typecheck                            # tsc --noEmit over the TS workspace (vitest cannot see type errors)
 pnpm engine:test                          # Rust unit + integration (fast)
 ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
 ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
@@ -508,9 +512,9 @@ canvas update, screenshot.
   Linux-only, macOS falls back to `wal`).
 - **Docker + pnpm:** scripts that import workspace deps must live in a workspace package
   (`docker/package.json`) — running `tsx docker/x.ts` from the repo root can't resolve them.
-- **Verify against the live stack, not just types.** A headless `tsx` script driving the real client
-  against a running demo catches what the (absent) typechecker can't. **Changing code means
-  realigning docs in the same pass.**
+- **Verify against the live stack, not just types.** `pnpm typecheck` proves the types line up; a
+  headless `tsx` script driving the real client against a running demo catches what it can't.
+  **Changing code means realigning docs in the same pass.**
 
 ## Git Policy
 

@@ -23,6 +23,25 @@ import { createApiServer } from '@electric-circuits/api'
 import { createClient } from '@electric-circuits/client'
 import type { Schema } from '@electric-circuits/protocol'
 
+/** The engine's `/tables/:table/families` body — only the fields this bench reports on. */
+interface FamiliesResp {
+  families: unknown[]
+  standalone: number
+}
+/** One `/metrics` latency histogram (microseconds). */
+interface StageLatency {
+  p50_us: number
+  p99_us: number
+  max_us: number
+}
+/** The engine's `/metrics` body — only the fields this bench reports on. */
+interface EngineMetrics {
+  counters: { envelopes_processed: number; shape_appends: number }
+  process_envelope_us: StageLatency
+  family_step_us: StageLatency
+  append_us: StageLatency
+}
+
 const execFileP = promisify(execFile)
 // Durable, line-buffered logging so results survive even if the run is backgrounded or killed.
 const OUTFILE = process.env.BENCH_OUT ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'results.txt')
@@ -156,6 +175,10 @@ async function main() {
   const api = await createApiServer({ dsUrl, engineUrl: engine.url })
   const client = createClient({ apiUrl: api.url, schema, liveMode: 'long-poll' })
   await client.defineSchema(schema)
+  // `tables` is keyed by every spelling of every table in `schema`; `users` is declared there, so
+  // its absence would mean the schema this bench defines and the one it drives have diverged.
+  const users = client.tables.users
+  if (!users) throw new Error('client has no `users` table API — schema/bench mismatch')
   const pid = engine.proc.pid!
   enginePidForCleanup = pid
 
@@ -193,7 +216,7 @@ async function main() {
 
   const afterReg = await sampleRss(pid)
   const threads = await threadCount(pid)
-  const fams = await (await fetch(`${engine.url}/tables/users/families`)).json()
+  const fams = (await (await fetch(`${engine.url}/tables/users/families`)).json()) as FamiliesResp
   log(
     `topology: families=${fams.families.length} (eq shapes), standalone=${fams.standalone}; ` +
       `engine threads=${threads}; RSS=${afterReg.rssMb.toFixed(0)}MB`,
@@ -231,7 +254,7 @@ async function main() {
       const pk = 2_000_000 + tenant
       const t0 = now()
       try {
-        const { txid } = await client.tables.users.update({ id: pk, tenant, seq: seq++, active: true })
+        const { txid } = await users.update({ id: pk, tenant, seq: seq++, active: true })
         await sub.awaitTxId(txid, 5000)
         latencies.push(now() - t0)
       } catch {
@@ -248,7 +271,7 @@ async function main() {
       while (now() < deadline) {
         const tenant = Math.floor(Math.random() * HOTSET)
         const pk = 1 + tenant + HOTSET * Math.floor(Math.random() * 40) // bounded pk space, tenant = pk's slot
-        await client.tables.users.update({ id: pk, tenant, seq: seq++, active: pk % 2 === 0 }).catch(() => {})
+        await users.update({ id: pk, tenant, seq: seq++, active: pk % 2 === 0 }).catch(() => {})
         firehoseWrites++
       }
     })(),
@@ -256,7 +279,7 @@ async function main() {
 
   await Promise.all([sampler, prober, ...firehose])
   const loadMs = now() - (deadline - DURATION * 1000)
-  const metrics = await (await fetch(`${engine.url}/metrics`)).json()
+  const metrics = (await (await fetch(`${engine.url}/metrics`)).json()) as EngineMetrics
 
   // --- Report ---
   latencies.sort((a, b) => a - b)

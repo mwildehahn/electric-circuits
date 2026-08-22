@@ -9,6 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:conformance": "vitest run packages/conformance",
     "test:fuzz": "vitest run packages/conformance/src/conformance-fuzz.test.ts",
@@ -24,7 +25,8 @@
     "docker:up": "docker compose -f docker/compose.yaml up"
   },
   "devDependencies": {
-    "typescript": "^5.7.2",
+    "@types/node": "^22.20.1",
+    "typescript": "^7.0.2",
     "vitest": "^3.0.0",
     "tsx": "^4.19.2"
   },

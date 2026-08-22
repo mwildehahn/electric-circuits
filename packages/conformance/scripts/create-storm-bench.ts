@@ -45,8 +45,8 @@ try {
   )
   const wall = performance.now() - t0
   lat.sort((a, b) => a - b)
-  const q = (p: number) => lat[Math.min(lat.length - 1, Math.floor((p / 100) * lat.length))].toFixed(0)
-  console.log(`engine-direct: ${GROUPS} creates wall=${(wall / 1000).toFixed(1)}s p50=${q(50)}ms p95=${q(95)}ms p99=${q(99)}ms max=${lat[lat.length - 1].toFixed(0)}ms`)
+  const q = (p: number) => lat[Math.min(lat.length - 1, Math.floor((p / 100) * lat.length))]!.toFixed(0)
+  console.log(`engine-direct: ${GROUPS} creates wall=${(wall / 1000).toFixed(1)}s p50=${q(50)}ms p95=${q(95)}ms p99=${q(99)}ms max=${lat[lat.length - 1]!.toFixed(0)}ms`)
 } finally {
   await h.shutdown()
 }

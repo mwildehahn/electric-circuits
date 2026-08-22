@@ -3,15 +3,16 @@
 // specific mutation, drain, and assert the client materialization equals the pg oracle (and check the
 // specific row entered/left). Convergence is the contract — not Electric's exact control-message stream.
 
+import type { ShapeMaterialization } from '@electric-circuits/client'
 import type { Predicate, Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'
 
-async function ids(h: Harness, shape: { currentRows(): { id: unknown }[] }, def: ShapeDef, cols: string[]) {
-  const res = await waitForConvergence(h, { shape: shape as never, def, columns: cols, pk: 'id' })
+async function ids(h: Harness, shape: ShapeMaterialization, def: ShapeDef, cols: string[]) {
+  const res = await waitForConvergence(h, { shape, def, columns: cols, pk: 'id' })
   expect(res.equal, formatCompare(res)).toBe(true)
-  return (shape.currentRows() as { id: unknown }[]).map((r) => Number(r.id)).sort((a, b) => a - b)
+  return shape.currentRows().map((r) => Number(r.id)).sort((a, b) => a - b)
 }
 
 describe('conformance: subquery — NOT IN move-in/out', () => {

@@ -40,5 +40,9 @@ jobs:
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
 
+      # Fail fast: the vitest lane is esbuild (transpile-only) and sees no type errors at all.
+      - name: Typecheck
+        run: pnpm typecheck
+
       - name: Full test suite (incl. conformance)
         run: pnpm test

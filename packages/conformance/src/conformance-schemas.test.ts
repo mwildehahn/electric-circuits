@@ -81,7 +81,7 @@ describe('conformance: two schemas, one table name', () => {
     for (const t of ['public.items', 'other.items']) {
       const res = await fetch(`${h.engineUrl}/table/${encodeURIComponent(t)}/schema`)
       expect(res.status, t).toBe(200)
-      expect((await res.json()).table, t).toBe(t)
+      expect(((await res.json()) as { table: string }).table, t).toBe(t)
     }
   }, 60000)
 

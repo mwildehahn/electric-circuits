@@ -132,7 +132,7 @@ describe('conformance: a transaction too large for memory spills and is appended
     expect(oracle.length).toBe(ROWS)
     expect(rows.size).toBe(ROWS)
     // A sampled row must be byte-identical, not merely present.
-    const sample = oracle[Math.floor(ROWS / 2)]
+    const sample = oracle[Math.floor(ROWS / 2)]!
     expect(rows.get(String(sample.id))?.label).toBe(sample.label)
     expect(rows.get(String(sample.id))?.n).toBe(sample.n)
     expect(rows.has('1')).toBe(true)
@@ -158,7 +158,7 @@ describe('conformance: a transaction too large for memory spills and is appended
     const oracle = await pg('SELECT id, n, label FROM items WHERE n >= 0 ORDER BY id')
     expect(oracle.length).toBe(ROWS)
     expect(rows.size).toBe(ROWS)
-    const sample = oracle[Math.floor(ROWS / 3)]
+    const sample = oracle[Math.floor(ROWS / 3)]!
     expect(rows.get(String(sample.id))?.n).toBe(sample.n)
     expect(rows.get(String(sample.id))?.label).toBe(sample.label)
     expect(String(sample.label).endsWith('-v2')).toBe(true)

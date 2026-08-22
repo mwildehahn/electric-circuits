@@ -244,8 +244,15 @@ export function createClient(opts: {
         await nextDb.preload()
         return nextDb
       }
+      // `state` registers exactly one collection, keyed by the canonical table name, so this always
+      // resolves; the lookup is optional only because `collections` is index-signature typed.
+      const collectionOf = (streamDb: Awaited<ReturnType<typeof openDb>>) => {
+        const c = streamDb.collections[table]
+        if (!c) throw new Error(`stream DB has no collection for table ${table}`)
+        return c
+      }
       let db = await openDb(handle)
-      let collection = db.collections[table]
+      let collection = collectionOf(db)
       type Listener = {
         cb: (changes: Array<{ type: string; key: unknown; value?: unknown }>) => void
         unsubscribe: () => void
@@ -261,7 +268,7 @@ export function createClient(opts: {
         // subscription then creates a replacement and the returned handle is authoritative: bind
         // the new stream before publishing it, so callers never observe a half-swapped materialization.
         const nextDb = await openDb(next)
-        const nextCollection = nextDb.collections[table]
+        const nextCollection = collectionOf(nextDb)
         const previousDb = db
         db = nextDb
         collection = nextCollection
@@ -369,7 +376,7 @@ export function createClient(opts: {
               url,
               offset: '-1',
               live: opts.liveMode === true ? 'long-poll' : (opts.liveMode ?? 'long-poll'),
-              contentType: 'application/json',
+              json: true,
               signal: ac.signal,
             })
             for await (const env of resp.jsonStream()) {

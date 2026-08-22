@@ -12,9 +12,9 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '../../..')
 
 function dockerfilePin(file: string): string {
   const text = readFileSync(join(root, 'docker', file), 'utf8')
-  const match = text.match(/cargo install durable-streams --version ([^\s]+)/)
-  expect(match, `no durable-streams pin found in docker/${file}`).toBeTruthy()
-  return match![1]
+  const pin = text.match(/cargo install durable-streams --version ([^\s]+)/)?.[1]
+  if (pin === undefined) throw new Error(`no durable-streams pin found in docker/${file}`)
+  return pin
 }
 
 describe('durable-streams pin', () => {
