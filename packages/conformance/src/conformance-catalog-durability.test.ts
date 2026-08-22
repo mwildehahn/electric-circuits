@@ -242,6 +242,11 @@ describe('native catalog durability under a durable-streams status failure', () 
         proxy = await startCatalogFaultProxy(upstreamUrl)
         return proxy
       },
+      engineEnv: {
+        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
+        ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
+        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      },
     })
 
     await pgQuery(h, 'INSERT INTO items (id, n) VALUES (1, 10)')
@@ -272,10 +277,16 @@ describe('native catalog durability under a durable-streams status failure', () 
       proxy!.failShapeRetirements(false)
     })
 
-    expect(
-      (await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status,
-      'an acknowledged purge must remain absent after a crash',
-    ).toBe(404)
+    // Under ADR-0008 a purge acknowledged while the durable catalog was unavailable is reconverged
+    // by the LEASE after a restart, within one idle window: the shape comes back from its `Created`
+    // record with its subscriptions' restored lease ages, nothing renews them, and the sweeper
+    // reclaims it. (Waiting for the `Dropped` before answering is not an option — it would leave a
+    // caller unable to purge anything at all during an outage, deadlocking against a create parked
+    // on its own durability wait.)
+    await waitFor(
+      async () => (await fetch(`${h!.engineUrl}/shapes/${shape.shapeId}`)).status === 404,
+      'the lease to reclaim the purged shape after restart',
+    )
     await waitFor(async () => {
       const response = await fetch(shape.streamUrl)
       return response.status === 404 || response.status === 410
@@ -423,8 +434,12 @@ describe('native catalog durability under a durable-streams status failure', () 
         return proxy
       },
       engineEnv: {
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
-        ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
+        // A long idle window on purpose: these subscriptions are anonymous and never renewed, and
+        // this test is about what the FOLD does with a duplicated `Left` — not about leases. Under a
+        // second-scale window the sweeper would (correctly, ADR-0008) reclaim the survivor
+        // mid-assertion and hide the very thing being measured.
+        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '120',
+        ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '120',
         ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
@@ -453,11 +468,16 @@ describe('native catalog durability under a durable-streams status failure', () 
     // retention lifecycle has no right to retire their shared stream.
     const releasedSecond = await fetch(`${h.engineUrl}/shapes/${first.shapeId}`, { method: 'DELETE' })
     expect(releasedSecond.ok).toBe(true)
-    await waitFor(
-      async () => (await fetch(`${h!.engineUrl}/shapes/${first.shapeId}`)).status === 404,
-      'the duplicated Left to evict a shape that still has a subscriber',
-      15000,
-    )
+    // The reproduction, inverted into the requirement: the duplicated `Left` used to fold as two
+    // decrements, leaving a shape with a live subscriber at refcount 0 for retention to evict. It
+    // must now never happen, so this wait must TIME OUT.
+    await expect(
+      waitFor(
+        async () => (await fetch(`${h!.engineUrl}/shapes/${first.shapeId}`)).status === 404,
+        'the duplicated Left to evict a shape that still has a subscriber',
+        15000,
+      ),
+    ).rejects.toThrow()
     expect(
       (await fetch(`${h.engineUrl}/shapes/${first.shapeId}`)).status,
       'one remaining subscriber must keep its shared native shape alive',

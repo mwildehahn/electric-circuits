@@ -42,3 +42,12 @@ _Avoid_: table stream
 
 **Schema drift**:
 A difference between a table's compiled schema and what Postgres now reports for it.
+
+**Subscription**:
+One caller's named claim on a shape, identified by a caller-chosen id. Creating or releasing it twice
+is the same act once; it stays live only while renewed within the idle window (a **lease**).
+_Avoid_: refcount (for the caller's side), handle (that is what the caller receives)
+
+**Lease**:
+The liveness of a subscription: it counts only if created or renewed within
+`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`. Renewal is the same `POST /shapes` with the same subscription id.

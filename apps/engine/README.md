@@ -45,7 +45,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |
 | `ELECTRIC_CIRCUITS_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `electric_circuits_engine=debug`) |
 | `ELECTRIC_CIRCUITS_TRACE` | `1` (on) | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc) |
-| `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, refcount 0) before an active shape goes **dormant** (engine state dropped; stream + record retained). `0` disables dormancy |
+| `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). It is also the **subscription lease window** — a claim not renewed within it is released (see "Subscriptions"). `0` disables both |
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
 | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
@@ -199,9 +199,9 @@ unchanged.
 | `GET /health` | **liveness** — `ok`/200 while the process runs, and nothing else (see "Operating") |
 | `GET /ready` | **readiness** — 200 `{"status":"active"}` only when the engine can serve; 503 with `waiting`/`starting`/`degraded`/`shutting_down` otherwise |
 | `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |
-| `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`) — identical definitions share one stream |
-| `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`) |
-| `GET /shapes/{id}` / `DELETE /shapes/{id}` | look up a shape (incl. its retention `state`) / release one subscription — the shape is retained and ages through the retention lifecycle. `DELETE …?purge=true` force-drops it immediately (admin/debug; the visualizer's trash) |
+| `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`, `subscription`) — identical definitions share one stream. Repeating the create with the same `subscription` **renews** it and returns the same handle (see "Subscriptions") |
+| `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`, `subscription`) |
+| `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…` | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash) |
 | `GET /shapes/{id}/rows` | current contents of an existing shape (folds its stream; visualizer preview) |
 | `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
@@ -301,9 +301,41 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 | `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
 
+### Subscriptions: identified, idempotent, leased
+
+A subscriber **names its claim**. `POST /shapes` (and `POST /aggregate`) takes an optional
+`subscription` — any non-empty string up to 128 bytes, not starting with `~` (reserved for the ids
+the engine mints) — and every create response carries the `subscription` it was recorded under plus
+`leaseSeconds`. See `docs/adr/0008-subscriptions-are-identified-idempotent-and-leased.md`.
+
+- **Repeat = renew.** A create naming a subscription the shape already holds returns the same handle,
+  counts nothing, and moves the lease. So a create whose success response was lost can simply be
+  sent again. A subscription id held by a **different** shape is `409` — one name, one shape.
+- **Release is idempotent.** `DELETE /shapes/{id}?subscription=…` releases that claim; a second one
+  is a no-op `200`. `DELETE /shapes/{id}` **without** the parameter is the legacy anonymous
+  decrement, kept for callers that never learned their id: it is **not** retry-safe (nothing says
+  which claim was meant), and it releases an engine-minted claim before an identified one so it
+  cannot steal a named subscriber's. Omitting `subscription` on the create is the same trade — the
+  engine mints and returns one, but that first create had no idempotency, because a repeat is
+  indistinguishable from a new subscriber.
+- **A subscription is a lease.** Native reads go straight to durable-streams, so the engine never
+  sees them: a claim counts as live only while it is created or renewed within
+  `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
+  The retention sweeper releases an unrenewed one exactly as an explicit `DELETE` would, and the
+  shape then follows the ordinary lifecycle (idle → dormant → evicted). A client that renews late
+  simply re-subscribes and may find a fresh shape. `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` disables
+  dormancy and, with it, leases. Watch `subscriptions_live` (gauge) and
+  `subscriptions_lapsed_total` (counter); `GET /shapes/{id}` reports the per-shape count.
+- **Every catalog event carries an `eid`**, assigned when it is queued, and the boot fold ignores an
+  `eid` it has already applied — so the writer's retry-in-place (a response lost after the append
+  committed) can never double-apply a join, a leave or anything else. A catalog written before this
+  (no `eid`, no `subscription`) is boot-fatal, like the pre-ADR-0002 and pre-ADR-0006 formats.
+
 ### Durability of a create, and of a retirement
 
-`POST /shapes` (and a join) is acknowledged only once its record has reached the durable catalog. The
+`POST /shapes` (and a join that takes a NEW claim — a lease *renewal* promises nothing that is not
+already in the log, so its record is queued like any other) is acknowledged only once its record has
+reached the durable catalog. The
 catalog writer never drops an event: a transient failure — transport, timeout, 5xx — retries **that**
 event in place, forever, at 100 ms → 5 s, and everything queued behind it waits, which is what keeps
 the log's order equal to the engine's. So a create while durable-streams is down **waits** rather
@@ -324,11 +356,16 @@ stream: if storage has lost it, the stale registry entry is retired and the call
 rather than a dead URL.
 
 Removals are the other way round: `DELETE /shapes/{id}`, with or without `?purge=true`, is answered
-as soon as the engine state is updated and its `Left`/`Dropped` lands behind it, in order. Losing one
-would be benign (a restored refcount too many, which retention resolves; a shape whose stream is
-already retired fails to resume and is retired again) and cannot happen anyway — only be delayed —
-whereas waiting would let a slow delete time out and be **retried**, and a second delete decrements a
-shared refcount that was not the caller's. Answer first, record after.
+as soon as the engine state is updated and its `Left`/`Dropped` lands behind it, in order. Waiting
+would block every removal for the whole of a storage outage — including the purge a caller reaches
+for precisely because something must go NOW, and which may itself be what unblocks a create parked on
+its own durability wait. Losing one is bounded instead: a `Left` that never landed comes back as a
+subscription whose **restored lease age** is already past the idle window, so the sweeper releases it
+within one sweep; a `Dropped` that never landed comes back as a shape whose subscriptions are equally
+stale, and a repeated purge is a no-op. Answer first, record after.
+
+(ADR-0008 proposed making a client-facing purge durable-before-ack; the implementation deliberately
+does not — see `Engine::purge_shape` for why that combination is not implementable.)
 
 A *definite* refusal of a record (a 4xx, an event that will not serialize) is the pathological case —
 memory and storage disagree — and exits `74`. Note what that means for a storage front that accepts
@@ -608,9 +645,10 @@ Shapes follow a three-tier lifecycle (`src/retention.rs`) instead of delete-on-l
 a deliberate divergence from upstream Electric, which keeps every retained shape actively
 maintained:
 
-- **Active** — maintained live. Unsubscribing (`DELETE /shapes/{id}`, `/v1/shape` handle expiry)
-  does not deactivate; brief reconnects rejoin the same warm stream.
-- **Dormant** — after `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` with no reads and no subscribers: engine
+- **Active** — maintained live. Unsubscribing (`DELETE /shapes/{id}?subscription=…`, a lapsed lease,
+  `/v1/shape` handle expiry) does not deactivate; brief reconnects rejoin the same warm stream.
+- **Dormant** — after `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` with no reads and no **live** subscriptions
+  (a subscription is live only while renewed within that same window — see "Subscriptions"): engine
   routing state is dropped, the durable stream and shape record are retained at zero engine cost.
   Any touch (rejoin, `/v1/shape` re-snapshot, rows/log read) reactivates by replaying the change
   log from the captured resume position (`(segment, offset)`, following rotation pointers across

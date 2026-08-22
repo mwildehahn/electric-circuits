@@ -124,7 +124,22 @@ Writes go to Postgres with ordinary SQL (the engine ingests via replication). In
 (no Postgres), use `client.write(...)` or the schema-derived helpers
 `client.tables.<t>.insert/update/delete(row, txid?)`.
 
-**`close()` is one-shot and deletes server-side.** Every `shape()`/`subset()`/`aggregate()` holds
-one reference on a ref-counted server object; its `close()` releases exactly that reference (with
-retry — there is no server-side reaper) and is guarded against double-close. `client.close()`
-tears down everything still open. Design context: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
+**Every materialization holds a named subscription, and renews it.** `shape()`, `subset()` and
+`aggregate()` each mint a `subscription` id (a uuid) and send it with the create; the engine records
+the claim under that name and returns it on the handle together with `leaseSeconds`
+(ADR-0008). Two things follow:
+
+- **`close()` is one-shot and idempotent on the wire.** It releases exactly this materialization's
+  claim, by id, with retry — and because a release names the claim, a retry after a lost response
+  releases nothing a second time. (Before this, a retried delete could take another subscriber's
+  reference on a shared shape.) `client.close()` tears down everything still open.
+- **The subscription is a lease, so the client renews it.** Native reads go straight to
+  durable-streams, where the engine cannot see them, so an un-renewed claim is released after
+  `leaseSeconds` (the engine's `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`) and the shape follows its
+  retention lifecycle. Each open materialization renews on a third of that window automatically; a
+  caller whose timers do not run (a suspended tab, a test that controls time) can say it explicitly
+  with `shape.renew()` / `subset.renew()` / `aggregate.renew()` — the same create with the same id,
+  which the engine treats as "still here", never as a second subscriber. If a lease does lapse, the
+  next create simply re-subscribes (possibly to a fresh shape — the ordinary re-subscribe contract).
+
+Design context: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).

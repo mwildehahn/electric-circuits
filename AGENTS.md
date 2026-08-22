@@ -325,15 +325,16 @@ canvas update, screenshot.
   re-fold at boot can reconcile them — but only **once the catalog stream exists in this process**:
   until the creating PUT has succeeded, an append failure can just as well be "the stream is not
   there yet", so every failure is retried (a permanently-4xx PUT is retried forever, and says so).
-  The rule for which records wait: **durable-before-ack = `Created` and `Joined`** (`send_durable`,
-  awaited before the HTTP answer, no timeout — a create while storage is down waits rather than
-  handing back a shape a restart would forget); **queued-never-dropped = everything else, including
-  `Left` and `Dropped`** — a removal is answered at once and its record lands in order. Losing one of
-  those is benign in the safe direction (a restored refcount too many, or a shape whose stream is
-  already retired, which fails to resume and is retired again) and cannot happen anyway, only be
-  delayed; waiting on them would make a slow `DELETE` time out and be retried, which is the
-  double-delete hazard below. If you add a mutation whose acknowledgement CREATES something, use
-  `send_durable`.
+  The rule for which records wait: **durable-before-ack = `Created`, and `Joined` for a
+  NEW claim** (`send_durable`, awaited before the HTTP answer, no timeout — a create while storage is
+  down waits rather than handing back a shape a restart would forget; a lease RENEWAL promises
+  nothing new and is queued); **queued-never-dropped = everything else, including `Left` and
+  `Dropped`** — a removal is answered at once and its record lands in order. Waiting on a removal
+  would block every `DELETE`/purge for the whole of a storage outage — including the purge that
+  unblocks a create parked on its own durability wait — and losing one is bounded from the other
+  side: the restore brings the shape back with its subscriptions' **lease ages**, so an unrenewed
+  claim is released within one sweep (ADR-0008). If you add a mutation whose acknowledgement CREATES
+  something, use `send_durable`.
 - **A durability wait is an interval: re-check the closing conditions AFTER it, before answering**
   (`Engine::recheck_after_durability`). `send_durable` is unbounded external I/O, so anyone who can
   make storage slow can hold a create/join open while a `TRUNCATE`, a schema drift, an epoch reset or
@@ -371,10 +372,32 @@ canvas update, screenshot.
 - **Shape creation is atomic.** On any failure, everything (record, share entries, registry
   refcounts/edges, stream) rolls back and the error propagates — including to joiners waiting on the
   share's ready-watch. Never leave a signature pointing at a dead stream.
-- **Sharing lifecycle:** equal shapes share one id+stream, ref-counted; N joiners each release
-  exactly once. The final release does NOT delete anything: the shape stays active/warm and is
-  retired by the retention lifecycle (idle → dormant → evicted; `engine/src/retention.rs`). Client
-  `close()` must still be one-shot (a double delete steals another subscriber's refcount).
+- **Sharing lifecycle:** equal shapes share one id+stream, held by a SET of named subscriptions; N
+  joiners each release exactly once. The final release does NOT delete anything: the shape stays
+  active/warm and is retired by the retention lifecycle (idle → dormant → evicted;
+  `engine/src/retention.rs`). Client `close()` is still one-shot, but a repeat is now harmless (see
+  the subscription invariant below).
+- **A subscription is an identity, and it is a lease** (ADR-0008; `POST /shapes { subscription }`,
+  `DELETE /shapes/{id}?subscription=…`). The caller names its claim, so **repeating a create is a
+  renewal** (same handle, nothing counted) and **repeating a release is a no-op** — the two
+  ambiguous outcomes of an HTTP mutation (a response lost after the server committed) stop being
+  corruption. An id held by a different shape is refused 409; an omitted one is minted by the engine
+  and returned, with no idempotency on that first create; a `DELETE` with no id is the legacy
+  anonymous decrement (not retry-safe, and it takes a minted claim before a named one). And because
+  native reads go straight to durable-streams where the engine cannot see them, the renewal IS the
+  liveness signal: a claim not renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` is released by the
+  retention sweeper exactly as an explicit delete would release it (`Left { lapsed: true }`), and
+  the shape then follows the ordinary lifecycle. If you add a create path, thread the subscription
+  through it; if you add a release path, name the claim. A provisional claim taken before an await
+  needs a guard (`JoinGuard`/`CreateGuard`): a client that disconnects mid-wait must not leave one
+  behind, and the compensation is safe precisely because it names its own id.
+- **Every catalog event carries an `eid`, and the fold applies each one at most once** (ADR-0008).
+  The id is assigned at ENQUEUE (`CatalogWriter::send*`), so every append attempt of one event —
+  the first and every retry after a lost response — carries the same one; the boot fold keeps the
+  set it has seen and skips repeats. This is what makes "the writer never drops an event" safe for
+  records whose effect is not naturally idempotent. A catalog event without an `eid` (or a
+  shape-lifecycle event without a `subscription`) is boot-fatal, like the pre-ADR-0002 and
+  pre-ADR-0006 formats — greenfield, no compat.
 - **A backfill is never materialised.** Every Postgres backfill streams off a `query_raw` cursor and
   is consumed **chunk by chunk** (`pg::BackfillReader`, bounded by
   `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`), so engine memory per backfill is one chunk however wide

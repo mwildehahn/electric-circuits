@@ -274,7 +274,12 @@ To read retained state directly (independent of allocator noise), scrape the OTe
 
 Identical live queries are **de-duplicated end to end**: two `shape()`/`subset()`/`aggregate()`
 calls with the same definition (predicate order doesn't matter) share one maintained stream on the
-engine, ref-counted — always `close()` what you open (close is one-shot and safe to call twice).
+engine, each holding its own named **subscription** — always `close()` what you open (close is
+one-shot, and now safe to repeat on the wire too: it releases a claim by name, so a retry after a
+lost response cannot take another subscriber's). A subscription is also a **lease**: the client
+renews it automatically while the query is open, because native reads bypass the engine and a claim
+nobody renews is released after `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (see
+`docs/adr/0008-subscriptions-are-identified-idempotent-and-leased.md`).
 
 ## 8. See also
 

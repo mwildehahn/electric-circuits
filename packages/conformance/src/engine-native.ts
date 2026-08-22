@@ -24,6 +24,10 @@ export interface ShapeResp {
   shapeId: string
   streamPath: string
   streamUrl: string
+  /** The subscription the create was recorded under (ADR-0008) — sent, or minted by the engine. */
+  subscription?: string
+  /** Seconds a subscription may go unrenewed before the engine releases it (`0` = never). */
+  leaseSeconds?: number
 }
 
 /** `POST /shapes` as the control plane does it: the body is the shape definition, the answer a handle. */

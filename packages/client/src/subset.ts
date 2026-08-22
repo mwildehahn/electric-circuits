@@ -32,6 +32,12 @@ export interface SubsetSubscription<T extends Row = Row> {
   loadMore(pageSize?: number): Promise<number>
   /** False once a page returned fewer rows than requested (the set is fully loaded). */
   hasMore(): boolean
+  /**
+   * Renew this subscription's lease (ADR-0008). The client already renews on the server's cadence
+   * while the subscription is open; this is here for a caller that suspends its own timers (a
+   * backgrounded tab, a test) and wants to say "still here" explicitly.
+   */
+  renew(): Promise<void>
   /** Tear down the live feed (drops the server-side changes-only feed) and stop following the tail. */
   close(): Promise<void>
 }
@@ -159,17 +165,22 @@ function isNotFoundError(e: unknown): boolean {
 }
 
 /**
- * Release a server-side shape/feed subscriber ref, retrying transient failures. The engine
- * refcounts per identical create; the final release does not delete the shape (the retention
- * lifecycle — idle → dormant → evicted — retires it), but a swallowed release leaks a refcount
- * that pins the shape active forever, so retry with backoff and only warn once if the delete
- * never lands. "Not found" counts as success (the shape was already evicted by retention).
+ * Release a server-side subscription, retrying transient failures.
+ *
+ * The retry is only safe because the release is **identified**: it names this materialization's own
+ * `subscription` id (ADR-0008), and releasing an id the shape no longer holds is a no-op. Before
+ * that, a success response lost in transit turned one `close()` into two decrements and stole
+ * another subscriber's claim on a shared shape. Omitting the id falls back to the engine's legacy
+ * anonymous decrement, which is NOT retry-safe — nothing in this package does.
+ *
+ * A swallowed release still matters (it pins the shape until the lease lapses), so failures retry
+ * with backoff and warn once. "Not found" counts as success (the shape was already evicted).
  */
-export async function deleteShapeWithRetry(trpc: Trpc, id: string): Promise<void> {
+export async function deleteShapeWithRetry(trpc: Trpc, id: string, subscription?: string): Promise<void> {
   const attempts = 5
   for (let i = 0; i < attempts; i++) {
     try {
-      await trpc.shapes.delete.mutate({ id })
+      await trpc.shapes.delete.mutate({ id, ...(subscription ? { subscription } : {}) })
       return
     } catch (e) {
       if (isNotFoundError(e)) return
@@ -179,6 +190,72 @@ export async function deleteShapeWithRetry(trpc: Trpc, id: string): Promise<void
       }
       await new Promise((r) => setTimeout(r, 200 * 2 ** i))
     }
+  }
+}
+
+/** A fresh subscription id for one materialization (ADR-0008). */
+export function newSubscriptionId(): string {
+  return globalThis.crypto.randomUUID()
+}
+
+/** What a materialization holds to keep its subscription alive; see [`startLeaseRenewal`]. */
+export interface LeaseKeeper {
+  /** Renew now. A no-op once [`stop`](LeaseKeeper.stop) has been called. */
+  renew(): Promise<void>
+  /** Stop renewing, and wait for a renewal already in flight to settle. */
+  stop(): Promise<void>
+}
+
+/**
+ * Keep one subscription's lease alive until it is closed.
+ *
+ * A native subscriber reads its shape straight from durable-streams, so the engine cannot see the
+ * reads: an un-renewed subscription is indistinguishable from a client that vanished, and after
+ * `leaseSeconds` the engine releases it (ADR-0008). Renewing is the same create with the same id —
+ * idempotent, so a missed or duplicated renewal costs nothing.
+ *
+ * The cadence is a third of the server's own window (so two consecutive failures still leave a
+ * chance), clamped to a sane range, and read from the handle rather than assumed: the window is the
+ * server's to set. `leaseSeconds === 0` means dormancy is off and leases never lapse, so no timer
+ * runs — an explicit `renew()` still works, because the caller asked for it.
+ *
+ * **`stop()` is what makes `close()` safe.** A renewal is a create, so one still in flight when the
+ * `DELETE` goes out can land *after* it and re-take the very claim the close just released — a
+ * subscription nothing will ever release again, pinning the shape until its lease lapses. So a close
+ * stops the keeper first and awaits the in-flight renewal, and a `renew()` after that is a no-op
+ * rather than a resurrection (closing is one-shot in this client; a renewal racing it must lose).
+ */
+export function startLeaseRenewal(leaseSeconds: number | undefined, renew: () => Promise<unknown>): LeaseKeeper {
+  let stopped = false
+  let inFlight: Promise<unknown> = Promise.resolve()
+  const once = async (): Promise<void> => {
+    if (stopped) return
+    const attempt = renew()
+    inFlight = attempt.catch(() => {})
+    await attempt
+  }
+  const timer =
+    leaseSeconds && leaseSeconds > 0
+      ? setInterval(
+          () => {
+            void once().catch((e) => {
+              // A failed renewal is not fatal: the next tick tries again, and if the lease does
+              // lapse the materialization's next read simply finds a fresh shape (ADR-0007).
+              console.warn('client: subscription renewal failed:', e)
+            })
+          },
+          Math.min(Math.max((leaseSeconds * 1000) / 3, 250), 5 * 60_000),
+        )
+      : undefined
+  // Node keeps the process alive for a pending interval; a lease keeper must never do that.
+  ;(timer as unknown as { unref?: () => void } | undefined)?.unref?.()
+  return {
+    renew: once,
+    stop: async () => {
+      stopped = true
+      if (timer) clearInterval(timer)
+      await inFlight
+    },
   }
 }
 
@@ -287,8 +364,19 @@ export async function createSubset<T extends Row = Row>(
 
   // 1. Open the live tail FIRST so it captures every change from ~now. The feed may be SHARED with other
   //    subscriptions on the same predicate (the engine ref-counts identical changes-only feeds).
-  const feed = await deps.trpc.subset.live.mutate({ table: def.table, where: def.where as never, columns: cols })
+  // This subscription's own id: the feed may be SHARED with other subscriptions on the same
+  // predicate, and the id is what lets this one be renewed and released without touching theirs.
+  const subscription = newSubscriptionId()
+  const feed = await deps.trpc.subset.live.mutate({
+    table: def.table,
+    where: def.where as never,
+    columns: cols,
+    subscription,
+  })
   const feedUrl = deps.resolveStreamUrl(feed)
+  const lease = startLeaseRenewal(feed.leaseSeconds, () =>
+    deps.trpc.subset.live.mutate({ table: def.table, where: def.where as never, columns: cols, subscription }),
+  )
 
   const ac = new AbortController()
   let closed = false
@@ -453,19 +541,27 @@ export async function createSubset<T extends Row = Row>(
         }
       },
 
+      async renew() {
+        await lease.renew()
+      },
+
       async close() {
-        // One-shot: the engine DELETE decrements a shared refcount per call, so a double close must
-        // not steal another subscriber's reference on a shared feed.
+        // Still one-shot, and now idempotent on the wire too: the DELETE names THIS subscription,
+        // so neither a double close nor a retried one can touch another subscriber's claim. The
+        // lease keeper is stopped AND drained first — a renewal still in flight would otherwise
+        // land after the release and re-take the claim (see `startLeaseRenewal`).
         if (closed) return
         closed = true
+        await lease.stop()
         ac.abort()
-        await deleteShapeWithRetry(deps.trpc, feed.shapeId)
+        await deleteShapeWithRetry(deps.trpc, feed.shapeId, subscription)
       },
     }
   } catch (e) {
     closed = true
+    await lease.stop()
     ac.abort()
-    await deleteShapeWithRetry(deps.trpc, feed.shapeId)
+    await deleteShapeWithRetry(deps.trpc, feed.shapeId, subscription)
     throw e
   }
 }

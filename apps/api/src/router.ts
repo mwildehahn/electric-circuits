@@ -66,10 +66,23 @@ export const appRouter = t.router({
   }),
 
   shapes: t.router({
+    // `subscription` names the caller's claim (ADR-0008). Repeating a create with the same id
+    // renews it and returns the same handle, so a create is safe to retry after an ambiguous
+    // failure; a delete carrying it releases exactly that claim, so a delete is too.
     create: t.procedure
-      .input(z.object({ table: z.string(), where: predicateSchema.optional(), columns: z.array(z.string()).optional() }))
+      .input(
+        z.object({
+          table: z.string(),
+          where: predicateSchema.optional(),
+          columns: z.array(z.string()).optional(),
+          subscription: z.string().min(1).max(128).optional(),
+        }),
+      )
       .mutation(async ({ input, ctx }) =>
-        ctx.core.createShape({ table: input.table, where: input.where as never, columns: input.columns }),
+        ctx.core.createShape(
+          { table: input.table, where: input.where as never, columns: input.columns },
+          input.subscription,
+        ),
       ),
 
     get: t.procedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
@@ -79,9 +92,9 @@ export const appRouter = t.router({
     }),
 
     delete: t.procedure
-      .input(z.object({ id: z.string() }))
+      .input(z.object({ id: z.string(), subscription: z.string().min(1).max(128).optional() }))
       .mutation(async ({ input, ctx }) => {
-        await ctx.core.dropShape(input.id)
+        await ctx.core.dropShape(input.id, input.subscription)
         return { ok: true as const }
       }),
   }),
@@ -114,9 +127,19 @@ export const appRouter = t.router({
       ),
 
     live: t.procedure
-      .input(z.object({ table: z.string(), where: predicateSchema.optional(), columns: z.array(z.string()).optional() }))
+      .input(
+        z.object({
+          table: z.string(),
+          where: predicateSchema.optional(),
+          columns: z.array(z.string()).optional(),
+          subscription: z.string().min(1).max(128).optional(),
+        }),
+      )
       .mutation(async ({ input, ctx }) =>
-        ctx.core.createSubsetFeed({ table: input.table, where: input.where as never, columns: input.columns }),
+        ctx.core.createSubsetFeed(
+          { table: input.table, where: input.where as never, columns: input.columns },
+          input.subscription,
+        ),
       ),
   }),
 
@@ -130,10 +153,14 @@ export const appRouter = t.router({
           where: predicateSchema.optional(),
           fn: z.enum(['count', 'sum', 'avg', 'min', 'max']),
           col: z.string().optional(),
+          subscription: z.string().min(1).max(128).optional(),
         }),
       )
       .mutation(async ({ input, ctx }) =>
-        ctx.core.createAggregate({ table: input.table, where: input.where as never, fn: input.fn, col: input.col }),
+        ctx.core.createAggregate(
+          { table: input.table, where: input.where as never, fn: input.fn, col: input.col },
+          input.subscription,
+        ),
       ),
   }),
 })

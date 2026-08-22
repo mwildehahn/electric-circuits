@@ -205,6 +205,64 @@ struct CreateShapeReq {
     /// tail feed). Used by subset queries; a normal materialized shape leaves this false.
     #[serde(default, rename = "changesOnly")]
     changes_only: bool,
+    /// The caller's **subscription id** (ADR-0008): a name for this claim on the shape.
+    ///
+    /// Repeating the create with the same id renews that subscription and returns the same handle
+    /// instead of taking a second claim — so a caller whose success response was lost can simply ask
+    /// again. Omitted, the engine mints one and returns it: the caller can then renew and release
+    /// with it, but it had **no idempotency on this create**, because a repeat is indistinguishable
+    /// from a new subscriber. An id another shape already holds is a `409`.
+    #[serde(default)]
+    subscription: Option<String>,
+}
+
+/// The checks every subscription id must pass, wherever it appears. Free-form (a uuid, a session
+/// id, a device id — the engine never interprets it), with two limits: it must not be empty, and it
+/// must fit in 128 bytes so a catalog event stays small. Control characters are refused because the
+/// id travels through logs and a JSON catalog record.
+///
+/// The `~` prefix is deliberately NOT checked here: the engine's own minted ids carry it, and they
+/// are returned to the caller precisely so it can renew and release with them (see
+/// [`validate_new_subscription`] for the one place forging is refused).
+fn validate_subscription(sub: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(sub) = sub else { return Ok(None) };
+    let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string() };
+    if sub.is_empty() {
+        return Err(bad("subscription must not be empty (omit it to have one minted)"));
+    }
+    if sub.len() > 128 {
+        return Err(bad("subscription must be at most 128 bytes"));
+    }
+    if sub.chars().any(char::is_control) {
+        return Err(bad("subscription must not contain control characters"));
+    }
+    Ok(Some(sub))
+}
+
+/// [`validate_subscription`] for a CREATE, which is the only place an id can be brought into
+/// existence — and therefore the only place the engine's `~` namespace has to be defended.
+///
+/// A `~` id the engine currently holds is a **renewal or release of a claim it minted itself**, and
+/// must be accepted: a caller that omitted `subscription` got that id back in the response, and the
+/// whole point of returning it is that the caller can then say "still here" or "done" with it. A `~`
+/// id nobody holds could only have been made up, and accepting it would let a caller forge a claim
+/// that the legacy anonymous `DELETE` treats as expendable (it releases minted claims first) — so
+/// that one is a `400`.
+async fn validate_new_subscription(engine: &Engine, sub: Option<String>) -> Result<Option<String>, AppError> {
+    let sub = validate_subscription(sub)?;
+    if let Some(id) = &sub
+        && id.starts_with(crate::engine::MINTED_SUB_PREFIX)
+        && !engine.subscription_is_held(id).await
+    {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!(
+                "subscription '{id}' starts with '~', which only the engine mints; send the id a \
+                 create returned to you, or a name of your own"
+            ),
+        });
+    }
+    Ok(sub)
 }
 
 #[derive(Serialize)]
@@ -214,16 +272,49 @@ struct ShapeResp {
     table: TableRef,
     stream_path: String,
     stream_url: String,
+    /// The subscription this create was recorded under (ADR-0008) — the caller's own id, or the one
+    /// the engine minted. Release it with `DELETE /shapes/{id}?subscription=…`, renew it by
+    /// repeating the create with it. Absent on `GET /shapes/{id}`, which belongs to no subscriber.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subscription: Option<String>,
+    /// How long a subscription may go unrenewed before the engine releases it
+    /// (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse, because dormancy is off).
+    /// The renewal cadence is the server's to set, so clients read it from here rather than guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_seconds: Option<u64>,
     /// Retention lifecycle: `active` | `deactivating` | `dormant` | `reactivating` (see
     /// `crate::retention`). Shapes handed out by create are always active.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'static str>,
+    /// Live subscriptions on the shape (`GET /shapes/{id}` only) — the count, never the ids. This
+    /// is the number that explains a shape which will not go dormant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subscriptions: Option<usize>,
 }
 
 impl ShapeResp {
     fn of(engine: &Engine, rec: ShapeRecord) -> Self {
         let stream_url = engine.stream_url(&rec.stream_path);
-        ShapeResp { shape_id: rec.id, table: rec.table, stream_path: rec.stream_path, stream_url, state: None }
+        ShapeResp {
+            shape_id: rec.id,
+            table: rec.table,
+            stream_path: rec.stream_path,
+            stream_url,
+            subscription: None,
+            lease_seconds: None,
+            state: None,
+            subscriptions: None,
+        }
+    }
+
+    /// A create's answer: the record plus the subscription it was taken under and the lease window
+    /// that subscription must be renewed within.
+    fn created(engine: &Engine, rec: ShapeRecord, subscription: String) -> Self {
+        ShapeResp {
+            subscription: Some(subscription),
+            lease_seconds: Some(engine.lease_seconds()),
+            ..ShapeResp::of(engine, rec)
+        }
     }
 }
 
@@ -257,9 +348,12 @@ async fn create_shape(
     State(engine): State<Engine>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
+    let subscription = validate_new_subscription(&engine, req.subscription).await?;
     // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
-    let rec = engine.create_shape(&req.table, req.where_, req.columns, req.changes_only, true).await?;
-    Ok(Json(ShapeResp::of(&engine, rec)))
+    let (rec, sub) = engine
+        .create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription)
+        .await?;
+    Ok(Json(ShapeResp::created(&engine, rec, sub)))
 }
 
 #[derive(Deserialize)]
@@ -271,6 +365,9 @@ struct AggregateReq {
     func: crate::engine::AggFn,
     #[serde(default)]
     col: Option<String>,
+    /// The caller's subscription id — identical semantics to `CreateShapeReq::subscription`.
+    #[serde(default)]
+    subscription: Option<String>,
 }
 
 /// Create a scalar aggregation shape (electric-circuits extension; not in the Electric protocol).
@@ -278,8 +375,9 @@ async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
-    let rec = engine.create_aggregate(&req.table, req.where_, req.func, req.col).await?;
-    Ok(Json(ShapeResp::of(&engine, rec)))
+    let subscription = validate_new_subscription(&engine, req.subscription).await?;
+    let (rec, sub) = engine.create_aggregate_as(&req.table, req.where_, req.func, req.col, subscription).await?;
+    Ok(Json(ShapeResp::created(&engine, rec, sub)))
 }
 
 async fn get_shape(
@@ -290,7 +388,8 @@ async fn get_shape(
     match engine.get_shape(&id).await {
         Some(rec) => {
             let state = engine.shape_lifecycle(&rec.id).await;
-            Ok(Json(ShapeResp { state, ..ShapeResp::of(&engine, rec) }))
+            let subscriptions = Some(engine.subscription_count(&rec.id).await);
+            Ok(Json(ShapeResp { state, subscriptions, ..ShapeResp::of(&engine, rec) }))
         }
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") }),
     }
@@ -462,10 +561,19 @@ struct ReleaseShapeQuery {
     /// retention lifecycle — an admin/debug operation (the visualizer's trash button).
     #[serde(default)]
     purge: bool,
+    /// Which subscription to release (ADR-0008) — the caller's own id, or the `~` one a create
+    /// returned when it named none. Omitted = the **legacy anonymous** decrement, kept for callers
+    /// that never learned their id; it is not retry-safe and prefers an engine-minted claim over an
+    /// identified one. Ignored with `?purge=true`, which removes the whole shape.
+    #[serde(default)]
+    subscription: Option<String>,
 }
 
-/// `DELETE /shapes/{id}` = unsubscribe. Releases one subscription (refcount); the shape itself is
-/// retained and follows the retention lifecycle (idle → dormant → evicted) — see `crate::retention`.
+/// `DELETE /shapes/{id}?subscription=…` = unsubscribe. Releases THAT subscription — repeating it is
+/// a no-op, so a caller whose response was lost may safely retry — and the shape itself is retained
+/// and follows the retention lifecycle (idle → dormant → evicted; see `crate::retention`). Without
+/// `subscription` it is the legacy anonymous decrement.
+///
 /// With `?purge=true` it instead force-drops the shape immediately (subscribed clients recreate via
 /// the normal 404 / must-refetch path).
 async fn release_shape(
@@ -473,12 +581,16 @@ async fn release_shape(
     Path(id): Path<String>,
     Query(q): Query<ReleaseShapeQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Both answer as soon as the engine state is updated: the catalog record is queued behind them
-    // and lands in order (see `Engine::release_shape` for why a removal is not durable-before-ack).
     if q.purge {
+        // Answered as soon as the engine state is updated, like the release below: see
+        // `Engine::purge_shape` for why the `Dropped` record is queued rather than waited on.
         engine.purge_shape(&id).await?;
     } else {
-        engine.release_shape(&id).await;
+        // Answered as soon as the engine state is updated: the `Left` is queued behind it and lands
+        // in order, and a lost one is reclaimed by the lease within one idle window (see
+        // `Engine::release_subscription`).
+        let subscription = validate_subscription(q.subscription)?;
+        engine.release_subscription(&id, subscription.as_deref()).await;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -744,6 +856,10 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::CreateRaced>().is_some()
         {
             StatusCode::SERVICE_UNAVAILABLE
+        // A subscription id that already names another shape is the caller's conflict to resolve,
+        // not a server fault and not something a retry changes (ADR-0008).
+        } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some() {
+            StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };

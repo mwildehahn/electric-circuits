@@ -12,6 +12,7 @@ import {
   lsnToU64,
   makeCmp,
   mergeFeedDelta,
+  startLeaseRenewal,
   type SubsetDeps,
   type SubsetView,
 } from './subset.js'
@@ -322,5 +323,58 @@ describe('window ordering agrees with the engine, not with UTF-16', () => {
   it('a text column holding digits is still text: "10" sorts before "9"', () => {
     const cmp = makeCmp('id', { col: 'label' }, () => 'text')
     expect(cmp({ id: 1, label: '10' }, { id: 2, label: '9' })).toBeLessThan(0)
+  })
+})
+
+// A renewal is a create, so one still in flight when `close()` releases the subscription would land
+// after it and re-take the claim — a subscription nothing will ever release again, pinning the
+// shared shape until its lease lapses. `stop()` is what closes that window (ADR-0008).
+describe('lease renewal keeper', () => {
+  it('stop() waits for a renewal already in flight, so a close cannot be overtaken', async () => {
+    const events: string[] = []
+    let settle: (() => void) | undefined
+    const keeper = startLeaseRenewal(0, () => {
+      events.push('renew:start')
+      return new Promise<void>((resolve) => {
+        settle = () => {
+          events.push('renew:done')
+          resolve()
+        }
+      })
+    })
+
+    const renewing = keeper.renew()
+    const stopping = keeper.stop().then(() => events.push('stopped'))
+    // Nothing has finished yet: `stop()` must still be waiting on the in-flight renewal.
+    await new Promise((r) => setTimeout(r, 10))
+    expect(events).toEqual(['renew:start'])
+
+    settle!()
+    await Promise.all([renewing, stopping])
+    expect(events, 'the release may only proceed once the renewal has landed').toEqual([
+      'renew:start',
+      'renew:done',
+      'stopped',
+    ])
+  })
+
+  it('renew() after stop() is a no-op: a closed materialization does not resurrect its claim', async () => {
+    let calls = 0
+    const keeper = startLeaseRenewal(0, async () => {
+      calls += 1
+    })
+    await keeper.renew()
+    expect(calls).toBe(1)
+
+    await keeper.stop()
+    await keeper.renew()
+    await keeper.renew()
+    expect(calls, 'every renewal after the close is dropped').toBe(1)
+  })
+
+  it('a failing renewal never rejects stop(): the close path must not inherit it', async () => {
+    const keeper = startLeaseRenewal(0, () => Promise.reject(new Error('storage is down')))
+    await expect(keeper.renew()).rejects.toThrow('storage is down')
+    await expect(keeper.stop()).resolves.toBeUndefined()
   })
 })

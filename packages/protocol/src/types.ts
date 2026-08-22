@@ -148,6 +148,19 @@ export interface ShapeHandle {
   table: string
   /** Stream path on the durable-streams server, e.g. `shape/<shapeId>`. */
   streamPath: string
+  /**
+   * The **subscription** this handle's claim was recorded under (ADR-0008) — the id the caller sent,
+   * or one the engine minted. Repeating the create with it renews the lease and returns this same
+   * handle; releasing with it is idempotent, so a lost response can safely be retried. Absent only
+   * on a handle read back with `shapes.get`, which belongs to no subscriber.
+   */
+  subscription?: string
+  /**
+   * How long the subscription may go unrenewed before the engine releases it, in seconds
+   * (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse). The renewal cadence is the
+   * server's to set — read it from here rather than assuming one.
+   */
+  leaseSeconds?: number
 }
 
 // --- Subset queries ----------------------------------------------------------

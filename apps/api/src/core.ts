@@ -28,17 +28,32 @@ export interface ShapeHandle {
   table: string
   streamPath: string
   streamUrl: string
+  /** The subscription the create was recorded under (ADR-0008). See `@electric-circuits/protocol`. */
+  subscription?: string
+  /** Seconds a subscription may go unrenewed before the engine releases it (`0` = never). */
+  leaseSeconds?: number
 }
 
 export interface ElectricCore {
   readonly dsUrl: string
   defineSchema(schema: Schema): Promise<void>
   write(input: WriteInput): Promise<{ txid: string }>
-  /** Register a **materialized, live** shape (backfilled + maintained as a durable stream). */
-  createShape(def: ShapeDef): Promise<ShapeHandle>
+  /**
+   * Register a **materialized, live** shape (backfilled + maintained as a durable stream).
+   *
+   * `subscription` names this caller's claim (ADR-0008): repeating the create with the same id
+   * renews it and returns the same handle rather than taking a second claim, which is what makes a
+   * create safe to retry after an ambiguous failure. Omitted, the engine mints one and returns it —
+   * with no idempotency on that first create.
+   */
+  createShape(def: ShapeDef, subscription?: string): Promise<ShapeHandle>
   getShape(id: string): Promise<ShapeHandle | null>
-  /** Drop a shape (or subset feed) and tear down its stream. Idempotent. */
-  dropShape(id: string): Promise<void>
+  /**
+   * Release a subscription on a shape. Genuinely idempotent when `subscription` is given (releasing
+   * an id the shape does not hold does nothing), which is why the client may retry it; without one
+   * it is the engine's legacy anonymous decrement and a retry releases a second claim.
+   */
+  dropShape(id: string, subscription?: string): Promise<void>
   /** Run a one-shot **subset query** (ephemeral, non-materialized query-back from Postgres). */
   querySubset(def: SubsetDef): Promise<SubsetResult>
   /**
@@ -46,10 +61,10 @@ export interface ElectricCore {
    * (no backfill, no stored set). The client seeds rows from {@link querySubset} and applies this
    * feed's deltas, re-checking view membership — so paging never becomes server-side range state.
    */
-  createSubsetFeed(def: Pick<SubsetDef, 'table' | 'where' | 'columns'>): Promise<ShapeHandle>
+  createSubsetFeed(def: Pick<SubsetDef, 'table' | 'where' | 'columns'>, subscription?: string): Promise<ShapeHandle>
   /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-circuits
    * extension (not in the Electric protocol). Streams a single value maintained incrementally. */
-  createAggregate(def: AggregateDef): Promise<ShapeHandle>
+  createAggregate(def: AggregateDef, subscription?: string): Promise<ShapeHandle>
 }
 
 export interface CoreOptions {
@@ -117,10 +132,15 @@ export function createCore(opts: CoreOptions): ElectricCore {
       throw new Error('append changes: the change log kept rotating away from under the write')
     },
 
-    async createShape(def) {
+    async createShape(def, subscription) {
       return engineJson<ShapeHandle>('/shapes', {
         method: 'POST',
-        body: JSON.stringify({ table: def.table, where: def.where ?? null, columns: def.columns ?? null }),
+        body: JSON.stringify({
+          table: def.table,
+          where: def.where ?? null,
+          columns: def.columns ?? null,
+          ...(subscription ? { subscription } : {}),
+        }),
       })
     },
 
@@ -131,12 +151,13 @@ export function createCore(opts: CoreOptions): ElectricCore {
       return (await res.json()) as ShapeHandle
     },
 
-    async dropShape(id) {
-      const res = await doFetch(`${engineUrl}/shapes/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    async dropShape(id, subscription) {
+      const query = subscription ? `?subscription=${encodeURIComponent(subscription)}` : ''
+      const res = await doFetch(`${engineUrl}/shapes/${encodeURIComponent(id)}${query}`, { method: 'DELETE' })
       if (!res.ok && res.status !== 404) throw new Error(`engine DELETE /shapes/${id} -> ${res.status}`)
     },
 
-    async createSubsetFeed(def) {
+    async createSubsetFeed(def, subscription) {
       return engineJson<ShapeHandle>('/shapes', {
         method: 'POST',
         body: JSON.stringify({
@@ -144,14 +165,21 @@ export function createCore(opts: CoreOptions): ElectricCore {
           where: def.where ?? null,
           columns: def.columns ?? null,
           changesOnly: true,
+          ...(subscription ? { subscription } : {}),
         }),
       })
     },
 
-    async createAggregate(def) {
+    async createAggregate(def, subscription) {
       return engineJson<ShapeHandle>('/aggregate', {
         method: 'POST',
-        body: JSON.stringify({ table: def.table, where: def.where ?? null, fn: def.fn, col: def.col ?? null }),
+        body: JSON.stringify({
+          table: def.table,
+          where: def.where ?? null,
+          fn: def.fn,
+          col: def.col ?? null,
+          ...(subscription ? { subscription } : {}),
+        }),
       })
     },
 

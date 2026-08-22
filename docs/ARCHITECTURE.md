@@ -371,15 +371,27 @@ into a double, so a number there would be a wrong answer that looks right. AVG s
 
 ### 5.3 Shape de-duplication (the sharing layer)
 
-Any two **equal** shapes share one maintained stream, ref-counted:
+Any two **equal** shapes share one maintained stream, held by a set of named subscriptions
+(ADR-0008 — "ref-counted", where the count is that set's size):
 
 - **Signature.** Row shapes: `(table, canonical predicate, sorted projection, changes_only)` —
   predicate canonicalization is order-insensitive (`a AND b` ≡ `b AND a`). Aggregations:
   `(table, canonical predicate, function, column)`, namespaced so the two kinds never collide.
-- **Join.** A create whose signature already exists increments the refcount and returns the *same*
-  shape id + stream. Joiners **wait for the creator's backfill to land** (a watch channel in the
-  share entry) so no caller ever sees a stream whose snapshot isn't readable yet — and a *failed*
-  creation propagates to every waiting joiner rather than handing them a dead stream.
+- **Join.** A create whose signature already exists adds this caller's **subscription** to the
+  shape's live set and returns the *same* shape id + stream. Joiners **wait for the creator's
+  backfill to land** (a watch channel in the share entry) so no caller ever sees a stream whose
+  snapshot isn't readable yet — and a *failed* creation propagates to every waiting joiner rather
+  than handing them a dead stream. A join abandoned mid-wait (the client disconnected while storage
+  was slow) compensates with a `Left` for its own subscription — idempotent, so it cannot take
+  anyone else's claim.
+- **Subscriptions, not a refcount** (ADR-0008). The "refcount" is the SIZE of a per-shape set of
+  caller-named subscription ids. Repeating a create with an id the shape already holds is a
+  **renewal**: same handle, nothing counted, lease moved; an id held by a *different* shape is
+  refused (409). Releasing names the id, so a repeat is a no-op instead of a second decrement — the
+  ambiguity that used to let one client's retried `DELETE` evict a shape under another. A
+  subscription is also a **lease**: native reads bypass the engine entirely, so a claim counts as
+  live only while renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, and the retention sweeper
+  releases an unrenewed one exactly as an explicit delete would.
 - **A join verifies the retained stream still exists** — one `HEAD` per join. The record is engine
   state; the stream is storage's, and storage can lose it (an operator `DELETE`, a restore from an
   older backup). Gone (404/410) or closed means the registry entry is stale: it is retired properly
@@ -389,10 +401,11 @@ Any two **equal** shapes share one maintained stream, ref-counted:
   so probing a pending one would kill a create in flight. `GET /shapes/{id}` deliberately does NOT
   do this: it is a metadata read on every polling client's hot path, and joining is where a dead
   handle actually gets handed out.
-- **Drop.** Deletes decrement; the shape, its routing/registry entries, **and its durable stream**
-  are torn down when the last subscriber leaves (a dropped shape must not leave an orphaned stream
-  on the storage server). N joiners hold the same id and must each delete exactly once; the client
-  enforces one-shot `close()`.
+- **Drop.** A delete removes that subscription; the shape itself is retained and ages through the
+  retention lifecycle (idle → dormant → evicted, §"Shape retention" in the engine README) — the last
+  release is not a teardown. N subscribers hold the same id, each releasing its own; the client
+  still enforces one-shot `close()`, but a double or retried close is now harmless on the wire
+  because it names a claim that is already gone.
 - **Both public surfaces share.** The Electric `/v1/shape` adapter passes `share=true` as well and
   keys its per-request live state by the SHARED shape id (`electric.rs`), so identical Electric
   definitions collapse onto one maintained stream like everything else; `share=false` remains for a
@@ -734,14 +747,16 @@ absolute membership emission makes them unnecessary for convergence).
 | ingestor → change log | append (chunked past `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`; contiguous on one segment, last envelope marked `headers.last`) → acknowledge **after the last chunk**; reader holds an unterminated run + `(lsn,seq)` de-dup, checkpointed together — ADR-0003 | at-least-once delivery, exactly-once effect; a commit of any size at bounded INGESTOR memory, still one unit of visibility |
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
-| shared shapes | signature + refcount + ready-watch + atomic rollback | joiners see a live, backfilled stream or an error; last drop tears everything down |
+| shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
+| subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
+| catalog event → fold | every event carries an `eid` assigned at enqueue; the boot fold applies an `eid` at most once | the writer's retry-in-place (a response lost after the append committed) can never double-apply a join, a leave, a drop or a rotation |
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
-| client-facing mutation → catalog | **durable-before-ack: `Created`, `Joined`** — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`). **Queued-never-dropped: everything else, `Left`/`Dropped` included** — answered at once, the record lands in order. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream. A lost removal is benign in the other direction (a refcount too many, resolved by retention; a shape whose stream is retired fails to resume and is retired again) and cannot be lost anyway, only delayed — while WAITING on it would let a slow `DELETE` time out and be retried, which is the double-delete that steals another subscriber\'s refcount. The cost is that a create while storage is down **waits** rather than lying |
+| client-facing mutation → catalog | **durable-before-ack** = the records that CREATE something the client is promised: `Created`, and the `Joined` of a NEW claim — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`). **Queued-never-dropped** = everything else: a *renewal's* `Joined` (that claim is already in the log), `Left`, `Dropped` — answered at once, the record lands in order. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream. A queued record cannot be lost, only delayed — and if a process dies with one still queued, the **lease** reconverges it: the shape comes back with its subscriptions' restored ages, so a `Left` that never landed is re-applied within one idle window, and a `Dropped` that never landed leaves a shape whose stale claims lapse the same way. Waiting on a removal instead would block every `DELETE`/purge for the whole of a storage outage — including the purge that would unblock a create parked on its own durability wait — and buys nothing the lease does not already give. The cost is that a create while storage is down **waits** rather than lying |
 | shape ids → streams | the boot resumes `next_shape_id` past the maximum id of every `Created` in the log, dropped ones included (`CatalogFold::max_shape_id`) | an id is never re-minted while the `shape/*` stream it named still exists: a new shape can never inherit a dead one\'s stream (and its rows), and a pending retirement can never delete a live shape\'s stream |
 | shape removal → stream removal | `Dropped` (intent) is written BEFORE the retirement, `Retired` (completion) only after storage accepts the delete; failures go to a background queue that retries to completion, and every boot re-queues each `Dropped` with no `Retired` — ADR-0007 | no shape stream outlives its shape, whatever storage was doing at the moment it was retired or which process was alive at the time; this is also the orphan-`shape/*` GC, bounded by the catalog rather than a storage listing |
 | change log ↔ disk | segment rotation by size/age + delete-when-nothing-can-resume (the DURABLE checkpoint past it AND no shape pinning it; a dormant shape pinning past the retain window is evicted first, a reactivating one is never evicted mid-replay) — ADR-0006 | the log is bounded without prefix trimming; no reader ever loses its place (positions are `(segment, offset)`, the pointer is followed, the current segment is never deleted) |
-| engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop/retire + change-log position checkpoints + segment rotations) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
+| engine restart | durable shape catalog (`meta/catalog`: create/join/leave (each naming a subscription + its lease time)/drop/retire + change-log position checkpoints + segment rotations, every event carrying an `eid`) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
 | compiled schema ↔ Postgres | fingerprint compare on every `Relation` + a 60 s catalog reconciler; drift/TRUNCATE/identity regression retires that table's dependents, and a per-table schema generation refuses any create that overlapped it (ADR-0005) | never serves rows over a schema Postgres no longer has; the catalog records `schemaChanged` as the audit trail for the drops |
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
 | graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch, flushes, writes a final `Offset` → catalog drains → exit 0; bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |

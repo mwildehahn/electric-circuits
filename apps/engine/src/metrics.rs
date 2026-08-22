@@ -104,6 +104,10 @@ pub struct Metrics {
     pub shapes_reactivated: AtomicU64, // retention: dormant -> active (table-stream replay)
     pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
+    /// ADR-0008 COUNTER: subscriptions released by the sweeper because their lease was not renewed
+    /// within the idle window. A climbing value with healthy clients means the renewal cadence is
+    /// longer than `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, not that anything crashed.
+    pub subscriptions_lapsed: AtomicU64,
     pub schema_drift: AtomicU64,       // ADR-0005: tables whose dependents were retired (drift / TRUNCATE / identity regression / drop)
     pub schema_unresolved: AtomicU64,  // ADR-0005: drifts that could not be resolved (table parked, retrying)
     pub epoch_breaks: AtomicU64,       // ADR-0004: slots the engine could no longer vouch for
@@ -143,6 +147,10 @@ pub struct Metrics {
     pub sequencer_held_run: AtomicU64,
     /// GAUGE: 1 once a `SIGTERM`/`SIGINT` graceful shutdown has begun (see [`crate::shutdown`]).
     pub shutdown_in_progress: AtomicU64,
+    /// ADR-0008 GAUGE: live subscriptions across every shape — the claims pinning shapes against
+    /// dormancy right now. Republished by every retention sweep. A shape that will not go dormant
+    /// is explained by this number, not by the shape count.
+    pub subscriptions_live: AtomicU64,
     /// GAUGE: shape streams dropped from the engine's records whose deletion storage has not yet
     /// accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes right now;
     /// it should return to 0 on its own, and a boot re-derives it from the catalog.
@@ -173,6 +181,8 @@ pub fn metrics() -> &'static Metrics {
         shapes_reactivated: AtomicU64::new(0),
         shapes_evicted: AtomicU64::new(0),
         retention_pressure: AtomicU64::new(0),
+        subscriptions_lapsed: AtomicU64::new(0),
+        subscriptions_live: AtomicU64::new(0),
         schema_drift: AtomicU64::new(0),
         schema_unresolved: AtomicU64::new(0),
         epoch_breaks: AtomicU64::new(0),
@@ -210,6 +220,7 @@ impl Metrics {
                 "shapes_reactivated": self.shapes_reactivated.load(Ordering::Relaxed),
                 "shapes_evicted": self.shapes_evicted.load(Ordering::Relaxed),
                 "retention_pressure": self.retention_pressure.load(Ordering::Relaxed),
+                "subscriptions_lapsed_total": self.subscriptions_lapsed.load(Ordering::Relaxed),
                 "schema_drift_total": self.schema_drift.load(Ordering::Relaxed),
                 "schema_unresolved_total": self.schema_unresolved.load(Ordering::Relaxed),
                 "epoch_breaks_total": self.epoch_breaks.load(Ordering::Relaxed),
@@ -228,6 +239,7 @@ impl Metrics {
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
                 "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
                 "shutdown_in_progress": self.shutdown_in_progress.load(Ordering::Relaxed),
+                "subscriptions_live": self.subscriptions_live.load(Ordering::Relaxed),
                 "retirements_pending": self.retirements_pending.load(Ordering::Relaxed),
                 "replication_slot_retained_wal_bytes": self.replication_slot_retained_wal_bytes.load(Ordering::Relaxed),
                 "replication_confirmed_flush_lag_bytes": self.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed),
@@ -249,6 +261,7 @@ impl Metrics {
         self.shapes_reactivated.store(0, Ordering::Relaxed);
         self.shapes_evicted.store(0, Ordering::Relaxed);
         self.retention_pressure.store(0, Ordering::Relaxed);
+        self.subscriptions_lapsed.store(0, Ordering::Relaxed);
         self.schema_drift.store(0, Ordering::Relaxed);
         self.schema_unresolved.store(0, Ordering::Relaxed);
         self.epoch_breaks.store(0, Ordering::Relaxed);

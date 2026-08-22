@@ -20,7 +20,13 @@ import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { z } from 'zod'
 
-import { createSubset, deleteShapeWithRetry, type SubsetSubscription } from './subset.js'
+import {
+  createSubset,
+  deleteShapeWithRetry,
+  newSubscriptionId,
+  startLeaseRenewal,
+  type SubsetSubscription,
+} from './subset.js'
 import { canonicalTableIndex, resolveTableDef, tableSpellings } from './tables.js'
 
 export type { SubsetSubscription } from './subset.js'
@@ -36,6 +42,10 @@ export interface ShapeHandle {
   table: string
   streamPath: string
   streamUrl: string
+  /** This materialization's subscription id (ADR-0008) — see `@electric-circuits/protocol`. */
+  subscription?: string
+  /** Seconds a subscription may go unrenewed before the engine releases it (`0` = never). */
+  leaseSeconds?: number
 }
 
 export interface ShapeMaterialization {
@@ -48,6 +58,16 @@ export interface ShapeMaterialization {
   awaitTxId(txid: string, timeoutMs?: number): Promise<void>
   /** Subscribe to live change batches; returns an unsubscribe fn. */
   subscribe(cb: (changes: Array<{ type: string; key: unknown; value?: unknown }>) => void): () => void
+  /**
+   * Renew this materialization's subscription lease (ADR-0008): the same create, with the same
+   * subscription id, which the engine treats as "still here" rather than as a second subscriber.
+   *
+   * The client already renews on the server's own cadence (`handle.leaseSeconds`) for as long as the
+   * materialization is open — this is for a caller whose timers do not run (a suspended tab, a test
+   * that controls time) and wants to say it explicitly. After `close()` it is a **no-op**: a closed
+   * materialization must not resurrect the subscription it just released.
+   */
+  renew(): Promise<void>
   close(): Promise<void>
 }
 
@@ -74,6 +94,8 @@ export interface AggregateSubscription {
   /** Count of rows matching the predicate (available for every aggregation). */
   count(): number
   subscribe(cb: (value: AggregateValue) => void): () => void
+  /** Renew this subscription's lease — see `ShapeMaterialization.renew`. */
+  renew(): Promise<void>
   close(): Promise<void>
 }
 
@@ -188,11 +210,18 @@ export function createClient(opts: {
       // local schema (see `./tables.ts`).
       const tableDef = resolveTableDef(opts.schema, def.table)
 
-      const handle = (await trpc.shapes.create.mutate({
-        table: def.table,
-        where: def.where as never,
-        columns: def.columns,
-      })) as ShapeHandle
+      // One subscription id per materialization (ADR-0008). It makes this create idempotent — the
+      // same id is a renewal, never a second subscriber — so a retry after an ambiguous failure
+      // costs nothing, and it names exactly what `close()` releases.
+      const subscription = newSubscriptionId()
+      const create = () =>
+        trpc.shapes.create.mutate({
+          table: def.table,
+          where: def.where as never,
+          columns: def.columns,
+          subscription,
+        }) as Promise<ShapeHandle>
+      const handle = await create()
 
       // The envelope `type` on a shape stream is the table's CANONICAL `schema.name` (ADR-0002),
       // whatever spelling the caller used — the collection must be registered under that or nothing
@@ -213,6 +242,10 @@ export function createClient(opts: {
       await db.preload()
       const collection = db.collections[table]
 
+      // Renew for as long as the materialization is open: the engine cannot see reads that go
+      // straight to durable-streams, so the renewal IS the liveness signal (ADR-0008).
+      const lease = startLeaseRenewal(handle.leaseSeconds, create)
+
       const mat: ShapeMaterialization = {
         handle,
         collection,
@@ -222,11 +255,17 @@ export function createClient(opts: {
           const sub = collection.subscribeChanges(cb as never, { includeInitialState: false })
           return () => sub.unsubscribe()
         },
+        renew: () => lease.renew(),
         close: async () => {
+          // Stop AND drain the lease keeper first: a renewal still in flight is a create, and a
+          // create landing after the release would re-take the claim this close just gave up
+          // (see `startLeaseRenewal`). A `renew()` after this is a no-op.
+          await lease.stop()
           await db.close?.()
-          // Drop our subscriber ref: creates are refcounted server-side (share=true), so every
-          // shape() must delete exactly once or the shape (and its stream) leaks forever.
-          await deleteShapeWithRetry(trpc, handle.shapeId)
+          // Release OUR subscription: shapes are shared server-side, so every shape() must release
+          // exactly the claim it took — by id, which is also what makes the retry inside
+          // `deleteShapeWithRetry` safe.
+          await deleteShapeWithRetry(trpc, handle.shapeId, subscription)
         },
       }
       return track(mat)
@@ -259,12 +298,17 @@ export function createClient(opts: {
     },
 
     async aggregate(def) {
-      const handle = (await trpc.aggregate.create.mutate({
-        table: def.table,
-        where: def.where as never,
-        fn: def.fn,
-        col: def.col,
-      })) as ShapeHandle
+      const subscription = newSubscriptionId()
+      const create = () =>
+        trpc.aggregate.create.mutate({
+          table: def.table,
+          where: def.where as never,
+          fn: def.fn,
+          col: def.col,
+          subscription,
+        }) as Promise<ShapeHandle>
+      const handle = await create()
+      const lease = startLeaseRenewal(handle.leaseSeconds, create)
       const url = opts.dsBaseUrl
         ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`
         : handle.streamUrl
@@ -309,9 +353,11 @@ export function createClient(opts: {
             subs.delete(cb)
           }
         },
+        renew: () => lease.renew(),
         close: async () => {
+          await lease.stop() // drain an in-flight renewal before releasing — see `shape()` above
           ac.abort()
-          await deleteShapeWithRetry(trpc, handle.shapeId)
+          await deleteShapeWithRetry(trpc, handle.shapeId, subscription)
         },
       }
       return track(sub)

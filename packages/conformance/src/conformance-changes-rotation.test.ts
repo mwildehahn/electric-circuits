@@ -62,15 +62,32 @@ interface ShapeResp {
   streamUrl: string
 }
 
-const createShape = (where: unknown) =>
+const createShape = (where: unknown, subscription?: string) =>
   fetch(`${h.engineUrl}/shapes`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ table: 'items', where }),
+    body: JSON.stringify({ table: 'items', where, ...(subscription ? { subscription } : {}) }),
   }).then(async (res) => {
     if (!res.ok) throw new Error(`POST /shapes -> ${res.status} ${await res.text()}`)
     return (await res.json()) as ShapeResp
   })
+
+/**
+ * Keep a subscription's lease alive (ADR-0008) while a test holds its shape without reading it
+ * through the engine.
+ *
+ * These tests run with a ONE SECOND idle window, and a native subscriber's reads (raw
+ * durable-streams) are invisible to the engine — so a shape held for the ten-odd seconds a rotation
+ * takes is, without renewals, a shape whose subscriber has said nothing for ten idle windows, and
+ * the engine parks it. Renewing is the same create with the same subscription id. (The tests that
+ * WANT dormancy release explicitly instead.)
+ */
+function keepAlive(where: unknown, subscription: string): () => void {
+  const timer = setInterval(() => {
+    void createShape(where, subscription).catch(() => {})
+  }, 400)
+  return () => clearInterval(timer)
+}
 
 const release = (id: string) => fetch(`${h.engineUrl}/shapes/${id}`, { method: 'DELETE' })
 
@@ -134,7 +151,9 @@ describe('conformance: the change log rotates into segments and old segments are
   it('a live shape keeps receiving every change across rotations, and passed segments are deleted', async () => {
     await pg('INSERT INTO items (id, n) VALUES (1, 10)')
     await drainEngine(h)
-    const shape = await createShape({ col: 'n', op: 'gte', value: 10 })
+    const where = { col: 'n', op: 'gte', value: 10 }
+    const shape = await createShape(where, 'live-across-rotations')
+    const stopRenewing = keepAlive(where, 'live-across-rotations')
 
     expect(await engineChangesSegment(h.engineUrl)).toBe(0)
     expect(await segmentStatus(0)).toBe(200)
@@ -161,6 +180,7 @@ describe('conformance: the change log rotates into segments and old segments are
     await pg('INSERT INTO items (id, n) VALUES ($1, 999)', [nextId])
     await drainEngine(h)
     await waitFor(async () => (await foldStream(shape.streamUrl)).has(String(nextId)), 'a post-deletion write')
+    stopRenewing()
   }, 90000)
 
   it('a dormant shape reactivates by replaying ACROSS a rotation pointer', async () => {
@@ -275,7 +295,11 @@ describe('conformance: the change log rotates into segments and old segments are
   it('a restart after rotations resumes on the right segment', async () => {
     await pg('INSERT INTO items (id, n) VALUES (1, 10)')
     await drainEngine(h)
-    const shape = await createShape({ col: 'n', op: 'gte', value: 10 })
+    const where = { col: 'n', op: 'gte', value: 10 }
+    const shape = await createShape(where, 'live-across-restart')
+    // Renewals continue across the restart below: the restored claim comes back with its lease age,
+    // so it must keep saying it is there on the far side too.
+    const stopRenewing = keepAlive(where, 'live-across-restart')
 
     const nextId = await writeAcrossRotations(2, 300)
     await drainEngine(h)
@@ -296,5 +320,6 @@ describe('conformance: the change log rotates into segments and old segments are
     const rows = await foldStream(shape.streamUrl)
     expect(rows.has(String(nextId))).toBe(true)
     expect(rows.has('1')).toBe(true)
+    stopRenewing()
   }, 120000)
 })

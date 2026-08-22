@@ -15,15 +15,37 @@ pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
 
 /// One catalog event. `Offset` checkpoints the sequencer's processed change-log position (the
 /// replay start after a restart), appended at most every ~2s.
+///
+/// Every event carries an **`eid`** on the wire — assigned at enqueue, not here (see
+/// [`CatalogWriter::enqueue`]), because it identifies the *append attempt* the writer may repeat,
+/// not the value. The fold ignores an `eid` it has already applied, which is what makes the writer's
+/// retry-in-place (no event is ever dropped, ADR-0007) safe for a record whose effect is not
+/// naturally idempotent.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "camelCase")]
 pub(crate) enum CatalogEvent {
-    Created { rec: ShapeRecord, sig: Option<String> },
-    /// A subscriber joined a shared feed (refcount +1).
-    Joined { id: String },
-    /// A subscriber left a shared feed (refcount −1). With retention, reaching refcount 0 keeps
-    /// the shape (it goes dormant later), so `Left` never implies teardown.
-    Left { id: String },
+    /// A shape was created, with the **subscription** that created it (ADR-0008) and the wall-clock
+    /// second it was taken at — the lease's start, restored by the fold so a restart does not hand
+    /// every subscription a fresh window.
+    Created { rec: ShapeRecord, sig: Option<String>, subscription: String, at: u64 },
+    /// A subscription joined a shared feed, or RENEWED its lease (ADR-0008): the same subscription
+    /// id twice is one claim, and the second one only moves `at`. The fold keeps a SET, so a
+    /// duplicate is a no-op rather than a second count.
+    Joined { id: String, subscription: String, at: u64 },
+    /// A subscription left a shared feed. `Left` for an id the shape does not hold is a no-op (the
+    /// release is idempotent — that is the point). With retention, an empty live set keeps the
+    /// shape (it goes dormant later), so `Left` never implies teardown.
+    ///
+    /// `lapsed` marks the retention sweeper's own release: the lease was not renewed within the
+    /// idle window (ADR-0008). It changes nothing about the fold — a lapse and an explicit release
+    /// are the same act — and exists so the durable record explains why a subscription no one
+    /// deleted disappeared.
+    Left {
+        id: String,
+        subscription: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        lapsed: bool,
+    },
     /// The shape went dormant: routing state dropped, stream + record retained. `resume` is the
     /// change-log position its stream is complete up to — a `(segment, offset)` pair since
     /// ADR-0006, because the offset alone is meaningless once the log has rotated; `gate` is its
@@ -78,6 +100,11 @@ pub(crate) enum CatalogEvent {
     SlotBound(crate::engine::epoch::SlotBinding),
 }
 
+/// `serde`'s `skip_serializing_if` wants a path, so the "omit the default" predicate is a function.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Exit code when the durable catalog **refused** an event (`EX_IOERR`): storage answered, the
 /// answer will not change with time, and the event cannot be written.
 ///
@@ -119,6 +146,10 @@ const CATALOG_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(
 /// One queued catalog event, plus the (optional) acknowledgement its sender is waiting on.
 struct CatalogSend {
     ev: CatalogEvent,
+    /// The event id the fold de-duplicates on (ADR-0008). Assigned at ENQUEUE, so every append
+    /// attempt of this event — the first and every retry after a lost response — carries the same
+    /// one.
+    eid: String,
     /// Resolved once the append has SUCCEEDED — the durable-before-ack half of a client-facing
     /// mutation (see [`CatalogWriter::send_durable`]). `None` for engine-initiated events, which
     /// nobody is waiting on.
@@ -134,6 +165,14 @@ struct CatalogSend {
 pub(crate) struct CatalogWriter {
     tx: mpsc::UnboundedSender<CatalogSend>,
     in_flight: Arc<std::sync::atomic::AtomicI64>,
+    /// This process's half of every `eid` it mints: a boot nonce, so two engines writing to the
+    /// same catalog (a restart, or the same storage adopted by another process) can never mint the
+    /// same id for different events. The other half is [`Self::next_eid`].
+    eid_nonce: String,
+    /// Monotonic within the process. Together with `eid_nonce` this is the whole identity of an
+    /// append attempt — no clock, no hashing of the payload (two identical `Left`s ARE two
+    /// different events; only a retry of the same one must be de-duplicated).
+    next_eid: Arc<std::sync::atomic::AtomicU64>,
     /// The last `Offset` checkpoint that has actually **landed in storage** — what a restart would
     /// resume from, as opposed to what this process has processed in memory.
     ///
@@ -153,7 +192,7 @@ impl CatalogWriter {
     /// use [`Self::send_durable`] instead: an acknowledged mutation the durable record does not
     /// contain is a shape that vanishes at the next restart.
     pub(crate) fn send(&self, ev: CatalogEvent) {
-        self.enqueue(CatalogSend { ev, done: None });
+        self.enqueue(ev, None);
     }
 
     /// Enqueue an event and hand back a future that resolves once it has **landed in storage**.
@@ -169,7 +208,7 @@ impl CatalogWriter {
     /// record lands anyway, the shape has no subscriber and retention evicts it.
     pub(crate) fn send_durable(&self, ev: CatalogEvent) -> impl std::future::Future<Output = ()> + Send + 'static {
         let (done, wait) = tokio::sync::oneshot::channel();
-        self.enqueue(CatalogSend { ev, done: Some(done) });
+        self.enqueue(ev, Some(done));
         async move {
             // An `Err` means the writer task is gone, i.e. the process is on its way out; there is
             // nothing better to do than let the caller finish.
@@ -177,9 +216,14 @@ impl CatalogWriter {
         }
     }
 
-    fn enqueue(&self, item: CatalogSend) {
+    /// Assign the event's `eid` and queue it. The id is minted HERE, once, so a retry-in-place
+    /// re-appends the same identity — the fold then applies it exactly once however many copies of
+    /// the record a lost response left in the log (ADR-0008).
+    fn enqueue(&self, ev: CatalogEvent, done: Option<tokio::sync::oneshot::Sender<()>>) {
+        let n = self.next_eid.fetch_add(1, Ordering::Relaxed);
+        let eid = format!("{}-{n:x}", self.eid_nonce);
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        if self.tx.send(item).is_err() {
+        if self.tx.send(CatalogSend { ev, eid, done }).is_err() {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -233,7 +277,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
         // `ensure_catalog_logged`); it outlives one event because the retry loop below runs per
         // attempt, and an outage spans many.
         let mut ensure_logged = false;
-        while let Some(CatalogSend { ev, done }) = rx.recv().await {
+        while let Some(CatalogSend { ev, eid, done }) = rx.recv().await {
             // Published only on a SUCCESSFUL append: an `Offset` whose write failed is not a
             // position a restart would resume from, and treating it as one would license deleting
             // the segment underneath it.
@@ -242,7 +286,16 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                 _ => None,
             };
             let json = match serde_json::to_value(&ev) {
-                Ok(json) => json,
+                // The `eid` rides on the wire beside the event's own fields (the enum is
+                // internally tagged, so the value is always a JSON object).
+                Ok(serde_json::Value::Object(mut map)) => {
+                    map.insert("eid".to_string(), serde_json::Value::String(eid.clone()));
+                    serde_json::Value::Object(map)
+                }
+                Ok(other) => refuse(
+                    &ev,
+                    &anyhow::anyhow!("catalog event serialized to a non-object ({other}); it cannot carry an eid"),
+                ),
                 // Not a storage problem and not one waiting fixes: the engine has state it cannot
                 // describe. Same verdict as a refusal, for the same reason.
                 Err(e) => refuse(&ev, &anyhow::Error::new(e).context("catalog event could not be serialized")),
@@ -306,7 +359,27 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
             counter.fetch_sub(1, Ordering::SeqCst);
         }
     });
-    CatalogWriter { tx, in_flight, durable }
+    CatalogWriter {
+        tx,
+        in_flight,
+        durable,
+        eid_nonce: process_nonce(),
+        next_eid: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    }
+}
+
+/// A short, per-process nonce — the namespace half of both the catalog's event ids and the
+/// subscription ids the engine mints (ADR-0008). Not cryptographic and not required to be: it only
+/// has to differ between processes writing to the same catalog, and the pair (start time, address of
+/// a fresh allocation) does that on every platform the engine runs on.
+pub(crate) fn process_nonce() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let here = Box::new(0u8);
+    let addr = std::ptr::addr_of!(*here) as usize as u64;
+    format!("{:x}", secs ^ addr.rotate_left(17))
 }
 
 /// The refusal half of [`spawn_catalog_writer`]: name the event and what storage answered, then
@@ -393,6 +466,54 @@ impl std::fmt::Display for CatalogPredatesSegmentation {
 
 impl std::error::Error for CatalogPredatesSegmentation {}
 
+/// The durable catalog holds an event written **before** ADR-0008: no `eid`, or a shape-lifecycle
+/// event with no `subscription`.
+///
+/// Fatal for the same reason the two above are, and it is the same class of thing: the value cannot
+/// be reconstructed and guessing would be worse than not booting. Without an `eid` the fold cannot
+/// tell a retried append from a second event, so a lost response in the old log has already been
+/// applied twice and there is no way to know which; without a `subscription` the live SET cannot be
+/// rebuilt, and inventing ids would restore a refcount that no client can ever release (nothing the
+/// caller holds names it). Greenfield: no such catalog can exist except from a pre-cutover build,
+/// and recovery is a deliberate human act (reset the storage).
+#[derive(Debug)]
+pub struct CatalogPredatesSubscriptions {
+    detail: String,
+}
+
+impl std::fmt::Display for CatalogPredatesSubscriptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "durable catalog predates ADR-0008 ({}); reset the durable-streams data directory",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for CatalogPredatesSubscriptions {}
+
+/// Is this raw catalog event missing what ADR-0008 requires of it? `Some(detail)` names it.
+///
+/// Positive-checking the raw JSON rather than trusting the deserializer, exactly like
+/// [`predates_segmentation`]: an event the strict deserializer cannot read is otherwise silently
+/// skipped by the fold, which for a `Created` would mean a shape that simply disappears at boot.
+fn predates_subscriptions(ev: &serde_json::Value) -> Option<String> {
+    let kind = ev.get("t").and_then(serde_json::Value::as_str).unwrap_or("<untagged>");
+    if ev.get("eid").and_then(serde_json::Value::as_str).is_none() {
+        return Some(format!("a {kind} event with no eid"));
+    }
+    if matches!(kind, "created" | "joined" | "left")
+        && ev.get("subscription").and_then(serde_json::Value::as_str).is_none()
+    {
+        return Some(format!("a {kind} event with no subscription"));
+    }
+    if matches!(kind, "created" | "joined") && ev.get("at").and_then(serde_json::Value::as_u64).is_none() {
+        return Some(format!("a {kind} event with no lease timestamp"));
+    }
+    None
+}
+
 /// The numeric half of a shape id (`s7` -> `7`). `None` for anything that is not one — the ids the
 /// engine mints always are, and a foreign spelling must not silently reset the id counter.
 fn shape_id_num(id: &str) -> Option<u64> {
@@ -454,9 +575,16 @@ async fn ensure_catalog(ds: &DsClient, logged: &mut bool) -> bool {
 }
 
 
-/// One shape as the fold reconstructed it: (record, sharing signature, refcount, dormant resume
-/// state). The last `Dormant`/`Reactivated` event wins.
-type Restored = (ShapeRecord, Option<String>, usize, Option<(LogPosition, crate::pg::SnapshotGate)>);
+/// One shape as the fold reconstructed it: (record, sharing signature, **live subscriptions**,
+/// dormant resume state). The last `Dormant`/`Reactivated` event wins.
+///
+/// The subscriptions are a SET, not a count (ADR-0008): `subscription id -> the wall-clock second
+/// its lease was last renewed at`. A repeated `Joined` for an id already in the set moves the
+/// timestamp and nothing else; a `Left` for an id that is not in it does nothing at all. That is
+/// what makes a duplicated record — a retry after a lost response, an over-eager client — harmless
+/// where counter arithmetic was not.
+type Restored =
+    (ShapeRecord, Option<String>, std::collections::BTreeMap<String, u64>, Option<(LogPosition, crate::pg::SnapshotGate)>);
 
 /// The durable catalog, folded — everything a boot needs before it decides what to *do* with it.
 ///
@@ -496,6 +624,13 @@ pub(crate) struct CatalogFold {
     /// The last `SlotBound`: the epoch these shapes belong to. `None` = nothing ever claimed one,
     /// which is a genuine first boot.
     pub(crate) binding: Option<crate::engine::epoch::SlotBinding>,
+    /// Every `eid` this fold has already applied (ADR-0008). The writer retries a failed append in
+    /// place, so a response lost after the append committed leaves the SAME event in the log twice;
+    /// applying the second copy is exactly the double-count this set exists to prevent.
+    ///
+    /// Bounded by the catalog's length, like the fold itself — it lives only for the duration of
+    /// one boot's read and is dropped with the fold.
+    seen: HashSet<String>,
 }
 
 impl Default for CatalogFold {
@@ -509,16 +644,29 @@ impl Default for CatalogFold {
             binding: None,
             current_segment: 0,
             segment_starts: std::collections::BTreeMap::new(),
+            seen: HashSet::new(),
         }
     }
 }
 
 impl CatalogFold {
+    /// Fold one event in, **once**: an `eid` this fold has already applied is ignored (ADR-0008).
+    ///
+    /// The de-duplication belongs here rather than in [`Self::apply`] because it is a property of
+    /// the LOG (the writer may have appended the same event twice), not of the event's meaning.
+    fn apply_once(&mut self, eid: &str, ev: CatalogEvent) {
+        if !self.seen.insert(eid.to_string()) {
+            tracing::debug!("catalog restore: ignoring a repeated append of event {eid}");
+            return;
+        }
+        self.apply(ev);
+    }
+
     /// Fold one event in. Pure (no engine, no IO), so the log's semantics — last-writer-wins for the
     /// epoch and the offset, remove-on-drop for the shapes — are unit-testable.
     fn apply(&mut self, ev: CatalogEvent) {
         match ev {
-            CatalogEvent::Created { rec, sig } => {
+            CatalogEvent::Created { rec, sig, subscription, at } => {
                 // Every create moves the id high-water mark, and nothing ever moves it back (see
                 // `max_shape_id`). `max`, not "the last one wins": the engine mints ids
                 // monotonically from one counter, so the log is monotonic anyway, and taking the
@@ -526,16 +674,22 @@ impl CatalogFold {
                 if let Some(num) = shape_id_num(&rec.id) {
                     self.max_shape_id = Some(self.max_shape_id.map_or(num, |cur| cur.max(num)));
                 }
-                self.recs.insert(rec.id.clone(), (rec, sig, 1, None));
+                self.recs.insert(rec.id.clone(), (rec, sig, [(subscription, at)].into_iter().collect(), None));
             }
-            CatalogEvent::Joined { id } => {
+            // A join and a lease RENEWAL are the same record: insert wins for a new id, and only
+            // moves the lease for one already held (ADR-0008). The restored `at` is what stops a
+            // restart from handing every subscription a fresh idle window.
+            CatalogEvent::Joined { id, subscription, at } => {
                 if let Some(e) = self.recs.get_mut(&id) {
-                    e.2 += 1;
+                    let lease = e.2.entry(subscription).or_insert(at);
+                    *lease = (*lease).max(at);
                 }
             }
-            CatalogEvent::Left { id } => {
+            // Idempotent by construction: releasing an id the set does not hold is a no-op, which
+            // is what makes a client's retried DELETE safe.
+            CatalogEvent::Left { id, subscription, lapsed: _ } => {
                 if let Some(e) = self.recs.get_mut(&id) {
-                    e.2 = e.2.saturating_sub(1);
+                    e.2.remove(&subscription);
                 }
             }
             CatalogEvent::Dormant { id, resume, gate } => {
@@ -652,8 +806,14 @@ impl Engine {
                 if let Some(detail) = predates_segmentation(&ev) {
                     return Err(anyhow::Error::new(CatalogPredatesSegmentation { detail }));
                 }
+                // ...and for an event written before ADR-0008 (no `eid`, no `subscription`): the
+                // fold cannot de-duplicate or rebuild the live set, and both failures are silent.
+                if let Some(detail) = predates_subscriptions(&ev) {
+                    return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
+                }
+                let eid = ev["eid"].as_str().unwrap_or_default().to_string();
                 let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
-                fold.apply(ev);
+                fold.apply_once(&eid, ev);
             }
             match next {
                 Some(n) if !up_to_date && n != off => off = n,
@@ -709,6 +869,8 @@ impl Engine {
             let mut st = self.state.lock().await;
             for (id, (rec, _, _, _)) in recs {
                 st.shapes.insert(id, rec); // `next_shape_id` was moved past every minted id above
+                // No share entries and therefore no subscriptions: a parked epoch's shapes exist
+                // only to be retired, and nothing may join or renew one.
             }
             tracing::warn!(
                 "catalog restore: {} shape(s) parked over a broken epoch — none is resumed or \
@@ -725,7 +887,7 @@ impl Engine {
         let mut dead_streams: Vec<(String, String)> = Vec::new();
         {
             let mut st = self.state.lock().await;
-            for (id, (rec, sig, refcount, dormant)) in recs {
+            for (id, (rec, sig, subs, dormant)) in recs {
                 // (`next_shape_id` was moved past every id the log ever minted, above.)
                 // DDL while the engine was DOWN is seen by nothing on the live path: no `Relation`
                 // message, no reconciler tick. The record's own fingerprint is the only witness —
@@ -759,7 +921,14 @@ impl Engine {
                     let (ready_tx, ready_rx) = tokio::sync::watch::channel(ShareOutcome::Ready);
                     drop(ready_tx); // receivers keep observing `Ready`
                     st.feed_by_sig.insert(sig.clone(), id.clone());
-                    st.feed_shares.insert(id.clone(), FeedShare { sig, refcount, ready: ready_rx });
+                    st.feed_shares.insert(id.clone(), FeedShare { sig, subs: Default::default(), ready: ready_rx });
+                    // The live set is restored WITH its lease ages (ADR-0008): a subscription that
+                    // was already past the idle window when the process died is past it here too,
+                    // so a restart neither forgets a subscription nor grants every one of them a
+                    // fresh window to pin the shape with.
+                    for (sub, at) in subs {
+                        st.subscribe(&id, sub, at);
+                    }
                 }
                 match dormant {
                     // A dormant shape restores AS dormant: record + stream retained, no routing,
@@ -811,6 +980,9 @@ impl Engine {
                 let mut st = self.state.lock().await;
                 st.shapes.remove(&rec.id);
                 self.catalog_tx.send(CatalogEvent::Dropped { id: rec.id.clone() });
+                // The restored subscriptions go with it: an id still claimed by a shape that no
+                // longer exists would refuse its own client's next create with a 409.
+                st.forget_subscriptions(&rec.id);
                 if let Some(share) = st.feed_shares.remove(&rec.id) {
                     st.feed_by_sig.remove(&share.sig);
                 }
@@ -937,6 +1109,9 @@ pub(crate) mod testing {
     pub(crate) struct FakeDsState {
         /// Remaining `POST /meta/catalog` calls to answer 503 (transient).
         fail_appends: AtomicU32,
+        /// Remaining `POST /meta/catalog` calls to COMMIT and then answer 503 — a response lost
+        /// after the write landed, which is what makes the writer's retry append a second copy.
+        lose_responses: AtomicU32,
         /// Remaining `DELETE` calls to answer 503.
         fail_deletes: AtomicU32,
         appends: AtomicU64,
@@ -977,6 +1152,15 @@ pub(crate) mod testing {
                                 if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&body) {
                                     st.events.lock().unwrap().extend(items);
                                 }
+                                // Committed, then the answer is lost: the caller cannot tell this
+                                // from a write that never happened, and retries.
+                                if st
+                                    .lose_responses
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .is_ok()
+                                {
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                }
                                 axum::http::StatusCode::NO_CONTENT
                             },
                         )
@@ -1008,6 +1192,11 @@ pub(crate) mod testing {
         /// Answer the next `n` catalog appends with 503.
         pub(crate) fn fail_appends(&self, n: u32) {
             self.state.fail_appends.store(n, Ordering::SeqCst);
+        }
+
+        /// Commit the next `n` catalog appends and then answer 503 (a lost success response).
+        pub(crate) fn lose_responses(&self, n: u32) {
+            self.state.lose_responses.store(n, Ordering::SeqCst);
         }
 
         /// Answer the next `n` stream deletes with 503.
@@ -1059,6 +1248,8 @@ mod tests {
                 "fingerprint": null,
             },
             "sig": null,
+            "subscription": "sub-a",
+            "at": 100,
         })
     }
 
@@ -1101,12 +1292,32 @@ mod tests {
         })
     }
 
+    /// Fold a sequence of events, giving each its own `eid` — the shape the writer produces when
+    /// nothing was retried. [`fold_of_with_eids`] is the one that repeats them.
     fn fold_of(events: Vec<CatalogEvent>) -> CatalogFold {
+        fold_of_with_eids(events.into_iter().enumerate().map(|(i, ev)| (format!("e{i}"), ev)).collect())
+    }
+
+    fn fold_of_with_eids(events: Vec<(String, CatalogEvent)>) -> CatalogFold {
         let mut fold = CatalogFold::default();
-        for ev in events {
-            fold.apply(ev);
+        for (eid, ev) in events {
+            fold.apply_once(&eid, ev);
         }
         fold
+    }
+
+    /// The three shape-lifecycle events, with the subscription and lease timestamp ADR-0008 gives
+    /// them — spelled out here so the fold tests read as "who is subscribed", not as bookkeeping.
+    fn joined(id: &str, sub: &str, at: u64) -> CatalogEvent {
+        CatalogEvent::Joined { id: id.to_string(), subscription: sub.to_string(), at }
+    }
+
+    fn left(id: &str, sub: &str) -> CatalogEvent {
+        CatalogEvent::Left { id: id.to_string(), subscription: sub.to_string(), lapsed: false }
+    }
+
+    fn subs_of(fold: &CatalogFold, id: &str) -> Vec<String> {
+        fold.recs.get(id).map(|r| r.2.keys().cloned().collect()).unwrap_or_default()
     }
 
     fn pos(segment: u32, offset: &str) -> LogPosition {
@@ -1297,10 +1508,10 @@ mod tests {
         let fold = fold_of(vec![
             bound("s", "7300000000000000001", "2026-08-21T11:30:00.000Z"),
             created,
-            CatalogEvent::Joined { id: "s1".to_string() },
+            joined("s1", "sub-b", 100),
         ]);
+        assert_eq!(subs_of(&fold, "s1"), vec!["sub-a".to_string(), "sub-b".to_string()], "create + join = two subscriptions");
         assert_eq!(fold.binding.map(|b| b.slot), Some("s".to_string()));
-        assert_eq!(fold.recs.get("s1").map(|r| r.2), Some(2), "create + join = refcount 2");
     }
 
     /// The event is stored (and restored) as its own `t` case, alongside the shape lifecycle — a
@@ -1354,8 +1565,8 @@ mod tests {
         let server = FakeDs::start().await;
         server.fail_appends(3);
         let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
-        w.send(CatalogEvent::Joined { id: "s1".to_string() });
-        w.send(CatalogEvent::Left { id: "s1".to_string() });
+        w.send(joined("s1", "sub-a", 100));
+        w.send(left("s1", "sub-a"));
         assert!(w.drain(std::time::Duration::from_secs(20)).await, "the queue must drain");
         assert_eq!(
             server.catalog_kinds(),
@@ -1371,7 +1582,7 @@ mod tests {
         let server = FakeDs::start().await;
         server.fail_appends(2);
         let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
-        let landed = w.send_durable(CatalogEvent::Joined { id: "s1".to_string() });
+        let landed = w.send_durable(joined("s1", "sub-a", 100));
         tokio::pin!(landed);
         // 100 ms + 200 ms of backoff to go, so the ack cannot have happened yet.
         tokio::select! {
@@ -1474,6 +1685,173 @@ mod tests {
         let st = engine.state.lock().await;
         assert_eq!(st.next_shape_id, 2);
         assert_eq!(st.shapes.len(), 1, "the record is parked for the reset to retire");
+    }
+
+    // --- subscriptions: identity, idempotence, leases (ADR-0008) --------------------------------
+
+    /// The whole of the fold's subscription semantics: a create opens the set, a join adds to it, a
+    /// REPEATED join is a renewal (one member, later lease), and a `Left` removes exactly one id —
+    /// a second one for the same id changing nothing.
+    #[test]
+    fn subscriptions_fold_as_a_set_not_a_count() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            created,
+            joined("s1", "sub-b", 200),
+            joined("s1", "sub-b", 300), // a renewal, not a second subscriber
+            joined("s1", "sub-c", 400),
+            left("s1", "sub-b"),
+            left("s1", "sub-b"), // the client retried its DELETE; nothing more to release
+            left("s1", "sub-zzz"), // never held here at all
+        ]);
+        assert_eq!(subs_of(&fold, "s1"), vec!["sub-a".to_string(), "sub-c".to_string()]);
+
+        // The renewal moved the lease, which is the only thing a repeated join may do.
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![created, joined("s1", "sub-a", 900)]);
+        assert_eq!(fold.recs["s1"].2.get("sub-a"), Some(&900), "the lease is restored at its LAST renewal");
+    }
+
+    /// A lapse is recorded as an ordinary `Left` with a marker: the fold treats it identically (the
+    /// subscription is released either way), and the flag is there so the durable record explains a
+    /// subscription that nobody deleted.
+    #[test]
+    fn a_lapsed_lease_folds_exactly_like_an_explicit_release() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let lapse = CatalogEvent::Left {
+            id: "s1".to_string(),
+            subscription: "sub-a".to_string(),
+            lapsed: true,
+        };
+        let json = serde_json::to_value(&lapse).unwrap();
+        assert_eq!(json["lapsed"], true);
+        assert_eq!(json["subscription"], "sub-a");
+        // An ordinary release does not carry the flag at all (the wire form stays minimal).
+        assert_eq!(serde_json::to_value(left("s1", "sub-a")).unwrap().get("lapsed"), None);
+
+        let fold = fold_of(vec![created, lapse]);
+        assert!(subs_of(&fold, "s1").is_empty(), "a lapsed subscription is released like any other");
+        assert!(fold.recs.contains_key("s1"), "...and the shape itself stays: retention decides its fate");
+    }
+
+    /// The regression the `eid` exists for: the SAME event appended twice (a retry after a lost
+    /// response) must be applied once. Without it, the second copy of a `Left` releases a
+    /// subscription the caller never released — the double-decrement that stole another
+    /// subscriber's claim.
+    #[test]
+    fn a_repeated_append_of_one_event_is_applied_once() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of_with_eids(vec![
+            ("e0".to_string(), created),
+            ("e1".to_string(), joined("s1", "sub-b", 200)),
+            ("e1".to_string(), joined("s1", "sub-b", 200)), // the writer's retry-in-place
+        ]);
+        assert_eq!(subs_of(&fold, "s1"), vec!["sub-a".to_string(), "sub-b".to_string()]);
+
+        // ...and the case that used to corrupt the count: one release, appended twice.
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of_with_eids(vec![
+            ("e0".to_string(), created),
+            ("e1".to_string(), joined("s1", "sub-b", 200)),
+            ("e2".to_string(), left("s1", "sub-a")),
+            ("e2".to_string(), left("s1", "sub-a")),
+        ]);
+        assert_eq!(subs_of(&fold, "s1"), vec!["sub-b".to_string()], "one release is one release");
+    }
+
+    /// A catalog written before ADR-0008 cannot be folded — the fold could neither de-duplicate a
+    /// retried append nor rebuild the live set — so the boot refuses it by name rather than
+    /// silently restoring something else.
+    #[test]
+    fn a_pre_subscription_catalog_is_refused_by_name() {
+        let no_eid = serde_json::json!({ "t": "joined", "id": "s1", "subscription": "sub-a", "at": 1 });
+        let detail = predates_subscriptions(&no_eid).expect("an event with no eid is recognised");
+        assert!(detail.contains("no eid"), "{detail}");
+        assert!(
+            CatalogPredatesSubscriptions { detail }.to_string().contains("predates ADR-0008"),
+            "the operator is told which cutover the catalog is on the wrong side of"
+        );
+
+        let no_sub = serde_json::json!({ "t": "left", "id": "s1", "eid": "e1" });
+        assert!(predates_subscriptions(&no_sub).unwrap().contains("no subscription"));
+        let no_at = serde_json::json!({ "t": "joined", "id": "s1", "subscription": "sub-a", "eid": "e1" });
+        assert!(predates_subscriptions(&no_at).unwrap().contains("no lease timestamp"));
+
+        // The current spellings pass, and an event that has no subscription of its own (an offset,
+        // a rotation) needs only its eid.
+        let now = serde_json::json!({ "t": "joined", "id": "s1", "subscription": "sub-a", "at": 1, "eid": "e1" });
+        assert!(predates_subscriptions(&now).is_none());
+        let offset = serde_json::json!({ "t": "offset", "pos": { "segment": 0, "offset": "1" }, "eid": "e2" });
+        assert!(predates_subscriptions(&offset).is_none());
+    }
+
+    /// End to end through the real writer and a real storage response: an append that COMMITS and
+    /// then loses its response is retried, so the log holds the event twice — with one `eid`, which
+    /// is what makes the fold apply it once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_response_leaves_two_records_with_one_event_id() {
+        let server = FakeDs::start().await;
+        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        server.lose_responses(1);
+        w.send(joined("s1", "sub-b", 200));
+        assert!(w.drain(std::time::Duration::from_secs(20)).await, "the queue must drain");
+
+        let events = server.catalog_events();
+        assert_eq!(events.len(), 2, "the retry appended a second copy: {events:?}");
+        let eids: Vec<&str> = events.iter().map(|e| e["eid"].as_str().unwrap_or("")).collect();
+        assert_eq!(eids[0], eids[1], "both copies are the same event, and say so");
+        assert!(!eids[0].is_empty(), "every event carries an eid");
+
+        // Fold them exactly as a boot would: one join.
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let mut fold = fold_of(vec![created]);
+        for ev in events {
+            let eid = ev["eid"].as_str().unwrap().to_string();
+            fold.apply_once(&eid, serde_json::from_value::<CatalogEvent>(ev).unwrap());
+        }
+        assert_eq!(subs_of(&fold, "s1"), vec!["sub-a".to_string(), "sub-b".to_string()]);
+    }
+
+    /// Two DIFFERENT events must never share an id (the dedup is per append attempt, not per
+    /// payload): two identical-looking joins from two callers are two claims.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_enqueued_event_gets_its_own_id() {
+        let server = FakeDs::start().await;
+        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        w.send(joined("s1", "sub-b", 200));
+        w.send(joined("s1", "sub-c", 200));
+        assert!(w.drain(std::time::Duration::from_secs(20)).await);
+        let events = server.catalog_events();
+        assert_ne!(events[0]["eid"], events[1]["eid"]);
+    }
+
+    /// The restore reads the live set back out of the log, with its lease ages — the two halves the
+    /// engine needs to answer "who is subscribed, and when did they last say so".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_shape_keeps_its_subscriptions_and_their_lease_ages() {
+        let mut created = created_event("public.users");
+        created["sig"] = serde_json::json!("sig-1");
+        created["at"] = serde_json::json!(1000);
+        let fold = fold_of(vec![
+            serde_json::from_value::<CatalogEvent>(created).unwrap(),
+            joined("s1", "sub-b", 2000),
+            // Restored as DORMANT, which is the one restore path that installs the shape without
+            // replaying it — the point here is the live set, not the resume.
+            CatalogEvent::Dormant {
+                id: "s1".to_string(),
+                resume: pos(0, "5"),
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
+        ]);
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+        let st = engine.state.lock().await;
+        let share = st.feed_shares.get("s1").expect("the restored share entry");
+        assert_eq!(share.subs.get("sub-a"), Some(&1000), "the creator's lease age survives the restart");
+        assert_eq!(share.subs.get("sub-b"), Some(&2000));
+        assert_eq!(share.refcount(), 2);
+        assert_eq!(st.subscription_owner("sub-b"), Some(&"s1".to_string()), "the id index is restored too");
     }
 
     #[test]

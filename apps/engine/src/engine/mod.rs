@@ -100,6 +100,32 @@ impl std::fmt::Display for CreateRaced {
 
 impl std::error::Error for CreateRaced {}
 
+/// A create named a **subscription id another shape already holds** (ADR-0008).
+///
+/// Typed because it is a 409, not a 500 and not a retry: nothing about waiting changes the answer,
+/// and the request is not malformed either — the caller simply used one name for two different
+/// shapes. Accepting it would leave that caller holding a single id against two subscriptions,
+/// unable to release either without saying which, which is the ambiguity the id exists to remove.
+#[derive(Debug)]
+pub struct SubscriptionConflict {
+    pub subscription: String,
+    /// The shape that holds it now.
+    pub shape: String,
+}
+
+impl std::fmt::Display for SubscriptionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "subscription '{}' already belongs to shape '{}'; a subscription id names one shape — \
+             release it first, or use a different id for this one",
+            self.subscription, self.shape
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionConflict {}
+
 /// Fail-closed degradation state, latched when a flip batch exhausts its retries.
 ///
 /// The inner-set node was already reconciled under the registry lock before the batch's query-backs
@@ -231,6 +257,10 @@ pub struct Engine {
     /// — because every part that must join it (the sequencer's select, the ingestor, the `/v1/shape`
     /// live poll, `GET /ready`) already has an `Engine`.
     shutdown: crate::shutdown::ShutdownToken,
+    /// Per-process nonce for the subscription ids the engine mints for creates that named none
+    /// (ADR-0008). The counter alone would not do: the catalog outlives the process, so a restart
+    /// would re-mint ids a restored shape still holds.
+    sub_nonce: Arc<str>,
 }
 
 /// A unit of deferred subquery propagation for the flip propagator (see [`Engine::flip_tx`]).
@@ -390,6 +420,19 @@ struct EngineState {
     /// it, or (worse) backfill at a snapshot taken before the NEW slot's consistent point and
     /// permanently miss the window between them.
     epoch_gen: u64,
+    /// Which shape each live subscription belongs to: `subscription id -> shape id` (ADR-0008).
+    ///
+    /// The reverse of `feed_shares[*].subs`, maintained by the same three methods
+    /// ([`Self::subscribe`], [`Self::unsubscribe`], [`Self::forget_subscriptions`]) so the two can
+    /// only move together. It exists for one question a create must answer before it does anything:
+    /// **is this subscription id already someone else's?** Re-using one id for a second predicate is
+    /// refused (409) rather than silently accepted, because the caller would then hold one name for
+    /// two shapes and be unable to release either without ambiguity.
+    subs_by_id: HashMap<String, String>,
+    /// Counter behind the ids the engine mints for creates that named no subscription. Combined
+    /// with a per-process nonce (see [`Engine::mint_subscription`]), so a minted id is unique
+    /// across restarts too — the catalog outlives the process that wrote it.
+    next_minted_sub: u64,
 }
 
 /// The generations a create captured for everything that can invalidate it: the schema of each table
@@ -436,13 +479,170 @@ impl EngineState {
     fn first_unresolved(&self, tables: &[TableRef]) -> Option<TableRef> {
         tables.iter().find(|t| self.unresolved.contains(*t)).cloned()
     }
+
+    // --- subscriptions (ADR-0008) ---------------------------------------------------------------
+
+    /// Which shape holds this subscription id right now, if any.
+    fn subscription_owner(&self, sub: &str) -> Option<&String> {
+        self.subs_by_id.get(sub)
+    }
+
+    /// Add (or RENEW) a subscription on a shape's share entry. Renewing is the same call: an id the
+    /// shape already holds keeps its place in the set and only moves its lease forward.
+    ///
+    /// Returns whether this was a NEW claim — the caller uses it to decide between a durable
+    /// `Joined` (a claim the client is about to be told about) and a queued one (a renewal, which
+    /// promises nothing new).
+    fn subscribe(&mut self, shape: &str, sub: String, at: u64) -> bool {
+        let Some(share) = self.feed_shares.get_mut(shape) else { return false };
+        let fresh = match share.subs.get_mut(&sub) {
+            Some(lease) => {
+                *lease = (*lease).max(at);
+                false
+            }
+            None => {
+                share.subs.insert(sub.clone(), at);
+                true
+            }
+        };
+        self.subs_by_id.insert(sub, shape.to_string());
+        fresh
+    }
+
+    /// Release one subscription. Returns whether it was actually held — a release for an id the
+    /// shape does not hold changes nothing and writes nothing, which is exactly what makes a
+    /// client's retried `DELETE` safe.
+    fn unsubscribe(&mut self, shape: &str, sub: &str) -> bool {
+        let removed = self.feed_shares.get_mut(shape).is_some_and(|s| s.subs.remove(sub).is_some());
+        if removed {
+            // Only if it still points HERE: an id released from one shape and immediately claimed
+            // on another must keep the newer owner.
+            if self.subs_by_id.get(sub).is_some_and(|owner| owner == shape) {
+                self.subs_by_id.remove(sub);
+            }
+        }
+        removed
+    }
+
+    /// The legacy anonymous release (`DELETE /shapes/{id}` with no `subscription`): drop ONE
+    /// subscription without being told which.
+    ///
+    /// Engine-minted ids go first, oldest lease first, and only then caller-named ones — a caller
+    /// that never learned the protocol must not be able to steal the claim of one that did. It is
+    /// still not retry-safe (nothing identifies which claim the caller meant), which is why the
+    /// route documents it as legacy.
+    ///
+    /// (A shape created with `share = false` has no share entry at all, so it holds no tracked
+    /// subscriptions and there is nothing here to release — as before ADR-0008. Nothing in the tree
+    /// creates one.)
+    fn unsubscribe_anonymous(&mut self, shape: &str) -> Option<String> {
+        let victim = {
+            let share = self.feed_shares.get(shape)?;
+            let pick = |minted: bool| {
+                share
+                    .subs
+                    .iter()
+                    .filter(|(id, _)| id.starts_with(MINTED_SUB_PREFIX) == minted)
+                    // Oldest lease first, and a tie broken by the minted id's COUNTER rather than
+                    // its spelling: `~n-10` is younger than `~n-9`, which a string compare has
+                    // backwards. Ties only arise within one wall-clock second, so this is about
+                    // being predictable rather than about correctness.
+                    .min_by_key(|(id, at)| (**at, minted_seq(id), (*id).clone()))
+                    .map(|(id, _)| id.clone())
+            };
+            pick(true).or_else(|| pick(false))?
+        };
+        self.unsubscribe(shape, &victim).then_some(victim)
+    }
+
+    /// Forget every subscription a shape held — the removal half of a purge/eviction/rollback,
+    /// where the share entry itself goes. Without it the id index would keep pointing at a shape
+    /// that no longer exists and refuse a perfectly good re-subscription with a 409.
+    fn forget_subscriptions(&mut self, shape: &str) {
+        if let Some(share) = self.feed_shares.get(shape) {
+            let ids: Vec<String> = share.subs.keys().cloned().collect();
+            for id in ids {
+                if self.subs_by_id.get(&id).is_some_and(|owner| owner == shape) {
+                    self.subs_by_id.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// Publish the live-subscription gauge. A gauge and not a counter: it describes how many claims
+    /// are pinning shapes right now, which is the number an operator watching a shape that will not
+    /// go dormant needs.
+    fn publish_subscription_gauge(&self) {
+        let live: usize = self.feed_shares.values().map(FeedShare::refcount).sum();
+        crate::metrics::metrics().subscriptions_live.store(live as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Every subscription whose lease has not been renewed within `window`, as
+    /// `(shape id, subscription id)` (ADR-0008). Pure bookkeeping — the caller records the `Left`s
+    /// and the retention sweep then treats the shape exactly as it would after an explicit release.
+    ///
+    /// `window == 0` disables leases entirely, together with dormancy: an engine that never parks
+    /// a shape has no use for the liveness signal, and expiring subscriptions under it would only
+    /// break sharing.
+    ///
+    /// The comparison is **strictly greater**, deliberately. The lease clock is wall-clock SECONDS,
+    /// so an age of `n` means "somewhere in `[n, n+1)` of real time"; lapsing at `>=` would end a
+    /// one-second window after as little as a few milliseconds, which is not the window the operator
+    /// asked for. A client renewing at any fraction of its window is unaffected either way — this
+    /// decides only the boundary case, and the boundary belongs to the client.
+    fn lapsed_subscriptions(&self, window: std::time::Duration, now: u64) -> Vec<(String, String)> {
+        if window.is_zero() {
+            return Vec::new();
+        }
+        let secs = window.as_secs().max(1);
+        let mut out = Vec::new();
+        for (shape, share) in &self.feed_shares {
+            for (sub, at) in &share.subs {
+                if now.saturating_sub(*at) > secs {
+                    out.push((shape.clone(), sub.clone()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
 }
 
 struct FeedShare {
     sig: String,
-    refcount: usize,
+    /// The shape's **live subscriptions** (ADR-0008): `subscription id -> the wall-clock second its
+    /// lease was last renewed at`. The refcount is this set's size, and it is a set precisely so
+    /// that repeating a create or a release is one claim, not two.
+    ///
+    /// The lease clock is deliberately WALL CLOCK, not the `Instant` the rest of retention uses: a
+    /// lease has to survive a restart, and only a wall-clock second can be written to the catalog
+    /// and read back as an age. (`last_read` stays an `Instant` — it is process-local and must not
+    /// move when the system clock does.)
+    subs: std::collections::BTreeMap<String, u64>,
     /// Creation outcome, observed by joiners (see [`ShareOutcome`]).
     ready: tokio::sync::watch::Receiver<ShareOutcome>,
+}
+
+impl FeedShare {
+    /// Live subscriptions — what the retention sweep calls the refcount.
+    fn refcount(&self) -> usize {
+        self.subs.len()
+    }
+}
+
+/// The prefix of an **engine-minted** subscription id, and a character a caller-chosen id may not
+/// start with (`http::validate_subscription`).
+///
+/// A create that names no subscription still gets one (it is in the response, and the caller can
+/// renew or release with it), but it is marked as un-named so the legacy anonymous
+/// `DELETE /shapes/{id}` — which has no id to go on — releases one of THOSE first rather than
+/// stealing an identified subscriber's claim.
+pub(crate) const MINTED_SUB_PREFIX: char = '~';
+
+/// The counter out of an engine-minted id (`~<nonce>-<n>` -> `n`); `None` for anything else, which
+/// sorts first. Used only to break a tie between two claims minted in the same second.
+fn minted_seq(id: &str) -> Option<u64> {
+    id.rsplit_once('-')?.1.parse().ok()
 }
 
 /// What a shared shape's creator publishes to the joiners waiting on it.
@@ -637,6 +837,8 @@ impl Engine {
                 schema_gen: HashMap::new(),
                 unresolved: HashSet::new(),
                 epoch_gen: 0,
+                subs_by_id: HashMap::new(),
+                next_minted_sub: 1,
             })),
             pg_url,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
@@ -667,6 +869,7 @@ impl Engine {
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
             shutdown,
+            sub_nonce: crate::engine::catalog::process_nonce().into(),
         };
         // The streams client must be able to ask the engine whether a terminal append answer is
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
@@ -1625,6 +1828,30 @@ impl Engine {
 
     pub async fn get_shape(&self, id: &str) -> Option<ShapeRecord> {
         self.state.lock().await.shapes.get(id).cloned()
+    }
+
+    /// Does any shape currently hold this subscription id? (`http::validate_new_subscription`.)
+    ///
+    /// The one question the create path asks about an id it did not mint: an unknown `~` id is a
+    /// forgery, a known one is the caller renewing or releasing a claim the engine handed it.
+    pub async fn subscription_is_held(&self, sub: &str) -> bool {
+        self.state.lock().await.subscription_owner(sub).is_some()
+    }
+
+    /// How many live subscriptions a shape has (`GET /shapes/{id}` — ADR-0008).
+    ///
+    /// The COUNT, not the ids: an operator needs to know why a shape will not go dormant, and the
+    /// ids are other callers' handles. Deliberately not a retention touch, like the rest of that
+    /// route.
+    pub async fn subscription_count(&self, id: &str) -> usize {
+        self.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
+    }
+
+    /// The lease window a subscription must renew within (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`),
+    /// handed to clients in every create response so the renewal cadence is the server's to set.
+    /// `0` = dormancy is off, so leases never lapse.
+    pub fn lease_seconds(&self) -> u64 {
+        self.retention.idle_timeout.as_secs()
     }
 
     /// The change-log position up to which the sequencer has processed (global — all tables share

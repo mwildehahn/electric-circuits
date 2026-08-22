@@ -72,15 +72,57 @@ impl Engine {
         changes_only: bool,
         share: bool,
     ) -> Result<ShapeRecord> {
+        self.create_shape_as(table, where_, columns, changes_only, share, None).await.map(|(rec, _)| rec)
+    }
+
+    /// [`Self::create_shape`] with a caller-chosen **subscription id** (ADR-0008), returning the id
+    /// the shape was subscribed under alongside the record.
+    ///
+    /// The id makes the create idempotent: repeating it with the same id renews that subscription
+    /// and returns the same handle instead of taking a second claim, so a client whose success
+    /// response was lost can simply ask again. `None` mints one — the caller still gets it back and
+    /// can renew or release with it, but it had no idempotency on THIS create, because the engine
+    /// could not have recognised a repeat. An id another shape already holds is refused
+    /// ([`SubscriptionConflict`]): one name, one shape.
+    pub async fn create_shape_as(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        changes_only: bool,
+        share: bool,
+        subscription: Option<String>,
+    ) -> Result<(ShapeRecord, String)> {
+        // Minted ONCE, outside the redo loop: a redone attempt must be the same subscription, or
+        // the retry would take a second claim — the very thing the id exists to prevent.
+        let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
             let res =
-                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share).await;
+                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub).await;
             match retry_create(res, attempt, "shape", table) {
-                Ok(out) => return out,
+                Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
             }
         }
         unreachable!("retry_create returns the error on the last attempt")
+    }
+
+    /// The caller's subscription id, or one minted for it (`~<nonce>-<n>` — see
+    /// [`MINTED_SUB_PREFIX`]).
+    pub(crate) async fn resolve_subscription(&self, subscription: Option<String>) -> String {
+        match subscription {
+            Some(s) => s,
+            None => self.mint_subscription().await,
+        }
+    }
+
+    /// Mint an engine-side subscription id. Unique across restarts (the catalog outlives the
+    /// process) via the same per-process nonce the catalog's event ids use.
+    async fn mint_subscription(&self) -> String {
+        let mut st = self.state.lock().await;
+        let n = st.next_minted_sub;
+        st.next_minted_sub += 1;
+        format!("{MINTED_SUB_PREFIX}{}-{n}", self.sub_nonce)
     }
 
     async fn create_shape_once(
@@ -90,6 +132,7 @@ impl Engine {
         columns: Option<Vec<String>>,
         changes_only: bool,
         share: bool,
+        sub: &str,
     ) -> Result<ShapeRecord> {
         // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
         // so it refuses to make one rather than backfill from state it knows is wrong. This early
@@ -141,64 +184,98 @@ impl Engine {
         if let Some(sig) = &feed_sig {
             if let Some(existing_id) = st.feed_by_sig.get(sig).cloned() {
                 if let Some(rec) = st.shapes.get(&existing_id).cloned() {
-                    // Refuse BEFORE taking the refcount: a join that is going to be turned away must
-                    // not leave a `Joined` in the durable catalog or a refcount for the caller to
-                    // give back. A joiner is re-checked against the same `gens` a creator is — the
-                    // ones captured with `ts` above, so a drift that landed during the `HEAD` window
-                    // refuses this join instead of acknowledging a shape the drift retired.
+                    // Refuse BEFORE taking the claim: a join that is going to be turned away must
+                    // not leave a `Joined` in the durable catalog or a subscription for the caller
+                    // to give back. A joiner is re-checked against the same `gens` a creator is —
+                    // the ones captured with `ts` above, so a drift that landed during the `HEAD`
+                    // window refuses this join instead of acknowledging a shape the drift retired.
                     self.ensure_schema_resolved(&st, &dep_tables)?;
-                    let share = st.feed_shares.get_mut(&existing_id).expect("share entry for live feed");
-                    share.refcount += 1;
-                    // Enqueued here (under the lock, so the log order matches the state order) and
-                    // WAITED on immediately before this join is acknowledged: a refcount the durable
-                    // record does not carry is a subscription a restart forgets.
-                    let joined_durable =
-                        self.catalog_tx.send_durable(CatalogEvent::Joined { id: existing_id.clone() });
-                    let ready = share.ready.clone();
+                    // One subscription id belongs to one shape (ADR-0008). Reusing it for a
+                    // different predicate is refused rather than silently accepted: the caller
+                    // would hold one name for two shapes and could release neither unambiguously.
+                    ensure_subscription_free(&st, sub, &existing_id)?;
+                    // A join and a RENEWAL are the same call: `subscribe` returns false when the
+                    // shape already holds this id, in which case nothing is claimed and only the
+                    // lease moves.
+                    let now = crate::changelog::now_secs();
+                    let fresh = st.subscribe(&existing_id, sub.to_string(), now);
+                    let ev = CatalogEvent::Joined {
+                        id: existing_id.clone(),
+                        subscription: sub.to_string(),
+                        at: now,
+                    };
+                    // A NEW claim is enqueued here (under the lock, so the log order matches the
+                    // state order) and WAITED on immediately before the join is acknowledged: a
+                    // subscription the durable record does not carry is one a restart forgets. A
+                    // renewal promises nothing new — the claim is already in the log — so its
+                    // record is queued like any engine-initiated event and the caller is not made
+                    // to wait on storage to keep a lease it already holds.
+                    let joined_durable = if fresh {
+                        Some(self.catalog_tx.send_durable(ev))
+                    } else {
+                        self.catalog_tx.send(ev);
+                        None
+                    };
+                    let ready = st
+                        .feed_shares
+                        .get(&existing_id)
+                        .expect("share entry for live feed")
+                        .ready
+                        .clone();
                     // Release the lock, then wait for the creator's backfill to land: a joiner must not
                     // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
                     // failed creation.
                     drop(st);
+                    // Everything the join has claimed before its first await, given back if it
+                    // never reaches its own end — including when the CLIENT disappears mid-wait.
+                    let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
                     if let Err(e) = await_share_ready(ready, &existing_id).await {
                         // The failed creator already removed the share entries; undo nothing.
                         // A degraded outcome arrives typed, so this joiner answers 503 with the
                         // same reason the creator did.
+                        joining.rollback().await;
                         return Err(e);
                     }
                     // The creator succeeded — but it may have succeeded a moment BEFORE the
                     // degradation mark, in which case the reaper is about to delete the very
                     // stream this handle points at. This is the joiner's equivalent of the
                     // creator's final `ensure_create_not_degraded`: check the same latch after
-                    // the work is done, and give back the refcount taken above so a refused
+                    // the work is done, and give back the claim taken above so a refused
                     // join does not pin the shape.
                     if let Err(e) = self.ensure_not_degraded() {
-                        self.release_shape(&existing_id).await;
+                        joining.rollback().await;
                         return Err(e);
                     }
                     // A rejoin is a touch: if the shape went dormant since the last subscriber
                     // left, reactivate it (change-log replay) before handing out the stream.
                     if let Err(e) = self.ensure_active(&existing_id).await {
                         // Roll the failed join back so the dead subscription doesn't pin the shape.
-                        self.release_shape(&existing_id).await;
+                        joining.rollback().await;
                         return Err(e);
                     }
                     if let Err(e) = self.ensure_schema_unchanged(&gens).await {
-                        self.release_shape(&existing_id).await;
+                        joining.rollback().await;
                         return Err(e);
                     }
-                    joined_durable.await;
+                    if let Some(durable) = joined_durable {
+                        durable.await;
+                    }
                     // ...and the same check ONCE MORE, after the wait: the target may have been
                     // purged or retired while this join was blocked on storage (see
-                    // `recheck_after_durability`). Give the provisional refcount back and answer
+                    // `recheck_after_durability`). Give the provisional claim back and answer
                     // retryable rather than hand out a handle whose stream is already 404.
                     if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
-                        self.release_shape(&existing_id).await;
+                        joining.rollback().await;
                         return Err(e);
                     }
+                    joining.complete();
                     return Ok(rec);
                 }
             }
         }
+        // Nothing to join: this create is about to mint a shape, so the id must be free of any
+        // OTHER shape as well (the join path checked it against the one it was joining).
+        ensure_subscription_free(&st, sub, "")?;
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -247,7 +324,12 @@ impl Engine {
             st.shapes.insert(id.clone(), rec.clone());
             // Durable BEFORE the create is acknowledged (awaited at the bottom of the success
             // path): a `POST /shapes` that returns 200 promises a shape that survives a restart.
-            let created = self.catalog_tx.send_durable(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+            let created = self.catalog_tx.send_durable(CatalogEvent::Created {
+                rec: rec.clone(),
+                sig: feed_sig.clone(),
+                subscription: sub.to_string(),
+                at: crate::changelog::now_secs(),
+            });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
             self.ensure_retention_sweeper();
             // First subquery shape: from here on a lost flip is possible, so the stream reaper that
@@ -259,7 +341,8 @@ impl Engine {
             let (ready_tx, ready_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
             if let Some(sig) = feed_sig {
                 st.feed_by_sig.insert(sig.clone(), id.clone());
-                st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: ready_rx });
+                st.feed_shares.insert(id.clone(), FeedShare { sig, subs: Default::default(), ready: ready_rx });
+                st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
             }
             // Release the engine-state lock before the registry work. Creation is three-phase:
             // begin (brief registry lock: nodes/edges/pending buffer registered) → Postgres
@@ -367,7 +450,12 @@ impl Engine {
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
         // Durable before the create is acknowledged — see the subquery path above.
-        let created = self.catalog_tx.send_durable(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+        let created = self.catalog_tx.send_durable(CatalogEvent::Created {
+            rec: rec.clone(),
+            sig: feed_sig.clone(),
+            subscription: sub.to_string(),
+            at: crate::changelog::now_secs(),
+        });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
         // Register the (first) shared feed so later identical subset feeds join it. Joiners wait on
@@ -375,7 +463,8 @@ impl Engine {
         let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
         if let Some(sig) = feed_sig {
             st.feed_by_sig.insert(sig.clone(), id.clone());
-            st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
+            st.feed_shares.insert(id.clone(), FeedShare { sig, subs: Default::default(), ready: share_rx });
+            st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
         }
         // Release the engine-state lock, then run the two-phase backfill+activate so the shape's
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
@@ -444,10 +533,24 @@ impl Engine {
         func: AggFn,
         col: Option<String>,
     ) -> Result<ShapeRecord> {
+        self.create_aggregate_as(table, where_, func, col, None).await.map(|(rec, _)| rec)
+    }
+
+    /// [`Self::create_aggregate`] with a caller-chosen **subscription id** — identical semantics to
+    /// [`Self::create_shape_as`] (idempotent repeat = renewal, foreign id = 409).
+    pub async fn create_aggregate_as(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        func: AggFn,
+        col: Option<String>,
+        subscription: Option<String>,
+    ) -> Result<(ShapeRecord, String)> {
+        let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res = self.create_aggregate_once(table, where_.clone(), func, col.clone()).await;
+            let res = self.create_aggregate_once(table, where_.clone(), func, col.clone(), &sub).await;
             match retry_create(res, attempt, "aggregate", table) {
-                Ok(out) => return out,
+                Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
             }
         }
@@ -460,6 +563,7 @@ impl Engine {
         where_: Option<PredicateJson>,
         func: AggFn,
         col: Option<String>,
+        sub: &str,
     ) -> Result<ShapeRecord> {
         // Same refusal as `create_shape`: a degraded engine does not get to answer for a fold over
         // rows whose membership it can no longer vouch for.
@@ -492,29 +596,47 @@ impl Engine {
         st = self.state.lock().await;
         if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned() {
             if let Some(rec) = st.shapes.get(&existing_id).cloned() {
-                // Refuse before taking the refcount — see the row-shape join path. Re-checked against
+                // Refuse before taking the claim — see the row-shape join path. Re-checked against
                 // the `gens` captured with `ts`, so a drift inside the `HEAD` window refuses the join.
                 self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
-                let share = st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate");
-                share.refcount += 1;
-                let joined = self.catalog_tx.send_durable(CatalogEvent::Joined { id: existing_id.clone() });
-                let ready = share.ready.clone();
+                ensure_subscription_free(&st, sub, &existing_id)?;
+                let now = crate::changelog::now_secs();
+                let fresh = st.subscribe(&existing_id, sub.to_string(), now);
+                let ev =
+                    CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
+                // Durable for a new claim, queued for a renewal — see the row-shape join path.
+                let joined = if fresh {
+                    Some(self.catalog_tx.send_durable(ev))
+                } else {
+                    self.catalog_tx.send(ev);
+                    None
+                };
+                let ready =
+                    st.feed_shares.get(&existing_id).expect("share entry for aggregate").ready.clone();
                 drop(st);
-                await_share_ready(ready, &existing_id).await?;
+                let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
+                if let Err(e) = await_share_ready(ready, &existing_id).await {
+                    joining.rollback().await;
+                    return Err(e);
+                }
                 if let Err(e) = self.ensure_schema_unchanged(&gens).await {
-                    self.release_shape(&existing_id).await;
+                    joining.rollback().await;
                     return Err(e);
                 }
                 self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
-                joined.await;
+                if let Some(durable) = joined {
+                    durable.await;
+                }
                 // ...and again after the wait — see `recheck_after_durability`.
                 if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
-                    self.release_shape(&existing_id).await;
+                    joining.rollback().await;
                     return Err(e);
                 }
+                joining.complete();
                 return Ok(rec);
             }
         }
+        ensure_subscription_free(&st, sub, "")?;
 
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
 
@@ -564,14 +686,19 @@ impl Engine {
                             CircuitPlacement { label: "counts".into(), col: None, counts: true },
                         );
                         // Durable before the create is acknowledged — see `create_shape`.
-                        let created = self
-                            .catalog_tx
-                            .send_durable(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
+                        let created = self.catalog_tx.send_durable(CatalogEvent::Created {
+                            rec: rec.clone(),
+                            sig: Some(agg_sig.clone()),
+                            subscription: sub.to_string(),
+                            at: crate::changelog::now_secs(),
+                        });
                         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
                         self.ensure_retention_sweeper();
                         let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
                         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
-                        st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
+                        st.feed_shares
+                            .insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
+                        st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
                         drop(st);
                         let mut creating =
                             CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
@@ -658,13 +785,19 @@ impl Engine {
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
         // Durable before the create is acknowledged — see `create_shape`.
-        let created = self.catalog_tx.send_durable(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
+        let created = self.catalog_tx.send_durable(CatalogEvent::Created {
+            rec: rec.clone(),
+            sig: Some(agg_sig.clone()),
+            subscription: sub.to_string(),
+            at: crate::changelog::now_secs(),
+        });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
         // Register this (first) aggregate so later identical ones join it by ref-count.
         let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
-        st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
+        st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
+        st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
         drop(st);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = backfill_and_activate(
@@ -711,25 +844,42 @@ impl Engine {
         }
     }
 
-    /// Release one subscription on a shape (extended-API `DELETE /shapes/{id}`, `/v1/shape` handle
-    /// eviction). Refcount-0 does **not** tear the shape down: it stays active (a brief reconnect
+    /// The **legacy anonymous** release: drop one subscription without being told which
+    /// (`DELETE /shapes/{id}` with no `subscription`, the `/v1/shape` adapter's handle eviction).
+    ///
+    /// Kept for callers that never learned their subscription id, and NOT retry-safe: nothing
+    /// identifies the claim the caller meant, so a repeat drops a second one. Engine-minted claims
+    /// go first (see [`EngineState::unsubscribe_anonymous`]) so it cannot steal an identified
+    /// subscriber's. Prefer [`Self::release_subscription`].
+    pub async fn release_shape(&self, id: &str) {
+        self.release_subscription(id, None).await;
+    }
+
+    /// Release one subscription on a shape (extended-API `DELETE /shapes/{id}?subscription=…`).
+    /// An empty live set does **not** tear the shape down: it stays active (a brief reconnect
     /// rejoins it warm), goes dormant after the retention idle timeout, and is eventually evicted
     /// by the layered policy (see `crate::retention`). Releasing is also a touch, so the idle
-    /// countdown starts at the disconnect. Infallible: it only adjusts in-memory counters.
+    /// countdown starts at the disconnect. Infallible: it only adjusts in-memory state.
     ///
-    /// The `Left` is queued, never waited on — including for the client-facing `DELETE
-    /// /shapes/{id}`. Durable-before-ack exists for records whose LOSS would make an acknowledged
-    /// subscription vanish (`Created`, `Joined`); a lost `Left` is benign in the other direction (a
-    /// restart restores one refcount too many, which retention resolves), and since the catalog
-    /// writer never drops an event it cannot be lost at all — only delayed. Waiting would be
-    /// actively harmful: a client that times out on a slow `DELETE` and retries it (the published
-    /// client retries five times) would decrement twice, which is the double-delete that steals
-    /// another subscriber's refcount. So a delete is answered at once and its record lands in order.
-    pub async fn release_shape(&self, id: &str) {
+    /// **Idempotent** (ADR-0008): releasing an id the shape does not hold changes nothing and
+    /// records nothing, so a client whose success response was lost may simply ask again — the
+    /// double-delete that used to steal another subscriber's claim is gone.
+    ///
+    /// The `Left` is queued, never waited on — including for the client-facing `DELETE`.
+    /// Durable-before-ack exists for records whose LOSS would make an acknowledged subscription
+    /// vanish (`Created`, `Joined`). A lost `Left` fails the other way: a restart restores one
+    /// subscription too many, whose lease then lapses within one idle window and releases it exactly
+    /// as this call would have (ADR-0008). Waiting instead would make a `DELETE` block for the whole
+    /// of a storage outage — the client times out, retries, and gets no better answer — while the
+    /// lease already guarantees the outcome.
+    pub async fn release_subscription(&self, id: &str, sub: Option<&str>) {
         let mut st = self.state.lock().await;
-        if let Some(share) = st.feed_shares.get_mut(id) {
-            share.refcount = share.refcount.saturating_sub(1);
-            self.catalog_tx.send(CatalogEvent::Left { id: id.to_string() });
+        let released = match sub {
+            Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
+            None => st.unsubscribe_anonymous(id),
+        };
+        if let Some(subscription) = released {
+            self.catalog_tx.send(CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false });
         }
         drop(st);
         self.touch_shape(id);
@@ -743,18 +893,27 @@ impl Engine {
     /// queue is FIFO, so a purge ordered after an in-flight resume removes whatever the resume
     /// registered.
     ///
-    /// The `Dropped` record is queued, not waited on, for every caller — the engine-initiated ones
-    /// (schema drift, `TRUNCATE`, the epoch reset, which drains the queue as an explicit barrier of
-    /// its own) and the client-facing `DELETE /shapes/{id}?purge=true` alike. See
-    /// [`Self::release_shape`] for why a removal is answered at once: losing the record cannot
-    /// resurrect the shape (the restore would fail to resume a shape whose stream is retired and
-    /// drop it again), and the writer does not lose records anyway.
+    /// The `Dropped` record is **queued, not waited on**, for every caller — the engine-initiated
+    /// ones (schema drift, `TRUNCATE`, the epoch reset, which drains the queue as an explicit
+    /// barrier of its own) and the client-facing `DELETE /shapes/{id}?purge=true` alike.
+    ///
+    /// ADR-0008 proposed making the client-facing purge durable-before-ack, and this is the one
+    /// place the implementation deviates from it, because that combination is not implementable:
+    /// a purge waiting on the catalog cannot be acknowledged at all while storage is down, and a
+    /// purge is exactly what a caller reaches for when it needs a shape gone NOW — including while a
+    /// concurrent create is parked on its own durability wait (the join-vs-purge race). Waiting
+    /// turns that into a deadlock in the caller's face rather than a promise kept. So a removal is
+    /// answered at once and its record lands in order, and the loss window is closed from the other
+    /// side: the restore brings a purged-but-unrecorded shape back **with its subscriptions' lease
+    /// ages**, so it is reclaimed within one idle window unless its clients are genuinely still
+    /// there — and a repeat purge is a no-op, so saying it again costs nothing.
     ///
     /// It does NOT wait on the retirement either: the stream may still be being deleted in the
     /// background when this returns, and `GET /shapes/{id}` is 404 from now on regardless.
     pub async fn purge_shape(&self, id: &str) -> Result<()> {
         let mut st = self.state.lock().await;
         self.lives.lock().unwrap().remove(id);
+        st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
             st.feed_by_sig.remove(&share.sig);
         }
@@ -783,6 +942,24 @@ impl Engine {
             tracing::info!("purged shape {id} (forced)");
         }
         Ok(())
+    }
+
+    /// Renew a subscription's lease **in memory only** — no catalog event (ADR-0008).
+    ///
+    /// For a subscriber the engine can actually SEE: the `/v1/shape` adapter, whose every poll goes
+    /// through the engine, unlike a native subscriber reading durable-streams directly. Its handle
+    /// is the liveness signal, so the poll renews the claim the handle holds and
+    /// `subscriptions_live` keeps describing reality rather than decaying to zero under a client
+    /// that is plainly still there.
+    ///
+    /// Nothing is recorded because there is nothing a restart could use it for: an Electric handle
+    /// does not survive one (the registry is in-memory, and a returning client gets `must-refetch`
+    /// and re-snapshots, which takes a fresh claim). A claim that lapsed before this call is
+    /// re-taken here for the same reason — the handle is demonstrably live — and if the shape is
+    /// gone entirely this is a no-op, which is exactly the `must-refetch` path.
+    pub(crate) async fn renew_subscription_local(&self, id: &str, sub: &str) {
+        let mut st = self.state.lock().await;
+        st.subscribe(id, sub.to_string(), crate::changelog::now_secs());
     }
 
     /// Record an engine-visible read of a shape (drives the retention idle timer + LRU order).
@@ -1030,7 +1207,7 @@ impl Engine {
         if rec.is_subquery || rec.aggregate.is_some() {
             return Ok(()); // never dormant (state not rebuildable from a bounded replay)
         }
-        if st.feed_shares.get(id).is_some_and(|s| s.refcount > 0) {
+        if st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
             return Ok(()); // resubscribed since the sweep snapshot
         }
         let Some(cmd_tx) = st.sequencer.as_ref().map(|s| s.cmd_tx.clone()) else { return Ok(()) };
@@ -1107,11 +1284,12 @@ impl Engine {
             if !evictable {
                 return Ok(Evicted::Skipped);
             }
-            if st.feed_shares.get(id).is_some_and(|s| s.refcount > 0) {
+            if st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
                 return Ok(Evicted::Skipped);
             }
             lives.remove(id);
         }
+        st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
             st.feed_by_sig.remove(&share.sig);
         }
@@ -1150,6 +1328,7 @@ impl Engine {
     /// sweep instead of waiting for the background interval.
     pub async fn retention_sweep(&self) {
         let cfg = self.retention.clone();
+        self.sweep_leases(&cfg).await;
         let snapshot: Vec<SweepShape> = {
             let st = self.state.lock().await;
             let bytes = self.ds.appended_bytes_with_prefix("shape/");
@@ -1170,7 +1349,7 @@ impl Engine {
                     };
                     SweepShape {
                         id: rec.id.clone(),
-                        refcount: st.feed_shares.get(&rec.id).map(|s| s.refcount).unwrap_or(0),
+                        refcount: st.feed_shares.get(&rec.id).map(FeedShare::refcount).unwrap_or(0),
                         idle,
                         dormant_for,
                         in_transition,
@@ -1210,6 +1389,39 @@ impl Engine {
         }
         // Same tick, second half: the change log's own retention (ADR-0006).
         self.sweep_change_log().await;
+    }
+
+    /// The lease half of a sweep (ADR-0008): release every subscription that has not been renewed
+    /// within [`RetentionConfig::idle_timeout`], exactly as an explicit `DELETE` would.
+    ///
+    /// This is the only liveness signal the engine has for a native subscriber. Its reads go
+    /// straight to durable-streams, so an un-renewed subscription is indistinguishable from a
+    /// client that vanished — and treating it as live pins the shape (and its stream, and its
+    /// change-log segment) for ever. A shape whose live set empties this way then follows the
+    /// ordinary lifecycle: idle → dormant → evicted, with the same grace as any other.
+    ///
+    /// A lapse is a `Left` like any other, marked `lapsed` so the durable record says who released
+    /// it. `idle_timeout == 0` disables dormancy, and with it leases: an engine that never parks a
+    /// shape has no use for the signal.
+    async fn sweep_leases(&self, cfg: &crate::retention::RetentionConfig) {
+        let lapsed = {
+            let mut st = self.state.lock().await;
+            let now = crate::changelog::now_secs();
+            let expired = st.lapsed_subscriptions(cfg.idle_timeout, now);
+            for (shape, sub) in &expired {
+                st.unsubscribe(shape, sub);
+            }
+            st.publish_subscription_gauge();
+            expired
+        };
+        for (shape, subscription) in lapsed {
+            tracing::debug!(
+                "retention: subscription {subscription} on shape {shape} was not renewed within {:?}; released",
+                cfg.idle_timeout
+            );
+            self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription, lapsed: true });
+            metrics().subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Delete the change-log segments nothing can resume inside any more, evicting first the
@@ -1535,6 +1747,90 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+/// Is this subscription id free to be claimed on `shape`? (ADR-0008.)
+///
+/// `shape` is the shape the caller is about to join — pass `""` for a create that is about to mint
+/// one. A subscription id already held by ANY other shape is refused with a typed
+/// [`SubscriptionConflict`] (409): the caller would otherwise hold one name for two shapes and be
+/// unable to release either of them unambiguously. Evaluated under the state lock, in the same
+/// critical section that takes the claim.
+fn ensure_subscription_free(st: &EngineState, sub: &str, shape: &str) -> Result<()> {
+    match st.subscription_owner(sub) {
+        Some(owner) if owner != shape => Err(anyhow::Error::new(SubscriptionConflict {
+            subscription: sub.to_string(),
+            shape: owner.clone(),
+        })),
+        _ => Ok(()),
+    }
+}
+
+/// Everything a JOIN claimed before its first await, given back if it never reaches its own end —
+/// the join-side twin of [`CreateGuard`] (ADR-0008).
+///
+/// The join's future is awaited straight from the HTTP handler, so a client that disconnects takes
+/// it away mid-flight — including while it is blocked on the `Joined` record's durability. Without
+/// this, the claim stays: an in-memory subscription nobody holds, pinning the shape past every
+/// retention layer, plus a durable `Joined` no client can ever balance (it never learned the id it
+/// was joining under, because it never got an answer).
+///
+/// A RENEWAL claims nothing (`fresh == false`), so its guard is inert: an id the caller already held
+/// before the request must survive the request failing.
+struct JoinGuard {
+    engine: Engine,
+    shape_id: String,
+    subscription: String,
+    /// Armed only for a NEW claim: `fresh == false` is a renewal, which claimed nothing and must
+    /// survive its request failing.
+    armed: bool,
+}
+
+impl JoinGuard {
+    fn new(engine: &Engine, shape_id: &str, subscription: &str, fresh: bool) -> Self {
+        Self {
+            engine: engine.clone(),
+            shape_id: shape_id.to_string(),
+            subscription: subscription.to_string(),
+            armed: fresh,
+        }
+    }
+
+    /// The join reached its end: the claim stays.
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+
+    /// The join failed and its caller is still there to be told: give the claim back in place, so
+    /// the error it returns is already true of the engine's state.
+    async fn rollback(&mut self) {
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        self.engine.release_subscription(&self.shape_id, Some(&self.subscription)).await;
+    }
+}
+
+impl Drop for JoinGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancelled. The compensation needs the async state lock, which `drop` cannot await, so it
+        // runs DETACHED — the same shape as `CreateGuard`, and for the same reason. The `Left` it
+        // records is idempotent and names this join's OWN subscription, so it can neither
+        // double-release nor steal another subscriber's claim, whatever else has happened since.
+        tracing::warn!(
+            "join of shape '{}' as subscription '{}' was cancelled; releasing it",
+            self.shape_id,
+            self.subscription
+        );
+        let (engine, shape_id, subscription) =
+            (self.engine.clone(), self.shape_id.clone(), self.subscription.clone());
+        tokio::spawn(async move {
+            engine.release_subscription(&shape_id, Some(&subscription)).await;
+        });
     }
 }
 
@@ -1885,6 +2181,9 @@ impl Engine {
         let mut st = self.state.lock().await;
         let existed = st.shapes.remove(id).is_some();
         st.circuit_placement.remove(id);
+        // The create's own subscription goes with it: a rolled-back create never happened, and
+        // leaving its id claimed would refuse the client's very next attempt with a 409.
+        st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
             // Only if the signature still points HERE: a joiner woken by this create's failure may
             // already have registered its own replacement under the same signature.
@@ -1970,7 +2269,8 @@ mod cancellation_tests {
         });
         let (_ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Pending);
         st.feed_by_sig.insert("sig".into(), id.to_string());
-        st.feed_shares.insert(id.to_string(), FeedShare { sig: "sig".into(), refcount: 1, ready });
+        st.feed_shares.insert(id.to_string(), FeedShare { sig: "sig".into(), subs: Default::default(), ready });
+        st.subscribe(id, "sub-a".to_string(), crate::changelog::now_secs());
         drop(st);
         engine.lives.lock().unwrap().insert(id.to_string(), ShapeLife::active());
         CreateGuard::new(engine, id, &"outer_t".into(), &format!("shape/{id}"), Registration::Registry)
@@ -2155,12 +2455,13 @@ mod cancellation_tests {
             fingerprint: None,
         });
         st.feed_by_sig.insert(sig.clone(), id.to_string());
-        st.feed_shares.insert(id.to_string(), FeedShare { sig, refcount: 1, ready: rx });
+        st.feed_shares.insert(id.to_string(), FeedShare { sig, subs: Default::default(), ready: rx });
+        st.subscribe(id, "sub-creator".to_string(), crate::changelog::now_secs());
         tx
     }
 
     async fn refcount(engine: &Engine, id: &str) -> usize {
-        engine.state.lock().await.feed_shares.get(id).map(|s| s.refcount).unwrap_or(0)
+        engine.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
     }
 
     /// Park until the joiner has actually joined (its refcount is taken) and is waiting on the
@@ -2249,5 +2550,240 @@ mod cancellation_tests {
         let err = joining.await.unwrap().expect_err("the joiner must be refused");
         assert!(err.downcast_ref::<Degraded>().is_none(), "not a degradation: {err:#}");
         assert!(format!("{err:#}").contains("failed to initialize"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    /// An engine with one shared shape and the given live subscriptions
+    /// (`subscription id -> lease timestamp`). No durable-streams behind it: every catalog record
+    /// these tests provoke is queued and retried in the background, which is exactly what the
+    /// engine does in production while storage is down — and none of the behaviour under test waits
+    /// on it.
+    async fn engine_with_share(id: &str, subs: &[(&str, u64)]) -> Engine {
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let mut st = engine.state.lock().await;
+        st.shapes.insert(id.to_string(), ShapeRecord {
+            id: id.to_string(),
+            table: "items".into(),
+            stream_path: format!("shape/{id}"),
+            changes_only: false,
+            where_json: None,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: None,
+            fingerprint: None,
+        });
+        let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
+        drop(ready_tx);
+        st.feed_by_sig.insert(format!("sig-{id}"), id.to_string());
+        st.feed_shares
+            .insert(id.to_string(), FeedShare { sig: format!("sig-{id}"), subs: Default::default(), ready });
+        for (sub, at) in subs {
+            st.subscribe(id, (*sub).to_string(), *at);
+        }
+        drop(st);
+        engine.lives.lock().unwrap().insert(id.to_string(), ShapeLife::active());
+        engine
+    }
+
+    async fn refcount(engine: &Engine, id: &str) -> usize {
+        engine.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
+    }
+
+    /// The double-delete this whole ADR exists for: a client whose success response was lost retries
+    /// its `DELETE`, and the second one must change nothing. Before subscription ids, it decremented
+    /// a shared counter again and stole the other subscriber's claim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn releasing_one_subscription_twice_releases_it_once() {
+        let engine = engine_with_share("s1", &[("sub-a", 10), ("sub-b", 10)]).await;
+
+        engine.release_subscription("s1", Some("sub-a")).await;
+        engine.release_subscription("s1", Some("sub-a")).await;
+        engine.release_subscription("s1", Some("sub-never-existed")).await;
+
+        assert_eq!(refcount(&engine, "s1").await, 1, "the other subscriber keeps its claim");
+        assert_eq!(
+            engine.state.lock().await.subscription_owner("sub-a"),
+            None,
+            "the released id is free to be claimed again"
+        );
+        assert_eq!(engine.state.lock().await.subscription_owner("sub-b").cloned(), Some("s1".to_string()));
+    }
+
+    /// The legacy path (`DELETE` with no `subscription`) still decrements exactly once per call —
+    /// and takes an engine-MINTED claim before an identified one, so a caller that never learned
+    /// the protocol cannot release a subscription that did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_anonymous_release_takes_a_minted_claim_first_and_decrements_once() {
+        let engine = engine_with_share("s1", &[("~boot-1", 10), ("named", 5)]).await;
+
+        engine.release_shape("s1").await;
+        assert_eq!(refcount(&engine, "s1").await, 1);
+        assert_eq!(
+            engine.state.lock().await.feed_shares["s1"].subs.keys().cloned().collect::<Vec<_>>(),
+            vec!["named".to_string()],
+            "the un-named claim went first, even though it was the newer lease"
+        );
+
+        engine.release_shape("s1").await;
+        assert_eq!(refcount(&engine, "s1").await, 0);
+        // ...and it is not idempotent, which is why it is documented as legacy: there is nothing
+        // left to release here, but nothing identified what the caller meant either.
+        engine.release_shape("s1").await;
+        assert_eq!(refcount(&engine, "s1").await, 0);
+    }
+
+    /// One subscription id names one shape. Re-using it for a different predicate is refused
+    /// (409-typed), because the caller would then hold one name for two claims and could release
+    /// neither of them unambiguously.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscription_id_held_by_another_shape_is_refused() {
+        let engine = engine_with_share("s1", &[("mine", 10)]).await;
+        let st = engine.state.lock().await;
+
+        // Joining the shape that already holds it is the renewal case, not a conflict.
+        ensure_subscription_free(&st, "mine", "s1").expect("renewing my own subscription is fine");
+
+        let err = ensure_subscription_free(&st, "mine", "s2").expect_err("a foreign shape must be refused");
+        let conflict = err.downcast_ref::<SubscriptionConflict>().expect("typed, so the API answers 409");
+        assert_eq!(conflict.shape, "s1");
+        assert!(err.to_string().contains("names one shape"), "{err}");
+
+        // A create that is about to mint a shape passes "" as the target: any owner is a conflict.
+        assert!(ensure_subscription_free(&st, "mine", "").is_err());
+        assert!(ensure_subscription_free(&st, "unclaimed", "").is_ok());
+    }
+
+    /// The lease: a subscription not renewed within the idle window is released by the sweeper,
+    /// exactly as an explicit `DELETE` would release it — and a renewed one is left alone. This is
+    /// the only liveness signal the engine has for a native subscriber, whose reads it never sees.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrenewed_lease_lapses_and_a_renewed_one_does_not() {
+        let now = crate::changelog::now_secs();
+        let engine = engine_with_share("s1", &[("stale", now - 60), ("renewed", now)]).await;
+        let cfg = crate::retention::RetentionConfig {
+            idle_timeout: std::time::Duration::from_secs(5),
+            ..crate::retention::RetentionConfig::default()
+        };
+
+        engine.sweep_leases(&cfg).await;
+
+        assert_eq!(
+            engine.state.lock().await.feed_shares["s1"].subs.keys().cloned().collect::<Vec<_>>(),
+            vec!["renewed".to_string()],
+            "only the subscription that stopped saying it was there is released"
+        );
+        assert_eq!(
+            engine.state.lock().await.subscription_owner("stale"),
+            None,
+            "and its id is free again — a late client simply re-subscribes"
+        );
+
+        // Renewing is the same `subscribe` call: it moves the lease and claims nothing new.
+        {
+            let mut st = engine.state.lock().await;
+            assert!(!st.subscribe("s1", "renewed".to_string(), now + 1), "a renewal is not a new claim");
+        }
+        assert_eq!(refcount(&engine, "s1").await, 1);
+    }
+
+    /// The boundary belongs to the client: a one-second window must last at least one second. The
+    /// lease clock is wall-clock SECONDS, so a claim renewed at `now` and swept at `now + 1` has an
+    /// age of "1" that may be a millisecond of real time — lapsing on `>=` would cut every window
+    /// short by up to a second, which for the second-scale windows tests and demos use is the whole
+    /// window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_lasts_at_least_its_whole_window() {
+        let now = crate::changelog::now_secs();
+        let engine = engine_with_share("s1", &[("edge", now)]).await;
+        let cfg = crate::retention::RetentionConfig {
+            idle_timeout: std::time::Duration::from_secs(1),
+            ..crate::retention::RetentionConfig::default()
+        };
+
+        let st = engine.state.lock().await;
+        assert!(st.lapsed_subscriptions(cfg.idle_timeout, now).is_empty(), "age 0 is inside the window");
+        assert!(
+            st.lapsed_subscriptions(cfg.idle_timeout, now + 1).is_empty(),
+            "age 1 of a 1s window may be a millisecond of real time — still inside"
+        );
+        assert_eq!(
+            st.lapsed_subscriptions(cfg.idle_timeout, now + 2),
+            vec![("s1".to_string(), "edge".to_string())],
+            "a full window has certainly passed by now"
+        );
+    }
+
+    /// The anonymous release picks the oldest MINTED claim, and breaks a same-second tie by the
+    /// counter the engine minted them with — `~n-10` is younger than `~n-9`, which a plain string
+    /// compare has backwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_anonymous_release_breaks_a_tie_by_mint_order() {
+        let engine = engine_with_share("s1", &[("~boot-9", 10), ("~boot-10", 10)]).await;
+        engine.release_shape("s1").await;
+        assert_eq!(
+            engine.state.lock().await.feed_shares["s1"].subs.keys().cloned().collect::<Vec<_>>(),
+            vec!["~boot-10".to_string()],
+            "the older claim (9) went first, not the lexicographically smaller one (10)"
+        );
+    }
+
+    /// `idle_timeout == 0` turns dormancy off, and with it leases: an engine that never parks a
+    /// shape has no use for the signal, and expiring subscriptions under it would only break
+    /// sharing for long-lived subscribers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leases_never_lapse_when_dormancy_is_disabled() {
+        let engine = engine_with_share("s1", &[("ancient", 1)]).await;
+        let cfg = crate::retention::RetentionConfig {
+            idle_timeout: std::time::Duration::ZERO,
+            ..crate::retention::RetentionConfig::default()
+        };
+        engine.sweep_leases(&cfg).await;
+        assert_eq!(refcount(&engine, "s1").await, 1);
+    }
+
+    /// A join that is abandoned mid-wait (the client disconnected while storage was slow) gives its
+    /// claim back. The compensation names the join's OWN subscription, so it can neither
+    /// double-release nor take another subscriber's claim — the two hazards that made a
+    /// cancellation guard impossible on an anonymous refcount.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_join_releases_its_own_subscription() {
+        let engine = engine_with_share("s1", &[("held", 10), ("joining", 10)]).await;
+
+        drop(JoinGuard::new(&engine, "s1", "joining", true));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while refcount(&engine, "s1").await > 1 {
+            assert!(std::time::Instant::now() < deadline, "the cancelled join never gave its claim back");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            engine.state.lock().await.feed_shares["s1"].subs.keys().cloned().collect::<Vec<_>>(),
+            vec!["held".to_string()],
+            "the other subscriber is untouched"
+        );
+    }
+
+    /// A cancelled RENEWAL compensates for nothing: the subscription existed before the request and
+    /// must survive it failing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_renewal_keeps_the_claim_it_did_not_take() {
+        let engine = engine_with_share("s1", &[("held", 10)]).await;
+        drop(JoinGuard::new(&engine, "s1", "held", false));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(refcount(&engine, "s1").await, 1);
+    }
+
+    /// A purge takes the subscriptions with it: leaving the ids claimed would refuse the client's
+    /// very next create with a 409 over a shape that no longer exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_frees_the_ids_the_shape_held() {
+        let engine = engine_with_share("s1", &[("mine", 10)]).await;
+        engine.purge_shape("s1").await.unwrap();
+        assert_eq!(engine.state.lock().await.subscription_owner("mine"), None);
     }
 }

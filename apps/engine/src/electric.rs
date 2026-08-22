@@ -25,7 +25,11 @@
 //!   (`create_shape` with `share = true`): concurrent clients and returning clients rejoin the same
 //!   retained stream instead of re-backfilling from Postgres. Handles stay **per client** (each
 //!   snapshot mints a unique handle id over the shared stream), so cursor state is never contended
-//!   across clients; each live handle holds one subscription on the shared shape.
+//!   across clients; each live handle holds one subscription on the shared shape — and every request
+//!   on a handle RENEWS that subscription's lease (ADR-0008), in memory, so a long-polling client
+//!   keeps its claim without knowing the id exists. (A handle does not survive a restart, so there
+//!   is nothing to record: a returning client gets `must-refetch` and re-snapshots, taking a fresh
+//!   claim.)
 //! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600). This is
 //!   **handle-state cleanup only**: the per-handle cursor state is dropped and the shape subscription
 //!   released — the underlying engine shape and its durable stream are retained and follow the
@@ -97,6 +101,10 @@ struct HandleEntry {
     /// so per-handle cursor state is never contended across clients — and each live handle holds
     /// exactly one shape subscription, released when the handle is evicted.
     shape_id: String,
+    /// The **subscription id** this handle's create/join took (ADR-0008), so the idle evictor
+    /// releases exactly this handle's claim rather than "one of them". An Electric client never
+    /// sees it: the handle is its name for the same thing.
+    subscription: String,
     table: TableRef,
     pk_name: String,
     /// When this handle was last touched by a request — drives idle-TTL eviction.
@@ -225,7 +233,7 @@ fn ensure_evictor(engine: &Engine) {
                     }
                     handles().lock().unwrap().remove(&id);
                     drop(guard);
-                    engine.release_shape(&entry.shape_id).await;
+                    engine.release_subscription(&entry.shape_id, Some(&entry.subscription)).await;
                     tracing::debug!("evicted idle electric handle {id} (shape retained)");
                 }
             }
@@ -902,13 +910,18 @@ async fn shape_inner(
         // returning client's re-snapshot rejoins the retained shape — reactivated inside
         // `create_shape` if it went dormant — instead of re-backfilling from Postgres. The handle
         // minted below stays per-client (see the module docs).
-        let rec = engine.create_shape(&p.table, pred, columns.clone(), false, true).await?;
+        // The subscription is the ENGINE's to mint here, not the adapter's (ADR-0008): an Electric
+        // client has no id of its own to renew or release with — the handle is its name for this
+        // claim — and a name the adapter derived from its own counter would collide after a restart
+        // with a claim the catalog restored. The minted id comes back with the record and is kept on
+        // the handle, so the idle evictor releases exactly this claim.
+        let (rec, subscription) = engine.create_shape_as(&p.table, pred, columns.clone(), false, true, None).await?;
         let (rows, tail) = match materialize(&engine, &rec.stream_path).await {
             Ok(v) => v,
             Err(e) => {
                 // Failed after taking the create/join subscription: give it back, or the dead
                 // subscription pins the shape active forever.
-                engine.release_shape(&rec.id).await;
+                engine.release_subscription(&rec.id, Some(&subscription)).await;
                 return Err(e.into());
             }
         };
@@ -933,6 +946,7 @@ async fn shape_inner(
             Arc::new(HandleEntry {
                 stream_path: rec.stream_path.clone(),
                 shape_id: rec.id.clone(),
+                subscription: subscription.clone(),
                 table: p.table.clone(),
                 pk_name: ts.pk_name.clone(),
                 last_access: std::sync::Mutex::new(Instant::now()),
@@ -961,6 +975,10 @@ async fn shape_inner(
         }
     };
     entry.touch();
+    // ...and the same touch renews the engine-side LEASE this handle holds (ADR-0008). A `/v1/shape`
+    // client's reads come through the engine, so unlike a native subscriber it does not have to
+    // renew by hand — the poll is the renewal. In memory only: a handle does not survive a restart.
+    engine.renew_subscription_local(&entry.shape_id, &entry.subscription).await;
     if entry.table != p.table {
         return Err(ApiError::bad_request(format!(
             "table '{}' does not match the shape of handle '{handle}' (table '{}')",
@@ -1276,6 +1294,7 @@ mod tests {
         Arc::new(HandleEntry {
             stream_path: "s".into(),
             shape_id: "s1".into(),
+            subscription: "~test-1".into(),
             table: "t".into(),
             pk_name: "id".into(),
             last_access: std::sync::Mutex::new(Instant::now()),

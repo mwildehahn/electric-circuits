@@ -179,13 +179,22 @@ async fn a_real_404_retires_the_shape_instead_of_leaving_it_stale() {
         assert!(std::time::Instant::now() < deadline, "the lost shape was never retired");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(
-        ds.deleted.lock().unwrap().iter().any(|p| p.ends_with("shape/s1")),
-        "retirement deletes the stream (ADR-0007)"
-    );
-    assert!(
-        ds.closed.lock().unwrap().iter().any(|p| p.ends_with("shape/s1")),
-        "retirement closes before deleting (ADR-0007) — the close is attempted even on a lost stream"
-    );
+    // The record going is the FIRST half of the retirement; the close and delete follow it (the
+    // record is removed under the state lock, the stream work happens after). Polling for them
+    // rather than asserting the instant the record vanishes is not leniency — asserting on the
+    // earlier of two ordered events is simply the wrong moment to look.
+    async fn until(what: &str, seen: &std::sync::Mutex<Vec<String>>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !seen.lock().unwrap().iter().any(|p| p.ends_with("shape/s1")) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    until("retirement deletes the stream (ADR-0007)", &ds.deleted).await;
+    until(
+        "retirement closes before deleting (ADR-0007) — the close is attempted even on a lost stream",
+        &ds.closed,
+    )
+    .await;
     assert!(engine.graph().await.shapes.is_empty(), "no shape may survive its lost stream");
 }

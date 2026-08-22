@@ -6,7 +6,7 @@ dependencies. Four modules, re-exported from the package root:
 
 | Module | Contents |
 |---|---|
-| `types.ts` | `Schema`/`TableDef`/`ColumnType` (`int` `text` `bool` `float`), `Row`/`Value`, the **Predicate AST**, `ShapeDef`/`ShapeHandle`, `SubsetDef`/`SubsetResult`, `AggregateDef`/`AggFn`, `ChangeEvent`, stream-path helpers |
+| `types.ts` | `Schema`/`TableDef`/`ColumnType` (`int` `text` `bool` `float`), `Row`/`Value`, the **Predicate AST**, `ShapeDef`/`ShapeHandle` (incl. the handle's `subscription` + `leaseSeconds` — ADR-0008), `SubsetDef`/`SubsetResult`, `AggregateDef`/`AggFn`, `ChangeEvent`, stream-path helpers |
 | `predicate.ts` | reference **evaluator** (`evaluate`) + `validatePredicate` |
 | `sql.ts` | predicate → SQL compiler (`predicateToSql`), DDL (`tableDDL`), DML (`changeEventToDML`), `shapeSelectSql` |
 | `envelope.ts` | `StreamEnvelope` — the State-Protocol change envelope on every table/shape durable stream (`type`, `key`, `value`, `headers.operation/txid/lsn/seq`) |
