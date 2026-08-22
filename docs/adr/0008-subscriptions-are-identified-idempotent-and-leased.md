@@ -74,19 +74,18 @@ phantom unrecoverable, the second lets any dead client pin a shape forever.
   making every renewal a storage round trip would put a client's heartbeat on the critical path of
   an outage it has no part in. (A `/v1/shape` handle's renewal is not even written: the poll renews
   it in memory, because an Electric handle does not survive a restart.)
-- **The engine mints an id for a create that names none** (as decided) — and marks it, with a `~`
-  prefix a caller may not invent. The legacy anonymous `DELETE` releases a minted claim before a
-  named one, so a caller that never learned the protocol cannot take the claim of one that did. The
-  mark is not a wall, and it is not tied to current ownership either: the catalog carries the
-  **provenance** of every `~` id this history has minted (restored by the fold from `Created` and
-  `Joined`), and any id in that set is accepted for renewal or release — after it lapses, after it is
-  released, and after a restart. That is what makes a minted id a returned capability rather than one
-  that expires the moment the engine forgets the claim. Only a `~` id the history has never minted is
-  refused (400), because that one could only have been forged.
-- **That provenance set only grows.** It holds one id per anonymous create for the lifetime of the
-  catalog — in memory, and re-derived by the fold on every boot — so it is bounded by the catalog's
-  length, not by the live subscription count. A deployment whose clients never name their own
-  subscriptions pays for that, and nothing compacts it today.
+- **The engine mints an id for a create that names none** (as decided) — `~<nonce>-<n>`, where the
+  `~` is a **marker, not a reserved namespace**. Its whole job is the legacy anonymous `DELETE`,
+  which releases a `~` claim before a named one so a caller that never learned the protocol cannot
+  take the claim of one that did. The engine does not check whether it minted a given `~` id: a
+  create may name any well-formed id, marked or not, so a returned minted id keeps working after it
+  lapses, after it is released, and after a restart — with no state to remember it by.
+- **Refusing an un-minted `~` id was tried and dropped.** Validating a create's `~` id against a
+  set of every id this history had minted only stopped a caller from making its OWN claim the
+  expendable one — which harms nobody else — and the ids were never unguessable anyway (a
+  time/address nonce plus a counter), so it bought no security boundary. The price was a
+  history-sized in-memory set, one entry per anonymous create for the catalog's lifetime, re-derived
+  by the fold at every boot and compacted by nothing. Not worth it.
 - **The lease boundary belongs to the client**: the clock is wall-clock seconds, so a claim lapses
   once its age is strictly greater than the window. Lapsing at `>=` would end a one-second window
   after a millisecond.

@@ -209,8 +209,8 @@ describe('native subscriptions are identified, idempotent and leased', () => {
     await h.restartEngine()
 
     // This id came from the native create response. Lapsing removes its claim, not the caller's
-    // right to use that returned identity to subscribe again as ADR-0008 documents; a restart does
-    // not revoke a capability whose origin is present in the durable catalog.
+    // right to use that returned identity to subscribe again as ADR-0008 documents; and since the
+    // `~` prefix is only a marker the engine never validates, a restart has no provenance to lose.
     const renewed = await createShape(h, { table: 'items', subscription: minted })
     expect(renewed.subscription).toBe(minted)
     expect((await shapeInfo(renewed.shapeId)).subscriptions).toBe(1)
@@ -228,15 +228,27 @@ describe('native subscriptions are identified, idempotent and leased', () => {
     expect(conflicting.status, 'one subscription id names one shape').toBe(409)
     expect(await conflicting.text()).toContain('already belongs to shape')
 
-    // A `~` id nobody holds could only have been made up: accepting it would let a caller forge a
-    // claim the legacy anonymous DELETE treats as expendable. (A `~` id the engine DID mint is
-    // accepted — see the minted-id test above.)
-    const forged = await fetch(`${h.engineUrl}/shapes`, {
+    // The `~` prefix is a MARKER, not a reserved namespace: the engine never checks whether it
+    // minted a given `~` id, so a caller may name one itself and it behaves like any other named
+    // subscription. (All such a caller achieves is making its OWN claim the one the legacy
+    // anonymous DELETE treats as expendable first.)
+    const selfMarked = await fetch(`${h.engineUrl}/shapes`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ table: 'items', subscription: '~forged' }),
+      body: JSON.stringify({ table: 'items', subscription: '~mine' }),
     })
-    expect(forged.status).toBe(400)
+    expect(selfMarked.status, 'a caller-invented `~` id is accepted').toBe(200)
+    const marked = (await selfMarked.json()) as { shapeId: string; subscription: string }
+    expect(marked.subscription).toBe('~mine')
+    expect(marked.shapeId, 'and it claims the shape it named, like any other id').toBe(
+      (await createShape(h, { table: 'items', subscription: 'sub-one' })).shapeId,
+    )
+    expect((await shapeInfo(marked.shapeId)).subscriptions, 'two distinct claims on one shape').toBe(2)
+    // Repeat = renew, release = idempotent: the ordinary named-subscription contract.
+    await createShape(h, { table: 'items', subscription: '~mine' })
+    expect((await shapeInfo(marked.shapeId)).subscriptions).toBe(2)
+    expect((await release(marked.shapeId, '~mine')).ok).toBe(true)
+    expect((await shapeInfo(marked.shapeId)).subscriptions).toBe(1)
   }, 90000)
 
   it('lets a lease lapse when nothing renews it, and keeps a renewed one live', async () => {

@@ -221,9 +221,8 @@ struct CreateShapeReq {
 /// must fit in 128 bytes so a catalog event stays small. Control characters are refused because the
 /// id travels through logs and a JSON catalog record.
 ///
-/// The `~` prefix is deliberately NOT checked here: the engine's own minted ids carry it, and they
-/// are returned to the caller precisely so it can renew and release with them (see
-/// [`validate_new_subscription`] for the one place forging is refused).
+/// The `~` prefix is deliberately NOT checked here — nor anywhere else: it is a MARKER, not a
+/// reserved namespace (see [`validate_new_subscription`]).
 fn validate_subscription(sub: Option<String>) -> Result<Option<String>, AppError> {
     let Some(sub) = sub else { return Ok(None) };
     let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string() };
@@ -240,26 +239,20 @@ fn validate_subscription(sub: Option<String>) -> Result<Option<String>, AppError
 }
 
 /// [`validate_subscription`] for a CREATE, which is the only place an id can be brought into
-/// existence — and therefore the only place the engine's `~` namespace has to be defended.
+/// existence. Identical to it today: the `~` prefix is a MARKER, not a namespace the engine
+/// defends, so any well-formed id — minted-looking or not — is accepted.
 ///
-/// A `~` id the catalog has ever seen the engine mint is a capability returned to a caller and must
-/// remain usable after lapse, release, and restart. An id absent from that provenance set was made
-/// up by the caller and is refused.
-async fn validate_new_subscription(engine: &Engine, sub: Option<String>) -> Result<Option<String>, AppError> {
-    let sub = validate_subscription(sub)?;
-    if let Some(id) = &sub
-        && id.starts_with(crate::engine::MINTED_SUB_PREFIX)
-        && !engine.subscription_was_minted(id).await
-    {
-        return Err(AppError {
-            status: StatusCode::BAD_REQUEST,
-            msg: format!(
-                "subscription '{id}' starts with '~', which only the engine mints; send the id a \
-                 create returned to you, or a name of your own"
-            ),
-        });
-    }
-    Ok(sub)
+/// The engine still mints `~<nonce>-<n>` ids for creates that name none, and the legacy anonymous
+/// `DELETE` still releases `~` claims before named ones. It just no longer tries to tell a minted
+/// `~` id from a caller-invented one. The only thing checking provenance ever bought was stopping a
+/// caller from deliberately making its OWN claim the expendable one — which hurts nobody else; the
+/// minted ids were never unguessable (a time/address nonce plus a counter), so it was not a security
+/// boundary either; and the price was a history-sized in-memory set of every id ever minted, growing
+/// with every anonymous create and compacted by nothing (ADR-0008).
+///
+/// It stays as a distinct call so the create paths keep one named place to hang a create-only rule.
+fn validate_new_subscription(sub: Option<String>) -> Result<Option<String>, AppError> {
+    validate_subscription(sub)
 }
 
 #[derive(Serialize)]
@@ -345,7 +338,7 @@ async fn create_shape(
     State(engine): State<Engine>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
-    let subscription = validate_new_subscription(&engine, req.subscription).await?;
+    let subscription = validate_new_subscription(req.subscription)?;
     // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
     let (rec, sub) = engine
         .create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription)
@@ -372,7 +365,7 @@ async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
-    let subscription = validate_new_subscription(&engine, req.subscription).await?;
+    let subscription = validate_new_subscription(req.subscription)?;
     let (rec, sub) = engine.create_aggregate_as(&req.table, req.where_, req.func, req.col, subscription).await?;
     Ok(Json(ShapeResp::created(&engine, rec, sub)))
 }

@@ -658,9 +658,6 @@ pub(crate) struct CatalogFold {
     /// Bounded by the catalog's length, like the fold itself — it lives only for the duration of
     /// one boot's read and is dropped with the fold.
     seen: HashSet<String>,
-    /// Every engine-minted subscription id ever observed, not only the currently live set. A
-    /// returned capability may be re-used after lapse/release and restart.
-    known_minted_subs: HashSet<String>,
 }
 
 impl Default for CatalogFold {
@@ -675,7 +672,6 @@ impl Default for CatalogFold {
             current_segment: 0,
             segment_starts: std::collections::BTreeMap::new(),
             seen: HashSet::new(),
-            known_minted_subs: HashSet::new(),
         }
     }
 }
@@ -705,18 +701,12 @@ impl CatalogFold {
                 if let Some(num) = shape_id_num(&rec.id) {
                     self.max_shape_id = Some(self.max_shape_id.map_or(num, |cur| cur.max(num)));
                 }
-                if subscription.starts_with(MINTED_SUB_PREFIX) {
-                    self.known_minted_subs.insert(subscription.clone());
-                }
                 self.recs.insert(rec.id.clone(), (rec, sig, [(subscription, at)].into_iter().collect(), None));
             }
             // A join and a lease RENEWAL are the same record: insert wins for a new id, and only
             // moves the lease for one already held (ADR-0008). The restored `at` is what stops a
             // restart from handing every subscription a fresh idle window.
             CatalogEvent::Joined { id, subscription, at } => {
-                if subscription.starts_with(MINTED_SUB_PREFIX) {
-                    self.known_minted_subs.insert(subscription.clone());
-                }
                 if let Some(e) = self.recs.get_mut(&id) {
                     let lease = e.2.entry(subscription).or_insert(at);
                     *lease = (*lease).max(at);
@@ -883,12 +873,9 @@ impl Engine {
         // A catalog of nothing but creates and drops folds to `is_empty()`, so this cannot wait for
         // the branches below — that is exactly the case where re-minting would collide with a
         // `shape/*` stream whose retirement is still pending.
-        if fold.max_shape_id.is_some() || !fold.known_minted_subs.is_empty() {
+        if let Some(max) = fold.max_shape_id {
             let mut st = self.state.lock().await;
-            if let Some(max) = fold.max_shape_id {
-                st.next_shape_id = st.next_shape_id.max(max + 1);
-            }
-            st.known_minted_subs.extend(fold.known_minted_subs.iter().cloned());
+            st.next_shape_id = st.next_shape_id.max(max + 1);
         }
         if fold.is_empty() {
             return Ok(());

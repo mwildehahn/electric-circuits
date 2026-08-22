@@ -304,9 +304,9 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 ### Subscriptions: identified, idempotent, leased
 
 A subscriber **names its claim**. `POST /shapes` (and `POST /aggregate`) takes an optional
-`subscription` — any non-empty string up to 128 bytes, not starting with `~` (reserved for the ids
-the engine mints) — and every create response carries the `subscription` it was recorded under plus
-`leaseSeconds`. See `docs/adr/0008-subscriptions-are-identified-idempotent-and-leased.md`.
+`subscription` — any non-empty string up to 128 bytes with no control characters — and every create
+response carries the `subscription` it was recorded under plus `leaseSeconds`. See
+`docs/adr/0008-subscriptions-are-identified-idempotent-and-leased.md`.
 
 - **Repeat = renew.** A create naming a subscription the shape already holds returns the same handle,
   counts nothing, and moves the lease. So a create whose success response was lost can simply be
@@ -317,9 +317,11 @@ the engine mints) — and every create response carries the `subscription` it wa
   which claim was meant), and it releases an engine-minted claim before an identified one so it
   cannot steal a named subscriber's. Omitting `subscription` on the create is the same trade — the
   engine mints and returns one, but that first create had no idempotency, because a repeat is
-  indistinguishable from a new subscriber. A minted `~` id is a real capability: the catalog remembers
-  every one this history has issued, so the caller may renew or release with it after the claim has
-  lapsed, after it has been released, and after a restart. A `~` id the engine never minted is `400`.
+  indistinguishable from a new subscriber. A minted id is `~<nonce>-<n>`; the `~` is a **marker, not
+  a reserved namespace** — it exists only for that anonymous-`DELETE` tie-break. The engine does not
+  check whether it minted a given `~` id, so a returned one keeps working after the claim has lapsed,
+  after it has been released, and after a restart, and a caller may name a `~` id of its own (all it
+  achieves is making its own claim the expendable one).
 - **A subscription is a lease.** Native reads go straight to durable-streams, so the engine never
   sees them: a claim counts as live only while it is created or renewed within
   `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).

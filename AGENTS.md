@@ -392,12 +392,12 @@ canvas update, screenshot.
   ambiguous outcomes of an HTTP mutation (a response lost after the server committed) stop being
   corruption. An id held by a different shape is refused 409; an omitted one is minted by the engine
   and returned, with no idempotency on that first create; a `DELETE` with no id is the legacy
-  anonymous decrement (not retry-safe, and it takes a minted claim before a named one). A minted `~`
-  id is validated against **provenance, not ownership** (`known_minted_subs`, restored by the fold
-  from `Created`/`Joined`): an id this history has ever minted stays usable after the claim lapses,
-  after it is released and across a restart — that is what makes it a returned capability — while an
-  id in the `~` namespace the engine never minted is a 400. The set only grows, one entry per
-  anonymous create for the catalog's lifetime. And because
+  anonymous decrement (not retry-safe, and it takes a minted claim before a named one). The `~` on a
+  minted id is a **marker, not a reserved namespace**: it exists only so that anonymous `DELETE`
+  tie-break can prefer it, and the engine never checks whether it minted a given `~` id — any
+  well-formed id is accepted from any caller, so a returned minted id stays usable after its claim
+  lapses, after it is released and across a restart, with nothing remembered to make that true. (A
+  caller that names a `~` id of its own only makes its own claim the expendable one.) And because
   native reads go straight to durable-streams where the engine cannot see them, the renewal IS the
   liveness signal: a claim not renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` is released by the
   retention sweeper exactly as an explicit delete would release it (`Left { lapsed: true }`), and
