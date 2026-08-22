@@ -1,4 +1,4 @@
-import type { AggregateSubscription, SubsetSubscription } from '@electric-circuits/client'
+import type { AggregateSubscription, AggregateValue, SubsetSubscription } from '@electric-circuits/client'
 import type { AggregateDef, Row, ShapeDef, SubsetDef } from '@electric-circuits/protocol'
 import { createCollection, type Collection } from '@tanstack/db'
 import { useLiveQuery } from '@tanstack/react-db'
@@ -158,8 +158,8 @@ export function useSubset<T extends Row = Row>(
  * `value` and matching-row `count` — e.g. the top-of-list issue counter, which is a real COUNT over the
  * visible set rather than a client-side length of the loaded window.
  */
-export function useAggregate(def: AggregateDef | null): { value: number | null; count: number } {
-  const [state, setState] = useState<{ value: number | null; count: number }>({ value: null, count: 0 })
+export function useAggregate(def: AggregateDef | null): { value: AggregateValue; count: number } {
+  const [state, setState] = useState<{ value: AggregateValue; count: number }>({ value: null, count: 0 })
   const key = def ? JSON.stringify(def) : null
 
   useEffect(() => {

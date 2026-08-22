@@ -322,8 +322,16 @@ delta — COUNT/SUM/AVG hold running scalars, MIN/MAX a `value → net-weight` m
 restore the previous extreme. A COUNT whose predicate decomposes over a counts pipeline's group
 columns is served from the circuit instead (§6b). SQL NULL semantics are mirrored exactly: aggregates ignore NULL values,
 `COUNT(col)` counts non-NULLs (`COUNT(*)` counts rows), AVG divides by the non-NULL count, and
-SUM/AVG/MIN/MAX over zero non-NULL values are NULL. The feed carries the current value as a
-single-row stream (`{ value, n }`).
+SUM/AVG/MIN/MAX over zero non-NULL values are NULL. SUM/AVG accumulate **integer** values in `i128`
+(`AggSum`), so a `bigint` column sums exactly rather than rounding past `f64`'s `2^53` — a single
+`bigint` cell can already exceed it; a float value promotes the accumulator to `f64`. Exactness is
+for INTEGER columns: `numeric` maps to `ColumnType::Float` (`pg.rs::map_pg_type`), so it sums in
+`f64` like any other float. The seed
+(streamed backfill) and the live fold share `fold_agg_row`, so they cannot disagree about it. The
+feed carries the current value as a single-row stream (`{ value, n }`), where an exact integer sum is
+a JSON **number** while it is exactly representable as one (`|v| ≤ 2^53 - 1`) and a decimal
+**string** beyond that — a JSON number that large is silently rounded by every parser that decodes
+into a double, so a number there would be a wrong answer that looks right. AVG stays a double.
 
 ### 5.3 Shape de-duplication (the sharing layer)
 

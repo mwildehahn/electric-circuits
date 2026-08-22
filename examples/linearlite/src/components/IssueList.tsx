@@ -186,13 +186,16 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
     ? { table: 'issues', where: buildBrowseWhere(aggProjects, filters, currentUserName), fn: 'count' }
     : null
   const agg = useAggregate(aggDef)
+  // `fn: 'count'` is always a number; the wide `AggregateValue` covers MIN/MAX over a text column
+  // and integer SUMs too big for a JSON number, neither of which this call site asks for.
+  const aggCount = aggDef ? (agg.value as number | null) : 0
 
   return (
     <ListChrome
       filters={filters}
       setFilters={setFilters}
       rows={rendered}
-      count={aggDef ? agg.value : 0}
+      count={aggCount}
       loading={loading}
       onEndReached={() => {
         if (hasMore) loadMore()

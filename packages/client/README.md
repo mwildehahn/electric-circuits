@@ -59,7 +59,7 @@ await page.close()
 
 ```ts
 const agg = await client.aggregate({ table: 'issues', fn: 'count', where })
-agg.value()                     // number | null (null before first value / empty avg-min-max)
+agg.value()                     // AggregateValue (null before first value / empty avg-min-max)
 agg.count()                     // matching-row count, available for every fn
 agg.subscribe((v) => { … })
 await agg.close()
@@ -76,4 +76,10 @@ Writes go to Postgres with ordinary SQL (the engine ingests via replication). In
 **`close()` is one-shot and deletes server-side.** Every `shape()`/`subset()`/`aggregate()` holds
 one reference on a ref-counted server object; its `close()` releases exactly that reference (with
 retry — there is no server-side reaper) and is guarded against double-close. `client.close()`
+`AggregateValue` is `number | string | boolean | null` — usually a number, but MIN/MAX carry the
+column's own value (a text column yields a string) and an **integer SUM outside the `2^53` range a
+JSON number round-trips arrives as a decimal string**, because the engine will not hand back a
+silently rounded total (`BigInt(v)` it). Float SUM/AVG are always numbers, and so is a `numeric`
+column's — exactness is for integer columns.
+
 tears down everything still open. Design context: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).

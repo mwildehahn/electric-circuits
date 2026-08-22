@@ -54,13 +54,22 @@ export interface TableApi {
   delete(pk: Value, txid?: string): Promise<{ txid: string }>
 }
 
+/**
+ * An aggregate's current value. Usually a number, but not always: MIN/MAX carry the column's own
+ * value (so a text column yields a string), and an integer SUM whose exact total is outside the
+ * `2^53` range a JSON number round-trips arrives as a **decimal string** — the engine will not
+ * hand back a silently rounded number (`docs/ARCHITECTURE.md` §2). `BigInt(v)` it when you need
+ * arithmetic on that scale.
+ */
+export type AggregateValue = number | string | boolean | null
+
 /** A live scalar aggregation (COUNT/SUM/AVG/MIN/MAX) maintained by the engine. */
 export interface AggregateSubscription {
   /** Current aggregate value (null before the first value, or empty avg/min/max). */
-  value(): number | null
+  value(): AggregateValue
   /** Count of rows matching the predicate (available for every aggregation). */
   count(): number
-  subscribe(cb: (value: number | null) => void): () => void
+  subscribe(cb: (value: AggregateValue) => void): () => void
   close(): Promise<void>
 }
 
@@ -239,9 +248,9 @@ export function createClient(opts: {
       const url = opts.dsBaseUrl
         ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`
         : handle.streamUrl
-      let current: number | null = null
+      let current: AggregateValue = null
       let n = 0
-      const subs = new Set<(v: number | null) => void>()
+      const subs = new Set<(v: AggregateValue) => void>()
       const ac = new AbortController()
       // The engine streams the running aggregate as `{ value, n }` envelopes (keyed "agg"); keep the latest.
       void (async () => {
@@ -258,9 +267,9 @@ export function createClient(opts: {
             // this guard its callbacks can land AFTER a replacement subscription's state and pin a
             // stale value (observed as a frozen count badge on aggregate-definition churn).
             if (ac.signal.aborted) break
-            const v = env.value as { value?: number | null; n?: number } | undefined
+            const v = env.value as { value?: AggregateValue; n?: number } | undefined
             if (v && 'value' in v) {
-              current = (v.value ?? null) as number | null
+              current = v.value ?? null
               n = v.n ?? 0
               for (const cb of subs) cb(current)
             }

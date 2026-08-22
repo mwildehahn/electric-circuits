@@ -262,6 +262,68 @@ pub(crate) fn value_f64(v: &Value) -> f64 {
     }
 }
 
+/// Integers a JSON number round-trips through IEEE-754 double without loss: `2^53 - 1`. Beyond it
+/// every JSON parser that decodes numbers as doubles (every JavaScript one) silently drops the low
+/// digits, so the sum has to leave the number space to stay exact.
+const JSON_EXACT_INT_MAX: u128 = 9_007_199_254_740_991;
+
+/// The running SUM/AVG accumulator.
+///
+/// Integer-typed values accumulate in `i128`, so a `bigint` column sums **exactly** — `f64` starts
+/// losing integers at `2^53`, which a single `bigint` cell can already exceed. A float value
+/// promotes the accumulator to `f64` (a column is homogeneously typed, so in practice this happens
+/// on the first value folded or never). One implementation for both tiers: seed and live share
+/// [`fold_agg_row`], which is the only thing that ever calls [`AggSum::add`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AggSum {
+    Int(i128),
+    Float(f64),
+}
+
+impl Default for AggSum {
+    fn default() -> Self {
+        AggSum::Int(0)
+    }
+}
+
+impl AggSum {
+    /// Add `value · weight` (weight is negative for a retraction).
+    fn add(&mut self, v: &Value, w: ZWeight) {
+        match self {
+            AggSum::Float(acc) => *acc += value_f64(v) * (w as f64),
+            AggSum::Int(acc) => match v {
+                Value::Int(i) => *acc += (*i as i128) * (w as i128),
+                Value::Bool(b) => *acc += i128::from(*b) * (w as i128),
+                _ => {
+                    let promoted = (*acc as f64) + value_f64(v) * (w as f64);
+                    *self = AggSum::Float(promoted);
+                }
+            },
+        }
+    }
+
+    /// The wire encoding of the running sum: a JSON **number** while the value is exactly
+    /// representable as one ([`JSON_EXACT_INT_MAX`]), a decimal **string** beyond that. A float sum
+    /// is always a number — it is a double already, so a string would claim a precision it lacks.
+    fn to_json(self) -> serde_json::Value {
+        match self {
+            // `unsigned_abs`, not `abs`: the latter panics on `i128::MIN` (unreachable in practice,
+            // but a total function costs nothing here).
+            AggSum::Int(v) if v.unsigned_abs() <= JSON_EXACT_INT_MAX => serde_json::json!(v as i64),
+            AggSum::Int(v) => serde_json::Value::String(v.to_string()),
+            AggSum::Float(f) => serde_json::json!(f),
+        }
+    }
+
+    /// The sum as a double — the AVG numerator, which is fractional anyway.
+    fn as_f64(self) -> f64 {
+        match self {
+            AggSum::Int(v) => v as f64,
+            AggSum::Float(f) => f,
+        }
+    }
+}
+
 /// A scalar aggregation maintained **incrementally** over the rows matching `pred` — a running fold over
 /// the Z-set of matching changes. Holds only the running aggregate, never the rows: COUNT is a sum of
 /// weights, SUM/AVG add `value·weight`, MIN/MAX keep a `value → net-weight` multiset. O(1) per change
@@ -278,7 +340,7 @@ pub(crate) struct AggShape {
     /// Matching rows whose aggregated column is non-NULL — SQL aggregates ignore NULLs, so this is
     /// the denominator for AVG, the COUNT(col) value, and the emptiness test for SUM/MIN/MAX.
     pub(crate) nn_count: i64,
-    pub(crate) sum: f64,
+    pub(crate) sum: AggSum,
     pub(crate) multiset: std::collections::BTreeMap<Value, i64>,
     pub(crate) last: Option<serde_json::Value>,
 }
@@ -300,7 +362,7 @@ impl HeapSize for AggShape {
 pub(crate) struct AggSeed {
     pub(crate) count: i64,
     pub(crate) nn_count: i64,
-    pub(crate) sum: f64,
+    pub(crate) sum: AggSum,
     pub(crate) multiset: std::collections::BTreeMap<Value, i64>,
 }
 
@@ -336,7 +398,7 @@ fn fold_agg_row(
     w: ZWeight,
     count: &mut i64,
     nn_count: &mut i64,
-    sum: &mut f64,
+    sum: &mut AggSum,
     multiset: &mut std::collections::BTreeMap<Value, i64>,
 ) {
     *count += w;
@@ -346,7 +408,7 @@ fn fold_agg_row(
         return; // SQL aggregates skip NULLs entirely
     }
     *nn_count += w;
-    *sum += value_f64(&v) * (w as f64);
+    sum.add(&v, w);
     if matches!(func, AggFn::Min | AggFn::Max) {
         let e = multiset.entry(v.clone()).or_insert(0);
         *e += w;
@@ -386,14 +448,14 @@ impl AggShape {
             }
             AggFn::Sum => {
                 if self.nn_count > 0 {
-                    serde_json::json!(self.sum)
+                    self.sum.to_json()
                 } else {
                     serde_json::Value::Null
                 }
             }
             AggFn::Avg => {
                 if self.nn_count > 0 {
-                    serde_json::json!(self.sum / self.nn_count as f64)
+                    serde_json::json!(self.sum.as_f64() / self.nn_count as f64)
                 } else {
                     serde_json::Value::Null
                 }

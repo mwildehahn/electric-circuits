@@ -82,7 +82,7 @@ fn agg_shape(func: AggFn, col: Option<usize>, ts: &TableSchema) -> AggShape {
         gate: crate::pg::SnapshotGate::passthrough(),
         count: 0,
         nn_count: 0,
-        sum: 0.0,
+        sum: Default::default(),
         multiset: std::collections::BTreeMap::new(),
         last: None,
     }
@@ -723,7 +723,7 @@ fn agg(func: AggFn, col: Option<usize>) -> AggShape {
         gate: crate::pg::SnapshotGate::passthrough(),
         count: 0,
         nn_count: 0,
-        sum: 0.0,
+        sum: Default::default(),
         multiset: std::collections::BTreeMap::new(),
         last: None,
     }
@@ -1005,6 +1005,71 @@ async fn emission_lanes_order_and_barrier() {
 
     // Same stream always hashes to the same lane (structural precondition for ordering).
     assert_eq!(lanes.lane_for("shape/a"), lanes.lane_for("shape/a"));
+
+/// SUM over an integer column is EXACT past `f64`'s 2^53 integer ceiling — a `bigint` cell can
+/// already exceed it, so a double accumulator would answer with a rounded sum. Above the ceiling
+/// the value leaves the JSON number space (a decimal string), because a JSON number that big is
+/// silently rounded by every parser that decodes into a double.
+#[test]
+fn aggregate_sum_of_big_integers_is_exact() {
+    let big = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())]);
+    let mut a = agg(AggFn::Sum, Some(1)); // col 1 = id
+    a.apply(&vec![Tup2(big(9_007_199_254_740_993), 1)]);
+    assert_eq!(a.value(), serde_json::json!("9007199254740993"));
+
+    // Still exact under retraction: adding then removing 1 returns the same odd value.
+    a.apply(&vec![Tup2(big(1), 1)]);
+    assert_eq!(a.value(), serde_json::json!("9007199254740994"));
+    a.apply(&vec![Tup2(big(1), -1)]);
+    assert_eq!(a.value(), serde_json::json!("9007199254740993"));
+
+    // Back inside the exactly-representable range it is a plain JSON number again.
+    a.apply(&vec![Tup2(big(9_007_199_254_740_993), -1), Tup2(big(7), 1)]);
+    assert_eq!(a.value(), serde_json::json!(7));
+
+    // Negative sums cross the same boundary symmetrically.
+    let mut neg = agg(AggFn::Sum, Some(1));
+    neg.apply(&vec![Tup2(big(-9_007_199_254_740_993), 1)]);
+    assert_eq!(neg.value(), serde_json::json!("-9007199254740993"));
+}
+
+/// A float column keeps folding in `f64` — the integer accumulator promotes on the first float
+/// value, so a float SUM is a JSON number exactly as before.
+#[test]
+fn aggregate_sum_of_floats_stays_floating() {
+    let row = |f: f64| Row(vec![Value::Bool(true), Value::Float(f.into()), Value::Text("n".into())]);
+    let mut a = agg(AggFn::Sum, Some(1));
+    a.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.25), 1)]);
+    assert_eq!(a.value(), serde_json::json!(3.75));
+    let mut avg = agg(AggFn::Avg, Some(1));
+    avg.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.5), 1)]);
+    assert_eq!(avg.value(), serde_json::json!(2.0));
+}
+
+/// The streamed-backfill seed and the live path must fold identically — they share
+/// `fold_agg_row`, and this pins that they agree on the big-integer accumulator too.
+#[test]
+fn aggregate_seed_and_live_fold_agree_on_big_integers() {
+    let ts = users();
+    let big = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())]);
+    let rows = vec![big(9_007_199_254_740_993), big(9_007_199_254_740_993), big(3)];
+
+    let pred = CompiledPredicate::compile_opt(
+        Some(&serde_json::from_value(serde_json::json!({ "col": "active", "op": "eq", "value": true })).unwrap()),
+        &ts,
+    )
+    .unwrap();
+    let mut seed = crate::engine::executors::AggSeed::default();
+    seed.fold_rows(&pred, AggFn::Sum, Some(1), &rows);
+
+    let mut live = agg(AggFn::Sum, Some(1));
+    live.apply(&rows.iter().map(|r| Tup2(r.clone(), 1)).collect::<Vec<_>>());
+
+    assert_eq!(seed.sum, live.sum);
+    assert_eq!(seed.count, live.count);
+    assert_eq!(seed.nn_count, live.nn_count);
+    assert_eq!(live.value(), serde_json::json!("18014398509481989"));
+}
 
     let env = |i: usize| Envelope {
         type_: "t".into(),

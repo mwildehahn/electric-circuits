@@ -97,6 +97,17 @@ maintain. The `REPEATABLE READ` bracket and the `SnapshotGate` capture are uncha
 *snapshot* still builds the whole body — that is what the Electric protocol asks for — but the key
 set it folds for a catch-up read keeps keys only, never the rows.)
 
+**An integer SUM is exact, and says so on the wire.** SUM/AVG accumulate integer values in `i128`, so
+a `bigint` column sums without the rounding an `f64` accumulator starts doing at `2^53` — which a
+single `bigint` cell can already exceed. The aggregate envelope's `value` is therefore a JSON
+**number** while the total is exactly representable as one (`|v| ≤ 2^53 - 1`) and a decimal
+**string** beyond that: a JSON number that large is silently rounded by every parser that decodes
+into a double, and the engine will not hand back a wrong total that looks right. Float columns are
+unchanged (always a number), and AVG stays a double. Exactness is for **integer** columns only:
+`numeric` maps to the protocol's `float` (`pg.rs::map_pg_type`), so a `numeric` column sums in
+`f64` like any other float. Clients: `AggregateValue` is `number | string | boolean | null`;
+`BigInt(v)` a string sum.
+
 **`GET /v1/health`** reports the boot state machine as an exact, whitespace-free JSON body:
 `{"status":"waiting"}` (202) until Postgres connects, `{"status":"starting"}` (202) through
 introspection/slot/ingest spawn, then `{"status":"active"}` (200). Library mode is `active` at once.
