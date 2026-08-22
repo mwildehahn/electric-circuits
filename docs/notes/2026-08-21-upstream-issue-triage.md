@@ -74,34 +74,18 @@ and would require forking the replication client. See ADR-0003.
 
 ## Follow-ups surfaced while implementing slices 1–6
 
-Recorded here so they are not lost; none blocks the order of work above.
+Tracked as issues on the fork (`pgxsinkit/electric-circuits`); none blocked the order of work above.
+The five `backlog/*` red tests (#1–#5) were fixed after slice 6 (`Fixes` lines on the commits).
 
-- **TRUNCATE replay window (ADR-0005).** A crash between a `TRUNCATE`'s append and its slot
-  acknowledgement (≤ 1 s) re-retires that table's shapes at the next boot, including shapes created
-  after boot that already reflect the truncation. Exact handling needs the shape's `SnapshotGate` on
-  its catalog record (or a sequencer round-trip during retirement). Cost today: one spurious resync.
-- **Circuit-tier drift exit has no end-to-end test.** `circuit_needs_rebuild` is unit-tested; no lane
-  boots with `ELECTRIC_CIRCUITS_DBSP_COUNTS`, triggers drift, and asserts exit 75 → restart → recover.
-- **Publication column-list refusal is untested** (`pg::inspect_publication`): the harness always
-  derives `<slot>_pub` itself. `prattrs` is PG15+; it is only queried for a hand-made publication.
-- **Stale `/v1/shape` handle after the delete lands** still answers 500 (the closed-stream case now
-  answers `409 must-refetch`); needs a typed "stream gone" read error in `ds.rs`.
-- **`packages/client` does not yet re-subscribe on `stream-closed` / 404 / 410** (ADR-0007 states
-  the contract as *must*); the engine side is done.
-- **A table dropped and re-created** is untracked until restart (documented in
-  `docs/deployment-postgres.md`).
-- **The replication ingestor's connection has no connect timeout.** `pg::connect` (boot, pool) now
-  applies a 10 s `connect_timeout`; the walsender connection is built by `pgwire-replication` from
-  its own `ReplicationConfig`. Not boot-blocking (its task joins the shutdown token), but a
-  firewalled host costs a wedged walsender connect rather than a fast failure.
-- **`ELECTRIC_CIRCUITS_DS_URL` is not parse-validated at config time** the way
-  `ELECTRIC_CIRCUITS_PG_URL` now is; an unusable one surfaces as a fatal `is_builder` error on first
-  use (still exit 78, just later).
-- **`wal_level` ≠ `logical` has no conformance test** (the harness cluster is always logical; changing
-  it needs a Postgres restart). Covered by the classifier unit tests and the explicit `SHOW wal_level`
-  call site only.
-- **A `tokio_postgres` error with no SQLSTATE and no io source** (e.g. a server demanding a password
-  the URL lacks) is retried forever rather than exiting 78 — `Kind` is private and matching the
-  `Display` string was rejected. Visible: `/ready` = `waiting` and every attempt is logged.
-- **`ELECTRIC_PROMETHEUS_PORT` is still accepted-but-unimplemented**; `/metrics/prometheus` is now a
-  complete scrape target, which makes the missing dedicated listener slightly more visible.
+- #11 — reconciler should pick up new and re-created tables without a restart (the "adding a table
+  ⇒ restart" rule; dropped-then-re-created table untracked until restart).
+- #12 — TRUNCATE replay window re-retires a table's shapes after a crash (ADR-0005).
+- #13 — test debt: circuit-tier drift exit, publication column-list refusal, `wal_level` refusal
+  have no end-to-end lane.
+- #14 — walsender connect should time out (`pgwire-replication` config has no timeout field).
+- #15 — config polish: validate `ELECTRIC_CIRCUITS_DS_URL` at resolve; implement or refuse
+  `ELECTRIC_PROMETHEUS_PORT`.
+- #16 — boot taxonomy: a Postgres error with no SQLSTATE and no io source retries forever.
+- #17 — `packages/client` must re-subscribe on `Stream-Closed` / 404 / 410 (ADR-0007 contract).
+- #18 — `/v1/shape`: a stale handle polled after its stream is deleted answers 500 (compat; out of
+  native-path scope, ADR-0001).
