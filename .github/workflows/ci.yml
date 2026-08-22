@@ -20,6 +20,9 @@ jobs:
       # next-trait-solver panic in structural_traits.rs). Keep in sync with
       # rust-toolchain.toml; do not float back to @stable until upstream is fixed.
       - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          # `cargo fmt --check` below needs the component; the action installs none by default.
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
 
       - name: Rust formatting (rustfmt.toml at the root)
