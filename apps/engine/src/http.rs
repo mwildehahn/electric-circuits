@@ -473,6 +473,8 @@ async fn release_shape(
     Path(id): Path<String>,
     Query(q): Query<ReleaseShapeQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Both answer as soon as the engine state is updated: the catalog record is queued behind them
+    // and lands in order (see `Engine::release_shape` for why a removal is not durable-before-ack).
     if q.purge {
         engine.purge_shape(&id).await?;
     } else {

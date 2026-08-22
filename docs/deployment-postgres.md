@@ -87,7 +87,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Where a spilled transaction's temporary file goes (created 0700, files 0600). Must have room for your largest transaction, must be writable at boot, and must not be shared between engines. |
 | `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | no | `16777216` | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below. |
 | `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | no | `0` (off) | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected. |
-| `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. A catalog append still being retried through a storage outage counts as work in flight (party `catalog writer`). |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` | no | `2` | How long the port stays open after `SIGTERM` answering `/ready` with 503, so a load balancer drains first. Comes out of the grace, must be less than it; `0` = stop accepting at once. |
 
 ¹ Omit `ELECTRIC_CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
@@ -321,6 +321,27 @@ Two caveats worth knowing rather than discovering:
   durable catalog, so a catalog the engine cannot read is refused rather than guessed at — booting on
   would look like "no epoch has ever been claimed", create a slot at the current WAL head, and leave
   every shape already in the log undropped and short of the gap. Restore durable-streams and restart.
+- **A durable-streams outage while running makes creates WAIT; it never makes them lie.** A shape is
+  acknowledged only once its `Created` record has reached the catalog (the same for a join), and a
+  catalog append that fails transiently — a refused connection, a timeout, a 5xx — is retried in
+  place, forever, at 100 ms → 5 s. So `POST /shapes` hangs for the duration of the outage instead of
+  returning a handle a restart would forget; use your client's own timeout, and expect
+  `catalog_append_retries_total` to climb with `shape_appends` flat. If the client gives up and the
+  record lands anyway, the shape simply has no subscriber and the retention sweeper evicts it.
+  **Deletes are not affected**: `DELETE /shapes/{id}` (and `?purge=true`) answers as soon as the
+  engine state is updated, and its record lands behind it — a delete that waited would time out and
+  be retried, and a repeated delete decrements a shared refcount twice. Two outcomes are NOT this: a
+  definite refusal from storage (a 4xx, once the catalog stream exists) exits the process `74`,
+  because the engine's memory and its durable record have diverged and only a re-fold at boot
+  reconciles them; and a `SIGTERM` during an outage names the `catalog writer` party and exits `70`
+  when the grace runs out.
+- **A shape stream never outlives its shape, even across a crash.** Removing a shape writes its
+  `Dropped` record BEFORE it retires the stream and a `Retired` record only after storage accepted
+  the delete, so a retirement storage refused is retried in the background (500 ms → 5 s) and, if the
+  process dies first, re-queued by the next boot straight from the catalog. `GET /shapes/{id}` is 404
+  from the moment the record goes, whether or not its stream has finished going. Watch the
+  `retirements_pending` gauge: non-zero means public stream URLs are outliving their shapes right
+  now, and it should return to 0 on its own.
 - **Consistency:** on shape registration the engine takes a `REPEATABLE READ` snapshot of the
   matching rows (the backfill) and, atomically with it, captures the snapshot's
   `pg_current_snapshot()` — the **snapshot gate**. Each replicated change is stamped with its

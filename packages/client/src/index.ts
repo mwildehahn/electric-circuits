@@ -21,8 +21,12 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { z } from 'zod'
 
 import { createSubset, deleteShapeWithRetry, type SubsetSubscription } from './subset.js'
+import { resolveTableDef } from './tables.js'
 
 export type { SubsetSubscription } from './subset.js'
+// Table-spelling resolution (ADR-0002): exported so an app that keeps its own schema map can key it
+// the same way the client does.
+export { lookupTableDef, resolveTableDef } from './tables.js'
 // LSN-positioning primitives (also unit-tested in subset.test.ts) — exported so integration tests can
 // exercise the real merge logic against the live engine.
 export { lsnToU64, mergeFeedDelta, type SubsetView, type MergeAction } from './subset.js'
@@ -165,8 +169,9 @@ export function createClient(opts: {
     tables,
 
     async shape(def) {
-      const tableDef = opts.schema.tables[def.table]
-      if (!tableDef) throw new Error(`client: unknown table "${def.table}"`)
+      // Either spelling: `items` and `public.items` name the same table, whichever one keyed the
+      // local schema (see `./tables.ts`).
+      const tableDef = resolveTableDef(opts.schema, def.table)
 
       const handle = (await trpc.shapes.create.mutate({
         table: def.table,

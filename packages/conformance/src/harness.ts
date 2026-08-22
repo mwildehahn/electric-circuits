@@ -206,6 +206,10 @@ export interface BootOptions {
   /** TEST-ONLY: runs after the tables exist and before the engine's FIRST boot — the window for
    * state the engine is supposed to find already there (e.g. an operator-created replication slot). */
   beforeEngine?: (info: { pgUrl: string; slot: string }) => Promise<void>
+  /** TEST-ONLY: put an external HTTP service in front of durable-streams for the engine process.
+   * The API and test client still use the real durable-streams URL, so the wrapper can inject
+   * transport/status failures without replacing storage or calling engine internals. */
+  wrapEngineDs?: (upstreamUrl: string) => Promise<{ url: string; close(): Promise<void> }>
 }
 
 function adminUrl(): string {
@@ -271,11 +275,13 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
   let api: ApiServer | undefined
   let oracle: Oracle | undefined
   let client: ElectricIvmClient | undefined
+  let engineDs: { url: string; close(): Promise<void> } | undefined
   const teardown = async () => {
     await client?.close().catch(() => {})
     await api?.close().catch(() => {})
     proc?.kill('SIGKILL')
     await oracle?.close().catch(() => {})
+    await engineDs?.close().catch(() => {})
     await server?.stop().catch(() => {})
     await dropPgArtifacts()
   }
@@ -304,8 +310,10 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     // 2. Boot durable-streams + the engine (Postgres mode) + API + client + oracle.
     server = new DurableStreamTestServer({ port: 0 })
     const dsUrl = await server.start()
+    engineDs = await opts.wrapEngineDs?.(dsUrl)
+    const engineDsUrl = engineDs?.url ?? dsUrl
     const tables = Object.keys(schema.tables)
-    let spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
+    let spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
     proc = spawned.proc
     const engineUrl = spawned.url
     api = await createApiServer({ dsUrl, engineUrl })
@@ -329,7 +337,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
       },
       waitForEngineExit: (timeoutMs = 30000) => spawned.raw.waitForExit(timeoutMs),
       startEngine: async () => {
-        spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
+        spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
         proc = spawned.proc
         h.engineUrl = spawned.url
       },

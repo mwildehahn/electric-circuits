@@ -55,7 +55,11 @@ impl Engine {
                     let gens = st.capture_gens(&joined);
                     let share = st.feed_shares.get_mut(&existing_id).expect("share entry for live feed");
                     share.refcount += 1;
-                    self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
+                    // Enqueued here (under the lock, so the log order matches the state order) and
+                    // WAITED on immediately before this join is acknowledged: a refcount the durable
+                    // record does not carry is a subscription a restart forgets.
+                    let joined_durable =
+                        self.catalog_tx.send_durable(CatalogEvent::Joined { id: existing_id.clone() });
                     let ready = share.ready.clone();
                     // Release the lock, then wait for the creator's backfill to land: a joiner must not
                     // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
@@ -88,6 +92,7 @@ impl Engine {
                         self.release_shape(&existing_id).await;
                         return Err(e);
                     }
+                    joined_durable.await;
                     return Ok(rec);
                 }
             }
@@ -139,7 +144,9 @@ impl Engine {
             // `ensure_create_not_degraded`) or observes `degraded` here and never registers at all.
             self.ensure_not_degraded()?;
             st.shapes.insert(id.clone(), rec.clone());
-            self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+            // Durable BEFORE the create is acknowledged (awaited at the bottom of the success
+            // path): a `POST /shapes` that returns 200 promises a shape that survives a restart.
+            let created = self.catalog_tx.send_durable(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
             self.ensure_retention_sweeper();
             // First subquery shape: from here on a lost flip is possible, so the stream reaper that
@@ -184,6 +191,12 @@ impl Engine {
                         creating.rollback().await;
                         return Err(e);
                     }
+                    // Durability BEFORE the guard is disarmed, so a client that gives up while
+                    // storage is down still unwinds cleanly: the create is rolled back exactly as
+                    // any other cancellation, and the `Created` that lands anyway is followed by the
+                    // rollback's `Dropped`. With storage down this waits — the client's own timeout
+                    // is the bound — and it never returns a shape the catalog lacks.
+                    created.await;
                     creating.complete();
                     let _ = ready_tx.send(ShareOutcome::Ready);
                     trace_lifecycle(
@@ -243,7 +256,8 @@ impl Engine {
         // for why this check and the one after the create's work are together sufficient.
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
-        self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+        // Durable before the create is acknowledged — see the subquery path above.
+        let created = self.catalog_tx.send_durable(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
         // Register the (first) shared feed so later identical subset feeds join it. Joiners wait on
@@ -282,6 +296,8 @@ impl Engine {
                     creating.rollback().await;
                     return Err(e);
                 }
+                // Durable before the guard is disarmed — see the subquery path above.
+                created.await;
                 creating.complete();
                 let _ = share_tx.send(ShareOutcome::Ready);
                 trace_lifecycle(
@@ -340,7 +356,7 @@ impl Engine {
                 let join_gens = st.capture_gens(std::slice::from_ref(table));
                 let share = st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate");
                 share.refcount += 1;
-                self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
+                let joined = self.catalog_tx.send_durable(CatalogEvent::Joined { id: existing_id.clone() });
                 let ready = share.ready.clone();
                 drop(st);
                 await_share_ready(ready, &existing_id).await?;
@@ -349,6 +365,7 @@ impl Engine {
                     return Err(e);
                 }
                 self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
+                joined.await;
                 return Ok(rec);
             }
         }
@@ -400,8 +417,10 @@ impl Engine {
                             id.clone(),
                             CircuitPlacement { label: "counts".into(), col: None, counts: true },
                         );
-                        self.catalog_tx
-                            .send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
+                        // Durable before the create is acknowledged — see `create_shape`.
+                        let created = self
+                            .catalog_tx
+                            .send_durable(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
                         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
                         self.ensure_retention_sweeper();
                         let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
@@ -428,6 +447,7 @@ impl Engine {
                                     creating.rollback().await;
                                     return Err(e);
                                 }
+                                created.await;
                                 creating.complete();
                                 let _ = share_tx.send(ShareOutcome::Ready);
                                 trace_lifecycle(
@@ -482,7 +502,8 @@ impl Engine {
         // for why this check and the one after the create's work are together sufficient.
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
-        self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
+        // Durable before the create is acknowledged — see `create_shape`.
+        let created = self.catalog_tx.send_durable(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
         // Register this (first) aggregate so later identical ones join it by ref-count.
@@ -511,6 +532,7 @@ impl Engine {
                     creating.rollback().await;
                     return Err(e);
                 }
+                created.await;
                 creating.complete();
                 let _ = share_tx.send(ShareOutcome::Ready);
                 trace_lifecycle(
@@ -532,6 +554,15 @@ impl Engine {
     /// rejoins it warm), goes dormant after the retention idle timeout, and is eventually evicted
     /// by the layered policy (see `crate::retention`). Releasing is also a touch, so the idle
     /// countdown starts at the disconnect. Infallible: it only adjusts in-memory counters.
+    ///
+    /// The `Left` is queued, never waited on — including for the client-facing `DELETE
+    /// /shapes/{id}`. Durable-before-ack exists for records whose LOSS would make an acknowledged
+    /// subscription vanish (`Created`, `Joined`); a lost `Left` is benign in the other direction (a
+    /// restart restores one refcount too many, which retention resolves), and since the catalog
+    /// writer never drops an event it cannot be lost at all — only delayed. Waiting would be
+    /// actively harmful: a client that times out on a slow `DELETE` and retries it (the published
+    /// client retries five times) would decrement twice, which is the double-delete that steals
+    /// another subscriber's refcount. So a delete is answered at once and its record lands in order.
     pub async fn release_shape(&self, id: &str) {
         let mut st = self.state.lock().await;
         if let Some(share) = st.feed_shares.get_mut(id) {
@@ -549,6 +580,16 @@ impl Engine {
     /// stream vanish and recreate via the normal 404 / must-refetch path. The sequencer command
     /// queue is FIFO, so a purge ordered after an in-flight resume removes whatever the resume
     /// registered.
+    ///
+    /// The `Dropped` record is queued, not waited on, for every caller — the engine-initiated ones
+    /// (schema drift, `TRUNCATE`, the epoch reset, which drains the queue as an explicit barrier of
+    /// its own) and the client-facing `DELETE /shapes/{id}?purge=true` alike. See
+    /// [`Self::release_shape`] for why a removal is answered at once: losing the record cannot
+    /// resurrect the shape (the restore would fail to resume a shape whose stream is retired and
+    /// drop it again), and the writer does not lose records anyway.
+    ///
+    /// It does NOT wait on the retirement either: the stream may still be being deleted in the
+    /// background when this returns, and `GET /shapes/{id}` is 404 from now on regardless.
     pub async fn purge_shape(&self, id: &str) -> Result<()> {
         let mut st = self.state.lock().await;
         self.lives.lock().unwrap().remove(id);
@@ -557,6 +598,8 @@ impl Engine {
         }
         let removed = st.shapes.remove(id);
         st.circuit_placement.remove(id);
+        // The `Dropped` INTENT goes first, always, and the retirement follows it (ADR-0007): a crash
+        // between the two leaves a record the boot can act on, the other order leaves an orphan.
         if removed.is_some() {
             self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
         }
@@ -571,10 +614,9 @@ impl Engine {
         // Subquery shapes live in the registry (a no-op for plain shapes).
         self.subqueries.lock().await.drop_subquery_shape(id).await;
         if let Some(rec) = removed {
-            // Retirement: close (releasing any tailing long-poll with `stream-closed`) then delete.
-            if let Err(e) = self.ds.retire_stream(&rec.stream_path).await {
-                tracing::warn!("failed to delete stream {} for purged shape {id}: {e:#}", rec.stream_path);
-            }
+            // Retirement: close (releasing any tailing long-poll with `stream-closed`) then delete,
+            // and record the completion. A storage failure is queued, never forgotten.
+            self.retire_shape_stream(id, &rec.stream_path).await;
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("purged shape {id} (forced)");
         }
@@ -930,10 +972,9 @@ impl Engine {
         }
         if let Some(rec) = removed {
             // Eviction is terminal (unlike deactivation), so the stream is retired: closed, then
-            // deleted — a client still tailing it is released at once with `stream-closed`.
-            if let Err(e) = self.ds.retire_stream(&rec.stream_path).await {
-                tracing::warn!("failed to delete stream {} for evicted shape {id}: {e:#}", rec.stream_path);
-            }
+            // deleted — a client still tailing it is released at once with `stream-closed` — and the
+            // completion recorded. A storage failure is queued, never forgotten.
+            self.retire_shape_stream(id, &rec.stream_path).await;
             metrics().shapes_evicted.fetch_add(1, Ordering::Relaxed);
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("evicted shape {id} ({})", reason.as_str());
@@ -1523,8 +1564,21 @@ impl Engine {
             self.subqueries.lock().await.abort_create(id).await;
         }
         // Deleted, not retired: the create never returned, so the stream was never handed to a
-        // subscriber and there is no one to signal with a close.
-        let _ = self.ds.delete_stream(stream_path).await;
+        // subscriber and there is no one to signal with a close. The `Dropped` above is still an
+        // intent that has to be closed out, so the delete records `Retired` when it lands — and when
+        // it does NOT, the retirement queue finishes the job (it closes first, which is a harmless
+        // extra round trip on a stream nobody ever read).
+        match self.ds.delete_stream(stream_path).await {
+            Ok(()) => {
+                if existed {
+                    self.catalog_tx.send(CatalogEvent::Retired { id: id.to_string() });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("rolling back create {id}: deleting {stream_path} failed ({e:#}); queued");
+                self.retirements.enqueue(stream_path, existed.then_some(id));
+            }
+        }
     }
 }
 

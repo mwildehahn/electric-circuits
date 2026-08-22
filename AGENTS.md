@@ -304,6 +304,40 @@ canvas update, screenshot.
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
   close — a parked dormant shape's stream must stay appendable, and a rolled-back create's stream
   had no subscriber (plain `delete_stream`).
+- **The catalog writer never drops an event, and the two records a client is *promised* are durable
+  before it is answered** (`engine/catalog.rs`). A failed append is classified with
+  `ds::is_unavailable`: transport/timeout/5xx retries THAT event in place, forever, with backoff
+  (100 ms → 5 s) — the queue is ordered and single-consumer, so everything behind it waits, which is
+  the point. A definite refusal (a 4xx, an event that will not serialize) exits `74` (`EX_IOERR`),
+  because an engine whose memory and durable record disagree has no honest way to continue and only a
+  re-fold at boot can reconcile them — but only **once the catalog stream exists in this process**:
+  until the creating PUT has succeeded, an append failure can just as well be "the stream is not
+  there yet", so every failure is retried (a permanently-4xx PUT is retried forever, and says so).
+  The rule for which records wait: **durable-before-ack = `Created` and `Joined`** (`send_durable`,
+  awaited before the HTTP answer, no timeout — a create while storage is down waits rather than
+  handing back a shape a restart would forget); **queued-never-dropped = everything else, including
+  `Left` and `Dropped`** — a removal is answered at once and its record lands in order. Losing one of
+  those is benign in the safe direction (a restored refcount too many, or a shape whose stream is
+  already retired, which fails to resume and is retired again) and cannot happen anyway, only be
+  delayed; waiting on them would make a slow `DELETE` time out and be retried, which is the
+  double-delete hazard below. If you add a mutation whose acknowledgement CREATES something, use
+  `send_durable`.
+- **A retirement completes, eventually — durable intent, durable completion** (ADR 0007;
+  `engine/retirement.rs`). `Dropped { id }` is written BEFORE the retirement at every site and
+  `Retired { id }` only after storage accepted the delete, so a `Dropped` with no `Retired` is exactly
+  "this stream must still go". Every `retire_stream` failure enqueues on the background retirement
+  queue (retries 500 ms → 5 s until it lands), and every boot re-queues the fold's unmatched intents —
+  which is also the orphan-`shape/*` GC, bounded by the catalog because durable-streams has no list
+  API. `GET /shapes/{id}` is 404 from the moment the record goes, pending retirement or not. If you
+  add a retirement site, write `Dropped` first and go through `Engine::retire_shape_stream`.
+- **A shape id is never re-minted, and the surviving records are not the high-water mark.** The boot
+  resumes `next_shape_id` past the maximum id of every `Created` the catalog fold saw, dropped ones
+  included (`CatalogFold::max_shape_id`), before the `is_empty()` early return and in `Park` alike. A
+  dropped shape's id stays spoken for while its `shape/sN` stream is still being retired: re-minting
+  it would PUT the new shape onto the dead one's stream (`ensure_stream` is idempotent, so it
+  succeeds), backfill alongside rows the new predicate never matched, and then let the pending
+  retirement close and delete the LIVE shape's stream — leaving a registered shape whose every append
+  is `Gone`.
 - **Subqueries: emit outer membership *absolutely*** — per touched pk, `upsert` if the row matches
   *now* else idempotent `delete`. Flip-driven query-backs run deferred on the flip-propagator task
   (out of commit order relative to the sequencer), so delta-based emission would miss move-outs.

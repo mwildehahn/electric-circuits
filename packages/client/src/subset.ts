@@ -12,6 +12,8 @@ import { stream } from '@durable-streams/client'
 import { createCollection, type Collection } from '@tanstack/db'
 import type { createTRPCClient } from '@trpc/client'
 
+import { resolveTableDef } from './tables.js'
+
 type Trpc = ReturnType<typeof createTRPCClient<AppRouter>>
 
 export interface SubsetSubscription<T extends Row = Row> {
@@ -217,8 +219,8 @@ export async function createSubset<T extends Row = Row>(
   deps: SubsetDeps,
   def: SubsetDef,
 ): Promise<SubsetSubscription<T>> {
-  const tableDef = deps.schema.tables[def.table]
-  if (!tableDef) throw new Error(`client: unknown table "${def.table}"`)
+  // Either spelling — `items` or `public.items` — whichever one keyed the local schema.
+  const tableDef = resolveTableDef(deps.schema, def.table)
   // Feed envelopes spell the table canonically (`schema.name`, ADR-0002) whatever spelling the
   // caller used, so the envelope filter below must compare against the canonical form.
   const feedType = canonicalTable(def.table)

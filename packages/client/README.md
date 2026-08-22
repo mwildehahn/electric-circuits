@@ -16,6 +16,17 @@ const client = createClient({
 })
 ```
 
+**Either table spelling works, whichever one keyed your schema.** `schema.name` is canonical and a
+bare name is shorthand for `public.<name>` (ADR-0002), so `shape({ table: 'public.issues' })` and
+`shape({ table: 'issues' })` resolve to the same entry of a `Schema` keyed `issues` *or*
+`public.issues`. The keys of your `Schema` are local config — the engine never sees them — so the
+client resolves the caller's spelling against them rather than requiring the two to match
+(`lookupTableDef` / `resolveTableDef` are exported if you keep your own map). A returned
+`handle.table` is always the canonical form the engine answered with, and only `public` has a bare
+shorthand: `billing.issues` never resolves to `issues`. If your schema happens to carry **both**
+`issues` and `public.issues` as separate keys, each spelling resolves to its own entry — the key as
+given always wins — so don't write that schema.
+
 ## `shape(def)` — materialized, live
 
 Registers a shape (backfilled + maintained server-side) and materializes its stream into a

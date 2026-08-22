@@ -248,7 +248,9 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
 
 **Streams are never closed or retired on shutdown.** A shape's stream is left exactly as it is and
 the restored shape continues it — clients see nothing, and there is no backfill storm. (Closing is
-*retirement*, which means "this shape is gone; re-subscribe"; a restart is not that.)
+*retirement*, which means "this shape is gone; re-subscribe"; a restart is not that.) A retirement
+that was still being retried when the signal landed is simply left to the next boot: its `Dropped`
+record is the durable intent, and the boot re-queues it.
 
 New `live=true` requests arriving during the drain are answered `503` + `Retry-After: 1`, not an
 empty 204: an Electric client re-polls a 204 immediately, so 204 would turn the drain window into a
@@ -267,9 +269,41 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 | code | meaning |
 |---|---|
 | `0` | a graceful shutdown completed inside its grace period |
-| `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which) |
+| `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
+| `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
 | `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
+
+### Durability of a create, and of a retirement
+
+`POST /shapes` (and a join) is acknowledged only once its record has reached the durable catalog. The
+catalog writer never drops an event: a transient failure — transport, timeout, 5xx — retries **that**
+event in place, forever, at 100 ms → 5 s, and everything queued behind it waits, which is what keeps
+the log's order equal to the engine's. So a create while durable-streams is down **waits** rather
+than handing back a shape a restart would forget; the client's own timeout is the bound, and a record
+that lands after the client gave up leaves a shape with no subscriber, which the retention sweeper
+evicts.
+
+Removals are the other way round: `DELETE /shapes/{id}`, with or without `?purge=true`, is answered
+as soon as the engine state is updated and its `Left`/`Dropped` lands behind it, in order. Losing one
+would be benign (a restored refcount too many, which retention resolves; a shape whose stream is
+already retired fails to resume and is retired again) and cannot happen anyway — only be delayed —
+whereas waiting would let a slow delete time out and be **retried**, and a second delete decrements a
+shared refcount that was not the caller's. Answer first, record after.
+
+A *definite* refusal of a record (a 4xx, an event that will not serialize) is the pathological case —
+memory and storage disagree — and exits `74`. Note what that means for a storage front that accepts
+the `PUT` creating `meta/catalog` but 4xx's the `POST` appending to it: the engine crash-loops on 74
+rather than refusing the boot with 78. That is intentional. Until the stream has been created once,
+every append failure is retried (so a misrouted PUT never exits); after it, the state is "storage
+refused a record the engine has already acted on", which is an IO failure to be restarted through,
+not a configuration to be rejected at boot.
+
+Removing a shape is the mirror image (ADR-0007): the `Dropped` record is written **before** the
+stream is retired and a `Retired` record only **after** storage accepted the delete, so a retirement
+storage refused is retried in the background (500 ms → 5 s) and, if the process dies first, re-queued
+by the next boot straight out of the catalog — which is also how an orphaned `shape/*` stream is
+collected. `GET /shapes/{id}` answers 404 from the moment the record goes, pending retirement or not.
 
 ### Boot: fatal vs retryable
 
@@ -321,6 +355,9 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `sequencer_orphan_fragments_total` | counter | incomplete transaction fragments discarded because a different transaction followed them (a reconnect re-delivering earlier commits first, or an epoch reset) |
 | `backfill_chunked_appends_total` | counter | chunk appends made by backfills too large for one append (a backfill that fits in one contributes 0) |
 | `shutdown_in_progress` | gauge | `1` once a graceful shutdown has begun |
+| `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
+| `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
+| `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
 
 The three replication-slot gauges are sampled every ~10 s by an **engine-owned** sampler on a
 **pooled** connection (never a dedicated one), and the same sample feeds StatsD — so the numbers are

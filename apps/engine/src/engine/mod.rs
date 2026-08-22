@@ -34,6 +34,7 @@ mod lifecycle;
 pub(crate) mod membership;
 mod output;
 mod planning;
+mod retirement;
 mod sequencer;
 #[cfg(test)]
 mod tests;
@@ -44,6 +45,7 @@ use epoch::*;
 use executors::*;
 use introspection::*;
 use planning::*;
+use retirement::*;
 use sequencer::*;
 
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
@@ -160,6 +162,10 @@ pub struct Engine {
     tables_shared: SharedTables,
     /// Ordered writer for the durable shape catalog (see [`CATALOG_STREAM`]).
     catalog_tx: CatalogWriter,
+    /// Shape streams whose retirement (close, then delete — ADR-0007) storage refused, retried in
+    /// the background until it lands. See [`crate::engine::retirement`]: the `Dropped` record is the
+    /// durable intent, so nothing here is lost by a restart.
+    retirements: RetirementQueue,
     /// The segmented change log (ADR-0006): which segment the ingestor appends to, when each
     /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
     /// the retention sweeper deletes segments and the epoch reset rotates one.
@@ -569,7 +575,11 @@ impl Engine {
             degrade.clone(),
             trace_tx.clone(),
         );
-        let catalog_tx = spawn_catalog_writer(ds.clone());
+        // Created before the writer so the writer can register a shutdown party while it is
+        // retrying an append (see `spawn_catalog_writer`).
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let catalog_tx = spawn_catalog_writer(ds.clone(), shutdown.clone());
+        let retirements = spawn_retirement_queue(ds.clone(), catalog_tx.clone(), shutdown.clone());
         // The change log's writer records every rotation in the durable catalog, so a restart knows
         // which segment is current (and when each one began, for the retain window).
         let changes = ChangeLogWriter::new(
@@ -608,6 +618,7 @@ impl Engine {
             degrade,
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
+            retirements,
             changes,
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
             seq_highwater: Arc::new(std::sync::Mutex::new(None)),
@@ -622,7 +633,7 @@ impl Engine {
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
-            shutdown: crate::shutdown::ShutdownToken::new(),
+            shutdown,
         }
     }
 

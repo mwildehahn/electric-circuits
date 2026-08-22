@@ -110,6 +110,12 @@ pub struct Metrics {
     pub epoch_resets: AtomicU64,       // ADR-0004: new epochs bound (every shape retired, fresh slot)
     pub changes_rotations: AtomicU64,  // ADR-0006: change-log segments closed and succeeded
     pub changes_segments_deleted: AtomicU64, // ADR-0006: rotated-out segments retired (nothing could resume inside)
+    /// Catalog appends re-attempted because durable-streams was unavailable. Never a dropped event
+    /// (the writer retries in place, forever) — this is the visible cost of that promise, and a
+    /// climbing value with a flat `shapes_*` means creates are waiting on storage.
+    pub catalog_append_retries: AtomicU64,
+    /// ADR-0007: retirement attempts that failed and were re-queued.
+    pub retirement_retries: AtomicU64,
     pub txn_spills: AtomicU64,         // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
     /// COUNTER (cumulative), not a gauge: bytes ever written to transaction spill files. A gauge
     /// would be meaningless — a spill file exists only between one `Begin` and its `Commit`, so any
@@ -137,6 +143,10 @@ pub struct Metrics {
     pub sequencer_held_run: AtomicU64,
     /// GAUGE: 1 once a `SIGTERM`/`SIGINT` graceful shutdown has begun (see [`crate::shutdown`]).
     pub shutdown_in_progress: AtomicU64,
+    /// GAUGE: shape streams dropped from the engine's records whose deletion storage has not yet
+    /// accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes right now;
+    /// it should return to 0 on its own, and a boot re-derives it from the catalog.
+    pub retirements_pending: AtomicU64,
     /// GAUGE: `pg_current_wal_lsn() - restart_lsn` for the engine's slot — the WAL Postgres is
     /// holding on disk **for this engine**. The number that fills the source database's disk when
     /// the engine falls behind or stops. Sampled ~every 10 s on a pooled connection.
@@ -170,6 +180,9 @@ pub fn metrics() -> &'static Metrics {
         changes_rotations: AtomicU64::new(0),
         changes_segments_deleted: AtomicU64::new(0),
         changes_segments_retained: AtomicU64::new(0),
+        catalog_append_retries: AtomicU64::new(0),
+        retirement_retries: AtomicU64::new(0),
+        retirements_pending: AtomicU64::new(0),
         backfill_chunked_appends: AtomicU64::new(0),
         sequencer_orphan_fragments: AtomicU64::new(0),
         sequencer_held_run: AtomicU64::new(0),
@@ -203,6 +216,8 @@ impl Metrics {
                 "epoch_resets_total": self.epoch_resets.load(Ordering::Relaxed),
                 "changes_rotations_total": self.changes_rotations.load(Ordering::Relaxed),
                 "changes_segments_deleted_total": self.changes_segments_deleted.load(Ordering::Relaxed),
+                "catalog_append_retries_total": self.catalog_append_retries.load(Ordering::Relaxed),
+                "retirement_retries_total": self.retirement_retries.load(Ordering::Relaxed),
                 "txn_spills_total": self.txn_spills.load(Ordering::Relaxed),
                 "txn_spill_bytes": self.txn_spill_bytes.load(Ordering::Relaxed),
                 "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),
@@ -213,6 +228,7 @@ impl Metrics {
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
                 "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
                 "shutdown_in_progress": self.shutdown_in_progress.load(Ordering::Relaxed),
+                "retirements_pending": self.retirements_pending.load(Ordering::Relaxed),
                 "replication_slot_retained_wal_bytes": self.replication_slot_retained_wal_bytes.load(Ordering::Relaxed),
                 "replication_confirmed_flush_lag_bytes": self.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed),
                 "replication_slot_active": self.replication_slot_active.load(Ordering::Relaxed),
@@ -239,14 +255,16 @@ impl Metrics {
         self.epoch_resets.store(0, Ordering::Relaxed);
         self.changes_rotations.store(0, Ordering::Relaxed);
         self.changes_segments_deleted.store(0, Ordering::Relaxed);
+        self.catalog_append_retries.store(0, Ordering::Relaxed);
+        self.retirement_retries.store(0, Ordering::Relaxed);
         self.txn_spills.store(0, Ordering::Relaxed);
         self.txn_spill_bytes.store(0, Ordering::Relaxed);
         self.txn_chunked_appends.store(0, Ordering::Relaxed);
         self.backfill_chunked_appends.store(0, Ordering::Relaxed);
         self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
         // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
-        // (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the three
-        // replication-slot gauges the sampler republishes).
+        // (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`,
+        // `retirements_pending`, and the three replication-slot gauges the sampler republishes).
         self.process_envelope.reset();
         self.family_step.reset();
         self.append.reset();

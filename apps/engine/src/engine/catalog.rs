@@ -33,6 +33,16 @@ pub(crate) enum CatalogEvent {
     /// A dormant shape was reactivated (replayed + re-registered).
     Reactivated { id: String },
     Dropped { id: String },
+    /// The shape's stream retirement COMPLETED: closed, then deleted (ADR-0007). Written only after
+    /// storage accepted the delete — a 404/410 counts, deletion is idempotent — so a `Dropped` with
+    /// no `Retired` after it is exactly "the engine promised to remove this stream and did not".
+    ///
+    /// The pair is what makes retirement survive a crash: `Dropped` is the durable INTENT (always
+    /// written before the retirement is attempted), `Retired` the durable COMPLETION, and the boot
+    /// hands every unmatched intent to the retirement queue. Without it a stream whose delete was
+    /// refused by storage would stay open forever, serving rows Postgres no longer has, with no
+    /// record anywhere that it should be gone (the engine has already forgotten the shape).
+    Retired { id: String },
     /// The sequencer's checkpoint: the change-log position a restart replays from, plus the
     /// `(lsn, seq)` de-duplication highwater it had applied up to at that position (ADR-0003).
     ///
@@ -68,6 +78,53 @@ pub(crate) enum CatalogEvent {
     SlotBound(crate::engine::epoch::SlotBinding),
 }
 
+/// Exit code when the durable catalog **refused** an event (`EX_IOERR`): storage answered, the
+/// answer will not change with time, and the event cannot be written.
+///
+/// This is the pathological state "memory and storage disagree" — the engine is serving shapes the
+/// durable record does not describe, and every second it keeps running widens the gap. There is no
+/// in-process repair: the catalog is append-only and the fold IS the restart contract, so the only
+/// way memory becomes consistent again is to re-fold from storage, i.e. to restart. So the process
+/// exits, loudly and named, rather than continuing over a record it knows is wrong.
+pub(crate) const EXIT_CATALOG_REFUSED: i32 = 74;
+
+/// What the writer does about an append it could not complete. Pure and separately decided, so the
+/// "exit the process" branch is unit-testable without exiting anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppendVerdict {
+    /// Transport, timeout or 5xx: storage is having a moment. Retry THIS event, in place, forever —
+    /// the queue is ordered and single-consumer, so everything behind it waits, which is exactly
+    /// right (a later event must never reach the log before an earlier one).
+    Retry,
+    /// A definite refusal: a 4xx the catalog cannot recover from, or an event that would not
+    /// serialize. Nothing about waiting changes the answer.
+    Refused,
+}
+
+/// Classify a failed catalog append. `is_unavailable` is deliberately the ONLY forgiving side (see
+/// [`crate::ds::is_unavailable`]): it forgives the transport and 5xx, and nothing else.
+pub(crate) fn classify_append(e: &anyhow::Error) -> AppendVerdict {
+    if crate::ds::is_unavailable(e) { AppendVerdict::Retry } else { AppendVerdict::Refused }
+}
+
+/// The retry schedule for a catalog append: 100 ms before the first retry, doubling, capped at 5 s.
+/// `attempt` counts from 1. Pure, so the schedule is a unit test rather than a comment.
+pub(crate) fn catalog_backoff(attempt: u32) -> std::time::Duration {
+    let step = attempt.saturating_sub(1).min(6);
+    std::time::Duration::from_millis(100u64.saturating_mul(1u64 << step)).min(CATALOG_BACKOFF_MAX)
+}
+
+const CATALOG_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One queued catalog event, plus the (optional) acknowledgement its sender is waiting on.
+struct CatalogSend {
+    ev: CatalogEvent,
+    /// Resolved once the append has SUCCEEDED — the durable-before-ack half of a client-facing
+    /// mutation (see [`CatalogWriter::send_durable`]). `None` for engine-initiated events, which
+    /// nobody is waiting on.
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 /// The catalog writer's ordered channel, plus the count of events sent but not yet appended.
 ///
 /// The counter exists for one caller: the circuit-tier drift path exits the process, and it must
@@ -75,7 +132,7 @@ pub(crate) enum CatalogEvent {
 /// then restore shapes whose streams it had just deleted (see [`CatalogWriter::drain`]).
 #[derive(Clone)]
 pub(crate) struct CatalogWriter {
-    tx: mpsc::UnboundedSender<CatalogEvent>,
+    tx: mpsc::UnboundedSender<CatalogSend>,
     in_flight: Arc<std::sync::atomic::AtomicI64>,
     /// The last `Offset` checkpoint that has actually **landed in storage** — what a restart would
     /// resume from, as opposed to what this process has processed in memory.
@@ -91,9 +148,38 @@ pub(crate) struct CatalogWriter {
 impl CatalogWriter {
     /// Enqueue an event. Infallible by design: a dead writer means the process is going away, and
     /// no caller has a better answer than continuing (the previous code spelled this `let _ =`).
+    ///
+    /// For an event a CLIENT is being told about — a create, a join, a release, an explicit purge —
+    /// use [`Self::send_durable`] instead: an acknowledged mutation the durable record does not
+    /// contain is a shape that vanishes at the next restart.
     pub(crate) fn send(&self, ev: CatalogEvent) {
+        self.enqueue(CatalogSend { ev, done: None });
+    }
+
+    /// Enqueue an event and hand back a future that resolves once it has **landed in storage**.
+    ///
+    /// The send happens here, synchronously, so callers keep enqueueing under the state lock and the
+    /// log order still matches the state-mutation order; only the WAIT moves to the caller's own
+    /// await point (after the lock is released, immediately before it answers its client).
+    ///
+    /// It always resolves or the process exits: the writer retries a transient failure forever and
+    /// exits [`EXIT_CATALOG_REFUSED`] on a definite refusal. There is deliberately no timeout — a
+    /// create while storage is down waits, because the alternative is telling a client about a shape
+    /// that will not exist after a restart. The client has its own timeout; if it gives up and the
+    /// record lands anyway, the shape has no subscriber and retention evicts it.
+    pub(crate) fn send_durable(&self, ev: CatalogEvent) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.enqueue(CatalogSend { ev, done: Some(done) });
+        async move {
+            // An `Err` means the writer task is gone, i.e. the process is on its way out; there is
+            // nothing better to do than let the caller finish.
+            let _ = wait.await;
+        }
+    }
+
+    fn enqueue(&self, item: CatalogSend) {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        if self.tx.send(ev).is_err() {
+        if self.tx.send(item).is_err() {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -128,18 +214,26 @@ impl CatalogWriter {
 
 /// Spawn the single catalog writer: events are appended strictly in send order (senders enqueue
 /// while holding the engine-state lock, so the log order matches the state-mutation order).
-pub(crate) fn spawn_catalog_writer(ds: DsClient) -> CatalogWriter {
-    let (tx, mut rx) = mpsc::unbounded_channel::<CatalogEvent>();
+///
+/// **The writer never drops an event.** A transient failure (transport, timeout, 5xx) retries THAT
+/// event in place, forever, so the log keeps its order and a restart cannot under-restore; a
+/// definite refusal exits [`EXIT_CATALOG_REFUSED`], because an engine whose memory and durable
+/// record disagree has no honest way to continue. The retry loop is bounded in practice by the
+/// shutdown grace: while it is retrying the writer registers a `catalog writer` shutdown party, so
+/// a `SIGTERM` during an outage exits 70 NAMING it rather than looking like a mystery hang.
+pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::ShutdownToken) -> CatalogWriter {
+    let (tx, mut rx) = mpsc::unbounded_channel::<CatalogSend>();
     let in_flight = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let counter = in_flight.clone();
     let durable: Arc<std::sync::Mutex<Option<LogPosition>>> = Arc::new(std::sync::Mutex::new(None));
     let landed = durable.clone();
     tokio::spawn(async move {
         let mut ensured = false;
-        while let Some(ev) = rx.recv().await {
-            if !ensured {
-                ensured = self::ensure_catalog(&ds).await;
-            }
+        // Latches the "catalog stream create failed" line to once per outage (see
+        // `ensure_catalog_logged`); it outlives one event because the retry loop below runs per
+        // attempt, and an outage spans many.
+        let mut ensure_logged = false;
+        while let Some(CatalogSend { ev, done }) = rx.recv().await {
             // Published only on a SUCCESSFUL append: an `Offset` whose write failed is not a
             // position a restart would resume from, and treating it as one would license deleting
             // the segment underneath it.
@@ -147,26 +241,104 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient) -> CatalogWriter {
                 CatalogEvent::Offset { pos, .. } => Some(pos.clone()),
                 _ => None,
             };
-            match serde_json::to_value(&ev) {
-                Ok(json) => match ds.append_json(CATALOG_STREAM, &[json]).await {
-                    Ok(()) => {
-                        if let Some(pos) = checkpoint {
-                            let mut g = landed.lock().unwrap();
-                            if g.as_ref().is_none_or(|cur| *cur < pos) {
-                                *g = Some(pos);
+            let json = match serde_json::to_value(&ev) {
+                Ok(json) => json,
+                // Not a storage problem and not one waiting fixes: the engine has state it cannot
+                // describe. Same verdict as a refusal, for the same reason.
+                Err(e) => refuse(&ev, &anyhow::Error::new(e).context("catalog event could not be serialized")),
+            };
+            // Held only while an outage is in progress, so the ordinary case leaves
+            // `wait_for_parties` untouched (a permanently-registered party would never let a
+            // shutdown finish).
+            let mut party: Option<crate::shutdown::ShutdownParty> = None;
+            let mut attempt = 0u32;
+            loop {
+                // Inside the retry loop, not before it: the PUT that creates the catalog stream is
+                // itself a storage round trip, so an engine that started while durable-streams was
+                // down has not made it yet — and appending to a stream that does not exist answers
+                // 404, which would otherwise read as a refusal and exit the process. Until it has
+                // succeeded ONCE, every failure here is transient by construction. (After that, a
+                // catalog stream that has *vanished* is a genuine refusal: the durable record has
+                // been destroyed under a running engine, and continuing would quietly start a
+                // second history.)
+                if !ensured {
+                    ensured = self::ensure_catalog(&ds, &mut ensure_logged).await;
+                }
+                match ds.append_json(CATALOG_STREAM, &[json.clone()]).await {
+                    Ok(()) => break,
+                    Err(e) => match if ensured { classify_append(&e) } else { AppendVerdict::Retry } {
+                        AppendVerdict::Refused => refuse(&ev, &e),
+                        AppendVerdict::Retry => {
+                            attempt += 1;
+                            crate::metrics::metrics().catalog_append_retries.fetch_add(1, Ordering::Relaxed);
+                            // Once per outage, not once per attempt: an unreachable storage server
+                            // must not turn one event into a log flood.
+                            if attempt == 1 {
+                                party = Some(shutdown.party("catalog writer"));
+                                tracing::warn!(
+                                    "catalog append failed ({e:#}); durable-streams is unavailable, so \
+                                     this event is retried until it lands — every catalog mutation \
+                                     behind it waits, and a client-facing create/join/release waits \
+                                     with it. No event is dropped."
+                                );
                             }
+                            let base = catalog_backoff(attempt);
+                            tokio::time::sleep(crate::replication::jitter(base, crate::replication::clock_nanos()))
+                                .await;
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("catalog append failed (event lost; restart may under-restore): {e:#}")
-                    }
-                },
-                Err(e) => tracing::error!("catalog event could not be serialized (event lost): {e:#}"),
+                    },
+                }
+            }
+            if let Some(pos) = checkpoint {
+                let mut g = landed.lock().unwrap();
+                if g.as_ref().is_none_or(|cur| *cur < pos) {
+                    *g = Some(pos);
+                }
+            }
+            if attempt > 0 {
+                tracing::info!("catalog append landed after {attempt} retr(ies); durable-streams is back");
+                drop(party.take());
+            }
+            // Only now: `send_durable`'s contract is "resolved after the append SUCCEEDED".
+            if let Some(done) = done {
+                let _ = done.send(());
             }
             counter.fetch_sub(1, Ordering::SeqCst);
         }
     });
     CatalogWriter { tx, in_flight, durable }
+}
+
+/// The refusal half of [`spawn_catalog_writer`]: name the event and what storage answered, then
+/// exit. Split out (and `-> !`) so the loop above reads as "retry or die" with no third branch.
+fn refuse(ev: &CatalogEvent, e: &anyhow::Error) -> ! {
+    tracing::error!(
+        "durable catalog REFUSED a {} event: {e:#}. Storage answered, and the answer will not change \
+         — the engine is now serving state its durable record does not describe, which no restart of \
+         the request and no amount of waiting can reconcile. Exiting {EXIT_CATALOG_REFUSED}: a boot \
+         re-folds the catalog, which is the only way memory becomes consistent with storage again.",
+        event_kind(ev)
+    );
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    std::process::exit(EXIT_CATALOG_REFUSED)
+}
+
+/// The event's variant name, for the refusal message (`serde` tags it, but only on the way out).
+fn event_kind(ev: &CatalogEvent) -> &'static str {
+    match ev {
+        CatalogEvent::Created { .. } => "created",
+        CatalogEvent::Joined { .. } => "joined",
+        CatalogEvent::Left { .. } => "left",
+        CatalogEvent::Dormant { .. } => "dormant",
+        CatalogEvent::Reactivated { .. } => "reactivated",
+        CatalogEvent::Dropped { .. } => "dropped",
+        CatalogEvent::Retired { .. } => "retired",
+        CatalogEvent::Offset { .. } => "offset",
+        CatalogEvent::ChangesRotated { .. } => "changesRotated",
+        CatalogEvent::ChangesSegmentDeleted { .. } => "changesSegmentDeleted",
+        CatalogEvent::SchemaChanged { .. } => "schemaChanged",
+        CatalogEvent::SlotBound(_) => "slotBound",
+    }
 }
 
 /// The durable catalog holds a record written **before** ADR-0002 (a bare `rec.table`).
@@ -221,6 +393,12 @@ impl std::fmt::Display for CatalogPredatesSegmentation {
 
 impl std::error::Error for CatalogPredatesSegmentation {}
 
+/// The numeric half of a shape id (`s7` -> `7`). `None` for anything that is not one — the ids the
+/// engine mints always are, and a foreign spelling must not silently reset the id counter.
+fn shape_id_num(id: &str) -> Option<u64> {
+    id.strip_prefix('s')?.parse().ok()
+}
+
 /// Is this raw catalog event a pre-ADR-0006 change-log position? `Some(detail)` names it.
 ///
 /// Deliberately positive-checking the OLD spelling rather than trusting the strict deserializer to
@@ -255,11 +433,21 @@ fn schema_moved_while_down(rec: &ShapeRecord, compiled: &HashMap<TableRef, Table
     }
 }
 
-pub(crate) async fn ensure_catalog(ds: &DsClient) -> bool {
+/// Idempotently create the catalog stream, logging a failure only the FIRST time through an outage
+/// — the writer retries this before every append attempt while the stream has never been created,
+/// and one error line per attempt for as long as storage is down is a flood, not information.
+/// `logged` is the caller's per-outage latch; it is cleared again on success.
+async fn ensure_catalog(ds: &DsClient, logged: &mut bool) -> bool {
     match ds.ensure_stream(CATALOG_STREAM).await {
-        Ok(()) => true,
+        Ok(()) => {
+            *logged = false;
+            true
+        }
         Err(e) => {
-            tracing::error!("catalog stream create failed: {e:#}");
+            if !*logged {
+                tracing::error!("catalog stream create failed: {e:#}");
+                *logged = true;
+            }
             false
         }
     }
@@ -277,6 +465,24 @@ type Restored = (ShapeRecord, Option<String>, usize, Option<(LogPosition, crate:
 /// in.
 pub(crate) struct CatalogFold {
     recs: HashMap<String, Restored>,
+    /// Shapes whose `Dropped` intent is in the log with no `Retired` completion after it: shape id →
+    /// stream path. These are streams the engine promised to remove and did not — the boot hands
+    /// them to the retirement queue (see [`Engine::apply_catalog`]).
+    ///
+    /// Bounded by the retirements actually outstanding, not by the log's length: the entry is
+    /// inserted on `Dropped` and removed again on the matching `Retired`.
+    pending_retire: HashMap<String, String>,
+    /// The highest numeric shape id the log has EVER minted — from every `Created`, including the
+    /// ones later dropped. `None` = the log created no shape.
+    ///
+    /// This, and not the surviving records, is the restart's id high-water mark. A dropped shape's
+    /// id stays spoken for as long as anything of it survives: its `shape/sN` stream lives until the
+    /// retirement lands, so re-minting `sN` would hand a brand-new shape the dead one's stream —
+    /// `ensure_stream` is idempotent, so the PUT succeeds, the backfill appends to a stream holding
+    /// pre-`TRUNCATE` rows, and the pending retirement then closes and deletes the LIVE shape's
+    /// stream (and records `Retired` against a registered shape, whose appends are `Gone` from then
+    /// on). Ids are never reused, full stop.
+    max_shape_id: Option<u64>,
     /// The sequencer's change-log replay start (the last `Offset` checkpoint).
     start_pos: LogPosition,
     /// The `(lsn, seq)` de-duplication highwater recorded with that checkpoint (ADR-0003).
@@ -296,6 +502,8 @@ impl Default for CatalogFold {
     fn default() -> Self {
         CatalogFold {
             recs: HashMap::new(),
+            pending_retire: HashMap::new(),
+            max_shape_id: None,
             start_pos: LogPosition::start(),
             start_highwater: None,
             binding: None,
@@ -311,6 +519,13 @@ impl CatalogFold {
     fn apply(&mut self, ev: CatalogEvent) {
         match ev {
             CatalogEvent::Created { rec, sig } => {
+                // Every create moves the id high-water mark, and nothing ever moves it back (see
+                // `max_shape_id`). `max`, not "the last one wins": the engine mints ids
+                // monotonically from one counter, so the log is monotonic anyway, and taking the
+                // maximum means a log that somehow is not cannot lower the mark.
+                if let Some(num) = shape_id_num(&rec.id) {
+                    self.max_shape_id = Some(self.max_shape_id.map_or(num, |cur| cur.max(num)));
+                }
                 self.recs.insert(rec.id.clone(), (rec, sig, 1, None));
             }
             CatalogEvent::Joined { id } => {
@@ -333,8 +548,17 @@ impl CatalogFold {
                     e.3 = None;
                 }
             }
+            // The record goes; the obligation to retire its stream stays until a `Retired` says it
+            // was honoured. The path is taken from the record itself (the event carries only the
+            // id): a `Dropped` for a record this fold never saw is a duplicate, and there is
+            // nothing left to retire.
             CatalogEvent::Dropped { id } => {
-                self.recs.remove(&id);
+                if let Some((rec, ..)) = self.recs.remove(&id) {
+                    self.pending_retire.insert(id, rec.stream_path);
+                }
+            }
+            CatalogEvent::Retired { id } => {
+                self.pending_retire.remove(&id);
             }
             CatalogEvent::Offset { pos, highwater } => {
                 self.start_pos = pos;
@@ -366,7 +590,20 @@ impl CatalogFold {
         self.start_pos.clone()
     }
 
+    /// Every `Dropped` with no `Retired` after it: `(shape id, stream path)`, sorted by id so the
+    /// boot's enqueue order is deterministic. This is the orphan-`shape/*` GC, bounded by the
+    /// catalog rather than by a storage listing (durable-streams exposes no list API).
+    pub(crate) fn pending_retirements(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> =
+            self.pending_retire.iter().map(|(id, path)| (id.clone(), path.clone())).collect();
+        v.sort();
+        v
+    }
+
     /// Nothing was ever written (or everything was dropped and nothing checkpointed).
+    ///
+    /// Deliberately does NOT consider `pending_retire`: this asks "is there anything to INSTALL",
+    /// and the boot enqueues outstanding retirements before it consults this at all.
     fn is_empty(&self) -> bool {
         self.recs.is_empty() && self.start_pos == LogPosition::start()
     }
@@ -435,6 +672,24 @@ impl Engine {
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
+        // BEFORE anything else, and in both modes: a `Dropped` with no `Retired` is a shape stream a
+        // previous process promised to remove and did not (its retirement was refused by storage,
+        // or the process died between the two). The engine has already forgotten the shape, so
+        // nothing else will ever notice — this is the only place it can be picked up. The queue
+        // retries each one to completion and writes the `Retired` that closes it out.
+        for (id, path) in fold.pending_retirements() {
+            tracing::info!("restore: shape {id} was dropped but its stream {path} was never retired; queued");
+            self.retirements.enqueue(&path, Some(&id));
+        }
+        // Also before anything else, and also in both modes: the id counter resumes past EVERY id
+        // the log ever minted, not past the ones that survived (see `CatalogFold::max_shape_id`).
+        // A catalog of nothing but creates and drops folds to `is_empty()`, so this cannot wait for
+        // the branches below — that is exactly the case where re-minting would collide with a
+        // `shape/*` stream whose retirement is still pending.
+        if let Some(max) = fold.max_shape_id {
+            let mut st = self.state.lock().await;
+            st.next_shape_id = st.next_shape_id.max(max + 1);
+        }
         if fold.is_empty() {
             return Ok(());
         }
@@ -453,10 +708,7 @@ impl Engine {
             // The epoch broke: hold the records, touch nothing else (see `RestoreMode::Park`).
             let mut st = self.state.lock().await;
             for (id, (rec, _, _, _)) in recs {
-                if let Ok(num) = id.trim_start_matches('s').parse::<u64>() {
-                    st.next_shape_id = st.next_shape_id.max(num + 1);
-                }
-                st.shapes.insert(id, rec);
+                st.shapes.insert(id, rec); // `next_shape_id` was moved past every minted id above
             }
             tracing::warn!(
                 "catalog restore: {} shape(s) parked over a broken epoch — none is resumed or \
@@ -468,13 +720,13 @@ impl Engine {
 
         // 2. Restore records + shares; subquery shapes are dropped (see CATALOG_STREAM docs).
         let mut resume: Vec<ShapeRecord> = Vec::new();
-        let mut dead_streams: Vec<String> = Vec::new();
+        // `(shape id, stream path)`: the id travels with the path because completing a retirement
+        // writes `Retired { id }`.
+        let mut dead_streams: Vec<(String, String)> = Vec::new();
         {
             let mut st = self.state.lock().await;
             for (id, (rec, sig, refcount, dormant)) in recs {
-                if let Ok(num) = id.trim_start_matches('s').parse::<u64>() {
-                    st.next_shape_id = st.next_shape_id.max(num + 1);
-                }
+                // (`next_shape_id` was moved past every id the log ever minted, above.)
                 // DDL while the engine was DOWN is seen by nothing on the live path: no `Relation`
                 // message, no reconciler tick. The record's own fingerprint is the only witness —
                 // if it no longer matches what boot introspected, the retained stream holds rows
@@ -486,7 +738,7 @@ impl Engine {
                         rec.table
                     );
                     self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                    dead_streams.push(rec.stream_path.clone());
+                    dead_streams.push((id.clone(), rec.stream_path.clone()));
                     continue;
                 }
                 if rec.is_subquery {
@@ -498,7 +750,7 @@ impl Engine {
                         "restore: dropping subquery shape {id} (inner-node state is not persisted); subscribers observe the deleted stream and recreate"
                     );
                     self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                    dead_streams.push(rec.stream_path.clone());
+                    dead_streams.push((id.clone(), rec.stream_path.clone()));
                     continue;
                 }
                 st.shapes.insert(id.clone(), rec.clone());
@@ -537,9 +789,11 @@ impl Engine {
         // Restored dormant shapes still need the TTL/eviction layers running.
         self.ensure_retention_sweeper();
         // Retirement: clients may still be tailing these streams from before the restart, so close
-        // before deleting — their long-poll is released at once with `stream-closed`.
-        for path in dead_streams {
-            let _ = self.ds.retire_stream(&path).await;
+        // before deleting — their long-poll is released at once with `stream-closed`. A storage
+        // failure here is not "lost": the `Dropped` above is the durable intent, and the retirement
+        // is finished in the background (or by the next boot).
+        for (id, path) in dead_streams {
+            self.retire_shape_stream(&id, &path).await;
         }
 
         // 3. Re-register with the sequencer. Plain/routed shapes resume without a backfill and
@@ -563,11 +817,10 @@ impl Engine {
                 drop(st);
                 // Engine-initiated removal, so retire the stream (close, then delete): the shape is
                 // gone, and a client still tailing it from before the restart must learn that rather
-                // than sit on a stream nothing will ever append to again. Logged, never fatal — a
-                // storage hiccup must not abort the restore of the other shapes.
-                if let Err(e) = self.ds.retire_stream(&rec.stream_path).await {
-                    tracing::warn!("restore: failed to retire stream {} for dropped shape {}: {e:#}", rec.stream_path, rec.id);
-                }
+                // than sit on a stream nothing will ever append to again. Never fatal — a storage
+                // hiccup must not abort the restore of the other shapes — and never forgotten: a
+                // failure goes to the retirement queue, which retries it to completion.
+                self.retire_shape_stream(&rec.id, &rec.stream_path).await;
             }
         }
         Ok(())
@@ -670,9 +923,125 @@ impl Engine {
 
 }
 
+/// A minimal, faultable durable-streams stand-in for the catalog writer + retirement queue tests.
+///
+/// Deliberately an HTTP server rather than a trait double: the behaviour under test is entirely
+/// about what the engine does with real statuses (`is_unavailable` reads the response, not a mock's
+/// intent), and a double that returns pre-classified errors would test the test.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    pub(crate) struct FakeDsState {
+        /// Remaining `POST /meta/catalog` calls to answer 503 (transient).
+        fail_appends: AtomicU32,
+        /// Remaining `DELETE` calls to answer 503.
+        fail_deletes: AtomicU32,
+        appends: AtomicU64,
+        deletes: AtomicU64,
+        closes: AtomicU64,
+        events: Mutex<Vec<serde_json::Value>>,
+    }
+
+    pub(crate) struct FakeDs {
+        url: String,
+        state: Arc<FakeDsState>,
+    }
+
+    impl FakeDs {
+        pub(crate) async fn start() -> FakeDs {
+            use axum::extract::State;
+            let state = Arc::new(FakeDsState::default());
+            let app = axum::Router::new()
+                .route(
+                    "/{*path}",
+                    axum::routing::put(|| async { axum::http::StatusCode::OK })
+                        .post(
+                            |State(st): State<Arc<FakeDsState>>,
+                             axum::extract::Path(path): axum::extract::Path<String>,
+                             body: String| async move {
+                                if path != "meta/catalog" {
+                                    st.closes.fetch_add(1, Ordering::SeqCst);
+                                    return axum::http::StatusCode::NO_CONTENT;
+                                }
+                                if st
+                                    .fail_appends
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .is_ok()
+                                {
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                }
+                                st.appends.fetch_add(1, Ordering::SeqCst);
+                                if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&body) {
+                                    st.events.lock().unwrap().extend(items);
+                                }
+                                axum::http::StatusCode::NO_CONTENT
+                            },
+                        )
+                        .delete(|State(st): State<Arc<FakeDsState>>| async move {
+                            st.deletes.fetch_add(1, Ordering::SeqCst);
+                            if st
+                                .fail_deletes
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                .is_ok()
+                            {
+                                return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                            }
+                            axum::http::StatusCode::NO_CONTENT
+                        }),
+                )
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            FakeDs { url: format!("http://{addr}"), state }
+        }
+
+        pub(crate) fn url(&self) -> &str {
+            &self.url
+        }
+
+        /// Answer the next `n` catalog appends with 503.
+        pub(crate) fn fail_appends(&self, n: u32) {
+            self.state.fail_appends.store(n, Ordering::SeqCst);
+        }
+
+        /// Answer the next `n` stream deletes with 503.
+        pub(crate) fn fail_deletes(&self, n: u32) {
+            self.state.fail_deletes.store(n, Ordering::SeqCst);
+        }
+
+        pub(crate) fn deletes(&self) -> u64 {
+            self.state.deletes.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn closes(&self) -> u64 {
+            self.state.closes.load(Ordering::SeqCst)
+        }
+
+        /// Every catalog event that LANDED, in order.
+        pub(crate) fn catalog_events(&self) -> Vec<serde_json::Value> {
+            self.state.events.lock().unwrap().clone()
+        }
+
+        /// Just the `t` tags of the events that landed — the order-and-once assertions.
+        pub(crate) fn catalog_kinds(&self) -> Vec<String> {
+            self.catalog_events()
+                .iter()
+                .map(|e| e["t"].as_str().unwrap_or("?").to_string())
+                .collect()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use testing::FakeDs;
 
     fn created_event(table: &str) -> serde_json::Value {
         serde_json::json!({
@@ -947,6 +1316,174 @@ mod tests {
         match serde_json::from_value::<CatalogEvent>(json).unwrap() {
             CatalogEvent::SlotBound(b) => assert_eq!(b.system_identifier, "73"),
             other => panic!("expected SlotBound, got {other:?}"),
+        }
+    }
+
+    // --- the writer never drops an event -------------------------------------------------------
+
+    /// The classification the whole retry-or-die decision hangs on, without exiting anything: a 5xx
+    /// or a dead transport is storage having a moment; a 4xx is an answer.
+    #[test]
+    fn a_5xx_retries_and_a_4xx_refuses() {
+        let five = anyhow::Error::new(crate::ds::DsUnavailable {
+            op: "POST",
+            path: CATALOG_STREAM.to_string(),
+            status: 503,
+        });
+        assert_eq!(classify_append(&five), AppendVerdict::Retry);
+        let four = anyhow::anyhow!("POST meta/catalog -> 400 Bad Request: malformed event");
+        assert_eq!(classify_append(&four), AppendVerdict::Refused);
+        let serialization = anyhow::anyhow!("catalog event could not be serialized");
+        assert_eq!(classify_append(&serialization), AppendVerdict::Refused);
+    }
+
+    #[test]
+    fn the_catalog_schedule_climbs_to_five_seconds_and_stays() {
+        let ms = |a: u32| catalog_backoff(a).as_millis();
+        assert_eq!(ms(1), 100, "the first retry is immediate-ish: a create is waiting on it");
+        assert_eq!(ms(2), 200);
+        assert_eq!(ms(6), 3200);
+        assert_eq!(ms(7), 5000, "capped");
+        assert_eq!(ms(70), 5000, "and stays capped");
+    }
+
+    /// The regression this exists for: a 503 on a catalog append used to log "event lost" and drop
+    /// the event, so an acknowledged shape simply was not in the log a restart folds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_append_is_retried_in_place_and_lands_exactly_once() {
+        let server = FakeDs::start().await;
+        server.fail_appends(3);
+        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        w.send(CatalogEvent::Joined { id: "s1".to_string() });
+        w.send(CatalogEvent::Left { id: "s1".to_string() });
+        assert!(w.drain(std::time::Duration::from_secs(20)).await, "the queue must drain");
+        assert_eq!(
+            server.catalog_kinds(),
+            vec!["joined".to_string(), "left".to_string()],
+            "both events land, exactly once each, in send order"
+        );
+    }
+
+    /// `send_durable` is the durable-before-ack primitive: the future must not resolve while the
+    /// append is still being refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_durable_resolves_only_after_the_append_lands() {
+        let server = FakeDs::start().await;
+        server.fail_appends(2);
+        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        let landed = w.send_durable(CatalogEvent::Joined { id: "s1".to_string() });
+        tokio::pin!(landed);
+        // 100 ms + 200 ms of backoff to go, so the ack cannot have happened yet.
+        tokio::select! {
+            _ = &mut landed => panic!("acknowledged a create whose record storage had refused"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        assert!(server.catalog_kinds().is_empty(), "nothing has landed yet");
+        tokio::time::timeout(std::time::Duration::from_secs(20), landed)
+            .await
+            .expect("the append lands once storage recovers");
+        assert_eq!(server.catalog_kinds(), vec!["joined".to_string()]);
+    }
+
+    // --- retirement: intent and completion ------------------------------------------------------
+
+    /// A `Dropped` with no `Retired` is the durable form of "this stream must still go".
+    #[test]
+    fn a_drop_without_a_retirement_stays_pending() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![created, CatalogEvent::Dropped { id: "s1".to_string() }]);
+        assert!(fold.recs.is_empty(), "the record is gone the moment the drop is recorded");
+        assert_eq!(fold.pending_retirements(), vec![("s1".to_string(), "shape/s1".to_string())]);
+    }
+
+    /// ...and the completion clears it, so an ordinary retirement leaves the boot nothing to do.
+    #[test]
+    fn a_completed_retirement_leaves_nothing_pending() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            created,
+            CatalogEvent::Dropped { id: "s1".to_string() },
+            CatalogEvent::Retired { id: "s1".to_string() },
+        ]);
+        assert!(fold.pending_retirements().is_empty());
+    }
+
+    /// A `Dropped` for a record this fold never saw (a duplicate, or a drop from before whatever
+    /// the log still holds) has no stream path to retire and must not invent one.
+    #[test]
+    fn a_drop_with_no_record_is_not_a_pending_retirement() {
+        let fold = fold_of(vec![CatalogEvent::Dropped { id: "s404".to_string() }]);
+        assert!(fold.pending_retirements().is_empty());
+    }
+
+    /// A shape id is spoken for by its `shape/*` stream, which outlives the record whenever the
+    /// retirement has not landed. The fold's high-water mark therefore comes from every `Created`,
+    /// not from the survivors.
+    #[test]
+    fn the_id_high_water_mark_survives_the_drop() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![created, CatalogEvent::Dropped { id: "s1".to_string() }]);
+        assert!(fold.recs.is_empty());
+        assert_eq!(fold.max_shape_id, Some(1), "s1 is still spoken for: its stream is being retired");
+    }
+
+    /// ...and it is a MAXIMUM, so nothing in the log can lower it (the engine mints monotonically,
+    /// so this is belt-and-braces rather than a case that occurs).
+    #[test]
+    fn the_id_high_water_mark_never_goes_backwards() {
+        let at = |id: &str| {
+            let mut ev = created_event("public.users");
+            ev["rec"]["id"] = serde_json::json!(id);
+            ev["rec"]["stream_path"] = serde_json::json!(format!("shape/{id}"));
+            serde_json::from_value::<CatalogEvent>(ev).unwrap()
+        };
+        let fold = fold_of(vec![
+            at("s3"),
+            CatalogEvent::Dropped { id: "s3".to_string() },
+            at("s1"),
+        ]);
+        assert_eq!(fold.max_shape_id, Some(3));
+    }
+
+    /// The end-to-end property the fold exists for: a restart must not re-mint an id whose stream is
+    /// still being retired. `Created s1` + `Dropped s1` folds to `is_empty()`, so this is also the
+    /// case that proves the counter is restored BEFORE that early return.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_boot_over_a_dropped_shape_mints_the_next_id_not_that_one() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![created, CatalogEvent::Dropped { id: "s1".to_string() }]);
+        assert!(fold.is_empty(), "nothing to install — only an id that must not come back");
+        // No durable-streams behind it: the queued retirement retries in the background and this
+        // test does not depend on it (the id counter is engine state, decided before any IO).
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+        assert_eq!(engine.state.lock().await.next_shape_id, 2, "s1 is taken; the next shape is s2");
+    }
+
+    /// The same over a broken epoch: `Park` restores records to be retired, and it must not hand the
+    /// reset a fresh create colliding with one of them either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parking_a_broken_epoch_also_moves_the_id_counter() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            created,
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
+        ]);
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Park).await.unwrap();
+        let st = engine.state.lock().await;
+        assert_eq!(st.next_shape_id, 2);
+        assert_eq!(st.shapes.len(), 1, "the record is parked for the reset to retire");
+    }
+
+    #[test]
+    fn retired_round_trips_on_the_wire() {
+        let json = serde_json::to_value(CatalogEvent::Retired { id: "s3".to_string() }).unwrap();
+        assert_eq!(json["t"], "retired");
+        assert_eq!(json["id"], "s3");
+        match serde_json::from_value::<CatalogEvent>(json).unwrap() {
+            CatalogEvent::Retired { id } => assert_eq!(id, "s3"),
+            other => panic!("expected Retired, got {other:?}"),
         }
     }
 }

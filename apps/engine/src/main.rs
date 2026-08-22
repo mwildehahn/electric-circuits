@@ -14,7 +14,8 @@
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean exit: a graceful shutdown completed inside its grace period |
-//! | `70` | the shutdown was **forced** — a second signal arrived, or the grace period elapsed with work still in flight ([`shutdown::EXIT_SHUTDOWN_FORCED`]) |
+//! | `70` | the shutdown was **forced** — a second signal arrived, or the grace period elapsed with work still in flight ([`shutdown::EXIT_SHUTDOWN_FORCED`]). A catalog append being retried through an outage is a named party here |
+//! | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered, and the answer will not change. Memory and storage disagree and only a re-fold at boot can reconcile them, so the process exits instead of serving state its record does not describe |
 //! | `75` | a counts pipeline must be rebuilt (schema drift or an epoch reset on a circuit-served table); restart to re-seed it |
 //! | `78` | **boot refused** (`EX_CONFIG`): a misconfiguration retrying cannot fix — a setting the config resolver rejected (an unparseable `ELECTRIC_CIRCUITS_PG_URL`, an unusable `ELECTRIC_CIRCUITS_PG_TABLES`, an out-of-range byte budget, a missing `ELECTRIC_CIRCUITS_DS_URL`, an unwritable spill directory), or a fatal Postgres condition — bad credentials, a missing privilege, an unknown database, `wal_level` ≠ `logical`, a publication with a column list, an unreadable durable catalog |
 //!
