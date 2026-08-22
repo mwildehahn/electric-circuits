@@ -49,8 +49,9 @@ and would require forking the replication client. See ADR-0003.
 4. Change-log rotation: segments, `(segment, offset)`, close-then-continue pointer, evict-before-delete,
    retention knobs (ADR-0006).
 5. Large transactions: per-transaction cap → spill → chunked appends, ack after the last (ADR-0003).
-6. Ops: SIGTERM, readiness, boot-time fatal-vs-retryable taxonomy, streamed backfills, off-by-default
-   slow-backfill timeout.
+6. Ops: SIGTERM, readiness (`/ready` split from the liveness `/health`), boot-time
+   fatal-vs-retryable taxonomy, streamed backfills, off-by-default slow-backfill timeout, and the
+   replication-slot gauges made engine-owned so `/metrics` carries them without StatsD.
 7. Feature work.
 
 ## Deferred, with reasons
@@ -71,7 +72,7 @@ and would require forking the replication client. See ADR-0003.
 - #12: the `table/*` framing predates the single `changes` log.
 - `electric.rs:761` strips a non-`public` schema qualifier and answers with the `public` table's rows.
 
-## Follow-ups surfaced while implementing slices 1–2
+## Follow-ups surfaced while implementing slices 1–6
 
 Recorded here so they are not lost; none blocks the order of work above.
 
@@ -89,3 +90,18 @@ Recorded here so they are not lost; none blocks the order of work above.
   the contract as *must*); the engine side is done.
 - **A table dropped and re-created** is untracked until restart (documented in
   `docs/deployment-postgres.md`).
+- **The replication ingestor's connection has no connect timeout.** `pg::connect` (boot, pool) now
+  applies a 10 s `connect_timeout`; the walsender connection is built by `pgwire-replication` from
+  its own `ReplicationConfig`. Not boot-blocking (its task joins the shutdown token), but a
+  firewalled host costs a wedged walsender connect rather than a fast failure.
+- **`ELECTRIC_CIRCUITS_DS_URL` is not parse-validated at config time** the way
+  `ELECTRIC_CIRCUITS_PG_URL` now is; an unusable one surfaces as a fatal `is_builder` error on first
+  use (still exit 78, just later).
+- **`wal_level` ≠ `logical` has no conformance test** (the harness cluster is always logical; changing
+  it needs a Postgres restart). Covered by the classifier unit tests and the explicit `SHOW wal_level`
+  call site only.
+- **A `tokio_postgres` error with no SQLSTATE and no io source** (e.g. a server demanding a password
+  the URL lacks) is retried forever rather than exiting 78 — `Kind` is private and matching the
+  `Display` string was rejected. Visible: `/ready` = `waiting` and every attempt is logged.
+- **`ELECTRIC_PROMETHEUS_PORT` is still accepted-but-unimplemented**; `/metrics/prometheus` is now a
+  complete scrape target, which makes the missing dedicated listener slightly more visible.

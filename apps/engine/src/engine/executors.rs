@@ -290,9 +290,74 @@ impl HeapSize for AggShape {
     }
 }
 
+/// An aggregate's fold state, folded **incrementally** by the creator as the backfill streams in.
+///
+/// A backfill never has to be materialised for an aggregate: the creator folds each chunk of rows
+/// into one of these and drops the rows, and activation adopts the result. `AggShape` holds the same
+/// four terms and folds with the same rule ([`fold_agg_row`]), so the seed and the live path can
+/// never disagree about what a row contributes.
+#[derive(Default)]
+pub(crate) struct AggSeed {
+    pub(crate) count: i64,
+    pub(crate) nn_count: i64,
+    pub(crate) sum: f64,
+    pub(crate) multiset: std::collections::BTreeMap<Value, i64>,
+}
+
+impl AggSeed {
+    /// Fold one chunk of backfill rows (each weight `+1`). Matching is the shape's own predicate —
+    /// the SQL pushed into the backfill `SELECT` is only a sound superset filter, so `matches()`
+    /// stays the authority here exactly as it is on the live path.
+    pub(crate) fn fold_rows(
+        &mut self,
+        pred: &CompiledPredicate,
+        func: AggFn,
+        col: Option<usize>,
+        rows: &[Row],
+    ) {
+        for row in rows {
+            if !pred.matches(row) {
+                continue;
+            }
+            fold_agg_row(func, col, row, 1, &mut self.count, &mut self.nn_count, &mut self.sum, &mut self.multiset);
+        }
+    }
+}
+
+/// Fold one row at weight `w` into the `(count, nn_count, sum, multiset)` aggregate terms.
+///
+/// The single implementation shared by the live `AggShape::apply` and the creator-side
+/// [`AggSeed`], so a streamed backfill's seed is arithmetically identical to feeding the same rows
+/// through the live path. NULL column values are excluded (SQL semantics: aggregates ignore NULLs).
+fn fold_agg_row(
+    func: AggFn,
+    col: Option<usize>,
+    row: &Row,
+    w: ZWeight,
+    count: &mut i64,
+    nn_count: &mut i64,
+    sum: &mut f64,
+    multiset: &mut std::collections::BTreeMap<Value, i64>,
+) {
+    *count += w;
+    let Some(ci) = col else { return };
+    let v = row.0.get(ci).cloned().unwrap_or(Value::Null);
+    if matches!(v, Value::Null) {
+        return; // SQL aggregates skip NULLs entirely
+    }
+    *nn_count += w;
+    *sum += value_f64(&v) * (w as f64);
+    if matches!(func, AggFn::Min | AggFn::Max) {
+        let e = multiset.entry(v.clone()).or_insert(0);
+        *e += w;
+        if *e <= 0 {
+            multiset.remove(&v);
+        }
+    }
+}
+
 impl AggShape {
     /// Fold a Z-set delta into the running aggregate. Returns true if any matching row was seen.
-    /// NULL column values are excluded from the fold (SQL semantics: aggregates ignore NULLs).
     pub(crate) fn apply(&mut self, delta: &[Tup2<Row, ZWeight>]) -> bool {
         let mut touched = false;
         for Tup2(row, w) in delta {
@@ -300,22 +365,10 @@ impl AggShape {
                 continue;
             }
             touched = true;
-            self.count += *w;
-            if let Some(ci) = self.col {
-                let v = row.0.get(ci).cloned().unwrap_or(Value::Null);
-                if matches!(v, Value::Null) {
-                    continue; // SQL aggregates skip NULLs entirely
-                }
-                self.nn_count += *w;
-                self.sum += value_f64(&v) * (*w as f64);
-                if matches!(self.func, AggFn::Min | AggFn::Max) {
-                    let e = self.multiset.entry(v.clone()).or_insert(0);
-                    *e += *w;
-                    if *e <= 0 {
-                        self.multiset.remove(&v);
-                    }
-                }
-            }
+            fold_agg_row(
+                self.func, self.col, row, *w,
+                &mut self.count, &mut self.nn_count, &mut self.sum, &mut self.multiset,
+            );
         }
         touched
     }

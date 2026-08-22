@@ -44,6 +44,89 @@ function engineBin(): string {
   return join(repoRoot(), 'target', 'debug', 'electric-circuits-engine')
 }
 
+/** How an engine process exited: `code` for a normal exit, `signal` when it was killed. */
+export interface EngineExit {
+  code: number | null
+  signal: NodeJS.Signals | null
+}
+
+/**
+ * A raw engine child process, with no assumption that it ever becomes ready.
+ *
+ * `bootHarness` waits for `ENGINE_LISTENING` (the boot RESOLVED); this handle exposes the two
+ * stages separately, which is what the boot-taxonomy and graceful-shutdown tests need: a binary
+ * pointed at an unreachable database opens its HTTP port (`ENGINE_BINDING`, so `GET /ready` is
+ * answerable) and never reports listening, and a binary with bad credentials exits 78 without
+ * either.
+ */
+export interface RawEngine {
+  proc: ChildProcess
+  stderr(): string
+  /** The bound base URL, once the process has printed `ENGINE_BINDING` (the port is open). */
+  waitForBinding(timeoutMs?: number): Promise<string>
+  /** The bound base URL, once the boot has fully resolved (`ENGINE_LISTENING`). */
+  waitForListening(timeoutMs?: number): Promise<string>
+  waitForExit(timeoutMs?: number): Promise<EngineExit>
+  signal(sig?: NodeJS.Signals): void
+}
+
+/**
+ * Spawn the engine binary with an explicit environment and hand back control of its lifecycle.
+ * Nothing is awaited here — the caller decides which milestone (if any) it expects.
+ */
+export function spawnRawEngine(env: Record<string, string>): RawEngine {
+  const proc = spawn(engineBin(), [], { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
+  let stderrBuf = ''
+  let stdoutBuf = ''
+  let exited: EngineExit | undefined
+  proc.stderr!.on('data', (d: Buffer) => {
+    const s = d.toString()
+    stderrBuf += s
+    process.stderr.write(s)
+  })
+  proc.stdout!.on('data', (d: Buffer) => {
+    stdoutBuf += d.toString()
+  })
+  proc.on('exit', (code, sig) => {
+    exited = { code, signal: sig }
+  })
+
+  const waitFor = (marker: string, timeoutMs: number) =>
+    new Promise<string>((resolve, reject) => {
+      const deadline = Date.now() + timeoutMs
+      const poll = () => {
+        const m = stdoutBuf.match(new RegExp(`${marker} (\\S+)`))
+        if (m) return resolve(m[1]!)
+        if (exited) return reject(new Error(`engine exited (code ${exited.code}) before printing ${marker}`))
+        if (Date.now() > deadline) return reject(new Error(`engine did not print ${marker} within ${timeoutMs}ms`))
+        setTimeout(poll, 25)
+      }
+      poll()
+    })
+
+  return {
+    proc,
+    stderr: () => stderrBuf,
+    waitForBinding: (timeoutMs = 20000) => waitFor('ENGINE_BINDING', timeoutMs),
+    waitForListening: (timeoutMs = 20000) => waitFor('ENGINE_LISTENING', timeoutMs),
+    waitForExit: (timeoutMs = 30000) =>
+      new Promise<EngineExit>((resolve, reject) => {
+        if (exited) return resolve(exited)
+        const timer = setTimeout(() => {
+          proc.kill('SIGKILL')
+          reject(new Error(`engine did not exit within ${timeoutMs}ms`))
+        }, timeoutMs)
+        proc.once('exit', (code, sig) => {
+          clearTimeout(timer)
+          resolve({ code, signal: sig })
+        })
+      }),
+    signal: (sig: NodeJS.Signals = 'SIGTERM') => {
+      proc.kill(sig)
+    },
+  }
+}
+
 async function spawnEngine(
   dsUrl: string,
   pgUrl: string,
@@ -51,53 +134,23 @@ async function spawnEngine(
   slot: string,
   fault?: string,
   extraEnv?: Record<string, string>,
-): Promise<{ url: string; proc: ChildProcess; stderr: () => string }> {
-  const proc = spawn(engineBin(), [], {
-    env: {
-      ...process.env,
-      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
-      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
-      ELECTRIC_CIRCUITS_LOG: process.env.ELECTRIC_CIRCUITS_LOG ?? 'warn',
-      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
-      ELECTRIC_CIRCUITS_PG_TABLES: tables.join(','),
-      ELECTRIC_CIRCUITS_PG_SLOT: slot,
-      ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
-      ...(fault ? { ELECTRIC_CIRCUITS_FAULT: fault } : {}),
-      ...(extraEnv ?? {}),
-    },
-    // Pipe stderr so tests can assert on engine logs (e.g. no silent `process_envelope failed`); teed
-    // back to our stderr below so it stays visible.
-    stdio: ['ignore', 'pipe', 'pipe'],
+): Promise<{ url: string; proc: ChildProcess; stderr: () => string; raw: RawEngine }> {
+  const raw = spawnRawEngine({
+    ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+    ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+    ELECTRIC_CIRCUITS_LOG: process.env.ELECTRIC_CIRCUITS_LOG ?? 'warn',
+    ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+    ELECTRIC_CIRCUITS_PG_TABLES: tables.join(','),
+    ELECTRIC_CIRCUITS_PG_SLOT: slot,
+    ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
+    ...(fault ? { ELECTRIC_CIRCUITS_FAULT: fault } : {}),
+    ...(extraEnv ?? {}),
   })
-  let stderrBuf = ''
-  proc.stderr!.on('data', (d: Buffer) => {
-    const s = d.toString()
-    stderrBuf += s
-    process.stderr.write(s)
-  })
-  const url = await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      proc.kill('SIGKILL') // don't leak the child if it never reports listening
-      reject(new Error('engine did not report listening within 20s'))
-    }, 20000)
-    let buf = ''
-    proc.stdout!.on('data', (d: Buffer) => {
-      buf += d.toString()
-      const m = buf.match(/ENGINE_LISTENING (\S+)/)
-      if (m) {
-        clearTimeout(timer)
-        resolve(m[1]!)
-      }
-    })
-    proc.on('exit', (code) => {
-      clearTimeout(timer)
-      reject(new Error(`engine exited early with code ${code}`))
-    })
-  }).catch((e) => {
-    proc.kill('SIGKILL')
+  const url = await raw.waitForListening(20000).catch((e: Error) => {
+    raw.proc.kill('SIGKILL') // don't leak the child if it never reports listening
     throw e
   })
-  return { url, proc, stderr: () => stderrBuf }
+  return { url, proc: raw.proc, stderr: raw.stderr, raw }
 }
 
 export interface Harness {
@@ -124,6 +177,20 @@ export interface Harness {
    * things only an absent engine allows (dropping its replication slot, applying DDL).
    */
   restartEngine(whileDown?: () => Promise<void>): Promise<void>
+  /**
+   * Send a signal to the engine process (default `SIGTERM`) WITHOUT waiting for it. The graceful
+   * shutdown tests need the window between the signal and the exit — that is where `/ready` turns
+   * 503 and a parked long-poll must come back.
+   */
+  signalEngine(sig?: NodeJS.Signals): void
+  /** Wait for the current engine process to exit; resolves with its code/signal. */
+  waitForEngineExit(timeoutMs?: number): Promise<EngineExit>
+  /**
+   * Boot a fresh engine process against the same durable streams, Postgres and slot — the second
+   * half of `restartEngine`, exposed on its own for tests that stop the engine themselves (with a
+   * `SIGTERM`, say) rather than killing it.
+   */
+  startEngine(): Promise<void>
   shutdown(): Promise<void>
 }
 
@@ -257,13 +324,20 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
       pgUrl,
       slot,
       engineStderr: () => spawned.stderr(),
+      signalEngine: (sig: NodeJS.Signals = 'SIGTERM') => {
+        proc?.kill(sig)
+      },
+      waitForEngineExit: (timeoutMs = 30000) => spawned.raw.waitForExit(timeoutMs),
+      startEngine: async () => {
+        spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
+        proc = spawned.proc
+        h.engineUrl = spawned.url
+      },
       restartEngine: async (whileDown?: () => Promise<void>) => {
         proc?.kill('SIGKILL')
         await new Promise((r) => proc?.once('exit', r))
         await whileDown?.()
-        spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
-        proc = spawned.proc
-        h.engineUrl = spawned.url
+        await h.startEngine()
         // NOTE: the API server keeps pointing at the dead engine; restart tests exercise the
         // engine + streams directly (the catalog restore is engine state, not API state).
       },

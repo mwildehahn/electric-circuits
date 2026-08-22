@@ -67,8 +67,10 @@ pub(crate) async fn query_rows_by_col(
     let client = crate::pg::pool_for(url).get().await?;
     let where_sql =
         value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
-    let bf = crate::pg::backfill_where(&client, ts, Some(where_sql)).await?;
-    Ok((bf.rows, bf.gate))
+    // `collect`, deliberately: a query-back's RESULT is the candidate set — there is no stream to
+    // append it to, and it is one key's worth of rows, not a table's.
+    let (rows, fences) = crate::pg::backfill_where_reader(&client, ts, Some(where_sql)).await?.collect().await?;
+    Ok((rows, fences.gate))
 }
 
 /// Query all rows of `ts` (full re-derive) from Postgres on a pooled connection, with the read's
@@ -79,8 +81,9 @@ pub(crate) async fn query_rows_all(
 ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
-    let bf = crate::pg::backfill_where(&client, ts, None).await?;
-    Ok((bf.rows, bf.gate))
+    // `collect`: a full re-derive's result IS the in-memory candidate set (see `query_rows_by_col`).
+    let (rows, fences) = crate::pg::backfill_where_reader(&client, ts, None).await?.collect().await?;
+    Ok((rows, fences.gate))
 }
 
 /// Build a `WHERE col = value` fragment + params for a move query-back (the LIVE re-derive path).

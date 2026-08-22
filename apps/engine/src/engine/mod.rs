@@ -199,6 +199,10 @@ pub struct Engine {
     /// Which replication slot, in which cluster, this engine is bound to — and what to do when that
     /// stops being true (see [`engine::epoch`], ADR-0004).
     epoch: Arc<EpochState>,
+    /// The process's graceful-shutdown state (see [`crate::shutdown`]). Held here — not in a global
+    /// — because every part that must join it (the sequencer's select, the ingestor, the `/v1/shape`
+    /// live poll, `GET /ready`) already has an `Engine`.
+    shutdown: crate::shutdown::ShutdownToken,
 }
 
 /// A unit of deferred subquery propagation for the flip propagator (see [`Engine::flip_tx`]).
@@ -616,7 +620,21 @@ impl Engine {
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
+            shutdown: crate::shutdown::ShutdownToken::new(),
         }
+    }
+
+    /// The process's shutdown token — the binary flips it on `SIGTERM`/`SIGINT` and every
+    /// long-running part of the engine joins it (see [`crate::shutdown`]).
+    pub fn shutdown_token(&self) -> crate::shutdown::ShutdownToken {
+        self.shutdown.clone()
+    }
+
+    /// Wait for every durable-catalog event sent so far to be appended (or `timeout`). The last
+    /// step of a graceful shutdown: the sequencer's final `Offset` is *queued* when it stops, and
+    /// only a drained queue makes it the position the next boot resumes from.
+    pub async fn drain_catalog(&self, timeout: std::time::Duration) -> bool {
+        self.catalog_tx.drain(timeout).await
     }
 
     /// Configure the always-on dbsp arrangement layer (call before
@@ -822,6 +840,7 @@ impl Engine {
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
+                self.shutdown.clone(),
             ));
         }
         st.sequencer.as_ref().expect("sequencer just spawned")
@@ -856,12 +875,47 @@ impl Engine {
         }
     }
 
+    /// Put the boot phase back to `waiting` — "not connected to Postgres, and about to try again".
+    ///
+    /// The binary's connect loop calls this after a retryable failure, because a failed attempt
+    /// leaves the phase wherever it got to (`starting`, once the connection was open) and a whole
+    /// backoff reported as `starting` tells an orchestrator the engine is making progress when it
+    /// is in fact waiting to redial.
+    pub fn set_waiting(&self) {
+        self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The `GET /ready` status word — the **readiness** probe, as distinct from the liveness one
+    /// (`GET /health`, which is "the process is running" and nothing more).
+    ///
+    /// `active` (200) means every precondition for serving is met: Postgres connected, the slot
+    /// verified against the epoch binding, the durable catalog restored, the ingestor spawned, no
+    /// degradation, no broken epoch. Anything else is 503 with the word that says why —
+    /// `waiting` (no Postgres yet), `starting` (introspecting / restoring), `degraded`,
+    /// or `shutting_down`.
+    ///
+    /// Shutdown outranks everything: the instant a `SIGTERM` lands this reports `shutting_down`, so
+    /// a load balancer stops routing to the pod BEFORE the engine starts winding anything down.
+    pub fn readiness_status(&self) -> &'static str {
+        if self.shutdown.is_shutting_down() {
+            return "shutting_down";
+        }
+        self.health_status()
+    }
+
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
     /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
     /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
     pub async fn setup_postgres(&self, selectors: &[TableSelector], slot: &str) -> Result<()> {
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
+        // A retryable failure below brings the boot back here (see the binary's connect loop), so
+        // the phase is reset rather than left wherever the last attempt stopped: `/ready` must say
+        // `waiting` while the engine is trying to reach Postgres, not `starting`.
+        self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         let client = crate::pg::connect(&url).await?;
+        // `wal_level` is checked explicitly, first, rather than left to surface as a slot-creation
+        // failure: it needs a Postgres RESTART to change, so it deserves its own named refusal.
+        crate::pg::check_wal_level(&client).await?;
         // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
         // ingest spawn still ahead). `/v1/health` reports 202 until the ingest loop is running.
         self.health.store(HEALTH_STARTING, std::sync::atomic::Ordering::Relaxed);
@@ -1003,6 +1057,9 @@ impl Engine {
         // It is spawned even when the epoch is broken and the policy is refuse: `EpochEvents`
         // refuses every connection until `POST /epoch/reset`, so it parks in its backoff loop and
         // starts streaming the moment the operator acts — no ingest happens in the meantime.
+        // Registered BEFORE the spawn so the shutdown wait can never observe "no parties" in the
+        // window between deciding to start the ingestor and the task actually running.
+        let party = self.shutdown.party("replication ingestor");
         tokio::spawn(crate::replication::run(
             url,
             slot.to_string(),
@@ -1014,6 +1071,8 @@ impl Engine {
             self.repl_lsn.clone(),
             self.repl_sync.clone(),
             self.txn_cfg.lock().unwrap().clone(),
+            self.shutdown.clone(),
+            party,
         ));
         // DDL with no following DML produces no `Relation` message; the reconciler catches it.
         self.ensure_schema_reconciler();

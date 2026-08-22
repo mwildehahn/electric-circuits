@@ -1,7 +1,8 @@
 //! Integration tests for the fleet HTTP surface added to the engine router: `/v1/health` (state
-//! machine + exact body + status codes + cache headers), `GET /` (200 empty), and the
-//! `OPTIONS /v1/shape` CORS preflight. The router is driven in-process via `Service::oneshot`; no
-//! Postgres or durable-streams server is needed (the health phase is set at Engine construction).
+//! machine + exact body + status codes + cache headers), `GET /` (200 empty), the
+//! `OPTIONS /v1/shape` CORS preflight, and the liveness/readiness split (`/health` vs `/ready`).
+//! The router is driven in-process via `Service::oneshot`; no Postgres or durable-streams server is
+//! needed (the health phase is set at Engine construction).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -65,6 +66,121 @@ async fn options_shape_is_cors_preflight() {
         res.headers().get("access-control-allow-methods").unwrap(),
         "GET, POST, HEAD, DELETE, OPTIONS"
     );
+}
+
+/// `GET /ready` is the probe a load balancer gates on: 200 only when the engine is actually able
+/// to serve. Library mode has nothing to wait for, so it is ready from construction.
+#[tokio::test]
+async fn ready_is_200_active_in_library_mode() {
+    let res = router(library_engine())
+        .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("cache-control").unwrap(), "no-cache, no-store, must-revalidate");
+    assert_eq!(body_string(res).await, r#"{"status":"active"}"#);
+}
+
+/// Postgres mode before `setup_postgres`: NOT ready (503 `waiting`), while `/v1/health` answers its
+/// fleet-parity 202 for the same phase. The two probes are deliberately different contracts.
+#[tokio::test]
+async fn ready_is_503_waiting_before_postgres_is_up() {
+    let engine = Engine::new_pg(DsClient::new("http://127.0.0.1:1"), "postgres://x/y".into());
+    assert_eq!(engine.readiness_status(), "waiting");
+    let res = router(engine)
+        .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_string(res).await, r#"{"status":"waiting"}"#);
+}
+
+/// A degraded engine is live but not ready — and `/health` must NOT go with it, or a kubelet would
+/// restart a pod whose problem a restart is the documented fix for only when an operator says so.
+#[tokio::test]
+async fn degraded_is_not_ready_but_is_still_live() {
+    let engine = library_engine();
+    engine.force_degraded();
+    assert_eq!(engine.readiness_status(), "degraded");
+
+    let res = router(engine.clone())
+        .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_string(res).await, r#"{"status":"degraded"}"#);
+
+    let res = router(engine)
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "liveness must not follow readiness");
+    assert_eq!(body_string(res).await, "ok");
+}
+
+/// The first thing a `SIGTERM` does: `/ready` turns 503 `shutting_down` so a load balancer drains
+/// the pod BEFORE anything is wound down. Liveness and `/v1/health` are untouched — the process is
+/// still perfectly able to answer what it already accepted.
+#[tokio::test]
+async fn shutdown_makes_ready_503_before_anything_else_changes() {
+    let engine = library_engine();
+    engine.shutdown_token().begin();
+    assert_eq!(engine.readiness_status(), "shutting_down");
+    assert_eq!(engine.health_status(), "active", "shutdown must not rewrite the boot phase");
+
+    let res = router(engine.clone())
+        .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_string(res).await, r#"{"status":"shutting_down"}"#);
+
+    let res = router(engine.clone())
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = router(engine)
+        .oneshot(Request::builder().uri("/v1/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "the fleet healthcheck is unchanged by shutdown");
+    assert_eq!(body_string(res).await, r#"{"status":"active"}"#);
+}
+
+/// A NEW `live=true` request during the drain is answered `503` + `Retry-After: 1`, not an empty
+/// 204. Electric's client re-polls a 204 immediately, so 204 would turn the drain window into a
+/// tight poll loop for every live subscriber; a 5xx is what it backs off on.
+#[tokio::test]
+async fn a_new_live_poll_during_the_drain_is_told_to_come_back() {
+    let engine = library_engine();
+    engine.shutdown_token().begin();
+    let res = router(engine)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/shape?table=items&handle=h1&offset=0_0&live=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.headers().get("retry-after").unwrap(), "1");
+    assert!(body_string(res).await.contains("shutting down"));
+}
+
+/// ...and a NON-live request is not: the drain window exists precisely so requests the engine has
+/// already accepted still get served.
+#[tokio::test]
+async fn a_non_live_request_during_the_drain_is_served_normally() {
+    let engine = library_engine();
+    engine.shutdown_token().begin();
+    let res = router(engine)
+        .oneshot(Request::builder().uri("/v1/shape?table=items&offset=-1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "only live polls are turned away");
 }
 
 #[tokio::test]

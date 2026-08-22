@@ -343,17 +343,36 @@ fn must_refetch() -> Response {
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// `Retry-After`, in seconds, when the answer is "come back" rather than "you were wrong".
+    retry_after: Option<u32>,
 }
 
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
-        ApiError { status: StatusCode::BAD_REQUEST, message: message.into() }
+        ApiError { status: StatusCode::BAD_REQUEST, message: message.into(), retry_after: None }
+    }
+
+    /// A NEW `live=true` request arriving after the shutdown token flipped.
+    ///
+    /// Returning the ordinary empty 204 would be technically correct and practically awful: an
+    /// Electric client re-polls immediately on a 204, so every live subscriber would spin a tight
+    /// poll loop for the whole drain window. A 5xx is what the client backs off on, and
+    /// `Retry-After` says for how long — by which time this pod is gone and the client reconnects
+    /// to its successor. Polls ALREADY parked are untouched: they return their normal 204 with the
+    /// offset they had (see `poll_live_until`), because they were promised an answer before any of
+    /// this started.
+    fn draining() -> Self {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "engine is shutting down; retry".to_string(),
+            retry_after: Some(1),
+        }
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:#}") }
+        ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:#}"), retry_after: None }
     }
 }
 
@@ -363,6 +382,11 @@ impl IntoResponse for ApiError {
         let len = body.len() as u64;
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(secs) = self.retry_after {
+            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                headers.insert(axum::http::header::RETRY_AFTER, v);
+            }
+        }
         let mut resp = (self.status, headers, body).into_response();
         resp.extensions_mut().insert(BodyLen(len));
         resp
@@ -391,6 +415,8 @@ fn offset_after(a: &str, b: &str) -> bool {
 /// **not** end the fold (that truncated snapshots), but a `closed` page does: a retired stream is
 /// terminal, so there is nothing further to wait for.
 struct StreamFold {
+    /// Key → current row value. When [`Self::keys_only`] is set the values are dropped as they are
+    /// folded (stored as `Null`) — see [`Self::up_to`].
     rows: HashMap<String, serde_json::Value>,
     /// Keys in first-appearance (stream) order. `rows` alone would randomize the snapshot's
     /// row order per request (HashMap iteration), which readers observably depend on — the
@@ -399,20 +425,36 @@ struct StreamFold {
     order: Vec<String>,
     offset: String,
     until: Option<String>,
+    /// Fold membership only: the caller wants the KEY SET, so a row's value is dropped the moment
+    /// its key is recorded. Everything else about the fold is identical — a delete still removes the
+    /// key, an upsert still adds it — so the key set is the same either way, at a fraction of the
+    /// memory for a wide shape.
+    keys_only: bool,
     done: bool,
 }
 
 impl StreamFold {
     fn to_tail() -> Self {
-        StreamFold { rows: HashMap::new(), order: Vec::new(), offset: "-1".into(), until: None, done: false }
+        StreamFold {
+            rows: HashMap::new(),
+            order: Vec::new(),
+            offset: "-1".into(),
+            until: None,
+            keys_only: false,
+            done: false,
+        }
     }
 
+    /// Rebuild the KEY SET as of `offset`. Values are never retained: the only consumer
+    /// ([`keys_as_of`]) throws them away, and a `/v1/shape` catch-up over a wide shape should not
+    /// hold a table's worth of JSON to work out which keys the client has.
     fn up_to(offset: &str) -> Self {
         StreamFold {
             rows: HashMap::new(),
             order: Vec::new(),
             offset: "-1".into(),
             until: Some(offset.to_string()),
+            keys_only: true,
             done: false,
         }
     }
@@ -436,6 +478,7 @@ impl StreamFold {
                 }
                 _ => {
                     if let Some(v) = env.value {
+                        let v = if self.keys_only { serde_json::Value::Null } else { v };
                         if self.rows.insert(env.key.clone(), v).is_none() {
                             self.order.push(env.key);
                         }
@@ -611,6 +654,7 @@ where
 async fn poll_live_until<F, Fut, E>(
     mut from: String,
     deadline: Instant,
+    shutdown: &crate::shutdown::ShutdownToken,
     mut read: F,
 ) -> Result<ReadResult, E>
 where
@@ -623,7 +667,16 @@ where
         if remaining.is_zero() {
             return Ok(last);
         }
-        match tokio::time::timeout(remaining, read(from.clone())).await {
+        // Shutdown ends the poll like an expired deadline: the client gets its 204 with the offset
+        // it had, and re-polls the next process. Without this a parked `live=true` request would
+        // hold the whole termination grace hostage for its full ~20 s window — the single loudest
+        // symptom of an engine that does not shut down gracefully.
+        let page = tokio::select! {
+            biased;
+            _ = shutdown.wait() => return Ok(last),
+            r = tokio::time::timeout(remaining, read(from.clone())) => r,
+        };
+        match page {
             Err(_elapsed) => return Ok(last),
             Ok(page) => {
                 let page = page?;
@@ -662,7 +715,8 @@ async fn positioned_read(
         let deadline = Instant::now() + live_timeout();
         let read_engine = engine.clone();
         let path = entry.stream_path.clone();
-        poll_live_until(from, deadline, move |f| {
+        let shutdown = engine.shutdown_token();
+        poll_live_until(from, deadline, &shutdown, move |f| {
             let engine = read_engine.clone();
             let path = path.clone();
             async move { engine.read_shape_stream(&path, &f, true).await }
@@ -791,6 +845,11 @@ async fn shape_inner(
 ) -> Result<Response, ApiError> {
     let offset = p.offset.clone().unwrap_or_else(|| "-1".into());
     let live = p.live.as_deref() == Some("true");
+    // Checked first, before the table lookup: a draining engine's cheapest useful answer to a new
+    // long-poll is "come back in a second", and it costs one atomic load to give.
+    if live && engine.shutdown_token().is_shutting_down() {
+        return Err(ApiError::draining());
+    }
     let columns = col_csv(&p.columns);
     let _ = &p.cursor; // accepted (cache-busting hint); we mint our own electric-cursor
     let _ = &p.replica; // accepted; we always send full rows (replica=full semantics)
@@ -947,6 +1006,7 @@ async fn shape_inner(
 mod tests {
     use super::*;
     use crate::ds::EnvelopeHeaders;
+    use crate::shutdown::ShutdownToken;
 
     fn env(op: &str, key: &str, offset: &str) -> Envelope {
         Envelope {
@@ -1009,7 +1069,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn live_poll_deadline_fires_through_hanging_read() {
         let deadline = Instant::now() + Duration::from_millis(200);
-        let r = poll_live_until("00".into(), deadline, |_from| async {
+        let r = poll_live_until("00".into(), deadline, &ShutdownToken::new(), |_from| async {
             // Simulates the ds server parking an idle long-poll indefinitely.
             tokio::time::sleep(Duration::from_secs(3600)).await;
             Ok::<ReadResult, ()>(page(vec![], "01", false))
@@ -1020,10 +1080,52 @@ mod tests {
         assert_eq!(r.next_offset, None, "mid-poll expiry must not advance the offset");
     }
 
+    /// The graceful-shutdown property: a `live=true` request parked on an idle stream must return
+    /// as soon as the token flips, not at its ~20 s deadline. Without this a single long-poll pins
+    /// the pod's whole termination grace.
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_returns_at_once_when_shutdown_begins() {
+        let shutdown = ShutdownToken::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s2.begin();
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let started = Instant::now();
+        let r = poll_live_until("00".into(), deadline, &shutdown, |_from| async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok::<ReadResult, ()>(page(vec![], "01", false))
+        })
+        .await
+        .unwrap();
+        assert!(r.envelopes.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown must end the poll immediately, not at the live deadline"
+        );
+    }
+
+    /// A token that is ALREADY flipped when the poll starts must not enter the read at all.
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_does_not_start_once_shutdown_has_begun() {
+        let shutdown = ShutdownToken::new();
+        shutdown.begin();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let r = poll_live_until("00".into(), deadline, &shutdown, |_from| async {
+            panic!("the read must not be entered after shutdown has begun");
+            #[allow(unreachable_code)]
+            Ok::<ReadResult, ()>(page(vec![], "01", false))
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.next_offset, None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn live_poll_returns_data_before_deadline() {
         let deadline = Instant::now() + Duration::from_secs(20);
-        let r = poll_live_until("00".into(), deadline, |_from| async {
+        let r = poll_live_until("00".into(), deadline, &ShutdownToken::new(), |_from| async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok::<ReadResult, ()>(page(vec![env("upsert", "k1", "01")], "01", false))
         })
@@ -1038,7 +1140,7 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(0));
         let deadline = Instant::now() + Duration::from_millis(500);
         let c = calls.clone();
-        let r = poll_live_until("00".into(), deadline, move |from| {
+        let r = poll_live_until("00".into(), deadline, &ShutdownToken::new(), move |from| {
             let c = c.clone();
             async move {
                 if c.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1063,6 +1165,24 @@ mod tests {
     }
 
     // C2: rebuilding the key set as of the client's *requested* offset (not the tail).
+    /// `up_to` is a KEY-SET fold: the values never reach memory, but membership is identical (a
+    /// delete past the requested offset is still ignored, an upsert still adds the key).
+    #[test]
+    fn fold_up_to_keeps_keys_and_drops_values() {
+        let mut fold = StreamFold::up_to("02");
+        fold.apply_page(page(vec![env("upsert", "k1", "01"), env("upsert", "k2", "02")], "02", true));
+        assert_eq!(fold.rows.len(), 2);
+        assert!(
+            fold.rows.values().all(|v| v.is_null()),
+            "a key-set fold must not retain row values: {:?}",
+            fold.rows
+        );
+        // The snapshot fold, by contrast, keeps them — it IS the response body.
+        let mut snap = StreamFold::to_tail();
+        snap.apply_page(page(vec![env("upsert", "k1", "01")], "01", true));
+        assert!(snap.rows.values().all(|v| !v.is_null()));
+    }
+
     #[test]
     fn fold_up_to_stops_at_the_requested_offset() {
         // Stream: insert k1 @01, insert k2 @02, delete k2 @03. A client at offset 02 holds {k1, k2}.

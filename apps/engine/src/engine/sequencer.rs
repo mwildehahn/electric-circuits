@@ -37,17 +37,19 @@ pub(crate) enum SequencerCmd {
         kind: CreateKind,
         ack: tokio::sync::oneshot::Sender<()>,
     },
-    /// Phase 2: the creator's backfill snapshot is appended (plain) or carried as `agg_seed`
-    /// (aggregates); drain the buffered deltas through the shape's snapshot gate and go live.
+    /// Phase 2: the creator's backfill snapshot has been appended chunk by chunk (plain) or folded
+    /// into `agg_seed` (aggregates); drain the buffered deltas through the shape's snapshot gate
+    /// and go live.
     /// `ready` mirrors the old add-shape handshake: `Ok(())` once the shape is live and its
     /// snapshot + gated buffer are on the stream, `Err(reason)` otherwise.
     ActivateShape {
         table: TableRef,
         shape_id: String,
         gate: crate::pg::SnapshotGate,
-        /// Backfill rows for seeding an aggregate's fold (empty for plain shapes — the creator
-        /// already appended their snapshot envelopes).
-        agg_seed: Vec<Row>,
+        /// An aggregate's fold, already seeded by the creator from the streamed backfill (`None`
+        /// for plain shapes — the creator appended their snapshot envelopes chunk by chunk — and
+        /// for a reactivation, whose state comes from the change-log replay).
+        agg_seed: Option<AggSeed>,
         /// Snapshot envelopes the creator appended (seeds the shape's emit counter).
         emitted_seed: u64,
         ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
@@ -109,11 +111,15 @@ pub(crate) fn spawn_sequencer(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
+    shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new(start.clone()));
     let stats = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let node_states = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Registered before the spawn: the shutdown wait must never see "no parties" in the window
+    // between deciding to run a sequencer and the task existing.
+    let party = shutdown.party("sequencer");
     tokio::spawn(sequencer_loop(
         ds,
         tables,
@@ -128,6 +134,8 @@ pub(crate) fn spawn_sequencer(
         trace_tx,
         arr,
         arr_gates,
+        shutdown,
+        party,
     ));
     SequencerHandle { cmd_tx, processed, stats, node_states }
 }
@@ -273,6 +281,9 @@ pub(crate) async fn sequencer_loop(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
+    shutdown: crate::shutdown::ShutdownToken,
+    // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
+    _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut pos = start;
@@ -450,6 +461,16 @@ pub(crate) async fn sequencer_loop(
                 }
                 None => break,
             },
+            // Graceful shutdown. Placed AFTER commands (so anything already queued is still
+            // answered — a create waiting on `ready` gets its answer rather than a dropped channel)
+            // and BEFORE the read, so the change-log long-poll below is abandoned at once instead
+            // of holding the pod's termination grace for its full window. Abandoning a read loses
+            // nothing: `pos` is only advanced inside the branch body, so the next boot re-reads
+            // from the checkpoint written just below.
+            _ = shutdown.wait() => {
+                tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
+                break;
+            }
             res = ds.read(&read_path, &read_off, true) => match res {
                 Ok(rr) => {
                     let next = rr.next_offset.clone();
@@ -500,10 +521,12 @@ pub(crate) async fn sequencer_loop(
                                 key,
                                 run_key_owned(&envs[0]),
                             );
+                            metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
                             held.clear();
                             held_from = None;
                             held_since = None;
                             held_warnings = 0;
+                            metrics().sequencer_held_run.store(0, Ordering::Relaxed);
                         } else {
                             // Only the leading run is filtered; everything after the first envelope
                             // of a different transaction passes through untouched.
@@ -537,6 +560,7 @@ pub(crate) async fn sequencer_loop(
                                 held_warnings = 0;
                             }
                             held = envs.split_off(cut);
+                            metrics().sequencer_held_run.store(1, Ordering::Relaxed);
                             let since = *held_since.get_or_insert_with(std::time::Instant::now);
                             // A hold longer than a minute is no longer "the next chunk is coming":
                             // ingest has stalled mid-transaction, and everything downstream of
@@ -563,6 +587,7 @@ pub(crate) async fn sequencer_loop(
                             held_from = None;
                             held_since = None;
                             held_warnings = 0;
+                            metrics().sequencer_held_run.store(0, Ordering::Relaxed);
                         }
                     }
                     // Split the read batch into transactions (runs of equal (txid, lsn) — the
@@ -729,14 +754,35 @@ pub(crate) async fn sequencer_loop(
                          segment the durable checkpoint has not passed, so storage has lost data or something \
                          outside the engine deleted it; the sequencer cannot advance. Backing off.",
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    // Cut short by a shutdown: this backoff is dead time, and spending 5 s of a
+                    // 25 s grace on it would be for nothing (the loop re-selects and breaks anyway).
+                    back_off(&shutdown, std::time::Duration::from_secs(5)).await;
                 }
                 Err(e) => {
                     tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    back_off(&shutdown, std::time::Duration::from_millis(200)).await;
                 }
             },
         }
+    }
+    // The loop is only left on shutdown (or on the command channel closing, i.e. the engine going
+    // away). Either way the batch it was in the middle of is fully fanned out and flushed — the
+    // select only chooses at the TOP of the loop — so one last `Offset` makes the position (and the
+    // de-duplication highwater riding with it) durable. Without it, everything since the last lazy
+    // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
+    // held run it would also re-read a transaction the ingestor never finished.
+    let ckpt = published(&pos, &held_from);
+    catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
+    tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
+}
+
+/// Wait out a read-error backoff, cut short by a shutdown. The backoff exists to stop a failing
+/// read spinning; once the process is going away there is nothing left to pace, and sleeping it out
+/// would spend the termination grace on dead time.
+async fn back_off(shutdown: &crate::shutdown::ShutdownToken, d: std::time::Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => {}
+        _ = shutdown.wait() => {}
     }
 }
 
@@ -805,7 +851,7 @@ pub(crate) async fn activate_shape(
     table: &TableRef,
     shape_id: &str,
     gate: crate::pg::SnapshotGate,
-    agg_seed: Vec<Row>,
+    agg_seed: Option<AggSeed>,
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
 ) -> Result<()> {
@@ -883,22 +929,22 @@ pub(crate) async fn activate_shape(
             }
         }
         CreateKind::Aggregate { func, col } => {
-            // Seed the fold from the backfill rows, emit the initial value, then fold the gated
-            // buffer (emitting a value envelope whenever the aggregate moves).
+            // Adopt the fold the creator built while STREAMING the backfill (no backfill rows ever
+            // existed in one place), emit the initial value, then fold the gated buffer (emitting a
+            // value envelope whenever the aggregate moves).
+            let seed = agg_seed.unwrap_or_default();
             let mut agg = AggShape {
                 pred: p.pred.clone(),
                 func,
                 col,
                 stream_path: p.stream_path.clone(),
                 gate: gate.clone(),
-                count: 0,
-                nn_count: 0,
-                sum: 0.0,
-                multiset: std::collections::BTreeMap::new(),
+                count: seed.count,
+                nn_count: seed.nn_count,
+                sum: seed.sum,
+                multiset: seed.multiset,
                 last: None,
             };
-            let seed: Vec<Tup2<Row, ZWeight>> = agg_seed.iter().map(|r| Tup2(r.clone(), 1)).collect();
-            agg.apply(&seed);
             let mut outs = vec![agg.envelope(&exec.ts, None, None)];
             agg.last = Some(agg.value());
             for env in &p.buffered {
@@ -1022,10 +1068,18 @@ pub(crate) async fn replay_changes_for_shape(
     Ok(emitted)
 }
 
-/// Creator-side half of the two-phase shape creation: await the pending-buffer ack, run the
-/// Postgres backfill on a pooled connection (appending the snapshot for plain shapes), then
-/// activate. The sequencer keeps processing other work the whole time — a slow backfill only
-/// delays THIS shape. Returns the creation outcome (`Err(reason)` mirrors the old handshake).
+/// Creator-side half of the two-phase shape creation: await the pending-buffer ack, **stream** the
+/// Postgres backfill on a pooled connection (appending it chunk by chunk for a plain shape, folding
+/// it for an aggregate), then activate. The sequencer keeps processing other work the whole time —
+/// a slow backfill only delays THIS shape. Returns the creation outcome (`Err(reason)` mirrors the
+/// old handshake).
+///
+/// **Nothing here ever holds a whole backfill.** The snapshot arrives in chunks bounded by
+/// `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`, and each chunk is appended (or folded) and dropped
+/// before the next is read, so the creator's memory is one chunk for a table of any size. Chunking
+/// needs no protocol change: the shape is PENDING until `ActivateShape` lands, so a partly-appended
+/// snapshot is on a stream no subscriber is reading yet, and a failure aborts the pending shape and
+/// rolls the whole creation back exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn backfill_and_activate(
     ds: &DsClient,
@@ -1038,7 +1092,10 @@ pub(crate) async fn backfill_and_activate(
     pred: &Arc<CompiledPredicate>,
     out_cols: Option<&Arc<Vec<usize>>>,
     changes_only: bool,
-    is_aggregate: bool,
+    // `Some((func, col))` makes this an aggregate: the backfill is FOLDED into an `AggSeed` rather
+    // than appended as snapshot envelopes.
+    aggregate: Option<(AggFn, Option<usize>)>,
+    shutdown: &crate::shutdown::ShutdownToken,
     ack_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> std::result::Result<(), String> {
     let abort = || {
@@ -1055,39 +1112,15 @@ pub(crate) async fn backfill_and_activate(
     // superset). A `changes_only` feed skips the backfill and forwards only future matches
     // (passthrough gate) — the non-materialized live tail a subset query follows.
     let (gate, agg_seed, emitted_seed) = if changes_only {
-        (crate::pg::SnapshotGate::passthrough(), Vec::new(), 0u64)
+        (crate::pg::SnapshotGate::passthrough(), None, 0u64)
     } else {
         let t0 = std::time::Instant::now();
-        let bf = match pg_backfill(pg_url, ts, Some(pred.as_ref())).await {
-            Ok(bf) => bf,
+        match stream_backfill(ds, pg_url, ts, pred, out_cols, stream_path, aggregate, shutdown, t0).await {
+            Ok(v) => v,
             Err(e) => {
                 abort();
-                return Err(format!("{e:#}"));
+                return Err(e);
             }
-        };
-        let make_new_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if is_aggregate {
-            // The sequencer seeds the fold and emits the initial value itself.
-            (bf.gate, bf.rows, 0)
-        } else {
-            let out: Vec<(Row, ZWeight)> =
-                bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
-            let rows = out.len() as u64;
-            let mut snapshot_bytes = 0u64;
-            let mut emitted_seed = 0u64;
-            if !out.is_empty() {
-                let envs = translate_output(ts, out, None, None, out_cols.map(|c| c.as_slice()));
-                if crate::statsd::enabled() {
-                    snapshot_bytes = envs_bytes(&envs);
-                }
-                if let Err(e) = ds.append(stream_path, &envs).await {
-                    abort();
-                    return Err(format!("append snapshot: {e:#}"));
-                }
-                emitted_seed = envs.len() as u64;
-            }
-            crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
-            (bf.gate, Vec::new(), emitted_seed)
         }
     };
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -1107,27 +1140,100 @@ pub(crate) async fn backfill_and_activate(
     ready_rx.await.unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
 }
 
-/// Read a backfill snapshot from Postgres (current rows + snapshot LSN). `filter`, when given, is the
-/// shape's predicate — backfill reads only matching rows instead of the whole table. Without a
-/// `pg_url` (library/no-source mode) the shape simply starts empty.
-pub(crate) async fn pg_backfill(
+/// What a create is refused with when a shutdown interrupts it. The client's move is to retry
+/// against the next process, so it reads as a retry instruction, not as a failure of the request.
+pub(crate) const SHUTTING_DOWN: &str = "engine is shutting down; retry the create against the next process";
+
+/// Stream one shape's backfill: chunk in, chunk out, nothing accumulated.
+///
+/// For a plain shape each chunk is filtered, translated and appended to the (still pending) shape
+/// stream; for an aggregate each chunk is folded into the seed. Returns the snapshot gate, the
+/// aggregate seed, and how many envelopes the snapshot appended (which seeds the shape's emit
+/// counter).
+#[allow(clippy::too_many_arguments)]
+async fn stream_backfill(
+    ds: &DsClient,
     pg_url: &Option<String>,
     ts: &TableSchema,
-    filter: Option<&CompiledPredicate>,
-) -> Result<crate::pg::Backfill> {
-    match pg_url {
-        Some(url) => {
-            let client = crate::pg::pool_for(url).get().await?;
-            crate::pg::backfill(&client, ts, filter).await
-        }
-        None => Ok(crate::pg::Backfill {
-            rows: Vec::new(),
-            seed_lsn: "0/0".to_string(),
-            gate: crate::pg::SnapshotGate::passthrough(),
-        }),
-    }
-}
+    pred: &Arc<CompiledPredicate>,
+    out_cols: Option<&Arc<Vec<usize>>>,
+    stream_path: &str,
+    aggregate: Option<(AggFn, Option<usize>)>,
+    shutdown: &crate::shutdown::ShutdownToken,
+    t0: std::time::Instant,
+) -> std::result::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64), String> {
+    // Library/no-source mode: the shape simply starts empty (and an aggregate starts at its
+    // empty-set value), exactly as the materialising version did.
+    let Some(url) = pg_url.as_deref() else {
+        return Ok((
+            crate::pg::SnapshotGate::passthrough(),
+            aggregate.map(|_| AggSeed::default()),
+            0,
+        ));
+    };
+    let client = crate::pg::pool_for(url).get().await.map_err(|e| format!("{e:#}"))?;
+    let mut reader = crate::pg::backfill_reader(&client, ts, Some(pred.as_ref()))
+        .await
+        .map_err(|e| format!("{e:#}"))?;
 
+    let mut agg_seed = aggregate.map(|_| AggSeed::default());
+    let mut rows_total = 0u64;
+    let mut snapshot_bytes = 0u64;
+    let mut emitted_seed = 0u64;
+    let mut appends = 0u64;
+    loop {
+        // A chunk boundary is this loop's safe point. Without it a backfill over a large table is
+        // an un-interruptible span of the termination grace — the exact shape of the boot's
+        // un-raced connect. Aborting costs nothing: the shape is still PENDING, so the caller's
+        // rollback removes the partly-appended stream and the client simply creates it again.
+        if shutdown.is_shutting_down() {
+            return Err(SHUTTING_DOWN.to_string());
+        }
+        let chunk = match reader.next_chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => return Err(format!("{e:#}")),
+        };
+        rows_total += chunk.len() as u64;
+        match (&mut agg_seed, aggregate) {
+            // The sequencer no longer receives rows for an aggregate: the fold happens here, one
+            // chunk at a time, and the chunk is dropped.
+            (Some(seed), Some((func, col))) => seed.fold_rows(pred.as_ref(), func, col, &chunk),
+            _ => {
+                let out: Vec<(Row, ZWeight)> =
+                    chunk.into_iter().filter(|r| pred.matches(r)).map(|r| (r, 1)).collect();
+                if out.is_empty() {
+                    continue;
+                }
+                let envs = translate_output(ts, out, None, None, out_cols.map(|c| c.as_slice()));
+                if crate::statsd::enabled() {
+                    snapshot_bytes += envs_bytes(&envs);
+                }
+                emitted_seed += envs.len() as u64;
+                if let Err(e) = ds.append(stream_path, &envs).await {
+                    return Err(format!("append snapshot: {e:#}"));
+                }
+                appends += 1;
+            }
+        }
+    }
+    // A backfill that fit in one append contributes 0, same accounting as a chunked commit's.
+    if appends > 1 {
+        metrics().backfill_chunked_appends.fetch_add(appends, Ordering::Relaxed);
+        tracing::info!(
+            table = %ts.table,
+            rows = rows_total,
+            chunks = appends,
+            duration_ms = t0.elapsed().as_secs_f64() * 1000.0,
+            "large backfill appended in chunks"
+        );
+    }
+    let fences = reader.finish().await;
+    if agg_seed.is_none() {
+        crate::statsd::snapshot_stored(rows_total, snapshot_bytes, t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok((fences.gate, agg_seed, emitted_seed))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_envelope(

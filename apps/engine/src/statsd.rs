@@ -310,6 +310,10 @@ pub fn slot_gauge_values(wal: &str, restart: Option<&str>, confirmed: Option<&st
 
 /// Emit the replication-slot WAL gauges for one sample (`wal` = pg_current_wal_lsn, `restart`/`confirmed`
 /// from `pg_replication_slots` for our slot). No-op when StatsD is off.
+///
+/// The sample itself is taken by the **engine-owned** sampler
+/// ([`crate::metrics::spawn_replication_slot_sampler`]), which publishes the same numbers as engine
+/// gauges so `GET /metrics` and `GET /metrics/prometheus` see them with or without StatsD.
 pub fn replication_slot_gauges(wal: &str, restart: Option<&str>, confirmed: Option<&str>) {
     let Some(s) = statsd() else { return };
     for (name, v) in slot_gauge_values(wal, restart, confirmed) {
@@ -472,61 +476,6 @@ pub fn spawn_storage_sampler(dir: Option<String>) {
             }
         }
     });
-}
-
-/// Spawn the replication-slot WAL sampler on its own ~10s cadence (Electric's cadence for these), pg
-/// mode only. Holds a single PG connection (reconnecting on failure). No-op when StatsD is off.
-pub fn spawn_replication_slot_sampler(pg_url: String, slot: String) {
-    if !enabled() {
-        return;
-    }
-    tokio::spawn(replication_slot_sampler(pg_url, slot));
-}
-
-async fn replication_slot_sampler(pg_url: String, slot: String) {
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut client: Option<tokio_postgres::Client> = None;
-    let mut logged_err = false;
-    loop {
-        tick.tick().await;
-        if client.is_none() {
-            match crate::pg::connect(&pg_url).await {
-                Ok(c) => {
-                    client = Some(c);
-                    logged_err = false;
-                }
-                Err(e) => {
-                    if !logged_err {
-                        tracing::warn!("statsd slot sampler: connect failed: {e:#}; will retry");
-                        logged_err = true;
-                    }
-                    continue;
-                }
-            }
-        }
-        // pg_current_wal_lsn() (primary) + our slot's restart/confirmed LSNs. NULLs (fresh slot) are
-        // reported as None -> the corresponding delta metric is omitted, never faked.
-        let q = "select pg_current_wal_lsn()::text, restart_lsn::text, confirmed_flush_lsn::text \
-                 from pg_replication_slots where slot_name = $1";
-        match client.as_ref().unwrap().query_opt(q, &[&slot]).await {
-            Ok(Some(row)) => {
-                let wal: String = row.get(0);
-                let restart: Option<String> = row.get(1);
-                let confirmed: Option<String> = row.get(2);
-                replication_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref());
-                logged_err = false;
-            }
-            Ok(None) => { /* slot not present yet — skip this tick */ }
-            Err(e) => {
-                if !logged_err {
-                    tracing::warn!("statsd slot sampler: query failed: {e:#}; reconnecting");
-                    logged_err = true;
-                }
-                client = None; // drop the (possibly dead) connection and reconnect next tick
-            }
-        }
-    }
 }
 
 /// Recursive `du`. Counts **allocated** bytes (`st_blocks * 512`, like real `du`), not apparent

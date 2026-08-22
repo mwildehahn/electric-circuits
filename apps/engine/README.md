@@ -24,8 +24,14 @@ ELECTRIC_CIRCUITS_PG_TABLES='*' \
 target/debug/electric-circuits-engine
 ```
 
-The engine prints `ENGINE_LISTENING <url>` to **stdout** (logs go to stderr) so a harness can
-discover the bound port.
+The engine prints two discovery lines to **stdout** (logs go to stderr), in this order:
+
+- `ENGINE_BINDING <url>` — the HTTP port is open. It is printed *before* Postgres is contacted, on
+  purpose: `GET /ready` is how an orchestrator learns the engine is still waiting for its database,
+  and a probe it cannot reach is no probe at all.
+- `ENGINE_LISTENING <url>` — the boot has **resolved** (in Postgres mode: connected, introspected,
+  slot verified, ingestor running). A harness that sees this can create shapes straight away. In
+  library mode the two are printed together.
 
 ## Environment
 
@@ -50,6 +56,10 @@ discover the bound port.
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM) |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
 | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for the largest transaction the database can produce, must be writable at boot, and must not be shared between engines |
+| `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | `16777216` (16 MiB) | Backfill: byte budget for one snapshot append. A shape's backfill is **streamed** from a `REPEATABLE READ` cursor and appended chunk by chunk, so engine memory per backfill is one chunk whatever the table's size. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
+| `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | `0` (off) | Backfill: when > 0, `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** create with a clear, retryable error (`canceling statement due to statement timeout`); nothing is retired and nothing is purged, and the client may simply try again |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | `25` | Graceful shutdown: how long the whole drain may take before it is forced (exit `70`). Below a typical Kubernetes `terminationGracePeriodSeconds: 30`, so the engine finishes on its own terms rather than being `SIGKILL`ed part-way. Must be > 0 |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` | `2` | Graceful shutdown: how long the HTTP port stays open after the signal, answering `GET /ready` with 503, so a load balancer's readiness probe observes the drain before the socket closes. Set it to at least your probe's `periodSeconds` × `failureThreshold`, or the socket closes while the poller still thinks the pod is ready. Comes **out of** the grace period, not on top of it; `0` = stop accepting at once. Must be < the grace |
 | `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` (Electric parity) retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
 | `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before its **handle state** is evicted and its shape subscription released (the shape + stream are retained and follow the retention lifecycle); a late request gets `409 must-refetch` and rejoins the retained shape |
@@ -74,6 +84,18 @@ unknown `ELECTRIC_*` var is accepted and logged once as "accepted (no-op)" — i
 | `ELECTRIC_SECRET` | *(unset)* | If set, `/v1/shape` requires `secret`/`api_secret` query param (else `401`) |
 | `ELECTRIC_INSECURE` | *(unset)* | Accepted; no-op when no secret |
 | `ELECTRIC_STORAGE_DIR` | *(unset)* | If set + exists, `du`'d every ~60s → `electric.storage.used.bytes` |
+
+**Backfills are streamed, never materialised.** A shape's initial rows come off a `REPEATABLE READ`
+cursor (`query_raw`) and are appended to the still-**pending** shape stream in chunks bounded by
+`ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`, so the engine holds one chunk at a time whatever the
+table's size. Shape creation is already two-phase — a pending buffer, then a gated activation — so
+chunking needs no protocol change: nothing reads the stream until `ActivateShape` lands, and a
+failure part-way aborts the pending shape and rolls the whole creation back exactly as before. An
+**aggregate** folds each chunk into its seed and drops the rows; a **subquery** inner-set node's seed
+is the one thing genuinely collected in memory, because that set *is* the state the node will
+maintain. The `REPEATABLE READ` bracket and the `SnapshotGate` capture are unchanged. (`GET /v1/shape`'s
+*snapshot* still builds the whole body — that is what the Electric protocol asks for — but the key
+set it folds for a catch-up read keeps keys only, never the rows.)
 
 **`GET /v1/health`** reports the boot state machine as an exact, whitespace-free JSON body:
 `{"status":"waiting"}` (202) until Postgres connects, `{"status":"starting"}` (202) through
@@ -110,7 +132,8 @@ unchanged.
 
 | Route | Purpose |
 |---|---|
-| `GET /health` | liveness |
+| `GET /health` | **liveness** — `ok`/200 while the process runs, and nothing else (see "Operating") |
+| `GET /ready` | **readiness** — 200 `{"status":"active"}` only when the engine can serve; 503 with `waiting`/`starting`/`degraded`/`shutting_down` otherwise |
 | `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |
 | `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`) — identical definitions share one stream |
 | `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`) |
@@ -138,6 +161,133 @@ a node, walked on down the graph) the moment the seed and the shape are in. The 
 state stays registry-owned across the whole install, so a client disconnect at any point — a
 partly-installed membership seed included — is unwound exactly and the same shape is immediately
 creatable again.
+
+## Operating
+
+### Probes
+
+Three endpoints, three different questions. Pointing an orchestrator at the wrong one is how a pod
+gets restarted for a condition a restart does not fix.
+
+| Route | Question | Answers |
+|---|---|---|
+| `GET /health` | **liveness** — is the process alive? | `200 ok`, always, while the process runs |
+| `GET /ready` | **readiness** — should it get traffic? | `200 {"status":"active"}`, else `503` with `waiting` / `starting` / `degraded` / `shutting_down` |
+| `GET /v1/health` | fleet parity (Electric's own healthcheck) | `202` while booting, `200 active`, `503 degraded` |
+
+`/ready` is 200 only when **every** precondition for serving holds: Postgres connected, the slot
+verified against the epoch binding, the durable catalog restored, the ingestor spawned, no lost
+membership effects, no broken epoch, no shutdown in progress. The HTTP surface comes up **before**
+Postgres, deliberately — a readiness probe an orchestrator cannot reach is no probe at all — so an
+engine still waiting for its database answers `503 waiting` rather than refusing connections.
+
+`/health` deliberately never fails for any of that. A kubelet restarts a pod whose *liveness* probe
+fails, and neither "Postgres is not up yet" nor "the epoch is broken and an operator must post
+`/epoch/reset`" is fixed by a restart — the second is actively made worse by one.
+
+### Graceful shutdown
+
+`SIGTERM` (or `SIGINT`) drains; it is not a kill.
+
+1. **`/ready` turns `503 {"status":"shutting_down"}` first**, before anything else changes, and the
+   port stays open for `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` (2 s) so a load balancer's probe
+   actually observes it and takes the pod out of rotation.
+2. The accept loop closes; in-flight requests finish. A parked `/v1/shape` `live=true` long-poll
+   returns **at once** (it joins the shutdown token in its select) instead of holding the
+   termination grace for its full `ELECTRIC_LIVE_TIMEOUT_MS` window — and so does the sequencer's own
+   long-poll on the change log.
+3. The **ingestor** finishes the transaction it is *appending*: if it is inside the chunked append
+   it runs to completion and records its position **locally**. The acknowledgement Postgres sees is
+   a separate thing — the replication client sends standby feedback on its own status interval
+   (1 s) and its stop path does not force a final one, so a commit appended in the last second or
+   so is re-delivered after the restart and dropped by the sequencer's `(lsn, seq)` highwater
+   (ADR-0003). If the ingestor is mid-transaction before the commit it simply stops, having
+   appended nothing. **Shutdown never advances the slot**; at worst it costs a bounded, de-duplicated
+   replay.
+4. The **sequencer** finishes the batch it is processing, flushes it, and writes a final `Offset`
+   checkpoint; the durable catalog writer drains it (≤ 10 s) so the next boot resumes from there
+   rather than replaying since the last lazy 2 s checkpoint.
+5. Exit `0`.
+
+**Streams are never closed or retired on shutdown.** A shape's stream is left exactly as it is and
+the restored shape continues it — clients see nothing, and there is no backfill storm. (Closing is
+*retirement*, which means "this shape is gone; re-subscribe"; a restart is not that.)
+
+New `live=true` requests arriving during the drain are answered `503` + `Retry-After: 1`, not an
+empty 204: an Electric client re-polls a 204 immediately, so 204 would turn the drain window into a
+tight poll loop for every live subscriber. Polls already parked are unaffected — they return their
+normal 204 with the offset they had.
+
+The whole sequence is bounded by `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` (25 s, under a typical
+Kubernetes `terminationGracePeriodSeconds: 30`). The bound is on the **process**, not on one step: a
+watchdog is armed the instant the signal lands and forces the exit wherever the engine has got to,
+naming whoever it was still waiting for. A **second** signal during the grace period, or the grace
+elapsing with work still in flight, exits `70` immediately — nothing is corrupted either way: an
+un-acknowledged commit is re-delivered (and de-duplicated) and the previous checkpoint stands.
+
+### Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | a graceful shutdown completed inside its grace period |
+| `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which) |
+| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it |
+| `78` | **boot refused** (`EX_CONFIG`) — see below |
+
+### Boot: fatal vs retryable
+
+A Postgres failure at boot is classified, not guessed at (`pg::classify`), and the two classes get
+opposite treatment.
+
+**Fatal → exit `78` at once, with a named message.** `wal_level` ≠ `logical` (checked explicitly
+with `SHOW wal_level`, right after connecting, rather than left to surface as a slot-creation
+failure — it needs a Postgres *restart* to change); authentication refused (`28000`, `28P01`);
+insufficient privilege (`42501`) for `CREATE PUBLICATION`, the slot, `REPLICA IDENTITY FULL` or
+`pg_control_system()`; an unknown database (`3D000`); any other SQLSTATE outside the transient
+classes below. So are the engine's own refusals, which are not Postgres errors at all and which
+exit `78` too: an unusable `ELECTRIC_CIRCUITS_PG_TABLES` entry, a publication with a per-table
+column list, a durable catalog the engine could not read, an unwritable
+`ELECTRIC_CIRCUITS_TXN_SPILL_DIR`, an out-of-range byte budget, a missing `ELECTRIC_CIRCUITS_DS_URL`
+— and a **connection string the driver cannot parse**, which is refused while resolving the
+configuration, before the port is bound. That last one is deliberate: a `Config::from_str` failure
+carries no SQLSTATE and no server answer, so the classifier could not tell it apart from "the
+database is not up yet" and would retry a typo for ever.
+
+**Retryable → back off (1 s → 30 s, jittered) and try again, indefinitely.** Connection refused,
+DNS, a timeout — a connection attempt that hangs is cut off after 10 s, so a non-routable address is
+a normal retry rather than an invisible wedge — TLS, anything with no SQLSTATE at all, plus SQLSTATE
+classes `08` (connection),
+`40` (serialization), `53` (resources, e.g. `53300` too many connections), `55` (`55006`, the slot is
+in use) and `57` (operator intervention, incl. `57P03` "the database system is starting up").
+`GET /ready` reports `503 waiting` throughout and each attempt is logged. **Durable-streams** is
+treated the same way: a refused connection, a timeout or a 5xx while folding the catalog or opening
+the change log backs off with `durable-streams is unreachable` rather than exiting — storage that
+comes up after its engine is as ordinary as a database that does. (A *malformed* catalog, a stream
+that is gone and an unusable `ELECTRIC_CIRCUITS_DS_URL` stay fatal: none of them is a transport
+problem.) There is no restart in any of these cases: an orchestrator gates traffic on readiness, and
+a dependency that comes up after its engine is the normal case, not a failure. A `SIGTERM` while
+still waiting exits `0` — the whole boot is raced against the shutdown token, so it stops in
+milliseconds even mid-connect.
+
+### Metrics
+
+`GET /metrics` (JSON) and `GET /metrics/prometheus` (OpenTelemetry exposition) now carry the same
+engine counters and gauges — the Prometheus endpoint used to export only the memory/cardinality
+gauges. Alongside the existing counters, the ops-relevant ones are:
+
+| metric | kind | meaning |
+|---|---|---|
+| `replication_slot_retained_wal_bytes` | gauge | `pg_current_wal_lsn() - restart_lsn` — the WAL **Postgres is holding on disk for this engine**. The number that fills the source database's volume when the engine falls behind or stops |
+| `replication_confirmed_flush_lag_bytes` | gauge | `pg_current_wal_lsn() - confirmed_flush_lsn` — ingest lag, in bytes of WAL |
+| `replication_slot_active` | gauge | `1` while a walsender holds the slot; `0` when it does not, and when the slot is not there at all |
+| `sequencer_held_run` | gauge | `1` while the sequencer is holding an incomplete transaction (ADR-0003). A hold pins the change-log position — the restart point, the convergence barrier, the segment-deletion floor — so a hold that does not end must be visible as a level |
+| `sequencer_orphan_fragments_total` | counter | incomplete transaction fragments discarded because a different transaction followed them (a reconnect re-delivering earlier commits first, or an epoch reset) |
+| `backfill_chunked_appends_total` | counter | chunk appends made by backfills too large for one append (a backfill that fits in one contributes 0) |
+| `shutdown_in_progress` | gauge | `1` once a graceful shutdown has begun |
+
+The three replication-slot gauges are sampled every ~10 s by an **engine-owned** sampler on a
+**pooled** connection (never a dedicated one), and the same sample feeds StatsD — so the numbers are
+there with or without `ELECTRIC_STATSD_HOST`.
 
 ## The change log
 

@@ -317,6 +317,29 @@ canvas update, screenshot.
   exactly once. The final release does NOT delete anything: the shape stays active/warm and is
   retired by the retention lifecycle (idle → dormant → evicted; `engine/src/retention.rs`). Client
   `close()` must still be one-shot (a double delete steals another subscriber's refcount).
+- **A backfill is never materialised.** Every Postgres backfill streams off a `query_raw` cursor and
+  is consumed **chunk by chunk** (`pg::BackfillReader`, bounded by
+  `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`), so engine memory per backfill is one chunk however wide
+  the table. A plain shape appends each chunk to its still-pending stream; an aggregate folds each
+  chunk into an `AggSeed` (via the same `fold_agg_row` the live path uses) and drops the rows. The
+  ONLY legitimate `BackfillReader::collect` callers are the ones whose *result* is an in-memory set
+  with nothing to stream it to — a subquery inner-set node's seed, a membership query-back's
+  candidate rows. If you add a backfill site, take chunks; if you find yourself building a
+  `Vec<Row>` of a whole table, that is the bug. The same rule governs stream folds: `/v1/shape`'s
+  snapshot must materialise (the body *is* every row), the key set it rebuilds for a catch-up must
+  not (`StreamFold::up_to` is keys-only by construction).
+- **`SIGTERM` drains; it never retires anything** (`src/shutdown.rs`). Order: `/ready` → 503
+  `shutting_down` FIRST (so a load balancer drains) and the port stays open for the drain window;
+  stop accepting; the ingestor completes a commit it is *appending* and records its position
+  LOCALLY — the wire ack rides the replication client's status interval (1 s) and is not forced on
+  the way out, so the last second's commits are re-delivered and de-duplicated by the sequencer
+  highwater; mid-transaction it just stops, having appended nothing. **Shutdown never advances the
+  slot.** The sequencer then completes its batch, flushes, and writes a final `Offset` checkpoint;
+  the catalog writer drains; exit 0. **Shape streams are left untouched**
+  — closing a stream means "this shape is gone, re-subscribe", and a restart is not that. Every
+  select that could block past the grace must join the shutdown token (the sequencer's change-log
+  long-poll, the ingestor's `recv` and its backoff, `poll_live_until`); if you add a long-poll, join
+  it, and if you add a task that must reach a safe point, register a `party`.
 - **Shapes vs subset queries stay distinct.** Ranges/`orderBy`/`limit` live ONLY in subset queries
   (never live-tailed); a `changes_only` feed uses a passthrough gate and the client reads from the
   offset captured *before* the page snapshot.

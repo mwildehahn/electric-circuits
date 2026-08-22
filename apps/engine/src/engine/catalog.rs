@@ -629,12 +629,12 @@ impl Engine {
         // Compiled lazily, after the circuit branch: a circuit-served subquery record never
         // needs (and could not build) a registry-free compiled predicate.
         let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), ts)?);
-        let (kind, changes_only, is_aggregate) = match &rec.aggregate {
+        let (kind, changes_only, aggregate) = match &rec.aggregate {
             Some(a) => {
                 let col = a.col.as_deref().map(|c| ts.column_index(c)).transpose()?;
-                (CreateKind::Aggregate { func: a.func, col }, false, true)
+                (CreateKind::Aggregate { func: a.func, col }, false, Some((a.func, col)))
             }
-            None => (CreateKind::Plain, true, false),
+            None => (CreateKind::Plain, true, None),
         };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         cmd_tx
@@ -660,7 +660,8 @@ impl Engine {
             &pred,
             out_cols.as_ref(),
             changes_only,
-            is_aggregate,
+            aggregate,
+            &self.shutdown_token(),
             ack_rx,
         )
         .await

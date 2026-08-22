@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use tokio_postgres::{Client, NoTls};
+use tokio_stream::StreamExt;
 
 use crate::heap_size::HeapSize;
 use crate::predicate::CompiledPredicate;
@@ -15,18 +16,232 @@ use crate::schema::{ColumnDef, ColumnType, FingerprintColumn, SchemaFingerprint,
 use crate::table_ref::TableRef;
 use crate::value::Row;
 
+/// How long one connection attempt may hang before it is a failure.
+///
+/// Without this a **non-routable** address (a firewalled host, a stale Service IP) hangs on the
+/// kernel's SYN retry schedule — minutes — with nothing above able to tell "connecting" from
+/// "wedged". That is a boot that never reports, and a `SIGTERM` that has nothing to interrupt.
+/// tokio-postgres maps the expiry to an ordinary error, which the boot taxonomy already calls
+/// retryable, so the effect is to turn an invisible hang into a visible, backed-off retry.
+/// A `connect_timeout` in the URL wins — an operator who set one meant it.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Connect and drive the connection on a background task. Returns the query `Client`.
 /// For per-request work (backfills, query-backs, subset queries) prefer [`pool_for`] — a fresh
 /// TCP+auth handshake per shape creation is the fleet benchmark's p99 driver, and thousands of
 /// concurrent creations exhaust ephemeral ports.
+///
+/// The pool dials through here too, so the boot connection and every pooled one share one config
+/// path — including the connect timeout.
 pub async fn connect(url: &str) -> Result<Client> {
-    let (client, conn) = tokio_postgres::connect(url, NoTls).await.context("connect postgres")?;
+    let mut cfg = parse_pg_url(url)?;
+    if cfg.get_connect_timeout().is_none() {
+        cfg.connect_timeout(CONNECT_TIMEOUT);
+    }
+    let (client, conn) = cfg.connect(NoTls).await.context("connect postgres")?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::error!("postgres connection error: {e}");
         }
     });
     Ok(client)
+}
+
+// ---- boot-time error taxonomy (issue #13) ------------------------------------------------------
+
+/// `sysexits.h` `EX_CONFIG`. The engine exits with this when a boot step failed for a reason
+/// retrying cannot fix — a misconfiguration, a missing privilege, the wrong database. Distinct from
+/// the circuit-rebuild `75` and from the forced-shutdown code so `kubectl describe` names the class
+/// of failure without anyone reading the log.
+pub const EXIT_CONFIG: i32 = 78;
+
+/// What the boot should do about a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootFailure {
+    /// Nothing the engine can do will change the answer: exit [`EXIT_CONFIG`] with a named message.
+    Fatal,
+    /// The condition may clear on its own (Postgres not up yet, DNS, a refused connection, a
+    /// restart in progress): back off and try again, forever. Kubernetes gates traffic on
+    /// `GET /ready`, which reports `waiting` throughout, so a restart buys nothing.
+    Retryable,
+}
+
+/// The parts of a Postgres failure the classifier looks at. Split out so the decision table is a
+/// pure function with unit tests — `tokio_postgres::Error` has no public constructor, so the
+/// alternative would be no test at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PgFailure<'a> {
+    /// The SQLSTATE the server sent, if the failure got that far.
+    pub sqlstate: Option<&'a str>,
+    /// The failure was a transport error (TCP, DNS, TLS, timeout) rather than a server answer.
+    pub io: bool,
+}
+
+/// The decision table. Documented as a table because it IS the contract an operator reads:
+///
+/// | SQLSTATE | meaning | verdict |
+/// |---|---|---|
+/// | `28000`, `28P01` | authentication / `pg_hba` refusal | **fatal** |
+/// | `42501` | insufficient privilege (`CREATE PUBLICATION`, slot, `REPLICA IDENTITY FULL`, `pg_control_system`) | **fatal** |
+/// | `3D000` | unknown database | **fatal** |
+/// | class `08` | connection exception | retryable |
+/// | class `40` | serialization / deadlock | retryable |
+/// | class `53` | insufficient resources (`53300` too many connections, disk full, OOM) | retryable |
+/// | class `55` | object not in prerequisite state (`55006` the slot is in use) | retryable |
+/// | class `57` | operator intervention — incl. `57P03` "the database system is starting up" | retryable |
+/// | any other SQLSTATE | an answer from the server that retrying will repeat | **fatal** |
+/// | *none* (transport: connection refused, DNS, timeout, TLS, a dropped connection) | the server is not there **yet** | retryable |
+///
+/// The default for an unrecognised SQLSTATE is deliberately **fatal**: a server error at boot that
+/// is not in the transient classes above is a statement the engine issued being refused, and
+/// retrying it forever would hide the message in a log nobody reads. The transient classes are
+/// enumerated rather than guessed at, so the fatal surface stays small and named.
+///
+/// The default for **no** SQLSTATE is the opposite — retryable — and just as deliberate. The server
+/// never answered, and by far the commonest reason for that is that it is not up yet; making it
+/// fatal would crash-loop a pod for an ordinary transport blip. The one no-SQLSTATE condition that
+/// genuinely is a misconfiguration — an unparseable connection string — never reaches here at all:
+/// `Config::resolve` refuses it at boot, before the retry loop exists ([`parse_pg_url`]). What
+/// remains is reported (see [`failure_name`]) but not exited on: `GET /ready` says `waiting`, every
+/// attempt is logged, and an operator reading either can see it.
+pub fn classify(f: PgFailure<'_>) -> BootFailure {
+    let Some(code) = f.sqlstate else {
+        // No SQLSTATE at all: the connection never produced a server answer.
+        return BootFailure::Retryable;
+    };
+    match code {
+        "28000" | "28P01" | "42501" | "3D000" => BootFailure::Fatal,
+        _ => match &code[..2.min(code.len())] {
+            "08" | "40" | "53" | "55" | "57" => BootFailure::Retryable,
+            _ => BootFailure::Fatal,
+        },
+    }
+}
+
+/// A short operator-facing name for a classified failure — what the boot's log line leads with,
+/// before the full error chain.
+///
+/// The two no-SQLSTATE names are distinct on purpose. Both retry (see [`classify`]), but they say
+/// different things: `io` means the engine could not reach the server at all (check the address,
+/// the network, whether Postgres is up), while its absence means the driver produced an error that
+/// carries no SQLSTATE — a connect timeout, a TLS handshake, a protocol surprise, or a credential
+/// the server demanded and the URL does not carry. The last of those will not fix itself, and the
+/// engine keeps retrying it anyway; the name is deliberately descriptive rather than diagnostic,
+/// because from here the driver does not say which it was.
+pub fn failure_name(f: PgFailure<'_>) -> &'static str {
+    match f.sqlstate {
+        Some("28000") | Some("28P01") => "authentication failed",
+        Some("42501") => "insufficient privilege",
+        Some("3D000") => "unknown database",
+        Some("57P03") => "the database system is starting up",
+        Some(_) => "Postgres refused a boot statement",
+        None if f.io => "Postgres is unreachable",
+        None => "Postgres returned an error without a SQLSTATE",
+    }
+}
+
+/// Extract [`PgFailure`] from a `tokio_postgres::Error`.
+pub fn failure_of(e: &tokio_postgres::Error) -> PgFailure<'_> {
+    PgFailure {
+        sqlstate: e.code().map(|c| c.code()),
+        io: {
+            let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+            let mut io = false;
+            while let Some(s) = src {
+                if s.downcast_ref::<std::io::Error>().is_some() {
+                    io = true;
+                    break;
+                }
+                src = s.source();
+            }
+            io
+        },
+    }
+}
+
+/// What the boot should do about an `anyhow` error from the Postgres setup path.
+///
+/// Anything that is **not** a Postgres failure — an unusable `ELECTRIC_CIRCUITS_PG_TABLES` entry, a
+/// publication with a column list, a `wal_level` that is not `logical`, a durable catalog the engine
+/// could not read — is fatal: those are the strictness refusals the engine already refused to boot
+/// past, and none of them changes by waiting.
+pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
+    if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
+        return classify(failure_of(pg));
+    }
+    // The boot also talks to durable-streams (the catalog fold, the change log). A storage server
+    // that is not up yet is the same kind of "not yet" as a database that is not up yet — and in a
+    // compose/Kubernetes start it is the NORMAL one — so it backs off rather than exiting 78. Only
+    // the transport is forgiven: a malformed catalog, a stream that is gone, an unusable
+    // ELECTRIC_CIRCUITS_DS_URL stay fatal (see `ds::is_unavailable`).
+    if crate::ds::is_unavailable(e) {
+        return BootFailure::Retryable;
+    }
+    BootFailure::Fatal
+}
+
+/// The name for the fatal log line (see [`failure_name`]). A failure with no `tokio_postgres::Error`
+/// in its chain is one of the engine's own strictness refusals — an unusable `PG_TABLES`, a
+/// publication with a column list, a `wal_level` that is not `logical`, an unreadable durable
+/// catalog — and none of them is transient.
+pub fn boot_failure_name(e: &anyhow::Error) -> &'static str {
+    if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
+        return failure_name(failure_of(pg));
+    }
+    if crate::ds::is_unavailable(e) {
+        return "durable-streams is unreachable";
+    }
+    "not a transient Postgres condition"
+}
+
+/// Parse a Postgres URL into a `tokio_postgres::Config`, **at boot**, so an unusable one is a named
+/// refusal instead of a connect that fails identically forever.
+///
+/// This is the one no-SQLSTATE failure that must never enter the retry loop: `postgres://…:notaport/db`
+/// produces a `tokio_postgres::Error` with no SQLSTATE and no server answer, indistinguishable from
+/// "the database is not up yet" to [`classify`] — so the engine would back off and re-parse the same
+/// broken string every 30 s forever. Parsing is pure and has no I/O, so it belongs in
+/// `Config::resolve` where every other unusable setting is refused.
+pub fn parse_pg_url(url: &str) -> Result<tokio_postgres::Config> {
+    url.parse::<tokio_postgres::Config>().map_err(|e| {
+        anyhow::anyhow!(
+            "unusable Postgres URL '{}': {e}. Expected a libpq connection string, e.g. \
+             postgres://user:password@host:5432/dbname",
+            redact_pg_url(url)
+        )
+    })
+}
+
+/// A Postgres URL with its password replaced, for a message an operator will paste into a ticket.
+fn redact_pg_url(url: &str) -> String {
+    // Purely textual (the URL may not even parse — that is why we are here): blank out anything
+    // between the first `:` after the scheme's `//` and the `@` that ends the userinfo. The LAST
+    // `@` ends it — a password may legally contain one (`p@ss`) and a host name may not — so
+    // splitting at the first would print the tail of the password.
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let Some((userinfo, host)) = rest.rsplit_once('@') else { return url.to_string() };
+    match userinfo.split_once(':') {
+        Some((user, _)) => format!("{scheme}://{user}:***@{host}"),
+        None => url.to_string(),
+    }
+}
+
+/// Refuse to boot against a cluster that cannot produce logical replication at all.
+///
+/// Checked **explicitly**, right after connecting, rather than left to surface as a slot creation
+/// failure: `wal_level` is a `postgresql.conf` setting that needs a **restart** to change, so
+/// naming it plainly (and exiting [`EXIT_CONFIG`]) is the difference between a five-minute fix and
+/// reading a decoding error's stack.
+pub async fn check_wal_level(client: &Client) -> Result<()> {
+    let level: String = client.query_one("show wal_level", &[]).await.context("reading wal_level")?.get(0);
+    if !level.eq_ignore_ascii_case("logical") {
+        bail!(
+            "wal_level is '{level}', but logical replication needs 'logical'. Set `wal_level = logical` \
+             in postgresql.conf (or your provider's parameter group) and RESTART Postgres; the engine \
+             cannot create or read a logical replication slot until then."
+        );
+    }
+    Ok(())
 }
 
 /// Maximum connections per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_SIZE` (default 20).
@@ -594,11 +809,15 @@ pub async fn inspect_publication(
     Ok(PublicationInfo { publish_generated })
 }
 
-pub struct Backfill {
-    pub rows: Vec<Row>,
+/// The fences a backfill snapshot captures, in the same statement that establishes the snapshot.
+///
+/// Handed back when the snapshot has been fully read (`BackfillReader::finish`), not before: a
+/// consumer needs them only at activation, and returning them first would invite treating the
+/// backfill as complete while rows are still arriving.
+pub struct BackfillFences {
     /// `pg_current_wal_lsn()` of the snapshot. A transaction visible to this REPEATABLE READ snapshot
     /// committed strictly before it, so its commit LSN is `< seed_lsn` and its changes are already in
-    /// `rows`; a transaction committing at/after the snapshot has commit LSN `>= seed_lsn`.
+    /// the rows; a transaction committing at/after the snapshot has commit LSN `>= seed_lsn`.
     pub seed_lsn: String,
     /// The snapshot's transaction-visibility gate — the *sound* backfill↔replication fence. See
     /// [`SnapshotGate`] for why LSN comparison alone is not.
@@ -685,55 +904,222 @@ impl SnapshotGate {
     }
 }
 
-/// Read the table's current rows in a single repeatable-read snapshot, plus the snapshot LSN. The
-/// engine seeds a shape/family from `rows` and skips replication changes whose COMMIT LSN is strictly
-/// `< seed_lsn` (see `engine::process_envelope`; the comparison is against the transaction commit LSN
-/// stamped by the ingestor, not the per-change record LSN).
-/// Uses an explicit transaction over `&Client` (so it needs a dedicated connection, not a shared one).
+// ---- streamed backfill (issue #13) -------------------------------------------------------------
+
+/// Byte budget for one backfill append, and the optional slow-backfill guard. Resolved once at boot
+/// (`ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`, `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS`)
+/// and published process-wide, like the pool size — every backfill site is deep inside the engine
+/// and none of them has a config handle to thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackfillConfig {
+    /// Largest request body one backfill append may build. Bounds the engine's memory per backfill
+    /// to one chunk.
+    pub append_bytes: u64,
+    /// `SET LOCAL statement_timeout` inside the backfill transaction, in milliseconds. `0` = off
+    /// (the default): a backfill takes as long as it takes.
+    pub statement_timeout_ms: u64,
+}
+
+impl Default for BackfillConfig {
+    fn default() -> Self {
+        BackfillConfig { append_bytes: 16 * 1024 * 1024, statement_timeout_ms: 0 }
+    }
+}
+
+static BACKFILL_CFG: OnceLock<BackfillConfig> = OnceLock::new();
+
+/// Publish the backfill settings. Call once at boot, before the first backfill.
+pub fn set_backfill_config(cfg: BackfillConfig) {
+    let _ = BACKFILL_CFG.set(cfg);
+}
+
+/// The backfill settings (defaults when nothing set them — library users and unit tests).
+pub fn backfill_config() -> BackfillConfig {
+    *BACKFILL_CFG.get_or_init(BackfillConfig::default)
+}
+
+/// Fixed bytes an `upsert` envelope adds around one backfill row's JSON value:
+/// `{"type":"","key":"","value":,"headers":{"operation":"upsert"}}` is 62 bytes; 96 leaves headroom
+/// for `DsClient`'s framing. The table name and the row's key are measured exactly on top of this,
+/// so the per-row estimate is an upper bound on what the envelope actually serializes to — and
+/// over-counting only makes chunks smaller.
+const BACKFILL_ENVELOPE_FRAMING: u64 = 96;
+
+/// Would adding a row costing `row_bytes` overflow a chunk that already holds `chunk_rows` rows and
+/// `chunk_bytes` bytes?
 ///
-/// `filter`, when given, is the shape's predicate: backfill reads only the matching rows
-/// (`… WHERE <predicate>`) instead of the whole table, so a selective shape never scans/transfers the
-/// rest. `None` reads the whole table (used while a family still seeds a full-table trace).
-pub async fn backfill(client: &Client, ts: &TableSchema, filter: Option<&CompiledPredicate>) -> Result<Backfill> {
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .context("begin backfill snapshot")?;
-    let result = backfill_in_txn(client, ts, filter).await;
-    client.batch_execute("COMMIT").await.ok();
-    result
+/// A chunk always takes at least one row: a single row bigger than the whole budget still has to go
+/// somewhere, and splitting a row would produce two invalid JSON items. Pure, so the packing rule is
+/// a unit test rather than an inference from a stack trace (mirrors `TxnDrain::next_chunk`).
+pub fn chunk_is_full(chunk_rows: usize, chunk_bytes: u64, row_bytes: u64, budget: u64) -> bool {
+    chunk_rows > 0 && chunk_bytes.saturating_add(row_bytes) > budget
 }
 
-async fn backfill_in_txn(client: &Client, ts: &TableSchema, filter: Option<&CompiledPredicate>) -> Result<Backfill> {
-    // Push the shape's predicate into the SELECT so only matching rows are read. Text literals are
-    // bound parameters; numeric/bool/null are inlined (see `crate::sql`). The engine still applies
-    // `matches()` afterward, so the SQL only needs to be a sound superset filter.
+/// A backfill snapshot being read, one chunk at a time.
+///
+/// The `REPEATABLE READ` transaction is open and its fences are already captured; rows arrive over a
+/// `query_raw` cursor with tokio-postgres's own backpressure, so the engine never holds more than
+/// **one chunk**, whatever the table's size. Shape creation is two-phase (a pending buffer, then a
+/// gated activation), so appending the snapshot chunk by chunk needs no protocol change: the shape
+/// is not live until `ActivateShape` lands either way.
+pub struct BackfillReader<'a> {
+    client: &'a Client,
+    ts: &'a TableSchema,
+    /// `None` once the cursor is exhausted.
+    stream: Option<std::pin::Pin<Box<tokio_postgres::RowStream>>>,
+    /// The row that did not fit the chunk just closed, carried into the next one.
+    pending: Option<(Row, u64)>,
+    budget: u64,
+    /// Per-row envelope framing (the fixed part plus this table's qualified name).
+    frame: u64,
+    fences: BackfillFences,
+    rows: u64,
+    chunks: u64,
+}
+
+impl<'a> BackfillReader<'a> {
+    /// The snapshot's fences. Available from the start (they were captured before the first row),
+    /// but consumers normally take them from [`Self::finish`].
+    pub fn fences(&self) -> &BackfillFences {
+        &self.fences
+    }
+
+    /// Rows delivered so far.
+    pub fn rows_read(&self) -> u64 {
+        self.rows
+    }
+
+    /// Chunks delivered so far.
+    pub fn chunks_read(&self) -> u64 {
+        self.chunks
+    }
+
+    /// The next chunk of rows, in snapshot order, or `None` when the snapshot is exhausted.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<Row>>> {
+        if self.stream.is_none() && self.pending.is_none() {
+            return Ok(None);
+        }
+        let mut chunk: Vec<Row> = Vec::new();
+        // `DsClient` posts the chunk as a JSON array: two brackets, plus a comma between items.
+        let mut body = 2u64;
+        loop {
+            let next = match self.pending.take() {
+                Some(p) => Some(p),
+                None => self.next_row().await?,
+            };
+            let Some((row, cost)) = next else { break };
+            let cost = cost + u64::from(!chunk.is_empty());
+            if chunk_is_full(chunk.len(), body, cost, self.budget) {
+                self.pending = Some((row, cost));
+                break;
+            }
+            body += cost;
+            chunk.push(row);
+        }
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        self.rows += chunk.len() as u64;
+        self.chunks += 1;
+        Ok(Some(chunk))
+    }
+
+    /// One row off the cursor, with the bytes it will cost in an append body.
+    async fn next_row(&mut self) -> Result<Option<(Row, u64)>> {
+        let Some(stream) = self.stream.as_mut() else { return Ok(None) };
+        let Some(row) = stream.next().await else {
+            self.stream = None;
+            return Ok(None);
+        };
+        let row = row.with_context(|| format!("backfill select {}", self.ts.table))?;
+        let j: serde_json::Value = row.get(0);
+        // Measured on the jsonb the SELECT returned — already in hand, so no extra allocation, and
+        // an upper bound on the emitted value (a projection emits fewer columns, never more).
+        let value_bytes = crate::txn_buffer::serialized_json_len(&j)?;
+        let obj = j.as_object().context("backfill row expr did not return an object")?;
+        let r = self.ts.row_from_json(obj)?;
+        let key_bytes = self.ts.key_string(&r).map(|k| k.len() as u64).unwrap_or(0);
+        Ok(Some((r, value_bytes + key_bytes + self.frame)))
+    }
+
+    /// Read the whole snapshot into memory.
+    ///
+    /// For the few consumers whose RESULT is an in-memory set — a subquery inner-set node's seed, a
+    /// membership query-back's candidate rows — where the set is the engine state being built and
+    /// there is nothing to stream it to. Everything that writes to a stream must use
+    /// [`Self::next_chunk`] instead.
+    pub async fn collect(mut self) -> Result<(Vec<Row>, BackfillFences)> {
+        let mut all = Vec::new();
+        while let Some(mut chunk) = self.next_chunk().await? {
+            all.append(&mut chunk);
+        }
+        Ok((all, self.finish().await))
+    }
+
+    /// Close the snapshot transaction and hand back its fences.
+    pub async fn finish(mut self) -> BackfillFences {
+        // Drop the cursor before COMMIT: tokio-postgres discards whatever is left of an abandoned
+        // portal, and the transaction is READ ONLY, so nothing is lost either way.
+        self.stream = None;
+        self.client.batch_execute("COMMIT").await.ok();
+        self.fences
+    }
+}
+
+/// Open a streamed backfill with the shape's compiled predicate pushed into the `SELECT`.
+///
+/// Text literals are bound parameters; numeric/bool/null are inlined (see [`crate::sql`]). The
+/// engine still applies `matches()` afterwards, so the SQL only has to be a sound superset filter.
+pub async fn backfill_reader<'a>(
+    client: &'a Client,
+    ts: &'a TableSchema,
+    filter: Option<&CompiledPredicate>,
+) -> Result<BackfillReader<'a>> {
     let where_sql = filter.and_then(|p| crate::sql::predicate_to_sql(p, ts));
-    backfill_where_in_txn(client, ts, where_sql).await
+    backfill_where_reader(client, ts, where_sql).await
 }
 
-/// Like [`backfill`], but with a **prebuilt** `WHERE` fragment + params (from the JSON SQL emitter) —
-/// used for subquery shapes/nodes, whose `IN (SELECT …)` SQL the compiled-predicate emitter can't
-/// reconstruct. `where_sql = None` reads the whole table.
-pub async fn backfill_where(
-    client: &Client,
-    ts: &TableSchema,
+/// Open a streamed backfill with a **prebuilt** `WHERE` fragment + params (from the JSON SQL
+/// emitter) — used for subquery shapes/nodes, whose `IN (SELECT …)` SQL the compiled-predicate
+/// emitter cannot reconstruct. `where_sql = None` reads the whole table.
+///
+/// The `REPEATABLE READ READ ONLY` bracket and the fence capture are byte-for-byte what the
+/// materialising version did; only the row transport changed (`query` → `query_raw`).
+pub async fn backfill_where_reader<'a>(
+    client: &'a Client,
+    ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
-) -> Result<Backfill> {
+) -> Result<BackfillReader<'a>> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .context("begin backfill snapshot")?;
-    let result = backfill_where_in_txn(client, ts, where_sql).await;
-    client.batch_execute("COMMIT").await.ok();
-    result
+    match backfill_open_in_txn(client, ts, where_sql).await {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            // Leave no transaction open on the pooled connection (its check-in ROLLBACKs anyway,
+            // but a failed open must not depend on that).
+            client.batch_execute("ROLLBACK").await.ok();
+            Err(e)
+        }
+    }
 }
 
-async fn backfill_where_in_txn(
-    client: &Client,
-    ts: &TableSchema,
+async fn backfill_open_in_txn<'a>(
+    client: &'a Client,
+    ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
-) -> Result<Backfill> {
+) -> Result<BackfillReader<'a>> {
+    let cfg = backfill_config();
+    // Slow-backfill guard, off by default. `LOCAL` scopes it to this transaction, so the pooled
+    // connection carries nothing back to the next borrower. A timeout fails THIS create with a
+    // clear, retryable error; nothing is retired and nothing is purged.
+    if cfg.statement_timeout_ms > 0 {
+        client
+            .batch_execute(&format!("SET LOCAL statement_timeout = {}", cfg.statement_timeout_ms))
+            .await
+            .context("setting the backfill statement timeout")?;
+    }
     // One statement establishes the snapshot AND captures both fences (LSN + xid snapshot)
     // atomically with it.
     let fence = client
@@ -746,18 +1132,22 @@ async fn backfill_where_in_txn(
         Some((w, ps)) => (format!(" where {w}"), ps),
         None => (String::new(), Vec::new()),
     };
-    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
     let q = format!("select {} from {} t{}", row_json_expr(ts), ts.table.quote_qualified(), where_clause);
-    let rows =
-        client.query(&q, &param_refs).await.with_context(|| format!("backfill select {}", ts.table))?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let j: serde_json::Value = r.get(0);
-        let obj = j.as_object().context("backfill row expr did not return an object")?;
-        out.push(ts.row_from_json(obj)?);
-    }
-    Ok(Backfill { rows: out, seed_lsn, gate })
+    let stream = client
+        .query_raw(&q, params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)))
+        .await
+        .with_context(|| format!("backfill select {}", ts.table))?;
+    Ok(BackfillReader {
+        client,
+        ts,
+        stream: Some(Box::pin(stream)),
+        pending: None,
+        budget: cfg.append_bytes,
+        frame: BACKFILL_ENVELOPE_FRAMING + ts.table.as_str().len() as u64,
+        fences: BackfillFences { seed_lsn, gate },
+        rows: 0,
+        chunks: 0,
+    })
 }
 
 /// Group-count seed for a counts pipeline: `SELECT <group cols>, count(*) … GROUP BY` under a
@@ -853,7 +1243,7 @@ pub struct SubsetQuery {
 
 /// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
 /// against Postgres in a `REPEATABLE READ` snapshot, returning the page rows and the snapshot LSN.
-/// Unlike [`backfill`], this creates no shape and no durable stream — it is the ephemeral query-back a
+/// Unlike [`backfill_reader`], this creates no shape and no durable stream — it is the ephemeral query-back a
 /// subset/pagination view uses (the live tail is followed separately). `order` is `(column index,
 /// descending?)`; the pk is appended as a tiebreaker so the window is total/stable.
 pub async fn query_subset(
@@ -965,6 +1355,150 @@ mod tests {
         let p = SnapshotGate::passthrough();
         assert!(!p.should_skip(0x50, Some(99)));
         assert!(!p.should_skip(0x50, None));
+    }
+
+    /// The boot taxonomy IS the contract: a fatal class must never be retried into an invisible
+    /// loop, and a transient one must never crash-loop the pod. One assertion per row of
+    /// `classify`'s table.
+    #[test]
+    fn boot_error_classification() {
+        let verdict = |code: &str| classify(PgFailure { sqlstate: Some(code), io: false });
+
+        // Fatal: nothing changes by waiting.
+        assert_eq!(verdict("28000"), BootFailure::Fatal, "pg_hba refusal");
+        assert_eq!(verdict("28P01"), BootFailure::Fatal, "bad password");
+        assert_eq!(verdict("42501"), BootFailure::Fatal, "insufficient privilege");
+        assert_eq!(verdict("3D000"), BootFailure::Fatal, "unknown database");
+        assert_eq!(verdict("42601"), BootFailure::Fatal, "syntax error: the engine's own statement");
+        assert_eq!(verdict("42P01"), BootFailure::Fatal, "undefined table");
+
+        // Retryable: the server is not ready, not wrong.
+        assert_eq!(verdict("57P03"), BootFailure::Retryable, "the database system is starting up");
+        assert_eq!(verdict("57P01"), BootFailure::Retryable, "admin shutdown");
+        assert_eq!(verdict("08006"), BootFailure::Retryable, "connection failure");
+        assert_eq!(verdict("08001"), BootFailure::Retryable, "cannot connect");
+        assert_eq!(verdict("53300"), BootFailure::Retryable, "too many connections");
+        assert_eq!(verdict("55006"), BootFailure::Retryable, "object in use (slot held)");
+        assert_eq!(verdict("40001"), BootFailure::Retryable, "serialization failure");
+
+        // No SQLSTATE at all: DNS, connection refused, timeout, TLS — the server is not there yet.
+        assert_eq!(classify(PgFailure { sqlstate: None, io: true }), BootFailure::Retryable);
+        assert_eq!(classify(PgFailure::default()), BootFailure::Retryable);
+    }
+
+    #[test]
+    fn fatal_failures_are_named_for_operators() {
+        let named = |code: &str| failure_name(PgFailure { sqlstate: Some(code), io: false });
+        assert_eq!(named("28P01"), "authentication failed");
+        assert_eq!(named("42501"), "insufficient privilege");
+        assert_eq!(named("3D000"), "unknown database");
+        assert_eq!(named("57P03"), "the database system is starting up");
+        // The two no-SQLSTATE cases are told apart, because they send an operator to different
+        // places even though both retry.
+        assert_eq!(failure_name(PgFailure { sqlstate: None, io: true }), "Postgres is unreachable");
+        assert_eq!(failure_name(PgFailure::default()), "Postgres returned an error without a SQLSTATE");
+    }
+
+    /// An unparseable connection string must be refused at boot, not retried: to [`classify`] it is
+    /// indistinguishable from "the database is not up yet" (no SQLSTATE, no server answer), so
+    /// without this check a typo in `ELECTRIC_CIRCUITS_PG_URL` would back off and re-parse the same
+    /// broken string forever.
+    #[test]
+    fn an_unusable_pg_url_is_refused_with_its_password_redacted() {
+        assert!(parse_pg_url("postgres://u:p@127.0.0.1:5432/app").is_ok());
+        let e = parse_pg_url("postgres://u:hunter2@host:notaport/db").unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("unusable Postgres URL"), "{msg}");
+        assert!(msg.contains("u:***@host:notaport/db"), "the password must not be logged: {msg}");
+        assert!(!msg.contains("hunter2"), "{msg}");
+        // ...and it is NOT a `tokio_postgres::Error` in the chain, so `boot_disposition` — which
+        // only ever sees it if this check were removed — would call it fatal too.
+        assert_eq!(boot_disposition(&e), BootFailure::Fatal);
+    }
+
+    /// A boot failure that is not a Postgres failure at all — an unusable `PG_TABLES` entry, an
+    /// unreadable durable catalog, a `wal_level` that is not `logical` — is fatal, because none of
+    /// them changes by waiting.
+    #[test]
+    fn non_postgres_boot_failures_are_fatal() {
+        let e = anyhow::anyhow!("ELECTRIC_CIRCUITS_PG_TABLES has 1 unusable entry");
+        assert_eq!(boot_disposition(&e), BootFailure::Fatal);
+        assert_eq!(boot_failure_name(&e), "not a transient Postgres condition");
+    }
+
+    /// Chunk packing: a chunk fills up to the budget and never past it, but a single row bigger
+    /// than the whole budget still becomes a chunk of its own (splitting a row would emit invalid
+    /// JSON, and refusing it would cost the shape its stream for being wide).
+    #[test]
+    fn chunk_packing_respects_the_budget_but_never_drops_a_row() {
+        // Empty chunk: never "full", whatever the row costs.
+        assert!(!chunk_is_full(0, 2, 10, 100));
+        assert!(!chunk_is_full(0, 2, 10_000, 100), "an over-budget row is still a chunk of its own");
+        // Fits exactly.
+        assert!(!chunk_is_full(1, 90, 10, 100));
+        // One byte over.
+        assert!(chunk_is_full(1, 91, 10, 100));
+        // Saturating: no overflow panic near u64::MAX.
+        assert!(chunk_is_full(1, u64::MAX, 10, 100));
+    }
+
+    /// The packing INVARIANT, exercised over a synthetic run of the same predicate
+    /// `BackfillReader::next_chunk` drives: every chunk body stays within the budget (unless it is
+    /// one over-budget row on its own), no row is dropped, and snapshot order is preserved across
+    /// the chunk boundaries. Those are the three properties a streamed backfill's correctness rests
+    /// on — a body over the budget is an append durable-streams can refuse, a dropped row is a
+    /// missing row in the shape, and a reordered one breaks the adapter's deterministic snapshot.
+    #[test]
+    fn packing_a_run_of_rows_respects_the_budget_and_preserves_order() {
+        const BUDGET: u64 = 100;
+        // A mix of ordinary rows and one that alone exceeds the whole budget.
+        let costs: Vec<u64> = vec![30, 30, 30, 30, 250, 10, 10, 10, 10, 10, 10, 10, 10, 90];
+        let mut chunks: Vec<(Vec<usize>, u64)> = Vec::new();
+        let mut chunk: Vec<usize> = Vec::new();
+        let mut body = 2u64; // the JSON array's brackets, as in `next_chunk`
+        for (i, &cost) in costs.iter().enumerate() {
+            let cost = cost + u64::from(!chunk.is_empty()); // the comma between items
+            if chunk_is_full(chunk.len(), body, cost, BUDGET) {
+                chunks.push((std::mem::take(&mut chunk), body));
+                body = 2 + cost;
+                chunk.push(i);
+            } else {
+                body += cost;
+                chunk.push(i);
+            }
+        }
+        chunks.push((chunk, body));
+
+        assert!(chunks.len() > 1, "this run must actually chunk, or it proves nothing");
+        for (rows, body) in &chunks {
+            assert!(!rows.is_empty(), "an empty chunk is never emitted");
+            assert!(
+                *body <= BUDGET || rows.len() == 1,
+                "a chunk may only exceed the budget when it is a single over-budget row: {rows:?} = {body}"
+            );
+        }
+        // Every row, exactly once, in snapshot order.
+        let flat: Vec<usize> = chunks.iter().flat_map(|(r, _)| r.iter().copied()).collect();
+        assert_eq!(flat, (0..costs.len()).collect::<Vec<_>>());
+    }
+
+    /// The packer's byte measure is the real serializer's, not an estimate of it: the same counting
+    /// writer the ingestor's chunking uses.
+    #[test]
+    fn row_payload_is_measured_with_the_real_serializer() {
+        let j = serde_json::json!({"id": 1, "label": "abc"});
+        let measured = crate::txn_buffer::serialized_json_len(&j).unwrap();
+        assert_eq!(measured as usize, serde_json::to_vec(&j).unwrap().len());
+    }
+
+    /// The default budget must be appendable: a value above the durable-streams body cap could
+    /// never land, and 16 MiB leaves three orders of magnitude of headroom.
+    #[test]
+    fn default_backfill_budget_is_within_the_storage_body_cap() {
+        let d = BackfillConfig::default();
+        assert_eq!(d.append_bytes, 16 * 1024 * 1024);
+        assert!(d.append_bytes <= crate::txn_buffer::DS_MAX_BODY_BYTES);
+        assert_eq!(d.statement_timeout_ms, 0, "the slow-backfill guard is off by default");
     }
 
     #[test]

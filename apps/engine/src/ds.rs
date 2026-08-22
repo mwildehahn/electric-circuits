@@ -133,6 +133,63 @@ pub fn is_stream_gone(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<StreamGone>().is_some())
 }
 
+/// The durable-streams server answered, but with a 5xx: it is reachable and not serving. Typed so
+/// callers (the boot, above all) can tell "storage is having a moment" from "this request is
+/// wrong", which a status embedded in a message string cannot express.
+#[derive(Debug)]
+pub struct DsUnavailable {
+    pub op: &'static str,
+    pub path: String,
+    pub status: u16,
+}
+
+impl std::fmt::Display for DsUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} -> {} (durable-streams unavailable)", self.op, self.path, self.status)
+    }
+}
+
+impl std::error::Error for DsUnavailable {}
+
+/// Is this a durable-streams failure that may clear on its own — the server not up yet, a refused
+/// connection, a timeout, a connection dropped mid-response, or a 5xx?
+///
+/// This is the read the **boot** takes: a storage server that comes up after its engine is the
+/// normal case in a compose/Kubernetes start, so it must back off rather than exit `EX_CONFIG`.
+/// Deliberately narrow — it forgives the TRANSPORT and nothing else:
+///
+/// * `reqwest::Error::is_builder` (an unusable `ELECTRIC_CIRCUITS_DS_URL`) is **not** forgiven: no
+///   amount of waiting reshapes a URL;
+/// * `is_decode` (a body that is not what it claims) is **not** forgiven — that is a malformed
+///   catalog, which is fatal by design;
+/// * a [`StreamGone`] (404/410) is **not** forgiven: a stream that is not there is an answer, and
+///   every caller has its own, very different response to it;
+/// * a typed catalog strictness refusal carries no `reqwest::Error` at all, so it stays fatal.
+pub fn is_unavailable(e: &anyhow::Error) -> bool {
+    if e.chain().any(|c| c.downcast_ref::<StreamGone>().is_some()) {
+        return false;
+    }
+    if e.chain().any(|c| c.downcast_ref::<DsUnavailable>().is_some()) {
+        return true;
+    }
+    e.chain().filter_map(|c| c.downcast_ref::<reqwest::Error>()).any(|r| {
+        !r.is_builder() && !r.is_decode() && (r.is_connect() || r.is_timeout() || r.is_request() || r.is_body())
+    })
+}
+
+/// Build the error for a non-2xx durable-streams response: typed when the server said it is
+/// unavailable (5xx), an ordinary message otherwise.
+fn status_error(op: &'static str, path: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    if status.is_server_error() {
+        return anyhow::Error::new(DsUnavailable { op, path: path.to_string(), status: status.as_u16() });
+    }
+    if body.is_empty() {
+        anyhow::anyhow!("{op} {path} -> {status}")
+    } else {
+        anyhow::anyhow!("{op} {path} -> {status}: {body}")
+    }
+}
+
 /// The outcome of an append that treats retirement as an answer rather than an error (see
 /// [`DsClient::append_checked`]).
 pub enum Appended {
@@ -211,7 +268,7 @@ impl DsClient {
         if status.is_success() {
             Ok(())
         } else {
-            bail!("PUT {path} -> {status}: {body}")
+            Err(status_error("PUT", path, status, &body))
         }
     }
 
@@ -232,7 +289,7 @@ impl DsClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            bail!("POST {path} -> {status}: {body}");
+            return Err(status_error("POST", path, status, &body));
         }
         Ok(())
     }
@@ -252,7 +309,7 @@ impl DsClient {
             return Ok((Vec::new(), next_offset, true));
         }
         if !status.is_success() {
-            bail!("GET {path} -> {status}");
+            return Err(status_error("GET", path, status, ""));
         }
         let body = res.text().await?;
         let events: Vec<serde_json::Value> = if body.trim().is_empty() {
@@ -324,7 +381,7 @@ impl DsClient {
         } else if status.as_u16() == 404 || status.as_u16() == 410 || (status.as_u16() == 409 && closed) {
             Err(AppendError::Gone(status.as_u16()))
         } else {
-            Err(AppendError::Other(anyhow::anyhow!("POST {path} -> {status}: {body}")))
+            Err(AppendError::Other(status_error("POST", path, status, &body)))
         }
     }
 
@@ -436,7 +493,7 @@ impl DsClient {
             return Ok(None);
         }
         if !status.is_success() {
-            bail!("HEAD {path} -> {status}");
+            return Err(status_error("HEAD", path, status, ""));
         }
         Ok(Some(StreamHead {
             next_offset: header(&res, "stream-next-offset"),
@@ -468,7 +525,7 @@ impl DsClient {
             return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: status.as_u16() }));
         }
         if !status.is_success() {
-            bail!("GET {path} -> {status}");
+            return Err(status_error("GET", path, status, ""));
         }
         let body = res.text().await?;
         let envelopes: Vec<Envelope> = if body.trim().is_empty() {
@@ -482,4 +539,68 @@ impl DsClient {
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {
     res.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boot classification of a durable-streams failure. Getting this wrong is expensive in
+    /// both directions: forgiving too much hides a malformed catalog behind an infinite retry,
+    /// forgiving too little exits `EX_CONFIG` for a storage pod that is merely slower to start than
+    /// the engine — which, in a compose or Kubernetes start, is the normal ordering.
+    #[tokio::test]
+    async fn transport_failures_are_retryable_and_answers_are_not() {
+        // A REAL connect refusal (nothing listens on port 1), not a fabricated one: `reqwest::Error`
+        // has no public constructor, and a mock would only prove the mock.
+        let refused = match DsClient::new("http://127.0.0.1:1").read("changes/0", "-1", false).await {
+            Err(e) => e,
+            Ok(_) => panic!("nothing listens on port 1"),
+        };
+        assert!(is_unavailable(&refused), "a refused connection must retry: {refused:#}");
+
+        // A 5xx: the server is there and not serving.
+        let five_oh_three = anyhow::Error::new(DsUnavailable {
+            op: "GET",
+            path: "meta/catalog".into(),
+            status: 503,
+        })
+        .context("folding the durable catalog");
+        assert!(is_unavailable(&five_oh_three));
+        assert_eq!(
+            crate::pg::boot_disposition(&five_oh_three),
+            crate::pg::BootFailure::Retryable,
+            "storage that is not serving yet must not exit EX_CONFIG"
+        );
+        assert_eq!(crate::pg::boot_failure_name(&five_oh_three), "durable-streams is unreachable");
+
+        // ...but an ANSWER is not a transport failure. A stream that is gone, a malformed catalog
+        // and a strictness refusal all stay fatal.
+        let gone = anyhow::Error::new(StreamGone { path: "meta/catalog".into(), status: 404 });
+        assert!(!is_unavailable(&gone));
+        assert_eq!(crate::pg::boot_disposition(&gone), crate::pg::BootFailure::Fatal);
+
+        let malformed = anyhow::Error::new(serde_json::from_str::<serde_json::Value>("{oh no").unwrap_err())
+            .context("parsing stream body");
+        assert!(!is_unavailable(&malformed));
+        assert_eq!(crate::pg::boot_disposition(&malformed), crate::pg::BootFailure::Fatal);
+
+        // A typed catalog strictness refusal carries no `reqwest::Error` at all, so it stays fatal
+        // — the same path every non-transport boot failure takes.
+        let strictness = anyhow::anyhow!("catalog predates ADR-0006 segmentation");
+        assert!(!is_unavailable(&strictness));
+        assert_eq!(crate::pg::boot_disposition(&strictness), crate::pg::BootFailure::Fatal);
+        assert_eq!(crate::pg::boot_failure_name(&strictness), "not a transient Postgres condition");
+    }
+
+    /// A 4xx carries its body (the server's own words); a 5xx becomes the typed, retryable error.
+    #[test]
+    fn status_errors_are_typed_only_for_5xx() {
+        let four = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_REQUEST, "bad config");
+        assert!(!is_unavailable(&four));
+        assert!(format!("{four:#}").contains("bad config"));
+        let five = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_GATEWAY, "");
+        assert!(is_unavailable(&five));
+        assert!(format!("{five:#}").contains("502"));
+    }
 }

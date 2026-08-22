@@ -36,6 +36,7 @@ pub mod predicate;
 pub mod replication;
 pub mod retention;
 pub mod schema;
+pub mod shutdown;
 pub mod sql;
 pub mod subq_circuit;
 // Host-side per-feed key sets (`HashMap<feed_id, RoaringBitmap>`) — the delete gate, moved out of

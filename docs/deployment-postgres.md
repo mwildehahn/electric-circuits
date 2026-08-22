@@ -85,6 +85,10 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | no | `134217728` | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below. |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | no | `67108864` | Byte budget for one append when a large commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — outside that, the engine refuses to boot. |
 | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Where a spilled transaction's temporary file goes (created 0700, files 0600). Must have room for your largest transaction, must be writable at boot, and must not be shared between engines. |
+| `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | no | `16777216` | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below. |
+| `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | no | `0` (off) | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected. |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` | no | `2` | How long the port stays open after `SIGTERM` answering `/ready` with 503, so a load balancer drains first. Comes out of the grace, must be less than it; `0` = stop accepting at once. |
 
 ¹ Omit `ELECTRIC_CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
 
@@ -110,6 +114,87 @@ activeUsers.subscribe((rows) => render(rows))
 //   UPDATE users SET active = false WHERE id = 42;
 // electric-circuits picks it up via logical replication and updates the shape.
 ```
+
+## Step 4 — Run it under Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: electric-circuits-engine
+spec:
+  # ONE replica. The engine binds a logical replication slot, and Postgres allows exactly one
+  # walsender per slot — a second pod does not share the work, it waits. It is not a cold standby
+  # either: it holds no state until it gets the slot. During a rolling update the new pod boots,
+  # finds the slot `busy` (its predecessor's walsender is still attached), and parks in its
+  # reconnect backoff answering `GET /ready` with 503 until the old pod's slot is released; then it
+  # restores the durable catalog and takes over. Give each engine its OWN slot
+  # (`ELECTRIC_CIRCUITS_PG_SLOT`) if you genuinely want more than one — they are independent
+  # engines, not replicas of each other.
+  replicas: 1
+  strategy:
+    type: Recreate # or RollingUpdate with maxSurge: 1 — the new pod waits on `busy` either way
+  selector:
+    matchLabels: { app: electric-circuits-engine }
+  template:
+    metadata:
+      labels: { app: electric-circuits-engine }
+    spec:
+      # 25s of engine grace (the default) + headroom for the kubelet.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: engine
+          image: electric-circuits-engine:latest
+          ports:
+            - { name: http, containerPort: 3000 }
+          env:
+            - { name: ELECTRIC_CIRCUITS_DS_URL, value: "http://durable-streams:8080" }
+            - { name: ELECTRIC_CIRCUITS_PG_TABLES, value: "*" }
+            - { name: ELECTRIC_CIRCUITS_BIND, value: "0.0.0.0:3000" }
+            - name: ELECTRIC_CIRCUITS_PG_URL
+              valueFrom: { secretKeyRef: { name: engine-db, key: url } }
+          # LIVENESS: "is the process alive". Never fails for a condition a restart does not fix —
+          # not for a database that is still coming up, and not for a broken epoch (which needs an
+          # operator's POST /epoch/reset, and which a restart would only make harder to recover).
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          # READINESS: "should this pod get traffic". 200 only when Postgres is connected, the slot
+          # is verified, the catalog is restored and the ingestor is running — and 503 the instant a
+          # SIGTERM lands, which is what drains the Service endpoint before the port closes.
+          #
+          # periodSeconds x failureThreshold is the WORST-CASE time to go unready, and it must fit
+          # inside ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS (default 2s) or the port closes while the
+          # probe still believes the pod is ready. 1x1 = 1s fits; the default 2x2 = 4s would not.
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 1
+            failureThreshold: 1
+          # NO startupProbe, deliberately. One on /ready would restart a pod whose only problem is
+          # that its database has not come up yet — which is the exact case the engine is built to
+          # wait through ("retry forever; a restart buys nothing"). Nothing needs one either:
+          # liveness is /health, which answers 200 from the moment the process is up, so a slow boot
+          # is never cut short. If you want a bounded "give up and page someone", do it with an
+          # alert on `engine_replication_slot_active == 0` or on the pod's readiness age — not with
+          # a probe that restarts.
+```
+
+**Drain window vs probe period.** The engine keeps its port open for
+`ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` (2 s) after the signal, answering `/ready` with 503, which is
+what a `preStop: sleep` is usually there to buy — so no `preStop` hook is needed **provided the
+window is at least your readiness `periodSeconds` × `failureThreshold`**. Raise it if your probe is
+slower (the snippet above instead makes the probe fast, 1 s × 1).
+
+Two caveats worth knowing rather than discovering:
+
+- For a **Service**, Kubernetes removes a `Terminating` pod's endpoint independently of its readiness
+  probe, so a Service's traffic drains even if the probe never gets a chance to fail. That masks a
+  mismatched drain window — it does not fix it.
+- For anything polling `/ready` **itself** — an external load balancer, a gateway with its own health
+  checks, a service mesh with passive health checking — there is no such masking, and the window is
+  the only thing keeping it from sending a request into a closing socket. Size it against that
+  poller, not against the Service.
 
 ## Operating notes
 
@@ -149,10 +234,67 @@ activeUsers.subscribe((rows) => render(rows))
   or dropped for being large. If the engine dies mid-transaction the file is left behind; the next
   boot sweeps it. `GET /metrics` reports `txn_spills_total`, `txn_spill_bytes` and
   `txn_chunked_appends_total`.
+- **`SIGTERM` drains, it does not kill.** On the signal the engine turns `GET /ready` into
+  `503 {"status":"shutting_down"}` and keeps the port open for
+  `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` (2 s) so your load balancer takes the pod out of rotation;
+  then it stops accepting, releases every parked `/v1/shape` long-poll at once (rather than holding
+  the termination grace for their full ~20 s window), lets the ingestor finish the transaction it is
+  *appending*, lets the sequencer finish its batch and write a final checkpoint, drains that
+  checkpoint to durable-streams, and exits `0`. The ingestor's position is recorded **locally**: the
+  acknowledgement Postgres sees rides the replication client's 1 s status interval and is not forced
+  on the way out, so a shutdown never advances the slot and the last second's commits are
+  re-delivered on the next boot and de-duplicated there. New `live=true` requests arriving during
+  the drain are answered `503` + `Retry-After: 1` so clients back off to the successor instead of
+  spinning. Shape streams are **never** closed or deleted on
+  shutdown — the restored shape continues its stream, so a restart costs clients nothing. The whole
+  sequence is bounded by `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` (25 s); a second signal, or the
+  grace running out, exits `70` immediately (nothing is corrupted: an unacknowledged commit is
+  re-delivered and the previous checkpoint stands). Keep `terminationGracePeriodSeconds` above the
+  grace.
+- **Liveness and readiness are different probes.** `GET /health` is liveness — `200 ok` while the
+  process runs, and it must never be what restarts a pod. `GET /ready` is readiness — 200 only when
+  Postgres is connected, the slot is verified, the catalog is restored and the ingestor is running;
+  otherwise 503 with the reason word (`waiting`, `starting`, `degraded`, `shutting_down`). Point
+  Kubernetes at those two, not at `/v1/health` (which exists for Electric-fleet parity and answers
+  202 while booting).
+- **A boot failure is either fatal or retryable, and the engine says which.** Bad credentials, a
+  missing privilege, an unknown database, `wal_level` ≠ `logical` (checked explicitly at connect —
+  it needs a Postgres *restart* to fix), a `ELECTRIC_CIRCUITS_PG_URL` the driver cannot parse (caught
+  while resolving the configuration, before the port is bound), an unusable
+  `ELECTRIC_CIRCUITS_PG_TABLES`, a publication with a column list, or a durable catalog it could not
+  read: the engine names the problem and exits **`78`** immediately, because retrying would only
+  repeat it. Every refused setting exits `78`, whether it was caught before or after the log
+  subscriber existed — the reason is always on stderr. **Durable-streams gets the same treatment as
+  Postgres:** a refused connection, a timeout or a 5xx from the storage server is retryable
+  (`durable-streams is unreachable` in the log, `/ready` = `waiting`), because storage coming up
+  after its engine is ordinary; a malformed catalog or an unusable `ELECTRIC_CIRCUITS_DS_URL` is
+  fatal. A connection attempt that *hangs* — a firewalled host, a stale Service IP — is cut off after
+  10 s and retried rather than silently wedging the boot. A connection refused, a DNS failure, a
+  timeout, or "the database system is starting up": it backs off 1 s → 30 s with jitter and keeps
+  trying **forever**, answering `/ready` with `503 waiting` and logging every attempt. Its HTTP port
+  is open the whole time, on purpose — a readiness probe you cannot reach is no probe at all — so a
+  database that comes up after its engine is a non-event. Alert on the pod restarting with `78`;
+  ignore `waiting`.
+- **Backfills are streamed; a wide table does not spike engine memory.** Creating a shape reads its
+  rows off a `REPEATABLE READ` cursor and appends them to the (not yet live) shape stream in chunks
+  of at most `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` (16 MiB), so the engine holds one chunk
+  regardless of the table's size — where before it read every matching row into memory first.
+  Aggregates fold each chunk and drop the rows; a subquery inner-set node's seed is the one thing
+  still collected whole, because that set is the state the node maintains. If a backfill can pin a
+  Postgres snapshot for longer than you are willing to tolerate (a `REPEATABLE READ` transaction
+  holds back vacuum), set `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS`: a timeout fails **that**
+  shape creation with `canceling statement due to statement timeout` and nothing else — no shape is
+  retired, nothing is purged, and the client may retry. It is off by default. `GET /metrics` reports
+  `backfill_chunked_appends_total`.
 - **Replication slot lag:** an engine that is stopped for a long time holds its slot, and Postgres
   retains WAL for it. If you decommission an engine, drop its slot:
-  `SELECT pg_drop_replication_slot('<slot>');` Monitor `pg_replication_slots.confirmed_flush_lsn` vs
-  `pg_current_wal_lsn()` to watch lag.
+  `SELECT pg_drop_replication_slot('<slot>');` The engine measures both numbers for you every ~10 s
+  on a pooled connection and publishes them on `GET /metrics` and `GET /metrics/prometheus` (with or
+  without StatsD): `replication_slot_retained_wal_bytes` (`pg_current_wal_lsn() - restart_lsn` — the
+  WAL the source database is holding on disk for this engine, i.e. what fills its volume) and
+  `replication_confirmed_flush_lag_bytes` (`pg_current_wal_lsn() - confirmed_flush_lsn` — ingest
+  lag). `replication_slot_active` is `1` while a walsender holds the slot. Alert on the first one
+  against `max_slot_wal_keep_size`.
 - **Losing the replication slot costs a full resync — and the engine says so.** The engine records
   which slot, in which cluster (`pg_control_system().system_identifier`), it is bound to, and checks
   that binding before *every* connection. Things that break it in practice:

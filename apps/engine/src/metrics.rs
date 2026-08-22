@@ -118,9 +118,35 @@ pub struct Metrics {
     /// ADR-0003: chunk appends made by commits too large for a single append. A commit that fits in
     /// one append contributes 0, so this counts exactly the chunked commits' POSTs.
     pub txn_chunked_appends: AtomicU64,
+    /// Backfills whose snapshot was too large for one append and went out in chunks: the number
+    /// of chunk POSTs those backfills made (a backfill that fits in one append contributes 0, same
+    /// accounting as `txn_chunked_appends`).
+    pub backfill_chunked_appends: AtomicU64,
+    /// ADR-0003: incomplete transaction fragments the sequencer discarded because a DIFFERENT
+    /// transaction followed them on the log (a reconnect re-delivering earlier complete commits
+    /// first, or an epoch reset abandoning the fragment). Never zero-cost silence: the fragment is
+    /// re-delivered in full or was abandoned, and either way an operator should be able to see it.
+    pub sequencer_orphan_fragments: AtomicU64,
     /// GAUGE, not a counter: how many change-log segments exist right now (republished by every
     /// retention sweep). `reset()` leaves it alone — a gauge describes the world, not the window.
     pub changes_segments_retained: AtomicU64,
+    /// GAUGE: 1 while the sequencer is holding an incomplete transaction (ADR-0003), 0 otherwise.
+    /// A hold pins the change-log position — the restart point, the convergence barrier and the
+    /// segment-deletion floor — so a hold that does not end must be visible as a level, not only as
+    /// a once-a-minute log line.
+    pub sequencer_held_run: AtomicU64,
+    /// GAUGE: 1 once a `SIGTERM`/`SIGINT` graceful shutdown has begun (see [`crate::shutdown`]).
+    pub shutdown_in_progress: AtomicU64,
+    /// GAUGE: `pg_current_wal_lsn() - restart_lsn` for the engine's slot — the WAL Postgres is
+    /// holding on disk **for this engine**. The number that fills the source database's disk when
+    /// the engine falls behind or stops. Sampled ~every 10 s on a pooled connection.
+    pub replication_slot_retained_wal_bytes: AtomicU64,
+    /// GAUGE: `pg_current_wal_lsn() - confirmed_flush_lsn` — how far behind the engine's
+    /// acknowledged position is. Ingest lag, in bytes of WAL.
+    pub replication_confirmed_flush_lag_bytes: AtomicU64,
+    /// GAUGE: 1 while a walsender holds the slot (i.e. this engine is streaming), 0 when it is not
+    /// — and 0 when the slot does not exist at all, which is the epoch-break case.
+    pub replication_slot_active: AtomicU64,
     pub process_envelope: Hist,   // end-to-end fan-out latency per table envelope
     pub family_step: Hist,        // one family circuit transaction
     pub append: Hist,             // one shape-stream append (durable-streams round-trip)
@@ -144,6 +170,13 @@ pub fn metrics() -> &'static Metrics {
         changes_rotations: AtomicU64::new(0),
         changes_segments_deleted: AtomicU64::new(0),
         changes_segments_retained: AtomicU64::new(0),
+        backfill_chunked_appends: AtomicU64::new(0),
+        sequencer_orphan_fragments: AtomicU64::new(0),
+        sequencer_held_run: AtomicU64::new(0),
+        shutdown_in_progress: AtomicU64::new(0),
+        replication_slot_retained_wal_bytes: AtomicU64::new(0),
+        replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
+        replication_slot_active: AtomicU64::new(0),
         txn_spills: AtomicU64::new(0),
         txn_spill_bytes: AtomicU64::new(0),
         txn_chunked_appends: AtomicU64::new(0),
@@ -173,9 +206,16 @@ impl Metrics {
                 "txn_spills_total": self.txn_spills.load(Ordering::Relaxed),
                 "txn_spill_bytes": self.txn_spill_bytes.load(Ordering::Relaxed),
                 "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),
+                "backfill_chunked_appends_total": self.backfill_chunked_appends.load(Ordering::Relaxed),
+                "sequencer_orphan_fragments_total": self.sequencer_orphan_fragments.load(Ordering::Relaxed),
             },
             "gauges": {
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
+                "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
+                "shutdown_in_progress": self.shutdown_in_progress.load(Ordering::Relaxed),
+                "replication_slot_retained_wal_bytes": self.replication_slot_retained_wal_bytes.load(Ordering::Relaxed),
+                "replication_confirmed_flush_lag_bytes": self.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed),
+                "replication_slot_active": self.replication_slot_active.load(Ordering::Relaxed),
             },
             "process_envelope_us": self.process_envelope.snapshot(),
             "family_step_us": self.family_step.snapshot(),
@@ -202,9 +242,123 @@ impl Metrics {
         self.txn_spills.store(0, Ordering::Relaxed);
         self.txn_spill_bytes.store(0, Ordering::Relaxed);
         self.txn_chunked_appends.store(0, Ordering::Relaxed);
-        // `changes_segments_retained` is deliberately NOT reset: it is a gauge of what exists.
+        self.backfill_chunked_appends.store(0, Ordering::Relaxed);
+        self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
+        // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
+        // (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the three
+        // replication-slot gauges the sampler republishes).
         self.process_envelope.reset();
         self.family_step.reset();
         self.append.reset();
+    }
+}
+
+// ---- replication-slot sampler ------------------------------------------------------------------
+
+/// How often the replication-slot gauges are refreshed. One small catalog query per tick, on a
+/// **pooled** connection — a dedicated one would sit idle 99.99% of the time and still count
+/// against `max_connections`.
+const SLOT_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawn the replication-slot gauge sampler (Postgres mode only).
+///
+/// These are engine-owned gauges, not StatsD-owned ones: `GET /metrics`,
+/// `GET /metrics/prometheus` and StatsD all read the same sample, so an operator without StatsD can
+/// still see the number that fills the source database's disk (`replication_slot_retained_wal_bytes`)
+/// and how far behind ingest is (`replication_confirmed_flush_lag_bytes`). It stops when the
+/// process begins shutting down.
+pub fn spawn_replication_slot_sampler(
+    pg_url: String,
+    slot: String,
+    shutdown: crate::shutdown::ShutdownToken,
+) {
+    tokio::spawn(async move {
+        let mut logged_err = false;
+        // Sample FIRST, then sleep. Sleeping first left the three gauges reading 0 for the first
+        // ten seconds of every process — and 0 retained WAL / 0 lag / an inactive slot is not
+        // "unknown", it is a specific and reassuring claim that happens to be false.
+        let mut first = true;
+        loop {
+            if !first {
+                tokio::select! {
+                    _ = shutdown.wait() => return,
+                    _ = tokio::time::sleep(SLOT_SAMPLE_PERIOD) => {}
+                }
+            }
+            first = false;
+            match sample_replication_slot(&pg_url, &slot).await {
+                Ok(()) => logged_err = false,
+                Err(e) => {
+                    // Once per outage, not once per tick: a Postgres blip must not become a log flood.
+                    if !logged_err {
+                        tracing::warn!("replication-slot sampler: {e:#}; will retry every {SLOT_SAMPLE_PERIOD:?}");
+                        logged_err = true;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// One sample: read `pg_current_wal_lsn()` and the slot's row, publish the engine gauges, and
+/// forward the same numbers to StatsD (a no-op when StatsD is off).
+///
+/// A slot that is not there at all leaves `replication_slot_active` at 0 and the two byte gauges
+/// **untouched** — their last real value, never a fabricated zero (a zero would read as "no lag",
+/// which is the opposite of what a missing slot means).
+async fn sample_replication_slot(pg_url: &str, slot: &str) -> anyhow::Result<()> {
+    let client = crate::pg::pool_for(pg_url).get().await?;
+    let q = "select pg_current_wal_lsn()::text, restart_lsn::text, confirmed_flush_lsn::text, active \
+             from pg_replication_slots where slot_name = $1";
+    let Some(row) = client.query_opt(q, &[&slot]).await? else {
+        metrics().replication_slot_active.store(0, Ordering::Relaxed);
+        return Ok(());
+    };
+    let wal: String = row.get(0);
+    let restart: Option<String> = row.get(1);
+    let confirmed: Option<String> = row.get(2);
+    let active: bool = row.get(3);
+    publish_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref(), active);
+    crate::statsd::replication_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref());
+    Ok(())
+}
+
+/// Publish one slot sample into the engine gauges (split out so it is unit-testable without a
+/// database). A `None` LSN — a freshly created slot has no `restart_lsn` yet — leaves that gauge at
+/// its last real value rather than storing a fabricated zero, which would read as "no lag".
+pub fn publish_slot_gauges(wal: &str, restart: Option<&str>, confirmed: Option<&str>, active: bool) {
+    let m = metrics();
+    let wal_u = crate::pg::lsn_to_u64(wal);
+    if let Some(r) = restart {
+        let retained = wal_u.saturating_sub(crate::pg::lsn_to_u64(r));
+        m.replication_slot_retained_wal_bytes.store(retained, Ordering::Relaxed);
+    }
+    if let Some(c) = confirmed {
+        let lag = wal_u.saturating_sub(crate::pg::lsn_to_u64(c));
+        m.replication_confirmed_flush_lag_bytes.store(lag, Ordering::Relaxed);
+    }
+    m.replication_slot_active.store(u64::from(active), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gauge arithmetic (and the deliberate "leave it alone" on a NULL LSN). The metrics
+    /// singleton is process-global, so this test owns the three slot gauges.
+    #[test]
+    fn slot_gauges_are_deltas_from_the_wal_head() {
+        publish_slot_gauges("0/1000", Some("0/0400"), Some("0/0C00"), true);
+        let m = metrics();
+        assert_eq!(m.replication_slot_retained_wal_bytes.load(Ordering::Relaxed), 0x1000 - 0x400);
+        assert_eq!(m.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed), 0x1000 - 0xC00);
+        assert_eq!(m.replication_slot_active.load(Ordering::Relaxed), 1);
+
+        // A slot with no restart_lsn yet (freshly created): the byte gauge keeps its last real
+        // value rather than reporting a fake zero; `active` still tracks reality.
+        publish_slot_gauges("0/2000", None, None, false);
+        assert_eq!(m.replication_slot_retained_wal_bytes.load(Ordering::Relaxed), 0x1000 - 0x400);
+        assert_eq!(m.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed), 0x1000 - 0xC00);
+        assert_eq!(m.replication_slot_active.load(Ordering::Relaxed), 0);
     }
 }

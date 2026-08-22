@@ -444,11 +444,17 @@ impl Write for CountingWriter {
     }
 }
 
+/// The serialized JSON length of `v`, without allocating it. Shared with the streamed backfill
+/// (`pg::BackfillReader`), which packs chunks against the same measure.
+pub(crate) fn serialized_json_len<T: serde::Serialize + ?Sized>(v: &T) -> Result<u64> {
+    let mut c = CountingWriter(0);
+    serde_json::to_writer(&mut c, v).context("measuring a value's serialized size")?;
+    Ok(c.0)
+}
+
 /// The serialized length of `env`, without allocating it.
 fn serialized_len(env: &Envelope) -> Result<u64> {
-    let mut c = CountingWriter(0);
-    serde_json::to_writer(&mut c, env).context("measuring a change's serialized size")?;
-    Ok(c.0)
+    serialized_json_len(env)
 }
 
 /// The commit-time stream out of a [`TxnBuffer`]: envelopes in transaction order, stamped, packed

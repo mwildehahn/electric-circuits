@@ -161,18 +161,19 @@ pub trait EpochEvents: Send + Sync {
 /// Reconnect backoff bounds (ADR-0004). One second is long enough that a flapping server is not
 /// hammered and short enough that an ordinary blip is invisible; 30 s is the ceiling for an outage
 /// that needs an operator anyway.
-const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_secs(1);
-const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+pub const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+pub const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Un-jittered backoff for the n-th consecutive failed attempt: 1s, 2s, 4s … capped at
-/// [`RECONNECT_MAX`]. Pure, so the schedule is a unit test rather than a stopwatch.
-fn backoff_base(attempt: u32) -> std::time::Duration {
+/// [`RECONNECT_MAX`]. Pure, so the schedule is a unit test rather than a stopwatch. Shared with the
+/// binary's boot connect loop, which retries a retryable Postgres failure on the same schedule.
+pub fn backoff_base(attempt: u32) -> std::time::Duration {
     RECONNECT_MIN.saturating_mul(1u32 << attempt.min(16)).min(RECONNECT_MAX)
 }
 
 /// Spread `base` by ±25% from `nanos` (the clock's sub-second noise — no RNG dependency, and
 /// precision is irrelevant here). Pure in `nanos` so the bounds are testable.
-fn jitter(base: std::time::Duration, nanos: u32) -> std::time::Duration {
+pub fn jitter(base: std::time::Duration, nanos: u32) -> std::time::Duration {
     let spread = base.as_millis() as u64 / 2; // the full ±25% window
     if spread == 0 {
         return base;
@@ -194,7 +195,7 @@ fn next_backoff(attempt: u32, connected: bool) -> (std::time::Duration, u32) {
 }
 
 /// The sub-second clock noise the jitter is drawn from.
-fn clock_nanos() -> u32 {
+pub fn clock_nanos() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -202,11 +203,18 @@ fn clock_nanos() -> u32 {
 }
 
 /// Wait out the backoff, cut short by an epoch rebind (so an operator's `/epoch/reset` is followed
-/// by a connect attempt at once rather than up to 30 s later).
-async fn backoff_wait(epoch: &dyn EpochEvents, d: std::time::Duration) {
+/// by a connect attempt at once rather than up to 30 s later) — or by a shutdown, so a pod that is
+/// terminating during an outage exits in milliseconds instead of sleeping out a 30 s ceiling inside
+/// the termination grace.
+async fn backoff_wait(
+    epoch: &dyn EpochEvents,
+    shutdown: &crate::shutdown::ShutdownToken,
+    d: std::time::Duration,
+) {
     tokio::select! {
         _ = tokio::time::sleep(d) => {}
         _ = epoch.epoch_rebound() => {}
+        _ = shutdown.wait() => {}
     }
 }
 
@@ -239,6 +247,9 @@ pub async fn run(
     last_lsn: Arc<std::sync::Mutex<String>>,
     sync_seq: Arc<AtomicI64>,
     txn_cfg: TxnBufferConfig,
+    shutdown: crate::shutdown::ShutdownToken,
+    // Held for this task's lifetime: dropping it is what tells the shutdown "the ingestor is done".
+    _party: crate::shutdown::ShutdownParty,
 ) {
     // A spill file lives only between a `Begin` and its `Commit`, so anything of ours still in the
     // spill dir belongs to a process that died mid-transaction (ADR-0003). Sweep it once, here,
@@ -252,12 +263,18 @@ pub async fn run(
     }
     let mut attempt: u32 = 0;
     loop {
+        // Shutdown is checked at the TOP, so a terminating process never opens a new replication
+        // connection it is about to abandon.
+        if shutdown.is_shutting_down() {
+            tracing::info!("replicator: shutdown requested; not reconnecting");
+            return;
+        }
         // The epoch gate. A refusal is never fatal — it is "not yet", and what could change the
         // answer differs per reason (see `Refused`).
         if let Err(refused) = epoch.before_connect().await {
             tracing::warn!("replicator: not connecting — {refused}");
             let (base, next) = next_backoff(attempt, false);
-            backoff_wait(epoch.as_ref(), jitter(base, clock_nanos())).await;
+            backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
             attempt = next;
             continue;
         }
@@ -266,23 +283,39 @@ pub async fn run(
             Err(e) => {
                 tracing::error!("replicator: bad connection config: {e:#}; retrying");
                 let (base, next) = next_backoff(attempt, false);
-                backoff_wait(epoch.as_ref(), jitter(base, clock_nanos())).await;
+                backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
                 attempt = next;
                 continue;
             }
         };
         let mut connected = false;
-        match stream_loop(cfg, &log, &tables, events.as_ref(), &last_lsn, &sync_seq, &txn_cfg, &mut connected).await
+        match stream_loop(
+            cfg, &log, &tables, events.as_ref(), &last_lsn, &sync_seq, &txn_cfg, &shutdown, &mut connected,
+        )
+        .await
         {
-            Ok(()) => tracing::warn!("replicator: stream ended; reconnecting"),
+            Ok(StreamEnd::ShuttingDown) => {
+                tracing::info!("replicator: stopped for shutdown");
+                return;
+            }
+            Ok(StreamEnd::Ended) => tracing::warn!("replicator: stream ended; reconnecting"),
             Err(e) => tracing::error!("replicator: {e:#}; reconnecting"),
         }
         // A connection that actually delivered is evidence the far side is healthy: start the next
         // outage's schedule from the bottom rather than from wherever the last one ended.
         let (base, next) = next_backoff(attempt, connected);
-        backoff_wait(epoch.as_ref(), jitter(base, clock_nanos())).await;
+        backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
         attempt = next;
     }
+}
+
+/// Why one replication connection's loop returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    /// The server stopped sending (the caller reconnects).
+    Ended,
+    /// A graceful shutdown was requested at a safe point (the caller returns).
+    ShuttingDown,
 }
 
 /// Build the walsender connection config from a `postgres://` URL. TLS is disabled — parity with
@@ -352,22 +385,42 @@ async fn stream_loop(
     last_lsn: &Arc<std::sync::Mutex<String>>,
     sync_seq: &Arc<AtomicI64>,
     txn_cfg: &TxnBufferConfig,
+    shutdown: &crate::shutdown::ShutdownToken,
     // Set once the server has actually delivered something, so the caller can tell "the server
     // never let us in" from "we streamed and then something went wrong" when choosing the next
     // backoff. NOT set at `connect`: that only spawns the worker task, and TCP, auth, `pg_hba` and
     // `START_REPLICATION` failures (a slot held by someone else, most of all) all surface on the
     // first `recv`. Setting it there would peg every one of those at the 1 s floor forever.
     connected: &mut bool,
-) -> Result<()> {
+) -> Result<StreamEnd> {
     let mut client = ReplicationClient::connect(cfg).await.context("replication connect")?;
     let mut dec = Decoder::new(tables.clone());
     // Dropped on every exit path (a replaced `Begin`, an error return, the stream ending), which is
     // what removes a spilled transaction's temporary file (ADR-0003).
     let mut txn: Option<TxnBuffer> = None;
     loop {
-        let ev = client.recv().await.context("replication stream")?;
+        // The ONE safe point for a graceful stop: between messages, never inside the `Commit` arm.
+        //
+        // A commit that is being APPENDED runs to completion — the arm below is not a select branch,
+        // so shutdown cannot interrupt it, and the chunked append + acknowledgement finish exactly
+        // as they would otherwise. Stopping mid-TRANSACTION (buffered changes, no `Commit` yet) is
+        // free: nothing was acknowledged, so Postgres re-delivers the whole transaction to the next
+        // process, and the spill file goes with the dropped buffer.
+        let ev = tokio::select! {
+            biased;
+            _ = shutdown.wait() => {
+                if txn.is_some() {
+                    tracing::info!(
+                        "replicator: shutdown requested mid-transaction; dropping the buffered changes \
+                         unacknowledged — Postgres re-delivers the whole transaction after the restart"
+                    );
+                }
+                return Ok(StreamEnd::ShuttingDown);
+            }
+            ev = client.recv() => ev.context("replication stream")?,
+        };
         *connected = true;
-        let Some(ev) = ev else { return Ok(()) };
+        let Some(ev) = ev else { return Ok(StreamEnd::Ended) };
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
                 txn = Some(TxnBuffer::new(xid, txn_cfg.clone()));

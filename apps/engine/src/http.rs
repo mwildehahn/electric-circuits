@@ -25,7 +25,9 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         // Fleet surface: root probe + health state machine (CORS preflight is on the /v1/shape route).
         .route("/", get(|| async { StatusCode::OK }))
         .route("/v1/health", get(health_v1))
+        // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
         .route("/health", get(|| async { "ok" }))
+        .route("/ready", get(ready))
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
         .route("/aggregate", post(create_aggregate))
@@ -101,6 +103,25 @@ async fn health_v1(State(engine): State<Engine>) -> Response {
         "degraded" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::ACCEPTED,
     };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    (code, headers, health_json(status)).into_response()
+}
+
+/// `GET /ready` — the **readiness** probe, and the only endpoint a load balancer should gate on.
+///
+/// 200 `{"status":"active"}` when every precondition for serving is met (Postgres connected, slot
+/// verified, catalog restored, ingestor spawned, not degraded, epoch intact, not shutting down);
+/// 503 with the word that says why otherwise — `waiting`, `starting`, `degraded`, `shutting_down`.
+///
+/// It is deliberately NOT `/health`, which stays pure **liveness**: "ok" while the process runs, so
+/// a kubelet never restarts an engine that is merely waiting for Postgres to come up, or draining.
+/// `/v1/health` is unchanged — it is the benchmarking-fleet's healthcheck and its status/code
+/// mapping (202 while booting) is parity, not a probe contract.
+async fn ready(State(engine): State<Engine>) -> Response {
+    let status = engine.readiness_status();
+    let code = if status == "active" { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));

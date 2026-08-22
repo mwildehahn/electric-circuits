@@ -262,7 +262,7 @@ impl Engine {
             Err(e) => Err(format!("creating shape stream: {e:#}")),
             Ok(()) => backfill_and_activate(
             &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &rec.stream_path, &pred,
-            out_cols.as_ref(), changes_only, false, ack_rx,
+            out_cols.as_ref(), changes_only, None, &self.shutdown_token(), ack_rx,
         )
         .await,
         };
@@ -493,7 +493,7 @@ impl Engine {
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = backfill_and_activate(
             &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &stream_path_c, &pred,
-            None, false, true, ack_rx,
+            None, false, Some((func, col_idx)), &self.shutdown_token(), ack_rx,
         )
         .await;
         match outcome {
@@ -784,7 +784,9 @@ impl Engine {
                 table: rec.table.clone(),
                 shape_id: id.to_string(),
                 gate,
-                agg_seed: Vec::new(),
+                // A reactivation replays the change log; there is no backfill to seed a fold from
+                // (and an aggregate never goes dormant, so this is always a plain shape).
+                agg_seed: None,
                 emitted_seed: emitted,
                 ready: ready_tx,
             })
@@ -1219,8 +1221,12 @@ impl Engine {
                 )
                 .get()
                 .await?;
-                let bf = crate::pg::backfill_where(&client, &ts, wsql).await?;
-                node_seeds.push((sig.clone(), bf.rows, bf.gate));
+                // `collect`: an inner-set node's seed IS engine state — the set it will maintain
+                // — so there is nothing to stream it to. It is read through the same streamed
+                // reader as every other backfill, so the transport (and the fences) are identical.
+                let (rows, fences) =
+                    crate::pg::backfill_where_reader(&client, &ts, wsql).await?.collect().await?;
+                node_seeds.push((sig.clone(), rows, fences.gate));
             }
             let outer_ts = begin
                 .schemas
@@ -1237,12 +1243,25 @@ impl Engine {
                 )
                 .get()
                 .await?;
-                let bf = crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?;
-                let seeded_pks: HashSet<String> =
-                    bf.rows.iter().map(|r| outer_ts.key_string(r).unwrap_or_default()).collect();
-                let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
+                // The OUTER shape's backfill is streamed: each chunk is appended to the (not yet
+                // installed) shape stream and dropped, so a wide subquery shape costs one chunk of
+                // memory, not a table's worth. Only the pk SET is kept — it is what
+                // `finish_create`'s gated replay is fenced against, and keys are small.
+                let mut reader =
+                    crate::pg::backfill_where_reader(&client, &outer_ts, Some((wsql, params))).await?;
+                let mut seeded_pks: HashSet<String> = HashSet::new();
                 let mut seeded = 0u64;
-                if !out.is_empty() {
+                let mut appends = 0u64;
+                while let Some(chunk) = reader.next_chunk().await? {
+                    // Same safe point as the plain path: a wide subquery shape's outer backfill
+                    // must not be an un-interruptible span of the termination grace.
+                    if self.shutdown_token().is_shutting_down() {
+                        anyhow::bail!("{}", crate::engine::sequencer::SHUTTING_DOWN);
+                    }
+                    for r in &chunk {
+                        seeded_pks.insert(outer_ts.key_string(r).unwrap_or_default());
+                    }
+                    let out: Vec<(Row, ZWeight)> = chunk.into_iter().map(|r| (r, 1)).collect();
                     let envs = translate_output(
                         &outer_ts,
                         out,
@@ -1250,10 +1269,17 @@ impl Engine {
                         None,
                         out_cols.as_deref().map(Vec::as_slice),
                     );
+                    if envs.is_empty() {
+                        continue;
+                    }
                     self.ds.append(stream_path, &envs).await?;
-                    seeded = envs.len() as u64;
+                    seeded += envs.len() as u64;
+                    appends += 1;
                 }
-                (bf.gate, seeded, seeded_pks)
+                if appends > 1 {
+                    metrics().backfill_chunked_appends.fetch_add(appends, Ordering::Relaxed);
+                }
+                (reader.finish().await.gate, seeded, seeded_pks)
             };
             Ok::<_, anyhow::Error>((node_seeds, outer_gate, seeded, seeded_pks))
         }

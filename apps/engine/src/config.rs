@@ -78,6 +78,16 @@ pub struct Config {
     /// Large-transaction handling on the ingest path (ADR-0003): the per-transaction memory cap
     /// before the buffer spills to disk, the spill directory, and the byte budget for one append.
     pub txn: TxnBufferConfig,
+    /// Backfill streaming: the byte budget for one backfill append and the off-by-default
+    /// slow-backfill `statement_timeout`.
+    pub backfill: crate::pg::BackfillConfig,
+    /// How long a graceful shutdown may take before it is forced
+    /// (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`).
+    pub shutdown_grace: Duration,
+    /// How long the HTTP server keeps accepting after a signal, answering `GET /ready` with 503, so
+    /// a load balancer's probe sees the drain (`ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS`). Comes out
+    /// of `shutdown_grace`, not on top of it.
+    pub shutdown_ready_drain: Duration,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
@@ -170,8 +180,15 @@ impl Config {
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
         let g = |k: &str| nonempty(get(k));
 
-        // Postgres URL: our internal var wins, then the fleet's DATABASE_URL.
+        // Postgres URL: our internal var wins, then the fleet's DATABASE_URL. Parsed here (parsing
+        // is pure — no I/O) so an unusable one is a NAMED boot refusal rather than a connect that
+        // fails identically forever: to the boot classifier a `Config::from_str` failure looks
+        // exactly like "the database is not up yet" (no SQLSTATE, no server answer), so without
+        // this a typo would back off and re-parse the same broken string every 30 s for ever.
         let pg_url = g("ELECTRIC_CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL"));
+        if let Some(url) = pg_url.as_deref() {
+            crate::pg::parse_pg_url(url).context("ELECTRIC_CIRCUITS_PG_URL / DATABASE_URL")?;
+        }
         let ds_url = g("ELECTRIC_CIRCUITS_DS_URL");
 
         // Bind address. ELECTRIC_CIRCUITS_BIND always wins (preserves 127.0.0.1:0 dev behavior). Otherwise,
@@ -320,7 +337,57 @@ impl Config {
 
         // Large transactions (ADR-0003). Boot-fatal on an unusable setting: a memory cap or append
         // budget that was meant to be applied and silently was not is the worst of both worlds.
-        let txn = TxnBufferConfig::resolve(g).context("large-transaction configuration")?;
+        let txn = TxnBufferConfig::resolve(&g).context("large-transaction configuration")?;
+
+        // Streamed backfills. Same stance as the large-transaction knobs: a budget that was meant
+        // to be applied and silently was not is worse than a refused boot.
+        let d = crate::pg::BackfillConfig::default();
+        let append_bytes = match g("ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES") {
+            None => d.append_bytes,
+            Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES must be a byte count, got '{}'",
+                    raw.trim()
+                )
+            })?,
+        };
+        if append_bytes == 0 {
+            bail!(
+                "ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES must be a positive byte count (it bounds one \
+                 backfill append's request body); 0 would make every shape unbackfillable"
+            );
+        }
+        if append_bytes > crate::txn_buffer::DS_MAX_BODY_BYTES {
+            bail!(
+                "ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES is {append_bytes}, above the durable-streams \
+                 request-body cap of {} bytes; an append that large could never land",
+                crate::txn_buffer::DS_MAX_BODY_BYTES
+            );
+        }
+        let statement_timeout_ms = match g("ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS") {
+            None => d.statement_timeout_ms,
+            Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS must be a whole number of \
+                     milliseconds (0 = off), got '{}'",
+                    raw.trim()
+                )
+            })?,
+        };
+        let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms };
+
+        let shutdown_grace = crate::shutdown::resolve_grace(&g).context("shutdown configuration")?;
+        let shutdown_ready_drain =
+            crate::shutdown::resolve_ready_drain(&g).context("shutdown configuration")?;
+        if shutdown_ready_drain >= shutdown_grace {
+            bail!(
+                "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS ({}s) must be less than \
+                 ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS ({}s): the drain comes OUT of the grace, and \
+                 spending all of it advertising 503 leaves nothing to finish an in-flight commit in",
+                shutdown_ready_drain.as_secs(),
+                shutdown_grace.as_secs(),
+            );
+        }
 
         Ok(Config {
             pg_url,
@@ -341,6 +408,9 @@ impl Config {
             trace,
             dbsp,
             txn,
+            backfill,
+            shutdown_grace,
+            shutdown_ready_drain,
             noop_vars: Vec::new(),
         })
     }
@@ -361,7 +431,8 @@ impl Config {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
              secret={} storage_dir={} prometheus_port={:?} trace={} log={} \
-             txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={}",
+             txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
+             backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
@@ -378,6 +449,10 @@ impl Config {
             self.txn.memory_bytes,
             self.txn.append_bytes,
             self.txn.spill_dir.display(),
+            self.backfill.append_bytes,
+            self.backfill.statement_timeout_ms,
+            self.shutdown_grace,
+            self.shutdown_ready_drain,
         )
     }
 }
@@ -391,8 +466,13 @@ pub fn is_noop_var(k: &str) -> bool {
 /// Redact `user:pass@` credentials from a Postgres/URL connection string for logging.
 fn redact_url(url: &str) -> String {
     // scheme://user:pass@host/... -> scheme://***@host/...
+    //
+    // Split at the LAST `@`, not the first: a password may legally contain one (`p@ss`), and
+    // splitting at the first would keep everything after it — i.e. the tail of the password — in a
+    // line that exists precisely to be safe to log. A host name cannot contain an `@`, so the last
+    // one always ends the userinfo.
     match url.split_once("://") {
-        Some((scheme, rest)) => match rest.split_once('@') {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
             Some((_creds, host)) => format!("{scheme}://***@{host}"),
             None => url.to_string(),
         },
@@ -459,6 +539,31 @@ mod tests {
         assert_eq!(c.pg_url.as_deref(), Some("postgres://fleet"));
         let c = cfg(&[]);
         assert_eq!(c.pg_url, None);
+    }
+
+    /// A connection string the driver cannot parse refuses the boot HERE, where every other
+    /// unusable setting is refused — never in the connect loop, which cannot tell it apart from a
+    /// database that has not come up yet and would retry it for ever.
+    #[test]
+    fn an_unparseable_pg_url_refuses_the_boot() {
+        let e = Config::resolve(|k| match k {
+            "ELECTRIC_CIRCUITS_PG_URL" => Some("postgres://u@host:notaport/db".into()),
+            _ => None,
+        })
+        .expect_err("an unusable connection string must not resolve");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("unusable Postgres URL"), "{msg}");
+        // The same string via the fleet's variable is refused identically.
+        assert!(Config::resolve(|k| (k == "DATABASE_URL").then(|| "postgres://u@host:notaport/db".into())).is_err());
+    }
+
+    /// A password containing an `@` must not leak its tail into the "safe to log" config line.
+    #[test]
+    fn redaction_splits_at_the_last_at_not_the_first() {
+        assert_eq!(redact_url("postgres://u:p@ss@host:5432/db"), "postgres://***@host:5432/db");
+        assert_eq!(redact_url("postgres://u:p@host/db"), "postgres://***@host/db");
+        assert_eq!(redact_url("postgres://host/db"), "postgres://host/db", "no userinfo, nothing to redact");
+        assert_eq!(redact_url("not a url"), "not a url");
     }
 
     #[test]

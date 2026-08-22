@@ -228,6 +228,22 @@ Unparseable values (e.g. `NaN` floats) still log errors when degraded to NULL.
 A shape's initial rows come from a single `REPEATABLE READ` snapshot with the predicate pushed into
 the `SELECT`. Live and backfill must then be reconciled so every change counts exactly once.
 
+**The snapshot is streamed, not materialised.** The rows arrive over a `query_raw` cursor (with
+tokio-postgres's own backpressure) and are appended to the still-**pending** shape stream in chunks
+bounded by `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` (16 MiB), so engine memory per backfill is one
+chunk whatever the table's size. No protocol change was needed: shape creation is already two-phase
+(`BeginShape` registers a pending buffer, `ActivateShape` goes live), so nothing reads the stream
+until activation and a failure part-way aborts the pending shape and rolls the creation back exactly
+as before. An **aggregate** folds each chunk into an `AggSeed` and drops the rows — the same
+`fold_agg_row` the live path uses, so the seed is arithmetically identical to feeding those rows
+through it. A **subquery inner-set node's** seed is the one thing still collected whole, because that
+set *is* the state the node will maintain; a subquery *shape's* outer backfill is chunked like any
+other, keeping only the pk set the gated replay is fenced against. The `REPEATABLE READ` bracket, the
+fence capture and `row_json_expr`'s casts are unchanged. The compat adapter's `/v1/shape` snapshot is
+the one place a whole result is still held at once, and it has to be — the snapshot body *is* every
+row; its sibling fold, the client's key set for a catch-up read, drops values as it goes and keeps
+keys only.
+
 **LSN comparison alone is not sound.** `pg_current_wal_lsn()` is a WAL *write* position, but snapshot
 visibility is decided later, at `ProcArrayEndTransaction` (after the commit record is fsynced). A
 transaction whose commit record is already in the WAL can be **invisible** to a snapshot taken during
@@ -596,6 +612,7 @@ absolute membership emission makes them unnecessary for convergence).
 | engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log position checkpoints + segment rotations) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
 | compiled schema ↔ Postgres | fingerprint compare on every `Relation` + a 60 s catalog reconciler; drift/TRUNCATE/identity regression retires that table's dependents, and a per-table schema generation refuses any create that overlapped it (ADR-0005) | never serves rows over a schema Postgres no longer has; the catalog records `schemaChanged` as the audit trail for the drops |
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
+| graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch, flushes, writes a final `Offset` → catalog drains → exit 0; bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
@@ -620,15 +637,47 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 
 Threads are flat in the number of shapes *and* in the number of equality templates.
 
+**Shutdown is cooperative** (`src/shutdown.rs`): one `tokio::sync::watch` token on `Engine`, flipped
+once by the binary's signal handler, joined by every select that could otherwise block — the
+sequencer's change-log long-poll, the ingestor's `recv` (and its reconnect backoff), and the
+`/v1/shape` live poll — so a parked long-poll returns in milliseconds instead of pinning the
+termination grace for its full window. The ingestor and the sequencer each register a named
+**party**; the binary waits for both (bounded), then drains the catalog writer, then exits. The
+ingestor's only safe point is *between* messages, so a commit that is being appended runs to
+completion; a transaction still buffering just stops, having appended nothing, and Postgres
+re-delivers it. Acknowledgement is local: standby feedback rides the replication client's 1 s status
+interval and is not forced on the way out, so a shutdown never advances the slot and the last
+second's commits come back on the next boot, where the highwater drops them.
+
+The grace is a bound on the **process**, not on one await point: a watchdog is armed the instant the
+token flips, and forces the exit (naming whoever was outstanding) wherever the process happens to
+be. Everything that could block for long joins the token too — the boot's connect/introspect/catalog
+fold, a backfill between chunks, the sequencer's read backoff — so the watchdog is a backstop rather
+than the mechanism.
+
 ---
 
 ## 11. Telemetry
 
 - `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`,
-  `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions) +
-  log-bucket latency histograms (`process_envelope`, `family_step`, `append`) with p50/p99/p999/max.
+  `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions,
+  `backfill_chunked_appends_total` for streamed backfills, `sequencer_orphan_fragments_total`) +
+  gauges (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the
+  replication-slot trio below) + log-bucket latency histograms (`process_envelope`, `family_step`,
+  `append`) with p50/p99/p999/max.
+- **Replication-slot gauges**, engine-owned and sampled every ~10 s on a *pooled* connection (never a
+  dedicated one): `replication_slot_retained_wal_bytes`
+  (`pg_current_wal_lsn() - restart_lsn` — the WAL the source database holds on disk for this engine),
+  `replication_confirmed_flush_lag_bytes` (`… - confirmed_flush_lsn` — ingest lag) and
+  `replication_slot_active`. The same sample feeds StatsD, so the numbers exist with or without it.
 - `GET /memory` + OTel gauges (`engine_shapes`, `engine_subquery_nodes`, `engine_subquery_contributors`,
-  `engine_family_circuits`, …) — the cardinalities that drive RSS; `GET /metrics/prometheus` exports.
+  `engine_family_circuits`, …) — the cardinalities that drive RSS. `GET /metrics/prometheus` exports
+  those **and** every counter/gauge above (it used to carry only the memory/cardinality half), so it
+  is a complete scrape target.
+- **Probes:** `GET /health` is liveness (`ok` while the process runs, and never more than that);
+  `GET /ready` is readiness (200 `active`, else 503 `waiting` / `starting` / `degraded` /
+  `shutting_down`); `GET /v1/health` is unchanged Electric-fleet parity. The HTTP surface comes up
+  before Postgres so readiness is answerable while the boot is still retrying.
 - `GET /graph`, `GET /graph/node?sig=…`, `GET /shapes/{id}/rows` — the live pipeline topology + node
   indexes + shape contents, consumed by the **pipeline explorer** (`apps/pipeline-viz`).
 - `GET /state`, `GET /state/node?id=…` — per-node live state: summaries for every pipeline node
