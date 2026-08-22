@@ -33,11 +33,16 @@ export interface SubsetDeps {
   liveMode?: boolean | 'sse' | 'long-poll'
 }
 
-/** Compare two cell values (numbers numerically, everything else lexically; null sorts first). */
+/**
+ * Compare two cell values (numbers numerically, everything else lexically). NULL sorts **last**,
+ * which is PostgreSQL's default for an ascending `ORDER BY`; `makeCmp` multiplies by the order's
+ * direction, so a descending order gets NULLS FIRST — Postgres's other default. The engine's page
+ * query uses a plain `ORDER BY <col> <dir>`, so this is the same order the page arrives in.
+ */
 function cmpVal(a: Value, b: Value): number {
   if (a === b) return 0
-  if (a == null) return b == null ? 0 : -1
-  if (b == null) return 1
+  if (a == null) return b == null ? 0 : 1
+  if (b == null) return -1
   if (typeof a === 'number' && typeof b === 'number') return a - b
   const as = String(a)
   const bs = String(b)
@@ -57,17 +62,35 @@ function makeCmp(pk: string, orderBy?: { col: string; desc?: boolean }): (a: Row
   }
 }
 
-/** Keyset predicate for rows strictly *after* `b` in the order — the cursor for the next page. */
+/**
+ * Keyset predicate for rows strictly *after* `b` in the order — the cursor for the next page.
+ *
+ * NULL sort keys need their own arms, because no comparison is ever TRUE against or about a NULL
+ * (three-valued logic), so a plain `col > b.col` cursor both fails to *reach* the NULL block and
+ * fails to *leave* it — paging would stop at the first NULL-keyed row for ever. The NULL block's
+ * position is the ORDER BY default this cursor has to agree with: ascending puts it last,
+ * descending puts it first.
+ */
 function cursorPredicate(pk: string, orderBy: { col: string; desc?: boolean } | undefined, b: Row): Predicate {
   const pkOp = orderBy?.desc ? 'lt' : 'gt'
   if (!orderBy?.col) return { col: pk, op: pkOp, value: b[pk] }
+  const col = orderBy.col
   const colOp = orderBy.desc ? 'lt' : 'gt'
-  return {
+  const nullBlockAfter: Predicate = { and: [{ col, isNull: true }, { col: pk, op: pkOp, value: b[pk] }] }
+  if (b[col] == null) {
+    // Inside the NULL block. Ascending (NULLS LAST): only later NULLs remain. Descending (NULLS
+    // FIRST): later NULLs, and then the whole non-NULL body of the table.
+    return orderBy.desc ? { or: [nullBlockAfter, { col, isNull: false }] } : nullBlockAfter
+  }
+  const after: Predicate = {
     or: [
-      { col: orderBy.col, op: colOp, value: b[orderBy.col] },
-      { and: [{ col: orderBy.col, op: 'eq', value: b[orderBy.col] }, { col: pk, op: pkOp, value: b[pk] }] },
+      { col, op: colOp, value: b[col] },
+      { and: [{ col, op: 'eq', value: b[col] }, { col: pk, op: pkOp, value: b[pk] }] },
     ],
   }
+  // Ascending: the NULL block still lies ahead of a non-NULL boundary and must be paged into.
+  // Descending: it sorted before the boundary, so it is already behind us.
+  return orderBy.desc ? after : { or: [after, { col, isNull: true }] }
 }
 
 function andPredicate(base: Predicate | undefined, cursor: Predicate): Predicate {
@@ -232,18 +255,33 @@ export async function createSubset<T extends Row = Row>(
       /* proxy/env without HEAD support → read from origin; correctness unaffected (only backlog). */
     }
 
-    // 2. Query-back page 1 straight from Postgres (no stream, no materialization).
+    // 2. Query-back page 1 straight from Postgres (no stream, no materialization). `offset` applies
+    //    to THIS page only: it is where the caller's window starts, and every later page is reached
+    //    by moving the keyset cursor past the boundary — re-applying the offset there would skip
+    //    that many rows again.
     const first = (await deps.trpc.subset.query.query({
       table: def.table,
       where: def.where as never,
       columns: cols,
       orderBy: def.orderBy,
       limit,
+      offset: def.offset,
     })) as SubsetResult
 
     // `boundary` = the last (lowest-in-order) loaded row; the loaded window is everything sorting <= it.
     let boundary: Row | null = first.rows.length ? first.rows[first.rows.length - 1]! : null
-    let ended = first.rows.length < limit
+    // ...and, WITH AN OFFSET, everything sorting >= the first loaded row. Without this lower bound
+    // the window is open at the bottom, so a live delta that moves a row into the region the offset
+    // deliberately skipped would insert it — the subset would silently grow past the page the
+    // caller asked for. A row sorting strictly before the first loaded row is out of the window
+    // under keyset semantics, and under OFFSET semantics it would SHIFT the window, which no live
+    // delta may do; "not in view" is the right answer either way. (An empty first page leaves no
+    // lower bound to take — nothing was loaded to anchor it to.)
+    const lower: Row | null = def.offset && first.rows.length ? first.rows[0]! : null
+    // A page shorter than the page size means the set is fully loaded. A page size of ZERO is never
+    // short, and can never move the cursor either, so it ends the subset outright rather than
+    // promising a next page that could never arrive.
+    let ended = limit === 0 || first.rows.length < limit
     const present = new Set<string>()
     // LSN positioning: `snapshotLsn` is the page's read point in the engine's replication timeline.
     // `applied` is a per-present-row watermark — the snapshot LSN the row's current value was read at
@@ -252,7 +290,12 @@ export async function createSubset<T extends Row = Row>(
     // LSN < snapshotLsn) are dropped — exactly-once after the snapshot, no double-count.
     const snapshotLsn = lsnToU64(first.lsn) ?? 0n
     const applied = new Map<string, bigint>()
-    const inView = (row: Row): boolean => ended || boundary == null || cmp(row, boundary) <= 0
+    const inView = (row: Row): boolean => {
+      // The lower bound holds even once `ended`: "fully loaded" means the pages ran out, not that
+      // the rows below the offset joined the window.
+      if (lower != null && cmp(row, lower) < 0) return false
+      return ended || boundary == null || cmp(row, boundary) <= 0
+    }
 
     let ctl: SyncCtl | null = null
     let loadsInFlight = 0
@@ -312,7 +355,9 @@ export async function createSubset<T extends Row = Row>(
       hasMore: () => !ended,
 
       async loadMore(pageSize = limit) {
-        if (closed || ended || !boundary || !ctl) return 0
+        // `pageSize <= 0` asks for nothing: answer 0 without a round-trip, and without concluding
+        // the set is exhausted (a zero-row answer to a zero-row request proves nothing about it).
+        if (closed || ended || pageSize <= 0 || !boundary || !ctl) return 0
         const where = andPredicate(def.where, cursorPredicate(pk, def.orderBy, boundary))
         loadsInFlight++
         try {

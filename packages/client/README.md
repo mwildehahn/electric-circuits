@@ -55,6 +55,15 @@ page.hasMore()
 await page.close()
 ```
 
+Paging rules worth knowing: `offset` positions the **first** page only (later pages move a keyset
+cursor past the boundary row) and its window is closed at the bottom too — a live change that moves
+a row below the first loaded row does not pull it into the page the offset skipped past; NULL sort
+keys page correctly in both directions, following
+Postgres's `ORDER BY` defaults — ascending puts NULLs last, descending first; `hasMore()` turns
+false once a page comes back **shorter than requested**, so exhausting a set takes one final
+`loadMore()` that returns 0; and `limit: 0` is ended from the start (a zero-size page can never be
+short, and never moves the cursor).
+
 ## `aggregate(def)` — live scalar
 
 ```ts
@@ -67,6 +76,12 @@ await agg.close()
 
 `fn` is `'count' | 'sum' | 'avg' | 'min' | 'max'`; `col` is required for all but `count`.
 
+`AggregateValue` is `number | string | boolean | null` — usually a number, but MIN/MAX carry the
+column's own value (a text column yields a string) and an **integer SUM outside the `2^53` range a
+JSON number round-trips arrives as a decimal string**, because the engine will not hand back a
+silently rounded total (`BigInt(v)` it). Float SUM/AVG are always numbers, and so is a `numeric`
+column's — exactness is for integer columns.
+
 ## Writes and lifecycle
 
 Writes go to Postgres with ordinary SQL (the engine ingests via replication). In library mode
@@ -76,10 +91,4 @@ Writes go to Postgres with ordinary SQL (the engine ingests via replication). In
 **`close()` is one-shot and deletes server-side.** Every `shape()`/`subset()`/`aggregate()` holds
 one reference on a ref-counted server object; its `close()` releases exactly that reference (with
 retry — there is no server-side reaper) and is guarded against double-close. `client.close()`
-`AggregateValue` is `number | string | boolean | null` — usually a number, but MIN/MAX carry the
-column's own value (a text column yields a string) and an **integer SUM outside the `2^53` range a
-JSON number round-trips arrives as a decimal string**, because the engine will not hand back a
-silently rounded total (`BigInt(v)` it). Float SUM/AVG are always numbers, and so is a `numeric`
-column's — exactness is for integer columns.
-
 tears down everything still open. Design context: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).

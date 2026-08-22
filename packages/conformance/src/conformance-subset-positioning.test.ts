@@ -56,7 +56,133 @@ async function readFeed(streamUrl: string): Promise<StreamEnvelope[]> {
   return out
 }
 
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 10000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (cond()) return
+    await new Promise((r) => setTimeout(r, 50))
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
 describe('subset LSN positioning (end-to-end)', () => {
+  it('reports no additional pages when the public limit is zero', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, 10)')
+    await drainEngine(h)
+
+    const sub = await h.client.subset({ table: 'items', orderBy: { col: 'id' }, limit: 0 })
+    try {
+      expect(sub.collection.toArray as unknown as Row[]).toEqual([])
+      expect(await sub.loadMore()).toBe(0)
+      expect(sub.hasMore()).toBe(false)
+    } finally {
+      await sub.close()
+    }
+  })
+
+  it('paginates through NULL sort keys using the public native subset API', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, NULL), (2, 10), (3, 20)')
+    await drainEngine(h)
+
+    // PostgreSQL's native ascending order puts NULL last. The first public page therefore contains
+    // id=2, while later pages must still reach id=3 and the NULL-keyed id=1.
+    const sub = await h.client.subset({ table: 'items', orderBy: { col: 'n' }, limit: 1 })
+    try {
+      expect((sub.collection.toArray as unknown as Row[]).map((r) => r.id)).toEqual([2])
+      expect(await sub.loadMore()).toBe(1)
+      expect(await sub.loadMore()).toBe(1)
+
+      const got = (sub.collection.toArray as unknown as Row[])
+        .map((r) => ({ id: r.id, n: r.n }))
+        .sort((a, b) => Number(a.id) - Number(b.id))
+      expect(got).toEqual([
+        { id: 1, n: null },
+        { id: 2, n: 10 },
+        { id: 3, n: 20 },
+      ])
+      // `hasMore()` is false once a page comes back SHORT (its documented contract), so exhaustion
+      // takes one more probe — three rows at page size 1 are three FULL pages, and nothing short of
+      // a `limit + 1` probe on every page could tell the client the set ended without asking again.
+      // The probe is also the other half of the bug under test: the cursor built from a NULL
+      // boundary must terminate rather than re-serve the NULL row for ever.
+      expect(await sub.loadMore()).toBe(0)
+      expect(sub.hasMore()).toBe(false)
+    } finally {
+      await sub.close()
+    }
+  })
+
+  it('paginates descending through NULL sort keys (NULLS FIRST) and terminates', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, NULL), (2, 10), (3, 20)')
+    await drainEngine(h)
+
+    // PostgreSQL's native DESCENDING order puts NULL first, so the first page is the NULL-keyed
+    // row; the cursor built from it must continue into the non-NULL body (20, then 10).
+    const sub = await h.client.subset({ table: 'items', orderBy: { col: 'n', desc: true }, limit: 1 })
+    try {
+      expect((sub.collection.toArray as unknown as Row[]).map((r) => r.id)).toEqual([1])
+      expect(await sub.loadMore()).toBe(1)
+      expect(await sub.loadMore()).toBe(1)
+      expect(await sub.loadMore()).toBe(0)
+      expect(sub.hasMore()).toBe(false)
+
+      const got = (sub.collection.toArray as unknown as Row[])
+        .map((r) => ({ id: r.id, n: r.n }))
+        .sort((a, b) => Number(a.id) - Number(b.id))
+      expect(got).toEqual([
+        { id: 1, n: null },
+        { id: 2, n: 10 },
+        { id: 3, n: 20 },
+      ])
+    } finally {
+      await sub.close()
+    }
+  })
+
+  it('seeds the same offset page through subset() as query()', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)')
+    await drainEngine(h)
+
+    const def = { table: 'items', orderBy: { col: 'n' }, limit: 2, offset: 2 } as const
+    const expected = await h.client.query(def)
+    expect(expected.rows.map((row) => row.id)).toEqual([3, 4])
+
+    const sub = await h.client.subset(def)
+    try {
+      expect((sub.collection.toArray as unknown as Row[]).map((row) => row.id)).toEqual([3, 4])
+    } finally {
+      await sub.close()
+    }
+  })
+
+  it('keeps an offset window closed at the bottom — a live delta below it never enters', async () => {
+    await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)')
+    await drainEngine(h)
+
+    // The window is rows 3 and 4; rows 1 and 2 were deliberately skipped by the offset.
+    const sub = await h.client.subset({ table: 'items', orderBy: { col: 'n' }, limit: 2, offset: 2 })
+    try {
+      expect((sub.collection.toArray as unknown as Row[]).map((r) => r.id)).toEqual([3, 4])
+
+      // A live update to a row BELOW the window. It matches the base predicate (there is none), so
+      // the feed delivers it — but it sorts before the first loaded row and must not join the view.
+      await pg('UPDATE items SET n = 11 WHERE id = 1')
+      // ...and one INSIDE the window, which must be applied. Ordered after the first write, so
+      // observing this one proves the first was already delivered and judged.
+      await pg('UPDATE items SET n = 35 WHERE id = 3')
+      await drainEngine(h)
+      await waitFor(
+        () => (sub.collection.toArray as unknown as Row[]).some((r) => Number(r.id) === 3 && r.n === 35),
+        'in-window update to apply',
+      )
+
+      const ids = (sub.collection.toArray as unknown as Row[]).map((r) => Number(r.id)).sort((a, b) => a - b)
+      expect(ids).toEqual([3, 4])
+    } finally {
+      await sub.close()
+    }
+  })
+
   it('drops the overlap-window delta already in the page — exactly-once, no double-count', async () => {
     // 1. Seed the table and let the engine ingest it.
     await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 30)')

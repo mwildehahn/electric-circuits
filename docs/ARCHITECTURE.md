@@ -601,6 +601,25 @@ carry their commit LSN for exactly this. Key invariants (all regression-tested):
 - Close is one-shot; the feed is deleted with retries; a failed page query-back deletes the
   just-created feed before rethrowing (no refcount pinning).
 
+Paging is **keyset**, and the cursor has to agree with the page query's `ORDER BY <col> <dir>,
+<pk> <dir>` exactly:
+
+- **`offset` is the first page's**, and only the first page's — later pages are reached by moving
+  the cursor past the boundary row, so re-applying the offset there would skip that many rows again.
+  An offset window is also closed at the **bottom**: the first loaded row is a lower bound on
+  membership (kept even once the pages run out), so a live delta that moves a row into the region
+  the offset deliberately skipped is dropped rather than growing the window past the page asked for.
+- **NULL sort keys are a block, not a value.** No comparison is ever TRUE about a NULL, so a plain
+  `col > boundary.col` cursor can neither reach the NULL block nor leave it — paging would stop at
+  the first NULL-keyed row for ever. The cursor adds explicit `IS NULL` / `IS NOT NULL` arms
+  positioned by the `ORDER BY` default the engine emits: **ascending = NULLS LAST**, **descending =
+  NULLS FIRST**. The client's window comparator sorts NULL last for the same reason (the order
+  direction flips it to first for `desc`), so `inView` and the cursor cannot disagree.
+- **`limit: 0` is ended, immediately.** A page can only be "short" — the exhaustion signal — against
+  a non-zero page size, and a zero-size page never moves the cursor, so `hasMore()` would otherwise
+  promise a next page that could never arrive. `loadMore(0)` is a no-op that reports 0 without
+  claiming exhaustion.
+
 ---
 
 ## 8. Electric protocol adapter
