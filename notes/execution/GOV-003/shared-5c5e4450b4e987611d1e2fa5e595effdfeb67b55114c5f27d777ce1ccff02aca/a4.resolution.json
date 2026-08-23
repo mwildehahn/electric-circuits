@@ -1,0 +1,25 @@
+{
+  "attempt_key": [
+    "GOV-003",
+    "shared-5c5e4450b4e987611d1e2fa5e595effdfeb67b55114c5f27d777ce1ccff02aca",
+    4
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "6324ee4421409bc2b89d4877ff484a55eb65294f4a870d25a767f99967accf21",
+  "controller_generation": 20,
+  "controller_head": "6da5a5eedda89bc0efaaf445669ca15de57a724e",
+  "controller_tree": "518c64db9b75d7ac2b56983363a314993b982af1",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "40fd5752b80ecdf00936c56e95f8e6e1fef49bff3fe8445a051e948a191654cd",
+  "packet_sha256": "209ef6d6be48abe69e7faf227977657320be650017ea48cb758cb1cbab62688f",
+  "prepared_patch_sha256": "731a91e1c3109e5d1a4878b4907c25ee3c3cc2fbe3bc620ec169147f2c7364b0",
+  "review_sha256": "7eee63475fa8c4703fa8ae5f1af160c1e8b2654729651e4f3e1329933889f8d7",
+  "gates": {
+    "tracker_mutation_tests": "pass_raw_8",
+    "pnpm_typecheck": "pass_full_mount",
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 5,
+  "reason": "Independent review found the handoff's tracker test count (9/9) disagreed with its retained raw output (8/8), and the run root lacked durable source/dependency/mount pre/post attestations required by protocol v2. The candidate is inadmissible despite a successful independently recreated full-mount typecheck; no artifact is integrated.",
+  "terminal_status": "invalidated"
+}

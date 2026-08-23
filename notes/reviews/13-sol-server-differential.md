@@ -9,15 +9,18 @@ Canonical spec: `notes/18-production-readiness-spec-reviewed.md`
 
 The canonical note has incorporated nearly all P0/P1 findings from the earlier server-correctness,
 operations/durability, PostgreSQL 18, and E2E/TDD reviews. It is materially stronger than the current
-server, but it is still a target plan, not evidence that the server is ready. I found one P0 startup
-ordering/ownership defect that is not closed by the current task wording, and several P1/P2
-dependency or gate gaps that can allow a green packet to omit a required server invariant.
+server, but it is still a target plan, not evidence that the server is ready. I found two P0
+correctness defects (startup ordering/ownership and sequencer fail-closed processing) that are not
+closed by the current task wording, and several P1/P2 dependency or gate gaps that can allow a green
+packet to omit a required server invariant.
 
-The most urgent issue is boot ordering: the current engine mutates PostgreSQL publication/replica
-identity state before it reads the durable catalog and verifies the epoch, and it marks a second
-engine active when the slot is busy. The first production profile says the runtime role must not do
-those mutations and that a successor must not be routable until exclusive ownership is proven. The
-plan needs an explicit startup/preflight owner and gate, not only the later deployment prose.
+The most urgent issues are boot ordering and fail-closed sequencing: the current engine mutates
+PostgreSQL publication/replica identity state before it reads the durable catalog and verifies the
+epoch, marks a second engine active when the slot is busy, and advances its source highwater after
+logging `process_envelope` failures. The first production profile says the runtime role must not do
+those mutations, a successor must not be routable until exclusive ownership is proven, and no
+committed effect may be acknowledged before it lands. The plan needs explicit startup and sequencer
+owners/gates, not only later deployment prose.
 
 ## Ranked findings
 
