@@ -963,8 +963,34 @@ impl Engine {
                     seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
             }
         }
+        let owned_barrier = if removed.is_some() {
+            let barrier = Arc::new(crate::engine::PurgeBarrier::new());
+            self.purge_barriers.lock().unwrap().insert(id.to_string(), barrier.clone());
+            Some(barrier)
+        } else {
+            None
+        };
         drop(st);
+        #[cfg(test)]
+        if durable && self.purge_test_hook.pause_after_remove.load(std::sync::atomic::Ordering::Acquire) {
+            self.purge_test_hook.removed.notify_one();
+            self.purge_test_hook.release.notified().await;
+        }
         if durable {
+            let (barrier, owner) = if let Some(barrier) = owned_barrier {
+                (barrier, true)
+            } else if let Some(barrier) = self.purge_barriers.lock().unwrap().get(id).cloned() {
+                (barrier, false)
+            } else {
+                self.catalog_tx.wait_durable().await;
+                return Ok(());
+            };
+            if !owner {
+                self.catalog_tx.wait_durable().await;
+                barrier.wait().await;
+                self.catalog_tx.wait_durable().await;
+                return Ok(());
+            }
             // The teardown this purge promised must NOT depend on the request that asked for it.
             // Giving up on a `DELETE` while storage is down is exactly what a client does during an
             // outage, and that drops this handler future — but the `Dropped` still lands, because
@@ -972,20 +998,45 @@ impl Engine {
             // would simply never run in this process: the stream would linger alive until the next
             // boot's GC and a subquery shape would stay registered and maintained as a zombie. So
             // the work after the durability wait is owned by the PROCESS, not by the request.
+            let task_barrier = barrier.clone();
             let (engine, owned) = (self.clone(), id.to_string());
             tokio::spawn(async move {
                 // ADR-0007 order is preserved inside the task: `Dropped` durable, then close/delete.
                 if let Some(wait) = wait {
                     wait.await;
                 }
-                engine.finish_purge(&owned, removed).await;
+                engine.finish_purge(&owned, removed, true, None).await;
+                task_barrier.complete();
+                engine.purge_barriers.lock().unwrap().remove(&owned);
             });
-            // The request waits only for the durability BARRIER — everything enqueued up to and
-            // including that `Dropped` is in the restart contract when this returns. A concurrent
-            // retry finds `removed == None`, enqueues nothing, and waits on the same barrier.
+            // The request waits for both barriers: the `Dropped` intent is durable, and the public
+            // shape/stream terminal state has been completed. A concurrent retry finds
+            // `removed == None`, enqueues nothing, and waits on the same barriers.
+            self.catalog_tx.wait_durable().await;
+            barrier.wait().await;
             self.catalog_tx.wait_durable().await;
         } else {
-            self.finish_purge(id, removed).await;
+            if let Some(barrier) = owned_barrier {
+                self.finish_purge(id, removed, false, Some(barrier.clone())).await;
+                let barrier_done = barrier.is_done();
+                if barrier_done {
+                    self.purge_barriers.lock().unwrap().remove(id);
+                } else {
+                    let barriers = self.purge_barriers.clone();
+                    let owned = id.to_string();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        barriers.lock().unwrap().remove(&owned);
+                    });
+                }
+            } else {
+                let existing = self.purge_barriers.lock().unwrap().get(id).cloned();
+                if let Some(barrier) = existing {
+                    barrier.wait().await;
+                } else {
+                    self.finish_purge(id, removed, false, None).await;
+                }
+            }
         }
         Ok(())
     }
@@ -993,13 +1044,31 @@ impl Engine {
     /// The half of a purge that must outlive the request that asked for it: registry cleanup, the
     /// stream retirement, the trace. Ordered strictly AFTER the `Dropped` intent (ADR-0007) — a
     /// crash between the two leaves a record the boot can act on, the other order leaves an orphan.
-    async fn finish_purge(&self, id: &str, removed: Option<ShapeRecord>) {
+    async fn finish_purge(
+        &self,
+        id: &str,
+        removed: Option<ShapeRecord>,
+        wait_retirement: bool,
+        completion_barrier: Option<Arc<crate::engine::PurgeBarrier>>,
+    ) {
         // Subquery shapes live in the registry (a no-op for plain shapes).
         self.subqueries.lock().await.drop_subquery_shape(id).await;
         if let Some(rec) = removed {
             // Retirement: close (releasing any tailing long-poll with `stream-closed`) then delete,
             // and record the completion. A storage failure is queued, never forgotten.
-            self.retire_shape_stream(id, &rec.stream_path).await;
+            if wait_retirement {
+                self.retire_shape_stream_wait(id, &rec.stream_path).await;
+            } else if let Some(barrier) = completion_barrier {
+                let completion = crate::engine::retirement::RetirementCompletion::new_non_durable();
+                let completion_wait = completion.clone();
+                tokio::spawn(async move {
+                    completion_wait.wait().await;
+                    barrier.complete();
+                });
+                self.retire_shape_stream_with_completion(id, &rec.stream_path, completion).await;
+            } else {
+                self.retire_shape_stream(id, &rec.stream_path).await;
+            }
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("purged shape {id} (forced)");
         }
@@ -2608,6 +2677,7 @@ mod cancellation_tests {
 #[cfg(test)]
 mod subscription_tests {
     use super::*;
+    use crate::engine::catalog::testing::FakeDs;
 
     /// An engine with one shared shape and the given live subscriptions
     /// (`subscription id -> lease timestamp`). No durable-streams behind it: every catalog record
@@ -2839,5 +2909,341 @@ mod subscription_tests {
         let engine = engine_with_share("s1", &[("mine", 10)]).await;
         engine.purge_shape("s1").await.unwrap();
         assert_eq!(engine.state.lock().await.subscription_owner("mine"), None);
+    }
+
+    /// Native purge acknowledgement is a terminal public-state promise: the stream must already
+    /// be retired when the request returns, not merely queued on a detached task after `Dropped`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_waits_for_stream_retirement_before_returning() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        assert!(!purging.is_finished(), "purge returned while stream deletion was still blocked");
+
+        server.release_delete();
+        purging.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_durable_purge_retries_join_the_original_teardown() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        engine.purge_test_hook.pause_after_remove.store(true, std::sync::atomic::Ordering::Release);
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.purge_test_hook.removed.notified())
+            .await
+            .expect("purge did not publish its barrier after removing the shape");
+        engine.purge_test_hook.pause_after_remove.store(false, std::sync::atomic::Ordering::Release);
+        let mut second = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second).await.is_err(),
+            "a concurrent retry must join the in-flight retirement"
+        );
+
+        engine.purge_test_hook.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        server.release_delete();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_waits_for_transient_retirement_failure_to_retry() {
+        let server = FakeDs::start().await;
+        server.fail_deletes(1);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        tokio::task::yield_now().await;
+        assert!(!purging.is_finished(), "purge must remain pending while queued retirement retries");
+        purging.await.unwrap().unwrap();
+        assert!(server.deletes() >= 2, "the queued retirement must retry after the transient failure");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_waits_for_retired_catalog_event_to_be_durable() {
+        let server = FakeDs::start().await;
+        server.block_retired(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_retired_started())
+            .await
+            .expect("Retired catalog append did not reach the blocking seam");
+        assert!(!purging.is_finished(), "purge returned before Retired was durable");
+        server.release_retired();
+        purging.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn internal_purge_waits_for_stream_retirement_before_returning() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        assert!(!purging.is_finished(), "internal purge returned while stream deletion was blocked");
+        server.release_delete();
+        purging.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_joining_internal_retry_waits_for_terminal_retirement() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        server.fail_deletes(1);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        let internal = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("initial stream delete did not reach the blocking seam");
+        server.release_delete();
+        internal.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("queued retirement retry did not reach the blocking seam");
+
+        let mut durable = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut durable).await.is_err(),
+            "durable purge returned before the queued internal retirement completed"
+        );
+        server.release_delete();
+        durable.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_purge_joining_internal_waits_for_retired_durability() {
+        let server = FakeDs::start().await;
+        server.block_retired(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+
+        engine.purge_shape("s1").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_retired_started())
+            .await
+            .expect("internal purge did not enqueue Retired");
+        let mut durable = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut durable).await.is_err(),
+            "durable purge returned before the internal Retired append was durable"
+        );
+        server.release_retired();
+        durable.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn internal_purge_during_durable_purge_joins_existing_barrier() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        let engine = Engine::new(DsClient::new(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(
+                "s1".to_string(),
+                ShapeRecord {
+                    id: "s1".to_string(),
+                    table: "items".into(),
+                    stream_path: "shape/s1".into(),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                },
+            );
+        }
+        engine.purge_test_hook.pause_after_remove.store(true, std::sync::atomic::Ordering::Release);
+        let durable = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape_durable("s1").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.purge_test_hook.removed.notified())
+            .await
+            .expect("purge did not publish its barrier after removing the shape");
+        engine.purge_test_hook.pause_after_remove.store(false, std::sync::atomic::Ordering::Release);
+        let mut internal = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.purge_shape("s1").await }
+        });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut internal).await.is_err());
+        engine.purge_test_hook.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+            .await
+            .expect("stream delete did not reach the blocking seam");
+        assert!(!internal.is_finished());
+        server.release_delete();
+        durable.await.unwrap().unwrap();
+        internal.await.unwrap().unwrap();
     }
 }
