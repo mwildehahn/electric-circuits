@@ -1209,6 +1209,10 @@ impl Engine {
         }
         tables.sort();
         tables.dedup();
+        // Validate tracked-table visibility before any durable catalog, slot, publication,
+        // identity or schema setup can mutate Postgres or storage. RLS is unsupported in the first
+        // profile because it can make logical replication silently selective.
+        crate::pg::reject_rls_tables(&client, &tables).await?;
         // --- The epoch (ADR-0004) ---
         //
         // Read the durable catalog and DECIDE before restoring anything: the epoch the catalog's
