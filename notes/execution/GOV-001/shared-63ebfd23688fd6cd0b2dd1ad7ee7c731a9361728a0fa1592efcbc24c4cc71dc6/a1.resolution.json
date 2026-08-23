@@ -1,0 +1,31 @@
+{
+  "attempt_key": [
+    "GOV-001",
+    "shared-63ebfd23688fd6cd0b2dd1ad7ee7c731a9361728a0fa1592efcbc24c4cc71dc6",
+    1
+  ],
+  "candidate_commit": null,
+  "candidate_tree": null,
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "1e02f4285360113a4c18eb089ad8703115dcc9be6926274e07954e7a8ba35e0c",
+  "controller_generation": 13,
+  "controller_head": "23d4655eb6bc0a9f16b7753bffda218ebd3b2723",
+  "controller_tree": "a40cffce1a1035ba231ca06bbcc6dc71be39e086",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_commit": null,
+  "integration_sha": "5f7566618aaa2c80395e7a9f8b7d87a5fbdacf88",
+  "integration_tree": "61948bf3e9b1f46ff5a7a11b0e5f8d68cfeb3a18",
+  "last_acknowledged_nonce": 13,
+  "lease_expired_at": null,
+  "packet_sha256": "499da265fb8a386d0513fb3d3c29e134e33a31930605c7119543a05cad945d0c",
+  "prepared_patch_sha256": "8759221bda08f7012f7766e907432d6869e9de6e805465b74b7f1bbcf99269b7",
+  "review_sha256": "7856dec285f76ab17ae6b8d9acff537ecbe21b9a0862c4898d9950f6dd99c6d0",
+  "gates": {
+    "git_diff_check": "pass",
+    "pnpm_typecheck_author": "pass",
+    "pnpm_typecheck_detached": "pass"
+  },
+  "reason": "Independent detached review passed; the packet-owned ADR and execution handoff were integrated as one serialized logical task. The old lease was stopped after integration and its controller event log was retained.",
+  "superseding_attempt": null,
+  "terminal_status": "integrated"
+}
