@@ -169,6 +169,9 @@ pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
     if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
         return classify(failure_of(pg));
     }
+    if e.chain().any(|cause| cause.downcast_ref::<crate::replication::Refused>().is_some()) {
+        return BootFailure::Retryable;
+    }
     // The boot also talks to durable-streams (the catalog fold, the change log). A storage server
     // that is not up yet is the same kind of "not yet" as a database that is not up yet — and in a
     // compose/Kubernetes start it is the NORMAL one — so it backs off rather than exiting 78. Only

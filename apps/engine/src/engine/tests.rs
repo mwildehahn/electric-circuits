@@ -4,6 +4,17 @@
 use super::*;
 use crate::schema::{TableDef, TableSchema};
 
+#[test]
+fn boot_does_not_restore_or_activate_when_slot_is_busy_or_epoch_is_broken() {
+    let busy = Verdict::Busy { active_pid: Some(4242) };
+    assert_eq!(boot_epoch_action(&busy), BootEpochAction::Wait(Some(4242)));
+    for reason in
+        [EpochBreakReason::SlotLost, EpochBreakReason::SlotWalLost, EpochBreakReason::SystemIdentifierMismatch]
+    {
+        assert_eq!(boot_epoch_action(&Verdict::Break(reason)), BootEpochAction::Park(reason));
+    }
+}
+
 /// The candidate set must contain every standalone shape that could match any row of the
 /// delta (old or new side), and exclude shapes whose necessary conjunct fails on all rows.
 #[test]
