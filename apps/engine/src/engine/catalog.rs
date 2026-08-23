@@ -533,6 +533,24 @@ impl std::fmt::Display for CatalogPredatesSubscriptions {
 
 impl std::error::Error for CatalogPredatesSubscriptions {}
 
+/// A catalog record cannot be resumed when its durable shape stream is absent or terminal.
+/// Restore checks every restorable record before installing any one of them, so a partial catalog
+/// cannot become visible after storage lost a stream during downtime.
+#[derive(Debug)]
+pub struct CatalogRestoreStreamInvalid {
+    pub shape_id: String,
+    pub path: String,
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for CatalogRestoreStreamInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shape {} stream {} is {}", self.shape_id, self.path, self.reason)
+    }
+}
+
+impl std::error::Error for CatalogRestoreStreamInvalid {}
+
 /// Is this raw catalog event missing what ADR-0008 requires of it? `Some(detail)` names it.
 ///
 /// Positive-checking the raw JSON rather than trusting the deserializer, exactly like
@@ -823,6 +841,44 @@ pub(crate) enum RestoreMode {
 }
 
 impl Engine {
+    /// Vouch for every stream that Resume would install before changing the registry, routing or
+    /// sequencer. Schema-drift and subquery records are intentionally dropped by the existing
+    /// restore path, so their streams are retired below rather than treated as resumable state.
+    async fn preflight_catalog_streams(
+        &self,
+        recs: &HashMap<String, Restored>,
+        compiled: &HashMap<TableRef, TableSchema>,
+    ) -> Result<()> {
+        for (id, (rec, _, _, _)) in recs {
+            if rec.is_subquery || schema_moved_while_down(rec, compiled).is_some() {
+                continue;
+            }
+            let head = self
+                .ds
+                .head(&rec.stream_path)
+                .await
+                .with_context(|| format!("catalog restore: checking shape {id} stream {}", rec.stream_path))?;
+            match head {
+                None => {
+                    return Err(anyhow::Error::new(CatalogRestoreStreamInvalid {
+                        shape_id: id.clone(),
+                        path: rec.stream_path.clone(),
+                        reason: "missing",
+                    }));
+                }
+                Some(head) if head.closed => {
+                    return Err(anyhow::Error::new(CatalogRestoreStreamInvalid {
+                        shape_id: id.clone(),
+                        path: rec.stream_path.clone(),
+                        reason: "closed",
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Read the durable shape catalog and fold it. No engine state is touched — see
     /// [`Self::apply_catalog`] for that half.
     pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
@@ -875,6 +931,12 @@ impl Engine {
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
+        // Resume must prove every retained stream is still appendable before any record, share or
+        // sequencer state is installed. Park intentionally skips this: it records old-epoch shapes
+        // for the reset's close-then-delete path and must preserve that existing semantics.
+        if mode == RestoreMode::Resume {
+            self.preflight_catalog_streams(&fold.recs, compiled).await?;
+        }
         // BEFORE anything else, and in both modes: a `Dropped` with no `Retired` is a shape stream a
         // previous process promised to remove and did not (its retirement was refused by storage,
         // or the process died between the two). The engine has already forgotten the shape, so
@@ -1193,6 +1255,7 @@ impl Engine {
 /// intent), and a double that returns pre-classified errors would test the test.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1214,6 +1277,9 @@ pub(crate) mod testing {
         block_retired: AtomicBool,
         retired_started: tokio::sync::Notify,
         release_retired: tokio::sync::Notify,
+        /// Shape streams to answer as absent/closed to restore preflight HEADs.
+        missing_heads: Mutex<HashSet<String>>,
+        closed_heads: Mutex<HashSet<String>>,
         events: Mutex<Vec<serde_json::Value>>,
     }
 
@@ -1225,11 +1291,30 @@ pub(crate) mod testing {
     impl FakeDs {
         pub(crate) async fn start() -> FakeDs {
             use axum::extract::State;
+            use axum::response::IntoResponse;
             let state = Arc::new(FakeDsState::default());
             let app = axum::Router::new()
                 .route(
                     "/{*path}",
                     axum::routing::put(|| async { axum::http::StatusCode::OK })
+                        .head(
+                            |State(st): State<Arc<FakeDsState>>,
+                             axum::extract::Path(path): axum::extract::Path<String>| async move {
+                                if st.missing_heads.lock().unwrap().contains(&path) {
+                                    return (axum::http::StatusCode::NOT_FOUND, [("stream-next-offset", "-1")])
+                                        .into_response();
+                                }
+                                let closed = st.closed_heads.lock().unwrap().contains(&path);
+                                let mut response =
+                                    (axum::http::StatusCode::OK, [("stream-next-offset", "0")]).into_response();
+                                if closed {
+                                    response
+                                        .headers_mut()
+                                        .insert("stream-closed", axum::http::HeaderValue::from_static("true"));
+                                }
+                                response
+                            },
+                        )
                         .post(
                             |State(st): State<Arc<FakeDsState>>,
                              axum::extract::Path(path): axum::extract::Path<String>,
@@ -1311,6 +1396,14 @@ pub(crate) mod testing {
         /// Answer the next `n` stream deletes with 503.
         pub(crate) fn fail_deletes(&self, n: u32) {
             self.state.fail_deletes.store(n, Ordering::SeqCst);
+        }
+
+        pub(crate) fn mark_stream_missing(&self, path: &str) {
+            self.state.missing_heads.lock().unwrap().insert(path.to_string());
+        }
+
+        pub(crate) fn mark_stream_closed(&self, path: &str) {
+            self.state.closed_heads.lock().unwrap().insert(path.to_string());
         }
 
         pub(crate) fn block_deletes(&self, block: bool) {
@@ -1965,7 +2058,8 @@ mod tests {
             },
             CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
         ]);
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let server = FakeDs::start().await;
+        let engine = Engine::new(DsClient::new(server.url()));
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
         let st = engine.state.lock().await;
         let share = st.feed_shares.get("s1").expect("the restored share entry");
@@ -1982,13 +2076,86 @@ mod tests {
     async fn restore_failure_is_returned_to_the_boot_boundary() {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
         let fold = fold_of(vec![created]);
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let server = FakeDs::start().await;
+        let engine = Engine::new(DsClient::new(server.url()));
 
         let err = engine
             .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
             .await
             .expect_err("a shape that cannot resume must fail catalog restore");
         assert!(format!("{err:#}").contains("public.users"), "restore failure keeps shape context: {err:#}");
+    }
+
+    /// Restore validates every retained shape stream before installing any record or routing
+    /// entry. A missing second stream must fail the whole restore, leaving the first valid shape
+    /// neither registered nor served; two present streams are the unaffected control.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_preflights_all_shape_streams_atomically() {
+        fn dormant(id: &str, path: &str, table: &str) -> Vec<CatalogEvent> {
+            let mut created = created_event(table);
+            created["rec"]["id"] = serde_json::json!(id);
+            created["rec"]["stream_path"] = serde_json::json!(path);
+            let created = serde_json::from_value::<CatalogEvent>(created).unwrap();
+            let gate = crate::pg::SnapshotGate::passthrough();
+            vec![created, CatalogEvent::Dormant { id: id.to_string(), resume: pos(0, "5"), gate }]
+        }
+
+        let missing_server = FakeDs::start().await;
+        missing_server.mark_stream_missing("shape/s2");
+        let fold = fold_of(
+            dormant("s1", "shape/s1", "public.users")
+                .into_iter()
+                .chain(dormant("s2", "shape/s2", "public.accounts"))
+                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
+                .collect(),
+        );
+        let engine = Engine::new(DsClient::new(missing_server.url()));
+        let err = engine
+            .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
+            .await
+            .expect_err("a missing retained stream must fail the whole restore");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("s2"), "restore error names the missing shape: {detail}");
+        let st = engine.state.lock().await;
+        assert!(st.shapes.is_empty(), "no restored shape is installed after preflight failure");
+        assert!(st.feed_shares.is_empty(), "no sharing/routing entry is installed after preflight failure");
+        drop(st);
+        assert!(engine.table_stats(&TableRef::parse("public.users").unwrap()).await.is_none());
+        assert!(engine.table_stats(&TableRef::parse("public.accounts").unwrap()).await.is_none());
+
+        let closed_server = FakeDs::start().await;
+        closed_server.mark_stream_closed("shape/s2");
+        let closed_fold = fold_of(
+            dormant("s1", "shape/s1", "public.users")
+                .into_iter()
+                .chain(dormant("s2", "shape/s2", "public.accounts"))
+                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
+                .collect(),
+        );
+        let closed_engine = Engine::new(DsClient::new(closed_server.url()));
+        let err = closed_engine
+            .apply_catalog(closed_fold, &HashMap::new(), RestoreMode::Resume)
+            .await
+            .expect_err("a closed retained stream must fail the whole restore");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("s2") && detail.contains("closed"), "restore error names the closed shape: {detail}");
+        assert!(closed_engine.state.lock().await.shapes.is_empty());
+
+        let valid_server = FakeDs::start().await;
+        let valid_fold = fold_of(
+            dormant("s1", "shape/s1", "public.users")
+                .into_iter()
+                .chain(dormant("s2", "shape/s2", "public.accounts"))
+                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
+                .collect(),
+        );
+        let valid_engine = Engine::new(DsClient::new(valid_server.url()));
+        valid_engine
+            .apply_catalog(valid_fold, &HashMap::new(), RestoreMode::Resume)
+            .await
+            .expect("present open streams retain the existing restore behavior");
+        let st = valid_engine.state.lock().await;
+        assert_eq!(st.shapes.len(), 2, "the valid-stream control restores both records");
     }
 
     /// Even a dormant-only catalog must fail closed when the existing sequencer command receiver
@@ -2005,7 +2172,8 @@ mod tests {
             },
             CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
         ]);
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let server = FakeDs::start().await;
+        let engine = Engine::new(DsClient::new(server.url()));
         let cmd = {
             let mut st = engine.state.lock().await;
             engine.ensure_sequencer(&mut st).cmd_tx.clone()
