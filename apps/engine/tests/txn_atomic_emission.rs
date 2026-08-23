@@ -156,6 +156,20 @@ async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
+async fn wait_for_progress_or_shutdown(engine: &Engine, table: &TableRef, expected: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if engine.shutdown_token().is_shutting_down() {
+            return;
+        }
+        if engine.table_offset(table).await.unwrap().offset != expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for the sequencer to consume the malformed page or request shutdown");
+}
+
 /// Chunk 1 alone flushes nothing and pins publication; a re-delivered prefix does not double-apply;
 /// the marked final chunk flushes the transaction once, whole, and releases the pin.
 #[tokio::test]
@@ -284,4 +298,59 @@ async fn the_highwater_is_checkpointed_even_while_the_position_is_pinned() {
     assert_eq!(hw.unwrap(), serde_json::json!([0x40, 0]));
     // ...and B, still held, was not part of it.
     assert_eq!(log.shape_flushes(&stream).len(), 1);
+}
+
+/// A fan-out failure is terminal: the malformed committed envelope must remain at the replay
+/// boundary, with no highwater/processed/checkpoint advancement that could make the effect vanish.
+#[tokio::test]
+async fn a_process_envelope_failure_fails_closed_without_progress() {
+    let (engine, log, stream, t) = boot().await;
+    let malformed = r#"{"type":"public.t","key":"bad","value":{"id":"bad"},"headers":{"operation":"bogus","txid":"500","lsn":"0/50","seq":1,"last":true}}"#;
+    log.serve("-1", "01", &[env_json(500, "0/50", "ok", 0, false), malformed.to_string()]);
+
+    wait_for_progress_or_shutdown(&engine, &t, "-1").await;
+    assert!(log.shape_flushes(&stream).is_empty(), "a failed envelope must not flush a partial effect");
+    assert_eq!(engine.table_offset(&t).await.unwrap().offset, "-1", "failed work stays at the replay boundary");
+    assert!(
+        log.checkpoints().iter().all(|(offset, _)| offset == "-1"),
+        "no checkpoint may advance past the failed envelope: {:?}",
+        log.checkpoints()
+    );
+    assert!(
+        log.checkpoints().iter().all(|(_, highwater)| highwater.is_none()),
+        "the failed transaction must not advance its highwater: {:?}",
+        log.checkpoints()
+    );
+
+    engine.shutdown_token().begin();
+}
+
+/// If a held transaction completes on the same page as a later processing failure, the safe
+/// replay boundary is still the page where the held transaction began, not the failing page.
+#[tokio::test]
+async fn a_failure_after_a_held_prefix_rewinds_to_the_held_boundary() {
+    let (engine, log, stream, t) = boot().await;
+    let malformed = r#"{"type":"public.t","key":"bad","value":{"id":"bad"},"headers":{"operation":"bogus","txid":"501","lsn":"0/51","seq":0,"last":true}}"#;
+    log.serve("-1", "01", &[env_json(500, "0/50", "b0", 0, false)]);
+    wait_for(|| log.shape_flushes(&stream).is_empty(), "the held prefix to remain unflushed").await;
+    assert_eq!(engine.table_offset(&t).await.unwrap().offset, "-1", "the held prefix pins the boundary");
+
+    log.serve("01", "02", &[env_json(500, "0/50", "b1", 1, true), malformed.to_string()]);
+    wait_for_progress_or_shutdown(&engine, &t, "-1").await;
+    wait_for(|| !log.shape_flushes(&stream).is_empty(), "B's completed transaction to flush").await;
+    let flushes = log.shape_flushes(&stream);
+    let keys: Vec<&str> = flushes[0].iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys, vec!["b0", "b1"], "B must be emitted exactly once before C fails");
+    assert_eq!(engine.table_offset(&t).await.unwrap().offset, "-1", "replay must include B's held prefix");
+    assert!(
+        log.checkpoints().iter().all(|(offset, _)| offset == "-1"),
+        "checkpoint crossed the held boundary: {:?}",
+        log.checkpoints()
+    );
+    assert!(
+        log.checkpoints().iter().all(|(_, highwater)| highwater.as_ref() == Some(&serde_json::json!([0x50, 1]))),
+        "B's completed highwater must accompany the held boundary: {:?}",
+        log.checkpoints()
+    );
+    engine.shutdown_token().begin();
 }

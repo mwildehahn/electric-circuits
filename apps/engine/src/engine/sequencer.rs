@@ -559,6 +559,10 @@ pub(crate) async fn sequencer_loop(
                         rotate_to = Some(n);
                     }
                     envs.retain(|e| !crate::changelog::is_control(e));
+                    // Keep the pre-page replay boundary separately from `held_from`, which is
+                    // cleared when a held transaction completes on this page. If a later
+                    // transaction then fails, replay must still include that completed prefix.
+                    let held_replay_from = held_from.clone();
                     // Re-attach the run held from an earlier page (ADR-0003).
                     //
                     // A re-delivery complicates this: when the ingestor fails part-way through a
@@ -665,8 +669,13 @@ pub(crate) async fn sequencer_loop(
                     // envelope carrying `headers.last`, so a commit appended in several chunks
                     // (ADR-0003) is processed once, whole, not chunk by chunk.
                     let mut touched = false;
+                    let mut processing_failed = false;
                     let mut i = 0;
                     while i < envs.len() {
+                        // Commit highwater only after the complete transaction succeeds. If an
+                        // envelope fails, staged output is discarded and replay must retry the
+                        // whole transaction rather than skipping an earlier prefix.
+                        let txn_highwater = highwater;
                         let txid = envs[i].headers.txid.clone();
                         let lsn = envs[i].headers.lsn.clone();
                         let mut j = i + 1;
@@ -677,12 +686,12 @@ pub(crate) async fn sequencer_loop(
                         // circuit BEFORE fanning it out, so circuit-served aggregates emit
                         // within the transaction that changed them. The counts layer re-checks
                         // its own (lsn, seq) highwater, so feeding pre-dedup envelopes is safe.
-                        let txn_count_deltas = if let Some(arr) = &arr {
+                        let txn_arr_deltas = if let Some(arr) = &arr {
                             let deltas: Vec<_> = envs[i..j]
                                 .iter()
                                 .filter_map(|env| stamped_delta_for_arrangements(&tables, arr, &arr_gates, env))
                                 .collect();
-                            arr.apply_batch(deltas).await
+                            deltas
                         } else {
                             Vec::new()
                         };
@@ -732,7 +741,10 @@ pub(crate) async fn sequencer_loop(
                             )
                             .await
                             {
-                                tracing::error!("process_envelope failed: {e:#}");
+                                tracing::error!("process_envelope failed: {e:#}; stopping before publishing this transaction");
+                                highwater = txn_highwater;
+                                processing_failed = true;
+                                break;
                             }
                             exec.envelopes_total += 1;
                             touched = true;
@@ -740,6 +752,18 @@ pub(crate) async fn sequencer_loop(
                                 highwater = Some(p);
                             }
                         }
+                        if processing_failed {
+                            // Do not run the count fold or flush the partial transaction. The
+                            // failed transaction is retried from its page boundary on restart.
+                            break;
+                        }
+                        // Do not mutate the arrangement until every envelope has fanned out
+                        // successfully; a failed transaction must leave no circuit-side prefix.
+                        let txn_count_deltas = if let Some(arr) = &arr {
+                            arr.apply_batch(txn_arr_deltas).await
+                        } else {
+                            Vec::new()
+                        };
                         // Counts pipeline → circuit-served aggregates.
                         if !txn_count_deltas.is_empty() {
                             apply_count_deltas(
@@ -755,6 +779,19 @@ pub(crate) async fn sequencer_loop(
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
                         i = j;
+                    }
+                    if processing_failed {
+                        // The read cursor advances before processing; rewind it to the page that
+                        // began any held transaction, not merely this page. A completed held
+                        // prefix may have been staged before the failure and must be replayed.
+                        if let Some(from) = held_replay_from {
+                            pos = from.clone();
+                            held_from = Some(from);
+                        } else {
+                            pos.offset = read_off;
+                        }
+                        shutdown.begin();
+                        break;
                     }
                     // Publish the processed position only after the whole batch is fanned out +
                     // flushed — and never past a run still being HELD (ADR-0003): a restart must
