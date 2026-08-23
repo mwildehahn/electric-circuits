@@ -1,0 +1,22 @@
+{
+  "attempt_key": [
+    "CMP-000",
+    "shared-02d624bd9f690cf5c18907355704e2f5649582bb43f1b85acc1da119e8345bed",
+    3
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "2d6618a80fae85b375d0cc87bf352ab95656a837602b90e9090ae0f7e6737028",
+  "controller_generation": 18,
+  "controller_head": "0f94a029dc82a29c6f0f36ff82d262f49572c232",
+  "controller_tree": "3367b528690875a8dc6c2195ae17db696b8ebe62",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "c7038da07ef4994cf2c50238376b00c21fa4f22f36e3d09885f17adf9081e810",
+  "packet_sha256": "f08ded49d67a6e0f52d10eb26f2563ff7cf669c30dbfcf374e848f777eed38c2",
+  "review_sha256": "162945871545fc119194b7bffb8731a3142d9235d113f58127babec90e051c77",
+  "gates": {
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 4,
+  "reason": "Independent review failed the executable regeneration guard: a content-hash-only mutation bypasses it, and the frozen typecheck evidence lacks raw logs/attestations and a verifiable immutable detached source/mount topology. No candidate was integrated; reissue after correcting guard and evidence.",
+  "terminal_status": "invalidated"
+}

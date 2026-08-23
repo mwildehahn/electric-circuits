@@ -1,0 +1,22 @@
+{
+  "attempt_key": [
+    "SEC-008B",
+    "shared-e875b3221f5e034a037cfc82c9acfbddbc72ed0d0774d73a1e2719e06f41b49c",
+    3
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "427aaf3b7191f4ab8768cea81432f75b060c861847d6e05893b534714fa3b454",
+  "controller_generation": 18,
+  "controller_head": "0f94a029dc82a29c6f0f36ff82d262f49572c232",
+  "controller_tree": "3367b528690875a8dc6c2195ae17db696b8ebe62",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "83f96ec9f1ae6e5670e39bdee3683bfb5c7ac54aa7205c71949beb98478380b1",
+  "packet_sha256": "cd48f53e0340b4783fd1bb7a1632e619c8093ea71995a2c56403e1cfff197442",
+  "review_sha256": "957553f58abd952de98822a8db3ab513eafbc7ba1962959d70e00ff407d7d3fa",
+  "gates": {
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 4,
+  "reason": "Independent review found remaining fail-open governance defects: invalid expiry accepted, OCI digest/integrity mismatch accepted, missing/negative secret results accepted, lockfile identity not bound to policy pins, incomplete mutation cuts/automation, and unverifiable frozen typecheck evidence. No candidate was integrated; reissue after correction.",
+  "terminal_status": "invalidated"
+}
