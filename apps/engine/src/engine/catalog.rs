@@ -1193,7 +1193,7 @@ impl Engine {
 /// intent), and a double that returns pre-classified errors would test the test.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -1208,6 +1208,12 @@ pub(crate) mod testing {
         appends: AtomicU64,
         deletes: AtomicU64,
         closes: AtomicU64,
+        block_deletes: AtomicBool,
+        delete_started: tokio::sync::Notify,
+        release_delete: tokio::sync::Notify,
+        block_retired: AtomicBool,
+        retired_started: tokio::sync::Notify,
+        release_retired: tokio::sync::Notify,
         events: Mutex<Vec<serde_json::Value>>,
     }
 
@@ -1239,6 +1245,14 @@ pub(crate) mod testing {
                                 {
                                     return axum::http::StatusCode::SERVICE_UNAVAILABLE;
                                 }
+                                let is_retired = serde_json::from_str::<serde_json::Value>(&body)
+                                    .ok()
+                                    .and_then(|value| value.as_array().cloned())
+                                    .is_some_and(|items| items.iter().any(|item| item["t"] == "retired"));
+                                if is_retired && st.block_retired.load(Ordering::SeqCst) {
+                                    st.retired_started.notify_one();
+                                    st.release_retired.notified().await;
+                                }
                                 st.appends.fetch_add(1, Ordering::SeqCst);
                                 if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&body) {
                                     st.events.lock().unwrap().extend(items);
@@ -1257,6 +1271,10 @@ pub(crate) mod testing {
                         )
                         .delete(|State(st): State<Arc<FakeDsState>>| async move {
                             st.deletes.fetch_add(1, Ordering::SeqCst);
+                            st.delete_started.notify_one();
+                            if st.block_deletes.load(Ordering::SeqCst) {
+                                st.release_delete.notified().await;
+                            }
                             if st
                                 .fail_deletes
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -1293,6 +1311,30 @@ pub(crate) mod testing {
         /// Answer the next `n` stream deletes with 503.
         pub(crate) fn fail_deletes(&self, n: u32) {
             self.state.fail_deletes.store(n, Ordering::SeqCst);
+        }
+
+        pub(crate) fn block_deletes(&self, block: bool) {
+            self.state.block_deletes.store(block, Ordering::SeqCst);
+        }
+
+        pub(crate) async fn wait_delete_started(&self) {
+            self.state.delete_started.notified().await;
+        }
+
+        pub(crate) fn release_delete(&self) {
+            self.state.release_delete.notify_waiters();
+        }
+
+        pub(crate) fn block_retired(&self, block: bool) {
+            self.state.block_retired.store(block, Ordering::SeqCst);
+        }
+
+        pub(crate) async fn wait_retired_started(&self) {
+            self.state.retired_started.notified().await;
+        }
+
+        pub(crate) fn release_retired(&self) {
+            self.state.release_retired.notify_waiters();
         }
 
         pub(crate) fn deletes(&self) -> u64 {
