@@ -66,6 +66,22 @@ const HEALTH_WAITING: u8 = 0;
 const HEALTH_STARTING: u8 = 1;
 const HEALTH_ACTIVE: u8 = 2;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BootEpochAction {
+    Restore,
+    Park(EpochBreakReason),
+    Wait(Option<i32>),
+}
+
+/// Decide what boot may do with the slot verdict before any catalog or schema state is installed.
+fn boot_epoch_action(verdict: &Verdict) -> BootEpochAction {
+    match verdict {
+        Verdict::FirstBoot | Verdict::Ok { .. } => BootEpochAction::Restore,
+        Verdict::Busy { active_pid } => BootEpochAction::Wait(*active_pid),
+        Verdict::Break(reason) => BootEpochAction::Park(*reason),
+    }
+}
+
 /// The engine computed membership effects it could not deliver (see [`DegradeState`]), so what it
 /// serves is silently wrong. A typed error: the HTTP layer maps it to 503 by downcast, never by
 /// matching on message text.
@@ -1188,32 +1204,6 @@ impl Engine {
         }
         tables.sort();
         tables.dedup();
-        // The publication is inspected BEFORE the first introspection, because it decides what a
-        // fingerprint even contains: pgoutput publishes stored generated columns only when
-        // `pubgencols = 's'`, and a column list means the wire can never deliver the row the
-        // catalog describes — a boot-fatal misconfiguration rather than runtime drift (ADR-0005).
-        let publication = format!("{slot}_pub");
-        crate::pg::ensure_publication(&client, &publication).await?;
-        let pubinfo = crate::pg::inspect_publication(&client, &publication, &tables).await?;
-        crate::pg::set_publish_generated(pubinfo.publish_generated);
-        if pubinfo.publish_generated {
-            tracing::info!("publication '{publication}' publishes stored generated columns");
-        }
-        let mut compiled = HashMap::new();
-        for t in &tables {
-            // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
-            // includes `relreplident`, and reading it before the ALTER would record the pre-boot
-            // identity — which the ingestor's first `Relation` message would then report as drift
-            // on every single boot (ADR-0005).
-            crate::pg::ensure_replica_identity_full(&client, t).await?;
-            let def = crate::pg::introspect(&client, t).await?;
-            let ts = TableSchema::from_def(t, &def)?;
-            compiled.insert(t.clone(), ts);
-        }
-        *self.tables_shared.write().unwrap() = compiled.clone();
-        self.state.lock().await.tables = compiled.clone();
-        self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
-
         // --- The epoch (ADR-0004) ---
         //
         // Read the durable catalog and DECIDE before restoring anything: the epoch the catalog's
@@ -1238,29 +1228,64 @@ impl Engine {
             )
         })?;
         self.adopt_epoch_binding(fold.binding.clone());
-        // The change log is segmented (ADR-0006), and which segment is CURRENT is folded out of the
-        // same catalog — so this necessarily comes after the read, not before it as the old
-        // unqualified `ensure_stream("changes")` did.
-        self.init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos()).await?;
-        let restored = match self.verify_epoch_at_boot(&client, slot).await? {
+        let verdict = self.verify_epoch_at_boot(&client, slot).await?;
+        let restored = match boot_epoch_action(&verdict) {
             // Either the epoch is intact or this boot just started one. Restore as usual.
-            epoch::Verdict::FirstBoot | epoch::Verdict::Ok { .. } | epoch::Verdict::Busy { .. } => Some(fold),
-            epoch::Verdict::Break(reason) => {
+            BootEpochAction::Restore => {
+                self.init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos()).await?;
+                Some(fold)
+            }
+            BootEpochAction::Wait(active_pid) => {
+                // A busy slot is not an epoch break, but ownership is not established. Do not
+                // mutate durable state, restore shapes, spawn tasks, or claim readiness.
+                self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
+                return Err(anyhow::Error::new(crate::replication::Refused::SlotBusy(active_pid)));
+            }
+            BootEpochAction::Park(reason) => {
+                self.init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos()).await?;
                 // Park the records (see `RestoreMode::Park`): nothing is resumed, so no old-epoch
                 // shape is ever maintained, and the reset — now, or whenever the operator asks —
                 // still retires each one properly instead of orphaning its stream. Parking BEFORE
-                // the policy runs is what gives the auto reset something to retire.
-                self.apply_catalog(fold, &compiled, catalog::RestoreMode::Park).await?;
+                // the policy runs is what gives the auto reset something to retire. No compiled
+                // schema is needed in Park mode.
+                self.apply_catalog(fold, &HashMap::new(), catalog::RestoreMode::Park).await?;
                 // The same latch/count/act path the ingestor's pre-connect check uses. A refusal is
                 // the expected outcome under the refuse policy, and boot continues (every route
                 // answers 503); a failed auto-reset leaves the break latched and the ingestor
                 // retries it.
                 if let Err(refused) = self.on_epoch_break(reason, slot).await {
                     tracing::warn!("boot: ingest will not start — {refused}");
+                    self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
+                    return Err(anyhow::Error::new(refused));
                 }
                 None
             }
         };
+
+        // Only after the durable catalog was readable and the slot ownership/epoch verdict was
+        // obtained do we perform the Postgres setup writes. A busy, foreign, lost, or mismatched
+        // slot therefore cannot cause publication/identity mutation before boot refuses or parks.
+        let publication = format!("{slot}_pub");
+        crate::pg::ensure_publication(&client, &publication).await?;
+        let pubinfo = crate::pg::inspect_publication(&client, &publication, &tables).await?;
+        crate::pg::set_publish_generated(pubinfo.publish_generated);
+        if pubinfo.publish_generated {
+            tracing::info!("publication '{publication}' publishes stored generated columns");
+        }
+        let mut compiled = HashMap::new();
+        for t in &tables {
+            // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
+            // includes `relreplident`, and reading it before the ALTER would record the pre-boot
+            // identity — which the ingestor's first `Relation` message would then report as drift
+            // on every single boot (ADR-0005).
+            crate::pg::ensure_replica_identity_full(&client, t).await?;
+            let def = crate::pg::introspect(&client, t).await?;
+            let ts = TableSchema::from_def(t, &def)?;
+            compiled.insert(t.clone(), ts);
+        }
+        *self.tables_shared.write().unwrap() = compiled.clone();
+        self.state.lock().await.tables = compiled.clone();
+        self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
         // Start (and seed) the dbsp arrangement layer BEFORE the catalog restore: the restore spawns
         // the sequencer (which captures the handle + seed gates) and may re-register circuit-served
         // shapes, both of which need the layer up. It is also after the epoch step, so a reset's new

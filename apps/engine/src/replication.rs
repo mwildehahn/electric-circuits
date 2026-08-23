@@ -144,6 +144,8 @@ impl std::fmt::Display for Refused {
     }
 }
 
+impl std::error::Error for Refused {}
+
 /// The engine's gate on the replication connection itself (ADR-0004). Split from [`SchemaEvents`]
 /// because it is about the **slot**, not about any table: the ingestor must never call
 /// `START_REPLICATION` on a slot the engine is not still bound to, or it would silently resume a
