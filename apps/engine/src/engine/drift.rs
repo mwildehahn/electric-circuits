@@ -778,6 +778,39 @@ mod tests {
         assert!(circuit_needs_rebuild(Some(&after), Some(TxnRef { xid: 200 })));
     }
 
+    /// The replay fence is exercised from the TRUNCATE handler as well as by the pure decision
+    /// test above.  A circuit-backed table is configured with the same gate captured by the boot
+    /// seed; handling a replayed TRUNCATE must retire the table's dependents but must not take the
+    /// process-exit path.  Calling the handler (rather than only the helper) protects the wiring
+    /// against a future change that accidentally passes `None` or a different transaction fence.
+    #[tokio::test]
+    async fn replayed_truncate_after_circuit_seed_does_not_restart() {
+        let (engine, items) = engine_with_items().await;
+        let arrangements = crate::arrangements::Arrangements::start(vec![crate::arrangements::CountSpec {
+            table: items.clone(),
+            group_cols: vec![0],
+        }])
+        .expect("test counts pipeline");
+        *engine.arrangements.lock().unwrap() = Some(arrangements.clone());
+        // The boot seed's snapshot has xmin/xmax 100, so xid 42 is already visible in its rows.
+        engine.arr_gates.write().unwrap().insert(items.clone(), SnapshotGate::parse("100:100:", "0/0"));
+
+        engine.handle_truncate(vec![items.clone()], Some(TxnRef { xid: 42 })).await;
+
+        // The handler completed normally (a non-visible xid would request EXIT_CIRCUIT_REBUILD).
+        assert_eq!(engine.state.lock().await.schema_gen.get(&items), Some(&1));
+        arrangements.shutdown().await;
+    }
+
+    /// A TRUNCATE outside the boot seed's visibility must retain the fail-closed rebuild decision.
+    /// This stays a pure assertion because exercising the negative branch would terminate the
+    /// test process by design (`EXIT_CIRCUIT_REBUILD`).
+    #[test]
+    fn truncate_not_reflected_in_circuit_seed_requires_rebuild() {
+        let seed = SnapshotGate::parse("100:100:", "0/0");
+        assert!(circuit_needs_rebuild(Some(&seed), Some(TxnRef { xid: 200 })));
+    }
+
     /// No transaction context (the reconciler, a retry task) is no evidence, so the safe answer is
     /// to rebuild — as it is for a table with no seed gate at all.
     #[test]
