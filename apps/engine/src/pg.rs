@@ -784,6 +784,44 @@ pub async fn inspect_publication(client: &Client, publication: &str, tables: &[T
     Ok(PublicationInfo { publish_generated })
 }
 
+/// Reject tracked tables whose row-level security could make logical replication silently
+/// selective. The first production profile does not use table RLS as a tenant boundary; an RLS
+/// enabled table is therefore a boot-time configuration error rather than a table that can be
+/// served with an uncertain visibility contract.
+pub async fn reject_rls_tables(client: &Client, tables: &[TableRef]) -> Result<()> {
+    // Keep this query separate from the publication query: relrowsecurity is relation metadata,
+    // not part of the publication definition, and checking it for the exact tracked set avoids
+    // rejecting unrelated application tables in a FOR ALL TABLES publication.
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let schemas: Vec<String> = tables.iter().map(|t| t.schema().to_string()).collect();
+    let names: Vec<String> = tables.iter().map(|t| t.name().to_string()).collect();
+    let rows = client
+        .query(
+            "select n.nspname, c.relname \
+             from pg_class c \
+             join pg_namespace n on n.oid = c.relnamespace \
+             join unnest($1::text[], $2::text[]) as w(s, t) \
+               on w.s = n.nspname and w.t = c.relname \
+             where c.relrowsecurity or c.relforcerowsecurity \
+             order by n.nspname, c.relname",
+            &[&schemas, &names],
+        )
+        .await
+        .context("check tracked-table row security")?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let which: Vec<String> =
+        rows.iter().map(|r| format!("{}.{}", r.get::<_, String>(0), r.get::<_, String>(1))).collect();
+    bail!(
+        "tracked table(s) {} have row-level security enabled; RLS is not supported for synced tables \
+         because it can filter logical replication. Disable RLS before starting the engine.",
+        which.join(", ")
+    );
+}
+
 /// The fences a backfill snapshot captures, in the same statement that establishes the snapshot.
 ///
 /// Handed back when the snapshot has been fully read (`BackfillReader::finish`), not before: a
