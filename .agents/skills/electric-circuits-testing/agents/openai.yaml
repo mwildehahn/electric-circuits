@@ -1,0 +1,3 @@
+interface:
+  display_name: "Electric Circuits Testing"
+  short_description: "TDD from stable black-box contracts"
