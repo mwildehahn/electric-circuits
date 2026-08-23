@@ -894,9 +894,11 @@ impl Engine {
             st.next_shape_id = st.next_shape_id.max(max + 1);
         }
         if fold.is_empty() {
+            self.release_restore_reads().await?;
             return Ok(());
         }
         let CatalogFold { recs, start_pos, start_highwater, .. } = fold;
+        let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The restored checkpoint IS durable (it was read back out of the log), so it is the
         // segment-deletion floor from boot rather than from this process's first checkpoint.
@@ -920,7 +922,25 @@ impl Engine {
                  maintained; they exist only to be retired by the reset",
                 st.shapes.len()
             );
+            drop(st);
+            self.release_restore_reads().await?;
             return Ok(());
+        }
+
+        // Resume registration must complete before the sequencer reads or checkpoints any history.
+        // The reader is spawned paused on this path and released only after every shape succeeds.
+        self.restore_reads_paused.store(true, std::sync::atomic::Ordering::Release);
+        let existing_seq = self.state.lock().await.sequencer.as_ref().map(|s| s.cmd_tx.clone());
+        if let Some(cmd_tx) = existing_seq {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let pause = match cmd_tx.send(SequencerCmd::PauseReads { done: done_tx }) {
+                Ok(()) => done_rx.await.map_err(|_| anyhow::anyhow!("sequencer pause acknowledgement dropped")),
+                Err(_) => Err(anyhow::anyhow!("sequencer pause command receiver closed")),
+            };
+            if let Err(e) = pause {
+                self.rollback_catalog_restore(&restored_ids, &cmd_tx).await;
+                return Err(e.context("catalog restore: sequencer pause handshake failed"));
+            }
         }
 
         // 2. Restore records + shares; subquery shapes are dropped (see CATALOG_STREAM docs).
@@ -1012,29 +1032,64 @@ impl Engine {
             let st = self.state.lock().await;
             st.sequencer.as_ref().expect("sequencer spawned above").cmd_tx.clone()
         };
+        resume.sort_by(|a, b| a.id.cmp(&b.id));
         for rec in resume {
             let outcome = self.resume_shape(&cmd_tx, &rec, compiled).await;
             if let Err(e) = outcome {
-                tracing::error!("restore: shape {} failed to resume ({e:#}); dropping it", rec.id);
-                let mut st = self.state.lock().await;
-                st.shapes.remove(&rec.id);
-                self.catalog_tx.send(CatalogEvent::Dropped { id: rec.id.clone() });
-                // The restored subscriptions go with it: an id still claimed by a shape that no
-                // longer exists would refuse its own client's next create with a 409.
-                st.forget_subscriptions(&rec.id);
-                if let Some(share) = st.feed_shares.remove(&rec.id) {
-                    st.feed_by_sig.remove(&share.sig);
-                }
-                drop(st);
-                // Engine-initiated removal, so retire the stream (close, then delete): the shape is
-                // gone, and a client still tailing it from before the restart must learn that rather
-                // than sit on a stream nothing will ever append to again. Never fatal — a storage
-                // hiccup must not abort the restore of the other shapes — and never forgotten: a
-                // failure goes to the retirement queue, which retries it to completion.
-                self.retire_shape_stream(&rec.id, &rec.stream_path).await;
+                tracing::error!("restore: shape {} failed to resume ({e:#}); rolling back the restore", rec.id);
+                self.rollback_catalog_restore(&restored_ids, &cmd_tx).await;
+                return Err(e.context(format!("catalog restore failed for shape {}", rec.id)));
             }
         }
+        if let Err(e) = self.release_restore_reads().await {
+            self.rollback_catalog_restore(&restored_ids, &cmd_tx).await;
+            return Err(e.context("catalog restore: sequencer resume handshake failed"));
+        }
         Ok(())
+    }
+
+    /// Release the replay gate only after the sequencer acknowledges the command. A dropped
+    /// receiver/ack must remain a setup error; clearing the shared gate would otherwise let a
+    /// replacement task race ahead of an incomplete catalog restore.
+    async fn release_restore_reads(&self) -> Result<()> {
+        let existing_seq = self.state.lock().await.sequencer.as_ref().map(|s| s.cmd_tx.clone());
+        if let Some(cmd_tx) = existing_seq {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(SequencerCmd::ResumeReads { done: done_tx })
+                .map_err(|_| anyhow::anyhow!("catalog restore: sequencer resume command receiver closed"))?;
+            done_rx.await.map_err(|_| anyhow::anyhow!("catalog restore: sequencer resume acknowledgement dropped"))?;
+        }
+        self.restore_reads_paused.store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Undo every in-memory and sequencer registration made by one Resume attempt. The remove
+    /// commands are fenced by a barrier so a failed boot cannot leave an earlier shape routed while
+    /// the caller retries the same durable catalog.
+    async fn rollback_catalog_restore(&self, ids: &[String], cmd_tx: &mpsc::UnboundedSender<SequencerCmd>) {
+        let records: Vec<(String, TableRef)> = {
+            let st = self.state.lock().await;
+            ids.iter().filter_map(|id| st.shapes.get(id).map(|rec| (id.clone(), rec.table.clone()))).collect()
+        };
+        for (id, table) in records {
+            let _ = cmd_tx.send(SequencerCmd::RemoveShape { table, shape_id: id });
+        }
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if cmd_tx.send(SequencerCmd::Barrier { done: done_tx }).is_ok() {
+            let _ = done_rx.await;
+        }
+        let mut st = self.state.lock().await;
+        let mut lives = self.lives.lock().unwrap();
+        for id in ids {
+            lives.remove(id);
+            st.forget_subscriptions(id);
+            if let Some(share) = st.feed_shares.remove(id) {
+                st.feed_by_sig.remove(&share.sig);
+            }
+            st.circuit_placement.remove(id);
+            st.shapes.remove(id);
+        }
     }
 
     /// Re-register one restored shape with the sequencer (the resume half of `apply_catalog`).
@@ -1693,8 +1748,10 @@ mod tests {
         // No durable-streams behind it: the queued retirement retries in the background and this
         // test does not depend on it (the id counter is engine state, decided before any IO).
         let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        engine.restore_reads_paused.store(true, std::sync::atomic::Ordering::Release);
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
         assert_eq!(engine.state.lock().await.next_shape_id, 2, "s1 is taken; the next shape is s2");
+        assert!(!engine.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// The same over a broken epoch: `Park` restores records to be retired, and it must not hand the
@@ -1704,10 +1761,13 @@ mod tests {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
         let fold = fold_of(vec![created, CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }]);
         let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        engine.restore_reads_paused.store(true, std::sync::atomic::Ordering::Release);
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Park).await.unwrap();
         let st = engine.state.lock().await;
         assert_eq!(st.next_shape_id, 2);
         assert_eq!(st.shapes.len(), 1, "the record is parked for the reset to retire");
+        drop(st);
+        assert!(!engine.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire));
     }
 
     // --- subscriptions: identity, idempotence, leases (ADR-0008) --------------------------------
@@ -1871,6 +1931,151 @@ mod tests {
         assert_eq!(share.subs.get("sub-b"), Some(&2000));
         assert_eq!(share.refcount(), 2);
         assert_eq!(st.subscription_owner("sub-b"), Some(&"s1".to_string()), "the id index is restored too");
+    }
+
+    /// A shape that cannot be re-registered is a restore failure, not an empty-catalog success.
+    /// The Postgres boot boundary must see this error before it starts serving, so it can apply
+    /// the ordinary retry/fatal boot classification instead of resuming from missing state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_failure_is_returned_to_the_boot_boundary() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![created]);
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+
+        let err = engine
+            .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
+            .await
+            .expect_err("a shape that cannot resume must fail catalog restore");
+        assert!(format!("{err:#}").contains("public.users"), "restore failure keeps shape context: {err:#}");
+    }
+
+    /// Even a dormant-only catalog must fail closed when the existing sequencer command receiver
+    /// is gone: ResumeReads is a readiness handshake, not a best-effort hint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dormant_resume_with_dead_sequencer_is_a_restore_error() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            created,
+            CatalogEvent::Dormant {
+                id: "s1".to_string(),
+                resume: pos(0, "5"),
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
+        ]);
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let cmd = {
+            let mut st = engine.state.lock().await;
+            engine.ensure_sequencer(&mut st).cmd_tx.clone()
+        };
+        engine.shutdown_token().begin();
+        tokio::time::timeout(std::time::Duration::from_secs(2), cmd.closed())
+            .await
+            .expect("sequencer command receiver must close");
+
+        let err = engine
+            .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
+            .await
+            .expect_err("a dead sequencer cannot acknowledge ResumeReads");
+        assert!(format!("{err:#}").contains("sequencer"), "handshake failure is named: {err:#}");
+        assert!(engine.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// If shape A has resumed and shape B then fails, the rollback barrier removes both registrations
+    /// before the retry. The durable records remain intact for the next Resume attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_resume_failure_rolls_back_the_first_shape_too() {
+        let mut first = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let mut second = created_event("public.accounts");
+        second["rec"]["id"] = serde_json::json!("s2");
+        second["rec"]["stream_path"] = serde_json::json!("shape/s2");
+        let second = serde_json::from_value::<CatalogEvent>(second).unwrap();
+        let first_rec = match &mut first {
+            CatalogEvent::Created { rec, .. } => rec.clone(),
+            _ => unreachable!(),
+        };
+        let second_rec = match second {
+            CatalogEvent::Created { rec, .. } => rec,
+            _ => unreachable!(),
+        };
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        {
+            let mut st = engine.state.lock().await;
+            st.shapes.insert(first_rec.id.clone(), first_rec.clone());
+            st.shapes.insert(second_rec.id.clone(), second_rec.clone());
+            st.circuit_placement
+                .insert(first_rec.id.clone(), CircuitPlacement { label: "all".into(), col: None, counts: false });
+            st.circuit_placement
+                .insert(second_rec.id.clone(), CircuitPlacement { label: "all".into(), col: None, counts: false });
+            engine.ensure_sequencer(&mut st);
+        }
+        let cmd_tx = engine.state.lock().await.sequencer.as_ref().unwrap().cmd_tx.clone();
+        let ids = vec!["s1".to_string(), "s2".to_string()];
+
+        // Model A's successful resume followed by B's failure, then invoke the same rollback
+        // barrier the production Resume path uses.
+        engine.rollback_catalog_restore(&ids, &cmd_tx).await;
+        let st = engine.state.lock().await;
+        assert!(st.shapes.is_empty(), "both restored records are removed from memory");
+        assert!(st.circuit_placement.is_empty(), "partial circuit placement is removed");
+        assert!(engine.lives.lock().unwrap().is_empty(), "lifecycle state is removed");
+        drop(st);
+        assert!(engine.table_stats(&first_rec.table).await.is_none(), "sequencer routing is fenced and empty");
+        assert!(engine.table_stats(&second_rec.table).await.is_none(), "second table routing is fenced and empty");
+    }
+
+    /// A historical page cannot advance the processed offset while Resume registration is paused;
+    /// releasing the gate then consumes the same page from the original checkpoint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_resume_reader_does_not_advance_or_checkpoint_history() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let app = {
+            let reads = reads.clone();
+            let notify = notify.clone();
+            axum::Router::new()
+                .route(
+                    "/{*path}",
+                    axum::routing::get(move |axum::extract::Path(path): axum::extract::Path<String>| {
+                        let reads = reads.clone();
+                        let notify = notify.clone();
+                        async move {
+                            if path == "changes/0" {
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                notify.notify_waiters();
+                                (axum::http::StatusCode::OK, [("stream-next-offset", "1")], "[]".to_string())
+                            } else {
+                                (axum::http::StatusCode::NO_CONTENT, [("stream-next-offset", "-1")], String::new())
+                            }
+                        }
+                    })
+                    .post(|| async { axum::http::StatusCode::NO_CONTENT }),
+                )
+                .with_state(())
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let engine = Engine::new(DsClient::new(format!("http://{addr}")));
+        engine.restore_reads_paused.store(true, Ordering::Release);
+        let cmd = {
+            let mut st = engine.state.lock().await;
+            engine.ensure_sequencer(&mut st).cmd_tx.clone()
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "paused Resume does not read history");
+        assert_eq!(engine.changes_position(), LogPosition::start());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let _ = cmd.send(SequencerCmd::ResumeReads { done: done_tx });
+        engine.restore_reads_paused.store(false, Ordering::Release);
+        let _ = done_rx.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), notify.notified()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let offset = engine.table_offset(&TableRef::parse("public.users").unwrap()).await.unwrap();
+        assert_eq!(offset.offset, "1", "release consumes from the original checkpoint");
     }
 
     #[test]

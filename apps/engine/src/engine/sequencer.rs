@@ -72,6 +72,18 @@ pub(crate) enum SequencerCmd {
         table: TableRef,
         shape_id: String,
     },
+    /// Restore rollback barrier: acknowledge after all preceding shape removals have been applied.
+    Barrier {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Release the boot replay gate after every catalog shape has resumed successfully.
+    ResumeReads {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Pause the change-log reader before a retrying Resume attempt.
+    PauseReads {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
     /// Schema drift (ADR-0005): forget everything the sequencer holds for this table. The executor
     /// is keyed by the OLD `TableSchema`, so it is dropped outright rather than patched; the next
     /// envelope for the table lazily rebuilds it from the (already swapped) shared schema view.
@@ -129,6 +141,8 @@ pub(crate) fn spawn_sequencer(
     // and carry no replication old-image, so the sequencer keeps the current row per key itself
     // (see `TableExec::library_rows`).
     library_mode: bool,
+    start_paused: bool,
+    pause_gate: Arc<std::sync::atomic::AtomicBool>,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -153,6 +167,8 @@ pub(crate) fn spawn_sequencer(
         arr,
         arr_gates,
         library_mode,
+        start_paused,
+        pause_gate,
         shutdown,
         party,
     ));
@@ -347,11 +363,14 @@ pub(crate) async fn sequencer_loop(
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
     library_mode: bool,
+    start_paused: bool,
+    pause_gate: Arc<std::sync::atomic::AtomicBool>,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
+    let mut paused = start_paused;
     let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
     // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
@@ -497,6 +516,17 @@ pub(crate) async fn sequencer_loop(
                     emitted.remove(&shape_id);
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
+                Some(SequencerCmd::Barrier { done }) => {
+                    let _ = done.send(());
+                }
+                Some(SequencerCmd::ResumeReads { done }) => {
+                    paused = false;
+                    let _ = done.send(());
+                }
+                Some(SequencerCmd::PauseReads { done }) => {
+                    paused = true;
+                    let _ = done.send(());
+                }
                 Some(SequencerCmd::ResetTable { table }) => {
                     if execs.remove(table.as_str()).is_some() {
                         tracing::warn!("sequencer: dropped the executor for '{table}' (schema drift)");
@@ -539,8 +569,14 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true) => match res {
+            res = ds.read(&read_path, &read_off, true), if !paused => match res {
                 Ok(rr) => {
+                    // A PauseReads command may win immediately after an in-flight HTTP read returns.
+                    // Discard that page before touching the cursor or checkpoint so an existing
+                    // sequencer can be fenced without advancing the retry boundary.
+                    if pause_gate.load(std::sync::atomic::Ordering::Acquire) {
+                        continue;
+                    }
                     let next = rr.next_offset.clone();
                     // How much this read delivered, BEFORE control envelopes are filtered out: a
                     // closed segment is only left once a read comes back empty, which is the proof
@@ -891,9 +927,13 @@ pub(crate) async fn sequencer_loop(
     // de-duplication highwater riding with it) durable. Without it, everything since the last lazy
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
-    let ckpt = published(&pos, &held_from);
-    catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
-    tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
+    if !paused {
+        let ckpt = published(&pos, &held_from);
+        catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
+        tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
+    } else {
+        tracing::info!("sequencer: stopped while replay was paused; no checkpoint published");
+    }
 }
 
 /// Wait out a read-error backoff, cut short by a shutdown. The backoff exists to stop a failing
