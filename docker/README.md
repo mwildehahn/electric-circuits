@@ -10,7 +10,7 @@ Services (see `compose.yaml`):
 
 | service | image | role | port |
 |---|---|---|---|
-| `postgres` | `postgres:16` (`wal_level=logical`) | system of record | 5432 |
+| `postgres` | `postgres:18.6` (`wal_level=logical`) | system of record | 5432 |
 | `ds` | `docker/Dockerfile.ds` | durable-streams server (the log; Rust binary from crates.io `durable-streams`) | 8791 |
 | `engine` | `docker/Dockerfile.engine` | Rust engine: replication ingest, shape/subquery/aggregation maintenance, control-plane HTTP **and Electric-compatible `GET /v1/shape`** | 7010 |
 | `api` | `docker/Dockerfile.node` | extended tRPC API for `@electric-circuits/client` (shapes, subset queries, aggregations) | 8790 |
