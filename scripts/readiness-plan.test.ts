@@ -12,7 +12,7 @@ const throws = (reason: string, operation: () => unknown) => assert.throws(opera
 const digest = 'a'.repeat(40)
 const evidence = () => ({ source_strategy: 'fresh_detached_worktree', source_commit: digest, source_tree: digest, pre_attestation_sha256: digest, post_attestation_sha256: digest, external_input_manifest_sha256: digest, mount_topology_sha256: digest, run_root_identity: 'run-a', empty_run_root_attestation_sha256: digest, effective_config_sha256: digest, source_clean: true, mount_read_only: true, run_root_new_empty: true, post_source_unchanged: true, external_inputs_unchanged: true, config_matches: true })
 const lease = () => ({ heartbeat_auth_ref: 'controller-root', reservation_lease_id: 'lease-a', scheduler_generation: 1, authenticated: true, generation: 1, current_generation: 1, packet_sha256: digest, heartbeat_nonce: 1, acknowledged_nonce: 1, ttl_ms: 30_000, heartbeat_interval_ms: 10_000, expires_at: Date.now() + 60_000, last_heartbeat_at: Date.now(), heartbeat_deadline_ms: 10_000, control_plane_available: true })
-const controllerState = (control: ReturnType<typeof lease>, resolutions = [{ task_id: 'PLAN-001', scope_id: 'bootstrap-plan-001', outcome: 'pass', state: 'integrated', generation: 1, base: { head: '520751ef250abd4936720e1e7e0c620a158833a0', tree: '8374caa150215bb0ad74c535769fc978e0e57af7' } }]) => ({ generation: 1, integration_head: '520751ef250abd4936720e1e7e0c620a158833a0', integration_tree: '8374caa150215bb0ad74c535769fc978e0e57af7', resolutions, lease: control })
+const controllerState = (control: ReturnType<typeof lease>, resolutions = [{ task_id: 'PLAN-001', scope_id: 'bootstrap-plan-001', outcome: 'pass', state: 'integrated', generation: 1, base: { head: '3f452e4dba00047b591e07617583aa4ec2387c2c', tree: '4621d91dad930c03b33e4775cc984d84d77c3f2d' } }]) => ({ generation: 1, integration_head: '3f452e4dba00047b591e07617583aa4ec2387c2c', integration_tree: '4621d91dad930c03b33e4775cc984d84d77c3f2d', resolutions, lease: control })
 const bootstrapFixture = () => ({
   packet_version: 2, packet_kind: 'bootstrap_plan', task_id: 'PLAN-001', attempt: 9,
   execution_scope: { kind: 'bootstrap', id: 'bootstrap-plan-001', profile_scope: 'uncompiled_all' }, profile: null, release_profile_hash: null,
@@ -116,11 +116,28 @@ test('planning-scope packets bind all six identities and defer profiles and genu
   throws('scenario_registry_unavailable', () => buildPlanningPacket(plan, 'ENG-006', state, control))
 })
 
+test('post-bootstrap planning packets bind the controller integration head/tree', () => {
+  const control = lease(); const head = '3f452e4dba00047b591e07617583aa4ec2387c2c'; const tree = '4621d91dad930c03b33e4775cc984d84d77c3f2d'
+  const state = controllerState(control, [{ task_id: 'PLAN-001', scope_id: 'bootstrap-plan-001', outcome: 'pass', state: 'integrated', generation: 1, base: { head, tree } }])
+  state.integration_head = head; state.integration_tree = tree
+  const packet: any = buildPlanningPacket(manifest(), 'GOV-001', state, control)
+  assert.equal(packet.base.initial_head, head); assert.equal(packet.base.integration_tree, tree); assert.equal(packet.authority.integration_commit, head)
+  assert.doesNotThrow(() => validatePacket(packet, manifest()))
+  const forged = clone(packet); forged.base.initial_head = '3'.repeat(40); forged.authority.integration_commit = '3'.repeat(40)
+  assert.throws(() => validatePacket(forged, manifest()), /stale_dispatch_base|packet_lease_binding/)
+  const forgedState: any = clone(state); forgedState.integration_head = '3'.repeat(40); forgedState.integration_tree = '4'.repeat(40)
+  assert.throws(() => buildPlanningPacket(manifest(), 'GOV-001', forgedState, control), /stale_controller_state/)
+  const full: any = { ...packet, candidate_identity: {}, execution: {}, ownership: {}, deliverables: {} }
+  assert.doesNotThrow(() => validatePacket(full, manifest()))
+  full.base.initial_head = '3'.repeat(40)
+  assert.throws(() => validatePacket(full, manifest()), /stale_dispatch_base/)
+})
+
 test('reviewed red artifacts are registry-bound, current-base, independent, and single-consumer', () => {
   const plan = manifest(); const scenario = { scenario_id: 'E2E-002R', semantic_hash: digest, owner: 'scenario-owner', test_owner_task: 'E2E-002R', profile_expression: 'true', oracle_hash: digest, exclusions_hash: digest, evidence_schema_hash: digest }; const registry = { kind: 'registered', identity: digest, scenarios: [scenario] }
-  const artifact = { identity: digest, provider_task: 'E2E-002R', consumer_task: 'SEC-002A', scenario_id: 'E2E-002R', profile_scope: 'shared', semantic_hash: digest, base_sha: '520751ef250abd4936720e1e7e0c620a158833a0', red_patch_sha: digest, red_tree_sha: digest, red_evidence_sha: digest, author_id: 'red-author', reviewer_id: 'red-reviewer', review_state: 'red_proved' }
+  const artifact = { identity: digest, provider_task: 'E2E-002R', consumer_task: 'SEC-002A', scenario_id: 'E2E-002R', profile_scope: 'shared', semantic_hash: digest, base_sha: '3f452e4dba00047b591e07617583aa4ec2387c2c', red_patch_sha: digest, red_tree_sha: digest, red_evidence_sha: digest, author_id: 'red-author', reviewer_id: 'red-reviewer', review_state: 'red_proved' }
   validateRedArtifactAdmission(plan, 'SEC-002A', registry, artifact, new Set())
-  throws('red_artifact_reused', () => validateRedArtifactAdmission(plan, 'SEC-002A', registry, artifact, new Set([`{"base":"520751ef250abd4936720e1e7e0c620a158833a0","consumer":"SEC-002A","identity":"${digest}","profile":"shared","provider":"E2E-002R","scenario":"E2E-002R"}`])))
+  throws('red_artifact_reused', () => validateRedArtifactAdmission(plan, 'SEC-002A', registry, artifact, new Set([`{"base":"3f452e4dba00047b591e07617583aa4ec2387c2c","consumer":"SEC-002A","identity":"${digest}","profile":"shared","provider":"E2E-002R","scenario":"E2E-002R"}`])))
   throws('invalid_red_registry_binding', () => validateRedArtifactAdmission(plan, 'SEC-002A', { ...registry, scenarios: [{ ...scenario, semantic_hash: 'b'.repeat(40) }] }, artifact, new Set()))
   throws('invalid_red_artifact', () => validateRedArtifactAdmission(plan, 'SEC-002A', registry, { ...artifact, reviewer_id: 'red-author' }, new Set()))
 })

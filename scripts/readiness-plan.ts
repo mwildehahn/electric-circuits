@@ -28,6 +28,7 @@ const sha256 = (value: string) => createHash('sha256').update(value).digest('hex
 const canonical = (value: unknown) => JSON.stringify(value, (_key, entry) => entry && typeof entry === 'object' && !Array.isArray(entry) ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b))) : entry)
 const fail = (reason: string): never => { throw new Error(reason) }
 const git = (...args: string[]) => execFileSync('git', args, { cwd: validatorRoot, encoding: 'utf8' }).trim()
+const checkoutIdentity = () => ({ head: git('rev-parse', 'HEAD'), tree: git('rev-parse', 'HEAD^{tree}') })
 let authoritiesValidated = false
 export const validateAuthorities = () => {
   if (authoritiesValidated) return
@@ -392,7 +393,7 @@ export const validateRedArtifactAdmission = (raw: ReturnType<typeof manifest>, t
   const semantic = (reviewed.semantic_contract_sha256 ?? reviewed.semantic_hash) as string | undefined
   const profileScope = (reviewed.profile_scope ?? reviewed.scope) as string | undefined
   if (typeof reviewed.identity !== 'string' || typeof reviewed.provider_task !== 'string' || typeof reviewed.consumer_task !== 'string' || typeof reviewed.scenario_id !== 'string' || typeof semantic !== 'string' || typeof profileScope !== 'string' || typeof reviewed.base_sha !== 'string' || reviewed.review_state !== 'red_proved' || typeof reviewed.author_id !== 'string' || typeof reviewed.reviewer_id !== 'string') fail('invalid_red_artifact')
-  const task = raw.tasks.find(item => item.id === taskId) ?? fail('unknown_packet_task'), currentHead = integrationCommit
+  const task = raw.tasks.find(item => item.id === taskId) ?? fail('unknown_packet_task'), currentHead = checkoutIdentity().head
   if (task.proof_kind !== 'genuine_red' || reviewed.consumer_task !== taskId || reviewed.base_sha !== currentHead || reviewed.author_id === reviewed.reviewer_id || typeof reviewed.red_patch_sha !== 'string' || typeof (reviewed.red_evidence_sha256 ?? reviewed.red_evidence_sha) !== 'string') fail('invalid_red_artifact')
   if (!(registered.scenarios as Json[]).some(row => {
     const rowSemantic = (row as Json).semantic_contract_sha256 ?? (row as Json).semantic_hash
@@ -406,8 +407,8 @@ export const buildPlanningPacket = (raw: ReturnType<typeof manifest>, taskId: st
   if (!control) fail('controller_lease_required')
   const issuedControl = control as Json
   validateOperational(controllerState, 'controller_state', 'controller_state')
-  const state = controllerState as Json, currentHead = integrationCommit, currentTree = integrationTree
-  if (state.integration_head !== currentHead || state.integration_tree !== currentTree) fail('stale_controller_state')
+  const state = controllerState as Json, currentHead = state.integration_head as string, currentTree = state.integration_tree as string, checkedOut = checkoutIdentity()
+  if (currentHead !== checkedOut.head || currentTree !== checkedOut.tree) fail('stale_controller_state')
   if (canonical(state.lease) !== canonical(issuedControl)) fail('unrelated_controller_lease')
   validateLease(issuedControl, Date.now(), issuedControl.acknowledged_nonce as number)
   const controllerCompleted = new Set((state.resolutions as Json[]).filter(row => { const resolved = raw.tasks.find(task => task.id === row.task_id); const expectedScope = row.task_id === 'PLAN-001' ? 'bootstrap-plan-001' : resolved ? sharedScopeId(raw, resolved) : ''; return row.outcome === 'pass' && row.state === 'integrated' && row.generation === state.generation && row.scope_id === expectedScope && (row.base as Json).head === currentHead && (row.base as Json).tree === currentTree }).map(row => row.task_id as string))
@@ -425,15 +426,15 @@ export const validatePlanningPacket = (packet: Json, raw: ReturnType<typeof mani
   if (scope.kind !== 'shared_producer' || packet.profile !== null || task.execution_scope !== 'shared_producer') fail('invalid_planning_scope')
   if (task.proof_kind === 'genuine_red') fail('scenario_registry_unavailable')
   const control = packet.control as Json; validateLease(control, Date.now(), control.acknowledged_nonce as number); if (packet.core_sha256 !== packetCoreSha256(packet) || control.packet_sha256 !== packet.core_sha256) fail('packet_lease_binding')
-  const predecessors = selectedDependencies(raw, task, { lane: 'NATIVE_CORE', features: [] }), expectedScope = sharedScopeId(raw, task), currentHead = integrationCommit, currentTree = integrationTree, base = packet.base as Json, authority = packet.authority as Json
+  const predecessors = selectedDependencies(raw, task, { lane: 'NATIVE_CORE', features: [] }), expectedScope = sharedScopeId(raw, task), base = packet.base as Json, authority = packet.authority as Json, currentHead = authority?.integration_commit as string, currentTree = authority?.integration_tree as string, checkedOut = checkoutIdentity()
   if (canonical(packet.predecessors) !== canonical(predecessors) || scope.id !== expectedScope || scope.profile_scope !== 'shared') fail('forged_planning_scope')
-  if (base.initial_head !== currentHead || base.integration_tree !== currentTree || authority.integration_commit !== currentHead || authority.integration_tree !== currentTree) fail('stale_dispatch_base')
+  if (currentHead !== checkedOut.head || currentTree !== checkedOut.tree || base.initial_head !== currentHead || base.integration_tree !== currentTree) fail('stale_dispatch_base')
   const actual = outputIdentities(); if (canonical(packet.output_identities) !== canonical(actual.outputs) || packet.output_bundle_sha256 !== actual.bundle_sha256 || canonical(authority.canonical_inputs) !== canonical(raw.authoritative_inputs)) fail('stale_output_identity')
 }
 export const validatePacket = (packet: Json, raw: ReturnType<typeof manifest>, registry: Json | null = null, consumedRed = new Set<string>()) => {
   if (packet.packet_kind === 'bootstrap_plan' && packet.packet_version === 2) { validateBootstrapV2(packet); return }
   if (packet.packet_kind === 'bootstrap_plan') fail('invalid_bootstrap_packet')
-  if (packet.packet_kind === 'task' && (packet.contract as Json)?.scenario_registry === 'not_applicable_pre_registry') { validatePlanningPacket(packet, raw); return }
+  if (packet.packet_kind === 'task' && (packet.contract as Json)?.scenario_registry === 'not_applicable_pre_registry' && !packet.candidate_identity) { validatePlanningPacket(packet, raw); return }
   // Full task packets carry the immutable execution/evidence/ownership contract.
   // Validate the discriminators here before applying the compact schema used by
   // planning packets; this prevents accepting a label-only or partial packet.
@@ -441,6 +442,8 @@ export const validatePacket = (packet: Json, raw: ReturnType<typeof manifest>, r
     const task = raw.tasks.find(item => item.id === packet.task_id) ?? fail('unknown_packet_task')
     const scope = packet.execution_scope as Json
     if (scope?.kind !== task.execution_scope || !packet.base || !packet.topology || !packet.contract || !packet.control || !packet.authority) fail('invalid_task_packet_contract')
+    const checkedOut = checkoutIdentity(), fullBase = packet.base as Json, fullAuthority = packet.authority as Json
+    if (fullBase.initial_head !== checkedOut.head || (fullBase.initial_tree_sha ?? fullBase.integration_tree) !== checkedOut.tree || fullAuthority.integration_commit !== checkedOut.head || fullAuthority.integration_tree !== checkedOut.tree) fail('stale_dispatch_base')
     const topology = packet.topology as Json; if (topology.proof_kind !== task.proof_kind) fail('packet_proof_mismatch')
     if (task.execution_scope === 'per_profile' && !packet.profile) fail('release_profile_unavailable')
     if (task.execution_scope === 'per_profile' && !(packet as Json).release_profile_hash) fail('release_profile_unavailable')
