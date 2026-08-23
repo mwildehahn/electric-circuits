@@ -1,0 +1,23 @@
+{
+  "attempt_key": [
+    "PLAN-001",
+    "bootstrap-plan-001",
+    9
+  ],
+  "candidate_commit": "fbf39442bd55dc0b94b41d074dfd8e8efbb36430",
+  "candidate_tree": "c2115204511b4b1b8c155a9ad8a61e050eb1221b",
+  "candidate_role": "non_evidence_seed_only",
+  "controller_event_log_sha256": "c8999376056505d5de8195c18831861d54df8a896ca58a930fcbd15e25bb1e47",
+  "controller_generation": 8,
+  "controller_head": "865b3abbffc98e6086d2b1a69cf36842d67efb1d",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_commit": null,
+  "integration_sha": null,
+  "last_acknowledged_nonce": 103,
+  "unacknowledged_after_invalidation": [104, 105],
+  "lease_expired_at": null,
+  "packet_sha256": "4ad42a26548d49e08bacb0855ef7e7770ff7d1bae196666647808e84295a1074",
+  "reason": "Invalidated before evidence or integration because the controller-issued bootstrap packet was structurally incomplete under protocol v2: it omitted the required typed base/merge-base, declared-output and future-input records, evidence workspace contract, named review roles, and complete bootstrap discriminator. The validator must reject that packet rather than bless an omission. The author produced a non-evidence prototype seed commit under explicit commit-only authority; it is not a pass, is not an integration result, and may be consumed only as a content-pinned seed by the superseding attempt. Heartbeats 104 and 105 arrived after the phase changed to invalidated and were not acknowledged.",
+  "superseding_attempt": 10,
+  "terminal_status": "invalidated"
+}
