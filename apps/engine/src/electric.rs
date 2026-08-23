@@ -348,11 +348,13 @@ struct ApiError {
     message: String,
     /// `Retry-After`, in seconds, when the answer is "come back" rather than "you were wrong".
     retry_after: Option<u32>,
+    /// The backing shape stream is terminal; Electric must discard this handle and snapshot again.
+    must_refetch: bool,
 }
 
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
-        ApiError { status: StatusCode::BAD_REQUEST, message: message.into(), retry_after: None }
+        ApiError { status: StatusCode::BAD_REQUEST, message: message.into(), retry_after: None, must_refetch: false }
     }
 
     /// A NEW `live=true` request arriving after the shutdown token flipped.
@@ -369,6 +371,16 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "engine is shutting down; retry".to_string(),
             retry_after: Some(1),
+            must_refetch: false,
+        }
+    }
+
+    fn must_refetch() -> Self {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            message: "must-refetch".to_string(),
+            retry_after: None,
+            must_refetch: true,
         }
     }
 }
@@ -384,14 +396,26 @@ impl From<anyhow::Error> for ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: format!("{e:#}"),
                 retry_after: Some(1),
+                must_refetch: false,
             };
         }
-        ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:#}"), retry_after: None }
+        if crate::ds::is_stream_gone(&e) {
+            return ApiError::must_refetch();
+        }
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("{e:#}"),
+            retry_after: None,
+            must_refetch: false,
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.must_refetch {
+            return must_refetch();
+        }
         let body = serde_json::json!({ "message": self.message }).to_string();
         let len = body.len() as u64;
         let mut headers = HeaderMap::new();
