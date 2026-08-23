@@ -1,0 +1,26 @@
+{
+  "attempt_key": [
+    "PG18-000",
+    "shared-cf1bdab5bbcdd2a95e7c23fc421da6feb9f832fcb1eb17f95cbb74362e38b15b",
+    1
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "62bdd03efb1eae820d69a1a117ed5fa56e676793e18aacd6c2a2d22f9ae515e6",
+  "controller_generation": 20,
+  "controller_head": "6da5a5eedda89bc0efaaf445669ca15de57a724e",
+  "controller_tree": "518c64db9b75d7ac2b56983363a314993b982af1",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "07ae17a1cd256b39bbba927b91ac4db3ea7020017a4fdd8112e62ee4b8979832",
+  "packet_sha256": "ff875397870c83dcef84c5982f0fb04b76ad0a664ca149721e48b923c4824aa5",
+  "prepared_patch_sha256": "c234ea555adffc8c3984be45f42f4a73ecb5741dcfda176cd87cece021b7d8bd",
+  "review_sha256": "92a3a0734142ae66837a9d0fc1e4616858de9d8be637d2328443bc52535761ef",
+  "gates": {
+    "git_diff_check": "pass",
+    "pnpm_typecheck": "pass",
+    "contract_tests": "pass_5",
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 2,
+  "reason": "The author changed the frozen handoff and patch after ready_for_review (the reviewer observed successive handoff hashes and the worker then published a final3 patch), violating immutable prepared-patch provenance. The independent review also found fail-open enforcement: empty and wrong OCI/platform identities were accepted; canonical PG18 scenario records were validated only by IDs/count; TLS, publication, admission and provider fields were not fully executable; cited run-root/attestation artifacts were absent; and PG16 entry points remained untouched. No artifact is integrated.",
+  "terminal_status": "invalidated"
+}
