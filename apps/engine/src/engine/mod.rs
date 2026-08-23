@@ -237,6 +237,8 @@ pub struct Engine {
     /// The `(lsn, seq)` de-duplication highwater the sequencer starts from, restored with the
     /// checkpoint (ADR-0003). `None` = start de-duplicating from nothing.
     seq_highwater: Arc<std::sync::Mutex<Option<(u64, u64)>>>,
+    /// Keeps the change-log reader/checkpointer paused while a durable catalog Resume is incomplete.
+    restore_reads_paused: Arc<std::sync::atomic::AtomicBool>,
     /// Per-shape retention lifecycle + last-read instant. A separate sync mutex (not
     /// `EngineState`) so hot read paths can touch it without the async engine lock. Lock order:
     /// when both are held, `state` first, then `lives`; never across `.await`.
@@ -860,6 +862,7 @@ impl Engine {
             changes,
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
             seq_highwater: Arc::new(std::sync::Mutex::new(None)),
+            restore_reads_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1094,6 +1097,8 @@ impl Engine {
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
                 self.pg_url.is_none(),
+                self.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire),
+                self.restore_reads_paused.clone(),
                 self.shutdown.clone(),
             ));
         }
@@ -1298,10 +1303,8 @@ impl Engine {
         // Replay the durable shape catalog (restores shapes + the change-log replay offset), then
         // start the sequencer from the restored position. Runs before the ingestor so the restored
         // routing sees every replayed change.
-        if let Some(fold) = restored
-            && let Err(e) = self.apply_catalog(fold, &compiled, catalog::RestoreMode::Resume).await
-        {
-            tracing::error!("catalog restore failed (continuing empty): {e:#}");
+        if let Some(fold) = restored {
+            self.apply_catalog(fold, &compiled, catalog::RestoreMode::Resume).await.context("catalog restore")?;
         }
         {
             let mut st = self.state.lock().await;
