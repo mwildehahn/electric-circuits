@@ -3,10 +3,13 @@
 The Rust engine at the center of [electric-circuits](../../README.md): a durable-streams client that
 turns Postgres logical-replication changes into incrementally-maintained **shapes**, **subquery
 inner-sets**, and **scalar aggregations** — one maintained stream per *distinct* definition,
-ref-counted and shared across subscribers. It serves two HTTP surfaces from one process:
+ref-counted and shared across subscribers. It serves the native versioned HTTP surface plus
+compatibility routes from one process:
 
-- the **control plane** (`/schema`, `/shapes`, `/aggregate`, `/query`, introspection), used by
-  `@electric-circuits/api`;
+- the **native control plane** (`/v1/shapes`, `/v1/subsets/query`, `/v1/subset-feeds`,
+  `/v1/aggregates`, and `/v1/openapi.json`), used directly by Swift and other native clients;
+- **legacy control-plane aliases** (`/schema`, `/shapes`, `/aggregate`, `/query`, introspection),
+  retained for existing tooling and conformance fixtures;
 - the **Electric-compatible `GET /v1/shape`**, so an unmodified ElectricSQL client can sync from it.
 
 Design and execution model: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) and
@@ -196,6 +199,11 @@ unchanged.
 
 | Route | Purpose |
 |---|---|
+| `GET /v1/openapi.json` | Generated OpenAPI document for the native Rust/Axum contract |
+| `POST /v1/shapes` · `GET/DELETE /v1/shapes/{id}` | Native shape creation/renewal, lookup and subscription release |
+| `POST /v1/subsets/query` | Native one-shot subset query |
+| `POST /v1/subset-feeds` | Native changes-only subset feed |
+| `POST /v1/aggregates` | Native live scalar aggregate |
 | `GET /health` | **liveness** — `ok`/200 while the process runs, and nothing else (see "Operating") |
 | `GET /ready` | **readiness** — 200 `{"status":"active"}` only when the engine can serve; 503 with `waiting`/`starting`/`degraded`/`shutting_down` otherwise |
 | `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |

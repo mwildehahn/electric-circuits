@@ -1,20 +1,30 @@
 # @electric-circuits/api
 
-The extended tRPC API server — the surface `@electric-circuits/client` talks to. It sits beside the
-Rust engine and durable-streams:
+The API gateway sits beside the Rust engine and durable-streams. `ElectricCore` is the
+TypeScript adapter used by the gateway (the historical name is retained for compatibility); it
+forwards lifecycle/query calls to the Rust engine's native Axum contract. The gateway exposes a
+tRPC compatibility adapter and an optional REST/JSON compatibility adapter:
+
+- tRPC procedures remain the surface used by `@electric-circuits/client`.
+- REST resources under `/v1` on this gateway are a compatibility facade for existing integrations.
+- Swift and other native clients should call the Rust engine directly, where `/v1` and
+  `/v1/openapi.json` are canonical.
+- Both gateway adapters call the same TypeScript adapter; neither adapter owns synchronization logic.
+
+The underlying operations are:
 
 - **writes** (`ingest.write`) append State-Protocol envelopes directly to the durable-streams
   `table/<name>` stream (the engine tails it; used in library mode — in Postgres mode apps write
   SQL to Postgres instead);
-- **schema and shape/subset/aggregate lifecycle** are forwarded to the engine's control-plane HTTP
-  (`/schema`, `/shapes`, `/query`, `/aggregate`);
+- **schema and shape/subset/aggregate lifecycle** are forwarded to the engine's native Axum HTTP
+  (`/schema`, `/v1/shapes`, `/v1/subsets/query`, `/v1/aggregates`);
 - **reads never pass through this server**: a create returns a `ShapeHandle` (`shapeId`,
   `streamPath`, `streamUrl`) and the client reads the durable stream directly.
 
 The Electric-compatible `GET /v1/shape` endpoint is served by the **engine**, not here. Architecture:
 [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
 
-## Procedures (`src/router.ts`)
+## tRPC procedures (`src/router.ts`)
 
 | Procedure | Kind | Purpose |
 |---|---|---|
@@ -28,6 +38,22 @@ The Electric-compatible `GET /v1/shape` endpoint is served by the **engine**, no
 
 The predicate input is the shared AST from [`@electric-circuits/protocol`](../../packages/protocol/README.md):
 leaf comparisons, `isNull`, `and`/`or`/`not`, and `IN (SELECT …)` subqueries.
+
+## REST compatibility resources (`src/rest.ts`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/shapes` | create or renew a materialized shape |
+| `GET` | `/v1/shapes/{id}` | look up a shape handle |
+| `DELETE` | `/v1/shapes/{id}?subscription=…` | release a named subscription |
+| `POST` | `/v1/subsets/query` | run a one-shot subset query |
+| `POST` | `/v1/subset-feeds` | open a changes-only subset feed |
+| `POST` | `/v1/aggregates` | create a live scalar aggregate |
+
+The Rust engine publishes the canonical contract and generated document at
+`GET <engineUrl>/v1/openapi.json`. The gateway facade uses ordinary JSON bodies and
+problem-detail-style errors for compatibility. Durable-stream reads remain a separate client
+transport using the `streamUrl` in the returned handle; they are not tRPC subscriptions.
 
 ## Starting a server
 

@@ -49,6 +49,57 @@ async fn root_returns_200_empty() {
     assert!(body_string(res).await.is_empty());
 }
 
+/// The native client contract is served by the engine itself. These routes must be registered on
+/// the Axum surface (rather than only on the TypeScript gateway); malformed/library-mode requests
+/// may fail validation, but a missing route is a contract failure.
+#[tokio::test]
+async fn native_v1_routes_are_registered_on_the_engine() {
+    let cases = [
+        ("POST", "/v1/shapes", r#"{"table":"items"}"#),
+        ("GET", "/v1/shapes/s1", ""),
+        ("DELETE", "/v1/shapes/s1", ""),
+        ("POST", "/v1/subsets/query", r#"{"table":"items"}"#),
+        ("POST", "/v1/subset-feeds", r#"{"table":"items"}"#),
+        ("POST", "/v1/aggregates", r#"{"table":"items","fn":"count"}"#),
+    ];
+    for (method, uri, body) in cases {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let res = router(library_engine()).oneshot(request).await.unwrap();
+        // A missing GET shape is a legitimate 404 from the handler. For the mutating/query
+        // routes, a 404 would instead mean the path was never registered.
+        if method != "GET" {
+            assert_ne!(res.status(), StatusCode::NOT_FOUND, "{method} {uri} must be an engine route");
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_openapi_document_describes_the_public_routes() {
+    let res = router(library_engine())
+        .oneshot(Request::builder().uri("/v1/openapi.json").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("content-type").unwrap(), "application/json");
+    let document: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+    assert_eq!(document["openapi"], "3.0.3");
+    for path in ["/v1/shapes", "/v1/shapes/{id}", "/v1/subsets/query", "/v1/subset-feeds", "/v1/aggregates"] {
+        assert!(document["paths"].get(path).is_some(), "missing documented path {path}");
+    }
+    let predicate = &document["components"]["schemas"]["OpenApiPredicate"];
+    assert!(predicate.is_object());
+    assert!(predicate["oneOf"].is_array(), "predicate schema must preserve its alternatives");
+    assert!(
+        serde_json::to_string(predicate).unwrap().contains("OpenApiPredicate"),
+        "recursive predicate references must be present in the generated document"
+    );
+}
+
 #[tokio::test]
 async fn options_shape_is_cors_preflight() {
     let res = router(library_engine())

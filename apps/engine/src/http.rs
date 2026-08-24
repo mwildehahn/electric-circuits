@@ -6,11 +6,255 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
 
 use crate::engine::{Engine, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 use crate::table_ref::TableRef;
+
+// These types are deliberately documentation-only. Runtime requests continue to use the
+// validated domain types below; keeping the OpenAPI projection separate means a schema change
+// cannot accidentally change parsing or engine behavior without a compiler/test failure.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum OpenApiLeafOp {
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    Like,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+struct OpenApiSubquery {
+    /// Bare names are accepted as `public.<name>` by the runtime parser.
+    #[schema(example = "public.projects")]
+    table: String,
+    project: String,
+    #[serde(rename = "where")]
+    where_: Option<Box<OpenApiPredicate>>,
+}
+
+/// Recursive predicate grammar exposed by the native API. This intentionally mirrors the Rust
+/// `PredicateJson` enum, including boxed recursion, instead of collapsing predicates to an
+/// untyped `{}` as the tRPC OpenAPI bridge does for z.lazy schemas.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+enum OpenApiPredicate {
+    Leaf {
+        col: String,
+        op: OpenApiLeafOp,
+        #[schema(value_type = Object)]
+        value: serde_json::Value,
+    },
+    IsNull {
+        col: String,
+        #[serde(rename = "isNull")]
+        is_null: bool,
+    },
+    And {
+        and: Vec<OpenApiPredicate>,
+    },
+    Or {
+        or: Vec<OpenApiPredicate>,
+    },
+    Not {
+        not: Box<OpenApiPredicate>,
+    },
+    In {
+        col: String,
+        #[serde(rename = "in")]
+        subquery: OpenApiSubquery,
+        #[serde(default)]
+        negated: bool,
+    },
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OpenApiShapeRequest {
+    #[schema(example = "public.items")]
+    table: String,
+    #[serde(rename = "where")]
+    where_: Option<OpenApiPredicate>,
+    columns: Option<Vec<String>>,
+    #[serde(rename = "changesOnly")]
+    changes_only: Option<bool>,
+    subscription: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OpenApiShapeResponse {
+    shape_id: String,
+    table: String,
+    stream_path: String,
+    stream_url: String,
+    subscription: Option<String>,
+    lease_seconds: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OpenApiSubsetOrderBy {
+    col: String,
+    desc: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OpenApiSubsetQuery {
+    #[schema(example = "public.items")]
+    table: String,
+    #[serde(rename = "where")]
+    where_: Option<OpenApiPredicate>,
+    columns: Option<Vec<String>>,
+    order_by: Option<OpenApiSubsetOrderBy>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+struct OpenApiSubsetResponse {
+    rows: Vec<serde_json::Value>,
+    lsn: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+struct OpenApiAggregateRequest {
+    #[schema(example = "public.items")]
+    table: String,
+    #[serde(rename = "where")]
+    where_: Option<OpenApiPredicate>,
+    #[serde(rename = "fn")]
+    function: String,
+    col: Option<String>,
+    subscription: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+struct OpenApiError {
+    error: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/shapes",
+    request_body = OpenApiShapeRequest,
+    responses(
+        (status = 200, description = "Shape created or renewed", body = OpenApiShapeResponse),
+        (status = 400, description = "Invalid request", body = OpenApiError),
+        (status = 409, description = "Subscription belongs to another shape", body = OpenApiError),
+        (status = 503, description = "Engine unavailable", body = OpenApiError)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_create_shape() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/shapes/{id}",
+    params(("id" = String, Path, description = "Shape id")),
+    responses(
+        (status = 200, description = "Shape metadata", body = OpenApiShapeResponse),
+        (status = 404, description = "Shape not found", body = OpenApiError)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_get_shape() {}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/shapes/{id}",
+    params(
+        ("id" = String, Path, description = "Shape id"),
+        ("subscription" = Option<String>, Query, description = "Subscription claim to release")
+    ),
+    responses(
+        (status = 200, description = "Release accepted"),
+        (status = 404, description = "Shape not found", body = OpenApiError)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_release_shape() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/subsets/query",
+    request_body = OpenApiSubsetQuery,
+    responses(
+        (status = 200, description = "Snapshot rows", body = OpenApiSubsetResponse),
+        (status = 400, description = "Invalid request", body = OpenApiError)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_subset_query() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/subset-feeds",
+    request_body = OpenApiShapeRequest,
+    responses(
+        (status = 200, description = "Changes-only shape feed", body = OpenApiShapeResponse),
+        (status = 400, description = "Invalid request", body = OpenApiError)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_subset_feed() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/aggregates",
+    request_body = OpenApiAggregateRequest,
+    responses(
+        (status = 200, description = "Aggregate shape", body = OpenApiShapeResponse),
+        (status = 400, description = "Invalid request", body = OpenApiError)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_aggregate() {}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Electric Circuits Native API",
+        version = "0.1.0",
+        description = "Versioned Rust/Axum control-plane contract for native clients."
+    ),
+    paths(
+        openapi_create_shape,
+        openapi_get_shape,
+        openapi_release_shape,
+        openapi_subset_query,
+        openapi_subset_feed,
+        openapi_aggregate
+    ),
+    components(schemas(
+        OpenApiLeafOp,
+        OpenApiSubquery,
+        OpenApiPredicate,
+        OpenApiShapeRequest,
+        OpenApiShapeResponse,
+        OpenApiSubsetOrderBy,
+        OpenApiSubsetQuery,
+        OpenApiSubsetResponse,
+        OpenApiAggregateRequest,
+        OpenApiError
+    ))
+)]
+struct NativeApiDoc;
+
+async fn openapi_json() -> Result<Response, AppError> {
+    let body = NativeApiDoc::openapi()
+        .to_json()
+        .map_err(|e| AppError { status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("serialize OpenAPI: {e}") })?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok((headers, body).into_response())
+}
 
 pub fn router(engine: Engine) -> Router {
     router_with_introspection(engine, true)
@@ -25,6 +269,14 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         // Fleet surface: root probe + health state machine (CORS preflight is on the /v1/shape route).
         .route("/", get(|| async { StatusCode::OK }))
         .route("/v1/health", get(health_v1))
+        // Native, versioned contract. The unversioned routes below remain for the visualizer and
+        // existing internal callers; clients should use these routes and the generated document.
+        .route("/v1/openapi.json", get(openapi_json))
+        .route("/v1/shapes", post(create_shape))
+        .route("/v1/shapes/{id}", get(get_shape).delete(release_shape))
+        .route("/v1/subsets/query", post(query_subset))
+        .route("/v1/subset-feeds", post(create_subset_feed))
+        .route("/v1/aggregates", post(create_aggregate))
         // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
@@ -174,6 +426,17 @@ async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -
     let order_by = req.order_by.map(|o| (o.col, o.desc));
     let (rows, lsn) = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
     Ok(Json(QueryResp { rows, lsn }))
+}
+
+/// A changes-only feed uses the same shape lifecycle and subscription semantics as a materialized
+/// shape, but deliberately skips its backfill. The distinction is explicit in the request sent to
+/// the engine, rather than being inferred from a path in the engine core.
+async fn create_subset_feed(
+    State(engine): State<Engine>,
+    Json(mut req): Json<CreateShapeReq>,
+) -> Result<Json<ShapeResp>, AppError> {
+    req.changes_only = true;
+    create_shape(State(engine), Json(req)).await
 }
 
 async fn define_schema(

@@ -1,6 +1,7 @@
-// electric-circuits "core": the logic behind the tRPC procedures. Writes append State-Protocol
-// envelopes directly to the current segment of the durable-streams change log (decoupled from the
-// engine, which tails it). Schema definition and shape lifecycle are forwarded to the Rust engine.
+// ElectricCore is the TypeScript gateway adapter (the historical name is retained for callers).
+// Writes append State-Protocol envelopes directly to the current segment of durable-streams in
+// library mode; schema and shape/query lifecycle calls go to the Rust engine's native Axum API.
+// HTTP/tRPC parsing and error mapping belong in the outer adapters.
 
 import {
   type AggregateDef,
@@ -133,7 +134,7 @@ export function createCore(opts: CoreOptions): ElectricCore {
     },
 
     async createShape(def, subscription) {
-      return engineJson<ShapeHandle>('/shapes', {
+      return engineJson<ShapeHandle>('/v1/shapes', {
         method: 'POST',
         body: JSON.stringify({
           table: def.table,
@@ -145,20 +146,20 @@ export function createCore(opts: CoreOptions): ElectricCore {
     },
 
     async getShape(id) {
-      const res = await doFetch(`${engineUrl}/shapes/${encodeURIComponent(id)}`)
+      const res = await doFetch(`${engineUrl}/v1/shapes/${encodeURIComponent(id)}`)
       if (res.status === 404) return null
-      if (!res.ok) throw new Error(`engine /shapes/${id} -> ${res.status}`)
+      if (!res.ok) throw new Error(`engine /v1/shapes/${id} -> ${res.status}`)
       return (await res.json()) as ShapeHandle
     },
 
     async dropShape(id, subscription) {
       const query = subscription ? `?subscription=${encodeURIComponent(subscription)}` : ''
-      const res = await doFetch(`${engineUrl}/shapes/${encodeURIComponent(id)}${query}`, { method: 'DELETE' })
-      if (!res.ok && res.status !== 404) throw new Error(`engine DELETE /shapes/${id} -> ${res.status}`)
+      const res = await doFetch(`${engineUrl}/v1/shapes/${encodeURIComponent(id)}${query}`, { method: 'DELETE' })
+      if (!res.ok && res.status !== 404) throw new Error(`engine DELETE /v1/shapes/${id} -> ${res.status}`)
     },
 
     async createSubsetFeed(def, subscription) {
-      return engineJson<ShapeHandle>('/shapes', {
+      return engineJson<ShapeHandle>('/v1/subset-feeds', {
         method: 'POST',
         body: JSON.stringify({
           table: def.table,
@@ -171,7 +172,7 @@ export function createCore(opts: CoreOptions): ElectricCore {
     },
 
     async createAggregate(def, subscription) {
-      return engineJson<ShapeHandle>('/aggregate', {
+      return engineJson<ShapeHandle>('/v1/aggregates', {
         method: 'POST',
         body: JSON.stringify({
           table: def.table,
@@ -184,7 +185,7 @@ export function createCore(opts: CoreOptions): ElectricCore {
     },
 
     async querySubset(def) {
-      return engineJson<SubsetResult>('/query', {
+      return engineJson<SubsetResult>('/v1/subsets/query', {
         method: 'POST',
         body: JSON.stringify({
           table: def.table,
