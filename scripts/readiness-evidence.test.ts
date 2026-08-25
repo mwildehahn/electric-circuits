@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { assertRunRoot, canonicalJson, sha256, validateEvidenceRow, validateExternalInputs } from './readiness-evidence.js'
 
@@ -58,4 +59,21 @@ test('mutation fixtures cover tracked/staged/untracked source observations', () 
   assert.equal(attestation('M  staged', []).clean, false)
   assert.equal(attestation('?? untracked', []).clean, false)
   assert.equal(attestation('', ['cache']).clean, false)
+})
+
+test('every scripts node:test file has an explicit product-gate or planner-audit lane', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const scripts = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).scripts as Record<string, string>
+  const productGate = ['scripts/postgres-image-version.test.ts', 'scripts/readiness-evidence.test.ts']
+  const plannerAudit = ['scripts/readiness-plan.test.ts']
+  const discovered = readdirSync(join(root, 'scripts'))
+    .filter((name) => name.endsWith('.test.ts'))
+    .map((name) => `scripts/${name}`)
+    .sort()
+
+  assert.match(scripts['test:node'], /Supported product Node test gate/)
+  assert.match(scripts['test:readiness-plan'], /Non-gating planner audit/)
+  for (const file of productGate) assert.match(scripts['test:node'], new RegExp(file.replace('.', '\\.')))
+  for (const file of plannerAudit) assert.match(scripts['test:readiness-plan'], new RegExp(file.replace('.', '\\.')))
+  assert.deepEqual([...productGate, ...plannerAudit].sort(), discovered)
 })

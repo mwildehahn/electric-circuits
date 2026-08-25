@@ -39,7 +39,19 @@ jobs:
 
       - name: Put PostgreSQL server binaries on PATH
         run: |
-          PGBIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+          # Pin the ephemeral logical-replication harness to PostgreSQL 18; do not let the
+          # runner's preinstalled major select the test boundary implicitly.
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-18 postgresql-client-18
+          PGBIN="/usr/lib/postgresql/18/bin"
           echo "$PGBIN" >> "$GITHUB_PATH"
           "$PGBIN/initdb" --version
 
@@ -50,5 +62,10 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Full test suite (incl. conformance)
-        run: pnpm test
+      # `test:readiness-plan` is an explicit non-gating planner/provenance audit with a known-red
+      # stale fixture. Do not silently fold it into this product gate or omit its classification.
+      - name: Supported product Node test gate (including PostgreSQL 18 resolver)
+        run: pnpm test:node
+
+      - name: Full Vitest suite (including conformance)
+        run: pnpm exec vitest run

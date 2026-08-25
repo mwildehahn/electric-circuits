@@ -10,7 +10,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
+    "test": "pnpm test:node && vitest run",
+    "test:node": "echo 'Supported product Node test gate (PostgreSQL image + evidence helpers; planner audit excluded).' && node --import tsx --test scripts/postgres-image-version.test.ts scripts/readiness-evidence.test.ts",
+    "test:readiness-plan": "echo 'Non-gating planner audit: known stale/red provenance-planning lane, not a product test gate.' && node --import tsx --test scripts/readiness-plan.test.ts",
     "test:conformance": "vitest run packages/conformance",
     "test:fuzz": "vitest run packages/conformance/src/conformance-fuzz.test.ts",
     "engine:build": "cargo build -p electric-circuits-engine",
