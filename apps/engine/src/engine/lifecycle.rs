@@ -3139,6 +3139,7 @@ mod subscription_tests {
     async fn internal_purge_waits_for_stream_retirement_before_returning() {
         let server = FakeDs::start().await;
         server.block_deletes(true);
+        server.pause_delete_after_start(true);
         let engine = Engine::new(DsClient::new(server.url()));
         {
             let mut st = engine.state.lock().await;
@@ -3159,16 +3160,24 @@ mod subscription_tests {
             );
         }
 
-        let purging = tokio::spawn({
+        let mut purging = tokio::spawn({
             let engine = engine.clone();
             async move { engine.purge_shape("s1").await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_after_start_paused())
             .await
-            .expect("stream delete did not reach the blocking seam");
+            .expect("stream delete did not pause after publishing its arrival");
         assert!(!purging.is_finished(), "internal purge returned while stream deletion was blocked");
+        // Deliberately release before the handler has registered its release waiter. The fake
+        // durable-stream seam must remember the release, otherwise this exact interleaving leaves
+        // the internal purge waiting for a DELETE response that can never arrive.
         server.release_delete();
-        purging.await.unwrap().unwrap();
+        server.continue_delete_after_start();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(1), &mut purging).await;
+        if completed.is_err() {
+            purging.abort();
+        }
+        completed.expect("internal purge did not return after the stream-delete release").unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3203,11 +3212,17 @@ mod subscription_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
             .await
             .expect("initial stream delete did not reach the blocking seam");
+        tokio::time::timeout(std::time::Duration::from_secs(1), server.wait_delete_blocked())
+            .await
+            .expect("initial stream delete did not remain blocked");
         server.release_delete();
         internal.await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_started())
             .await
             .expect("queued retirement retry did not reach the blocking seam");
+        tokio::time::timeout(std::time::Duration::from_secs(1), server.wait_delete_blocked())
+            .await
+            .expect("queued retirement retry did not remain blocked before the native retry");
 
         let mut durable = tokio::spawn({
             let engine = engine.clone();
