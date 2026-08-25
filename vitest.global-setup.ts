@@ -7,13 +7,17 @@ import { appendFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { postgres18Tools } from './scripts/postgres18.js'
+
 export default function setup() {
   execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { stdio: 'inherit' })
   process.env.ELECTRIC_CIRCUITS_ENGINE_PREBUILT = '1'
 
+  const postgres = postgres18Tools()
+
   const dir = mkdtempSync(join(tmpdir(), 'el-pg-'))
   const data = join(dir, 'data')
-  execFileSync('initdb', ['-D', data, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
+  execFileSync(postgres.initdb, ['-D', data, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
 
   // Try a few ports; initdb is done, only the chosen port differs per attempt.
   let port = 0
@@ -28,7 +32,7 @@ export default function setup() {
         `fsync = off\nsynchronous_commit = off\nfull_page_writes = off\n`,
     )
     try {
-      execFileSync('pg_ctl', ['-D', data, '-l', join(dir, 'log'), '-w', 'start'], { stdio: 'ignore' })
+      execFileSync(postgres.pgCtl, ['-D', data, '-l', join(dir, 'log'), '-w', 'start'], { stdio: 'ignore' })
       started = true
     } catch {
       /* port likely in use; loop appends a new port (last one wins in postgresql.conf) */
@@ -40,7 +44,7 @@ export default function setup() {
 
   return () => {
     try {
-      execFileSync('pg_ctl', ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
+      execFileSync(postgres.pgCtl, ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
     } catch {
       /* already down */
     }
