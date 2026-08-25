@@ -8,13 +8,15 @@
 //       tsx src/electric-adapter.ts     # prints ADAPTER_LISTENING <url>, stays up until killed
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import pgpkg from 'pg'
+
+import { postgres18Tools } from '../../../scripts/postgres18.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
@@ -26,6 +28,7 @@ function repoRoot(): string {
   throw new Error('repo root not found')
 }
 const SLOT = process.env.ADAPTER_PG_SLOT || 'electric_circuits_conformance'
+let postgres: ReturnType<typeof postgres18Tools> | undefined
 
 // Electric's full standard schema (level_1..4 + composite-PK *_tags side tables).
 const STANDARD_DDL = [
@@ -51,17 +54,40 @@ let pgDir: string | undefined
 let pgData: string | undefined
 let engineProc: ChildProcess | undefined
 let ds: DurableStreamTestServer | undefined
+let dsDataDir: string | undefined
+const cleanupFile = process.env.ADAPTER_CLEANUP_FILE
+let shuttingDown: Promise<void> | undefined
+
+function writeCleanupManifest(): void {
+  if (!cleanupFile) return
+
+  writeFileSync(
+    cleanupFile,
+    JSON.stringify({
+      adapterPid: process.pid,
+      enginePid: engineProc?.pid,
+      dsPid: ds?.pid,
+      dsUrl: ds?.url,
+      // This is a fresh `el-econf-ds-*` root created by this invocation, never a caller path.
+      // The oracle runner's forced-exit fallback validates that ownership marker before removal.
+      dsDataDir,
+      pgCtl: postgres?.pgCtl,
+      pgData,
+    }),
+  )
+}
 
 function bootEphemeralPg(): string {
+  postgres = postgres18Tools()
   pgDir = mkdtempSync(join(tmpdir(), 'el-econf-pg-'))
   pgData = join(pgDir, 'data')
-  execFileSync('initdb', ['-D', pgData, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
+  execFileSync(postgres.initdb, ['-D', pgData, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
   let port = 0
   for (let attempt = 0; attempt < 8; attempt++) {
     port = 55000 + Math.floor(Math.random() * 4000)
     execFileSync('bash', ['-c', `printf '\\nwal_level=logical\\nmax_replication_slots=10\\nmax_wal_senders=10\\nmax_connections=1200\\nlisten_addresses=\\047127.0.0.1\\047\\nunix_socket_directories=\\047/tmp\\047\\nport=${port}\\nfsync=off\\n' >> ${pgData}/postgresql.conf`])
     try {
-      execFileSync('pg_ctl', ['-D', pgData, '-l', join(pgDir, 'log'), '-w', 'start'], { stdio: 'ignore' })
+      execFileSync(postgres.pgCtl, ['-D', pgData, '-l', join(pgDir, 'log'), '-w', 'start'], { stdio: 'ignore' })
       return `postgres://postgres@127.0.0.1:${port}/postgres`
     } catch {
       /* retry */
@@ -86,6 +112,7 @@ async function main() {
   const waitTable = process.env.ADAPTER_WAIT_TABLE
   if (!pgUrl && waitTable) {
     pgUrl = bootEphemeralPg()
+    writeCleanupManifest()
     console.log(`ADAPTER_PG ${pgUrl}`)
     const client = new pgpkg.Client({ connectionString: pgUrl })
     await client.connect()
@@ -99,6 +126,7 @@ async function main() {
     console.error(`schema present (${waitTable}) → ${pgUrl}`)
   } else if (!pgUrl) {
     pgUrl = bootEphemeralPg()
+    writeCleanupManifest()
     const client = new pgpkg.Client({ connectionString: pgUrl })
     await client.connect()
     for (const ddl of STANDARD_DDL) await client.query(ddl)
@@ -111,10 +139,13 @@ async function main() {
   // changes" when an up-to-date response returns. With the 30s default, unchanged shapes stall a batch;
   // a short timeout returns up-to-date quickly (changed shapes still wake immediately on append).
   const longPollMs = Number(process.env.ADAPTER_LONGPOLL_MS || 1000)
-  ds = new DurableStreamTestServer({ port: 0, longPollTimeout: longPollMs })
+  dsDataDir = mkdtempSync(join(tmpdir(), 'el-econf-ds-'))
+  ds = new DurableStreamTestServer({ port: 0, dataDir: dsDataDir, longPollTimeout: longPollMs })
   const dsUrl = await ds.start()
+  writeCleanupManifest()
 
-  // The adapter's *overall* live deadline (how long a live=true request re-polls before 204) is
+  // The adapter's *overall* live deadline (how long a live=true request re-polls before its
+  // up-to-date control response) is
   // decoupled from the ds long-poll timeout above (which just paces the engine's re-poll loop).
   // Default = ADAPTER_LONGPOLL_MS so the oracle harness keeps its fast up-to-date detection; the
   // benchmark runner sets ADAPTER_LIVE_TIMEOUT_MS=20000 for Electric-like ~20s live behavior.
@@ -134,6 +165,7 @@ async function main() {
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
+  writeCleanupManifest()
   const url = await new Promise<string>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('engine did not start')), 30000)
     let buf = ''
@@ -152,25 +184,61 @@ async function main() {
   console.log(`ADAPTER_LISTENING ${url}`)
 }
 
-function shutdown() {
-  engineProc?.kill('SIGKILL')
-  void ds?.stop().catch(() => {})
-  if (pgData && pgDir) {
-    // pnpm/tsx can hard-kill this process moments after a SIGTERM reaches the process group — before
-    // a synchronous pg_ctl stop + rmSync would finish (which leaked the ephemeral PG + its tmpdir).
-    // Hand the teardown to a detached helper: it survives us AND a group-wide SIGKILL backstop
-    // (detached = its own process group).
-    spawn('bash', ['-c', `pg_ctl -D '${pgData}' -m immediate -w stop >/dev/null 2>&1; rm -rf '${pgDir}'`], {
-      detached: true,
-      stdio: 'ignore',
-    }).unref()
+async function stopEngine(): Promise<void> {
+  const proc = engineProc
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return
+  const exited = new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), 3_000)
+    proc.once('exit', () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
+  proc.kill('SIGTERM')
+  if (!(await exited) && proc.exitCode === null && proc.signalCode === null) {
+    const killed = new Promise<void>((resolve) => proc.once('exit', () => resolve()))
+    proc.kill('SIGKILL')
+    await killed
   }
-  process.exit(0)
 }
-process.on('SIGINT', shutdown)
-process.on('SIGTERM', shutdown)
+
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return shuttingDown
+  shuttingDown = (async () => {
+    await stopEngine()
+    try {
+      await ds?.stop()
+    } finally {
+      ds = undefined
+      if (dsDataDir) {
+        rmSync(dsDataDir, { recursive: true, force: true })
+        dsDataDir = undefined
+      }
+    }
+    if (pgData && pgDir) {
+      // pnpm/tsx can hard-kill this process moments after a SIGTERM reaches the process group — before
+      // a synchronous pg_ctl stop + rmSync would finish (which leaked the ephemeral PG + its tmpdir).
+      // Hand the teardown to a detached helper: it survives us AND a group-wide SIGKILL backstop
+      // (detached = its own process group).
+      if (!postgres) throw new Error('ephemeral Postgres tools were not initialized')
+      spawn('bash', ['-c', `'${postgres.pgCtl}' -D '${pgData}' -m immediate -w stop >/dev/null 2>&1; rm -rf '${pgDir}'`], {
+        detached: true,
+        stdio: 'ignore',
+      }).unref()
+    }
+  })()
+  return shuttingDown
+}
+
+function shutdownAndExit() {
+  void shutdown()
+    .catch((e) => console.error('adapter shutdown failed', e))
+    .finally(() => process.exit(0))
+}
+process.on('SIGINT', shutdownAndExit)
+process.on('SIGTERM', shutdownAndExit)
 
 main().catch((e) => {
   console.error(e)
-  shutdown()
+  shutdownAndExit()
 })

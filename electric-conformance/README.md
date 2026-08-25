@@ -1,8 +1,11 @@
 # Electric protocol conformance
 
-Runs ElectricSQL's **own** oracle harness (`Support.OracleHarness` / `ShapeChecker` — its
+Runs ElectricSQL's formerly-official oracle harness (`Support.OracleHarness` / `ShapeChecker` — its
 comparison-against-Postgres logic) against electric-circuits's `GET /v1/shape` adapter, driven by Electric's
-official Elixir `Electric.Client`. This proves electric-circuits speaks Electric's wire protocol.
+official Elixir `Electric.Client`. Current Electric main no longer ships those internal test-support modules, so
+the exact last upstream copies required by the deterministic oracle suite are vendored under
+[`vendor/electric-oracle-harness`](vendor/electric-oracle-harness/PROVENANCE.md), with source hashes and
+Apache-2.0 license. The runner verifies their bytes before installing them into the disposable Electric checkout.
 
 ## Run
 
@@ -12,9 +15,13 @@ electric-conformance/run.sh property   # or: oracle | subqueries
 ```
 
 The script locates an ElectricSQL checkout (`ELECTRIC_DIR`, default `../electric`; cloned from
-`ELECTRIC_REPO` when absent, optionally at `ELECTRIC_REF`), builds our release engine, copies the
-test files into `packages/sync-service/test/{integration,support}/`, and runs `mix test`.
+`ELECTRIC_REPO` when absent) at the pinned `ELECTRIC_REF` default
+`2f11f91d6c580e47fb57924f5d3f7954329314d8`, builds our release engine, copies the test files and verified
+vendored oracle support into `packages/sync-service/test/{integration,support}/`, and runs `mix test`.
 Requirements: elixir/mix, Rust, and PostgreSQL binaries (`initdb`/`pg_ctl`) on `PATH`.
+Each invocation owns an initially empty cleanup manifest. The adapter records its engine and durable-stream
+PIDs plus a fresh durable-stream root, waits for `ds.stop()` on graceful exit, and the runner uses those
+exact entries as a forced-exit fallback—never a process-name sweep or shared temporary directory cleanup.
 
 Both boot our stack (durable-streams + engine + adapter) via `packages/bench/src/electric-adapter.ts`,
 point Electric's official `Electric.Client` at it, and run Electric's own `OracleHarness`/`ShapeChecker`.
@@ -39,11 +46,12 @@ Tunables: `ORACLE_RUNS`, `ORACLE_SHAPE_COUNT`, `ORACLE_BATCH_COUNT`, `ORACLE_MUT
   retries instead of killing its sync loop.
 - **Live long-poll deadline** is the adapter's own **`ELECTRIC_LIVE_TIMEOUT_MS`** (default `20000`,
   matching Electric's ~20s live long-poll), decoupled from the durable-streams server's long-poll
-  timeout (which just paces the adapter's re-poll loop). At the deadline the response is `204` with
-  the electric headers (handle/offset unchanged, `electric-up-to-date`), matching Electric, instead
-  of a `200 []` the client would busy-loop on. The launcher (`electric-adapter.ts`) sets it from
-  `ADAPTER_LIVE_TIMEOUT_MS`, defaulting to `ADAPTER_LONGPOLL_MS` (1000) so the oracle harness keeps
-  its fast up-to-date detection; the fleet benchmark runner sets `ADAPTER_LIVE_TIMEOUT_MS=20000`.
+  timeout (which just paces the adapter's re-poll loop). At the deadline the engine directly returns
+  the current Electric-compatible `200` `up-to-date` control body with unchanged handle/offset and
+  the `electric-up-to-date` header; a plain `200 []` would make the client busy-loop. The launcher
+  (`electric-adapter.ts`) exposes that direct engine URL and sets the deadline from
+  `ADAPTER_LIVE_TIMEOUT_MS`, defaulting to `ADAPTER_LONGPOLL_MS` (1000) so the oracle
+  harness keeps its fast up-to-date detection; the fleet benchmark runner sets `ADAPTER_LIVE_TIMEOUT_MS=20000`.
 - **Live-request coalescing.** Concurrent `live=true` requests at the same (handle, offset) are
   identical, so one leader performs the serialized read+apply and every concurrent request at that
   offset receives the same response (write-fanout: N clients long-poll one handle at one offset —
@@ -70,10 +78,12 @@ and the stale-tag no-spurious-delete case. The **2 failures both assert Electric
 detail electric-circuits deliberately doesn't emit (we use absolute membership emission, not row tags). They
 are not membership/correctness failures.
 
-## Status — ✅ passing (oracle)
-The Electric oracle property test passes against electric-circuits across the **full** standard schema
-(`level_1..4` + composite-PK `*_tags`) and the full generated grammar: comparisons (`= <> < > <= >=`),
-`LIKE`/`NOT LIKE`, `BETWEEN`/`NOT BETWEEN`, `IN (list)`, 1/2/3-level `IN (SELECT …)` subqueries, tag
-subqueries, `NOT IN`, and `AND`/`OR`/`NOT` compositions — all converging vs the Postgres oracle through
-Electric's official client. Verified at `ORACLE_RUNS=25 ORACLE_SHAPE_COUNT=5 ORACLE_BATCH_COUNT=4`
-(`1 property, 0 failures`).
+## Compatibility scope
+
+The repaired `oracle` lane preserves the independent Postgres comparison and official `Electric.Client` at
+Electric `2f11f91d6c580e47fb57924f5d3f7954329314d8`. Its zero-restart grouped mutations are flattened only to
+match the vendored harness's official flat-sequence API; the SQL journal and independent oracle are unchanged.
+The optional generated `property` lane still references
+`WhereClauseGenerator`, which is absent both from that pinned checkout and from the reachable last upstream
+OracleHarness source. It is deliberately outside this minimal compatibility vendor; a future repair must source
+that generator from a reachable official revision and add its own provenance before claiming property coverage.

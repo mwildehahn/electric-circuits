@@ -18,9 +18,9 @@
 //!   same response (write-fanout: N clients long-poll one handle at one offset — serializing them behind
 //!   the mutex would hand each a full long-poll timeout in turn). A live request keeps re-polling the
 //!   ds stream until data arrives or `ELECTRIC_LIVE_TIMEOUT_MS` (default 20000, Electric-like ~20s)
-//!   elapses, then returns `204`. Every individual ds poll is bounded by the *remaining* deadline
+//!   elapses, then returns Electric's `200` `up-to-date` control message. Every individual ds poll is bounded by the *remaining* deadline
 //!   (`poll_live_until`): the ds server's own long-poll window can exceed ours, and an idle stream
-//!   must still produce the 204 on time.
+//!   must still produce that response on time.
 //! - Identical shape definitions (same table + canonical `where` + columns) share ONE engine shape
 //!   (`create_shape` with `share = true`): concurrent clients and returning clients rejoin the same
 //!   retained stream instead of re-backfilling from Postgres. Handles stay **per client** (each
@@ -172,7 +172,8 @@ pub(crate) async fn ttl_registry_heap_bytes() -> usize {
 }
 
 /// Overall deadline for a `live=true` long-poll, decoupled from the ds server's own long-poll timeout:
-/// the adapter keeps re-polling the ds stream until data arrives or this elapses, then returns `204`.
+/// the adapter keeps re-polling the ds stream until data arrives or this elapses, then returns an
+/// Electric-compatible `up-to-date` control message.
 /// `ELECTRIC_LIVE_TIMEOUT_MS` env var; default 20000 (Electric's ~20s live long-poll).
 fn live_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
@@ -359,13 +360,13 @@ impl ApiError {
 
     /// A NEW `live=true` request arriving after the shutdown token flipped.
     ///
-    /// Returning the ordinary empty 204 would be technically correct and practically awful: an
+    /// Returning an ordinary empty 204 would be technically correct and practically awful: an
     /// Electric client re-polls immediately on a 204, so every live subscriber would spin a tight
     /// poll loop for the whole drain window. A 5xx is what the client backs off on, and
     /// `Retry-After` says for how long — by which time this pod is gone and the client reconnects
-    /// to its successor. Polls ALREADY parked are untouched: they return their normal 204 with the
-    /// offset they had (see `poll_live_until`), because they were promised an answer before any of
-    /// this started.
+    /// to its successor. Polls ALREADY parked are untouched: they return their normal up-to-date
+    /// control response with the offset they had (see `poll_live_until`), because they were promised
+    /// an answer before any of this started.
     fn draining() -> Self {
         ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -606,7 +607,8 @@ impl crate::predicate::SubqueryCollector for ValidateOnly {
 }
 
 /// The result of one positioned read on a handle, cloneable to every coalesced waiter. `body: None`
-/// is the `204` long-poll-deadline response; `Some` carries the serialized JSON message array.
+/// is reserved for a body-less response; normal live deadline and data responses carry serialized
+/// JSON message arrays.
 /// `retired` short-circuits both: the shape's stream was closed by the engine (retirement), so the
 /// caller answers `409 must-refetch` — the same answer an evicted handle already gets. Coalesced
 /// waiters at the same offset all receive it, which is correct: the shape is gone for all of them.
@@ -680,7 +682,7 @@ where
 /// **closed**, or `deadline` elapses. Each poll is bounded by the **remaining** deadline — the ds
 /// server holds an idle
 /// long-poll far longer than our window, so an unbounded read would blow straight through the
-/// deadline (observed: idle `live=true` requests hanging >60s instead of 204 at ~20s). On expiry
+/// deadline (observed: idle `live=true` requests hanging >60s instead of an up-to-date response at ~20s). On expiry
 /// the last empty page is returned so a `next_offset` advanced past empty pages is preserved;
 /// expiry mid-poll (no page yet) yields an offset-less empty result, leaving the handle offset
 /// unchanged. A `closed` page ends the loop immediately: the engine retired the shape, so the stream
@@ -702,7 +704,7 @@ where
         if remaining.is_zero() {
             return Ok(last);
         }
-        // Shutdown ends the poll like an expired deadline: the client gets its 204 with the offset
+        // Shutdown ends the poll like an expired deadline: the client gets its up-to-date control response with the offset
         // it had, and re-polls the next process. Without this a parked `live=true` request would
         // hold the whole termination grace hostage for its full ~20 s window — the single loudest
         // symptom of an engine that does not shut down gracefully.
@@ -780,8 +782,8 @@ async fn positioned_read(
         st.offset = n.clone();
     }
 
-    // Live deadline reached with no new data: a 204 with the electric headers (handle, offset
-    // unchanged) like Electric does — a 200 `[]` without `up-to-date` would make the client busy-loop.
+    // Live deadline reached with no new data: current Electric answers 200 with its up-to-date
+    // control message plus the normal cursor headers. A plain 200 `[]` would make the client busy-loop.
     if live && r.envelopes.is_empty() {
         let served_offset = st.offset.clone();
         drop(st);
@@ -790,7 +792,7 @@ async fn positioned_read(
             offset: served_offset,
             up_to_date: true,
             cursor: next_cursor(),
-            body: None,
+            body: Some(serde_json::to_string(&vec![control_msg("up-to-date")]).unwrap_or_else(|_| "[]".into())),
             retired: false,
         });
     }
@@ -1104,8 +1106,8 @@ mod tests {
     }
 
     // The idle-live-poll bug: the ds server holds an idle long-poll far longer than our live
-    // deadline, so each poll must be bounded by the *remaining* deadline or the 204 never fires
-    // (observed in-container: idle live requests hung >60s instead of 204 at ~20s).
+    // deadline, so each poll must be bounded by the *remaining* deadline or the up-to-date response
+    // never fires (observed in-container: idle live requests hung >60s instead of ~20s).
     #[tokio::test(start_paused = true)]
     async fn live_poll_deadline_fires_through_hanging_read() {
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -1200,7 +1202,7 @@ mod tests {
         assert_eq!(
             r.next_offset.as_deref(),
             Some("05"),
-            "the last empty page's offset must survive to the 204 so the client resumes past it"
+            "the last empty page's offset must survive to the deadline response so the client resumes past it"
         );
     }
 
