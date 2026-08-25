@@ -123,7 +123,14 @@ function pgCtl(pg: Postgres18Tools, data: string, log: string, action: 'start' |
   if (action === 'start') args.push('-l', log, '-w', 'start')
   else if (action === 'stop') args.push('-m', mode ?? 'immediate', '-w', 'stop')
   else args.push('promote', '-w')
-  run(pg.pgCtl, args)
+  try {
+    run(pg.pgCtl, args)
+  } catch (error) {
+    if (action !== 'start') throw error
+    const ownedLog = existsSync(log) ? readFileSync(log, 'utf8') : '(the fixture log was not created)'
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`pg_ctl could not start fixture cluster (${detail}); owned log ${log}:\n${ownedLog}`)
+  }
 }
 
 function postmasterPid(data: string): number {
@@ -301,7 +308,7 @@ async function bootFixture(): Promise<PromotionFixture> {
     run(pg.initdb, ['-D', primaryData, '-U', 'postgres', '--auth=trust', '--no-sync'])
     appendFileSync(
       join(primaryData, 'postgresql.conf'),
-      `\nlisten_addresses = '127.0.0.1'\nport = ${primaryPort}\nwal_level = logical\nmax_wal_senders = 10\nmax_replication_slots = 10\n`,
+      `\nlisten_addresses = '127.0.0.1'\nunix_socket_directories = ''\nport = ${primaryPort}\nwal_level = logical\nmax_wal_senders = 10\nmax_replication_slots = 10\n`,
     )
     appendFileSync(join(primaryData, 'pg_hba.conf'), '\nhost replication all 127.0.0.1/32 trust\nhost all all 127.0.0.1/32 trust\n')
     pgCtl(pg, primaryData, join(root, 'primary.log'), 'start')
@@ -329,7 +336,10 @@ async function bootFixture(): Promise<PromotionFixture> {
       'stream',
       '--checkpoint=fast',
     ])
-    appendFileSync(join(standbyData, 'postgresql.conf'), `\nlisten_addresses = '127.0.0.1'\nport = ${standbyPort}\nhot_standby = on\n`)
+    appendFileSync(
+      join(standbyData, 'postgresql.conf'),
+      `\nlisten_addresses = '127.0.0.1'\nunix_socket_directories = ''\nport = ${standbyPort}\nhot_standby = on\n`,
+    )
     pgCtl(pg, standbyData, join(root, 'standby.log'), 'start')
     const standbyPid = postmasterPid(standbyData)
     const standbyUrl = `postgres://postgres@127.0.0.1:${standbyPort}/${dbName}`
@@ -404,6 +414,8 @@ describe('PG18-E2E-009: promotion without synchronized logical failover slots', 
 
     await startEngine(fx, fx.primaryUrl, 'primary_engine_ready')
     expect(await scalar<string>(fx.primaryUrl, 'SHOW server_version_num')).toMatch(/^18/)
+    expect(await scalar<string>(fx.primaryUrl, 'SHOW unix_socket_directories')).toBe('')
+    expect(await scalar<string>(fx.standbyUrl, 'SHOW unix_socket_directories')).toBe('')
     expect(await scalar<string>(fx.primaryUrl, 'SELECT pubname FROM pg_publication WHERE pubname = $1', [fx.publication])).toBe(
       fx.publication,
     )

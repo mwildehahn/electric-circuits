@@ -18,6 +18,7 @@ interface CleanupManifest {
   dsPid?: number
   dsUrl?: string
   dsDataDir?: string
+  engineBin?: string
   pgCtl?: string
   pgData?: string
 }
@@ -85,7 +86,14 @@ async function startAdapter(): Promise<AdapterRun> {
   const manifestPath = join(root, 'manifest.json')
   const child = spawn('pnpm', ['--filter', '@electric-circuits/bench', 'exec', 'tsx', 'src/electric-adapter.ts'], {
     cwd: repo,
-    env: { ...process.env, ADAPTER_CLEANUP_FILE: manifestPath, ADAPTER_LONGPOLL_MS: '50' },
+    env: {
+      ...process.env,
+      ADAPTER_CLEANUP_FILE: manifestPath,
+      ADAPTER_LONGPOLL_MS: '50',
+      // `pnpm engine:test` builds this debug artifact; do not make the product test gate depend
+      // on a separate release build.
+      ELECTRIC_CIRCUITS_ADAPTER_ENGINE_BIN: join(repo, 'target', 'debug', 'electric-circuits-engine'),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let output = ''
@@ -154,6 +162,7 @@ describe('electric adapter durable-stream ownership', () => {
     expect(run.manifest.dsPid).toEqual(expect.any(Number))
     expect(run.manifest.dsUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
     expect(run.manifest.dsDataDir).toEqual(expect.any(String))
+    expect(run.manifest.engineBin).toBe(join(repo, 'target', 'debug', 'electric-circuits-engine'))
     expect(existsSync(run.manifest.dsDataDir!)).toBe(true)
 
     process.kill(run.manifest.adapterPid!, 'SIGTERM')
@@ -179,6 +188,7 @@ describe('electric adapter durable-stream ownership', () => {
     expect(run.manifest.dsPid).toEqual(expect.any(Number))
     expect(run.manifest.dsUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
     expect(run.manifest.dsDataDir).toEqual(expect.any(String))
+    expect(run.manifest.engineBin).toBe(join(repo, 'target', 'debug', 'electric-circuits-engine'))
 
     process.kill(run.manifest.adapterPid!, 'SIGKILL')
     await waitForPidExit(run.manifest.adapterPid!)

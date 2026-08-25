@@ -28,6 +28,7 @@ function repoRoot(): string {
   throw new Error('repo root not found')
 }
 const SLOT = process.env.ADAPTER_PG_SLOT || 'electric_circuits_conformance'
+const ADAPTER_ENGINE_BIN = 'ELECTRIC_CIRCUITS_ADAPTER_ENGINE_BIN'
 let postgres: ReturnType<typeof postgres18Tools> | undefined
 
 // Electric's full standard schema (level_1..4 + composite-PK *_tags side tables).
@@ -55,8 +56,22 @@ let pgData: string | undefined
 let engineProc: ChildProcess | undefined
 let ds: DurableStreamTestServer | undefined
 let dsDataDir: string | undefined
+let selectedEngineBin: string | undefined
 const cleanupFile = process.env.ADAPTER_CLEANUP_FILE
 let shuttingDown: Promise<void> | undefined
+
+function selectEngineBin(): string {
+  const injected = process.env[ADAPTER_ENGINE_BIN]
+  const binary = injected ?? join(repoRoot(), 'target', 'release', 'electric-circuits-engine')
+  if (existsSync(binary)) return binary
+
+  if (!injected) {
+    // Keep the standalone adapter contract unchanged: its default remains the release engine.
+    console.error('build first: cargo build --release -p electric-circuits-engine')
+    process.exit(1)
+  }
+  throw new Error(`${ADAPTER_ENGINE_BIN} does not exist: ${binary}`)
+}
 
 function writeCleanupManifest(): void {
   if (!cleanupFile) return
@@ -71,6 +86,7 @@ function writeCleanupManifest(): void {
       // This is a fresh `el-econf-ds-*` root created by this invocation, never a caller path.
       // The oracle runner's forced-exit fallback validates that ownership marker before removal.
       dsDataDir,
+      engineBin: selectedEngineBin,
       pgCtl: postgres?.pgCtl,
       pgData,
     }),
@@ -97,10 +113,9 @@ function bootEphemeralPg(): string {
 }
 
 async function main() {
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'))) {
-    console.error('build first: cargo build --release -p electric-circuits-engine')
-    process.exit(1)
-  }
+  // Select and validate before starting any fixture-owned process. Tests inject the debug binary
+  // built by `pnpm engine:test`; standalone use still defaults to the release binary above.
+  selectedEngineBin = selectEngineBin()
 
   let pgUrl = process.env.ADAPTER_PG_URL || ''
   let tables =
@@ -151,7 +166,7 @@ async function main() {
   // benchmark runner sets ADAPTER_LIVE_TIMEOUT_MS=20000 for Electric-like ~20s live behavior.
   const liveTimeoutMs = Number(process.env.ADAPTER_LIVE_TIMEOUT_MS || longPollMs)
 
-  engineProc = spawn(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
+  engineProc = spawn(selectedEngineBin, [], {
     env: {
       ...process.env,
       ELECTRIC_LIVE_TIMEOUT_MS: String(liveTimeoutMs),
