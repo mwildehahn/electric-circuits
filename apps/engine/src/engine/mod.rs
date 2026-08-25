@@ -287,6 +287,8 @@ pub struct Engine {
 }
 
 pub(crate) struct PurgeBarrier {
+    dropped_durable: std::sync::atomic::AtomicBool,
+    dropped_notify: tokio::sync::Notify,
     done: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
@@ -301,7 +303,27 @@ pub(crate) struct PurgeTestHook {
 
 impl PurgeBarrier {
     fn new() -> Self {
-        Self { done: std::sync::atomic::AtomicBool::new(false), notify: tokio::sync::Notify::new() }
+        Self {
+            dropped_durable: std::sync::atomic::AtomicBool::new(false),
+            dropped_notify: tokio::sync::Notify::new(),
+            done: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn mark_dropped_durable(&self) {
+        self.dropped_durable.store(true, Ordering::Release);
+        self.dropped_notify.notify_waiters();
+    }
+
+    async fn wait_dropped_durable(&self) {
+        loop {
+            let notified = self.dropped_notify.notified();
+            if self.dropped_durable.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn complete(&self) {
