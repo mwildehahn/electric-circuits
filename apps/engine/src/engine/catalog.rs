@@ -1259,6 +1259,24 @@ pub(crate) mod testing {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// Wait for a request-scoped FakeDs blocking generation to be released. `Notify` only wakes
+    /// waiters; the generation is the durable test-control state, so an early release cannot be
+    /// lost and cannot release a request that began in a later generation.
+    async fn wait_while_blocked(
+        block: &AtomicBool,
+        release_generation: &AtomicU64,
+        observed_generation: u64,
+        released: &tokio::sync::Notify,
+    ) {
+        loop {
+            let notified = released.notified();
+            if !block.load(Ordering::SeqCst) || release_generation.load(Ordering::SeqCst) != observed_generation {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     #[derive(Default)]
     pub(crate) struct FakeDsState {
         /// Remaining `POST /meta/catalog` calls to answer 503 (transient).
@@ -1272,9 +1290,15 @@ pub(crate) mod testing {
         deletes: AtomicU64,
         closes: AtomicU64,
         block_deletes: AtomicBool,
+        delete_release_generation: AtomicU64,
         delete_started: tokio::sync::Notify,
+        delete_blocked: tokio::sync::Notify,
+        pause_delete_after_start: AtomicBool,
+        delete_after_start_paused: tokio::sync::Notify,
+        continue_delete_after_start: tokio::sync::Notify,
         release_delete: tokio::sync::Notify,
         block_retired: AtomicBool,
+        retired_release_generation: AtomicU64,
         retired_started: tokio::sync::Notify,
         release_retired: tokio::sync::Notify,
         /// Shape streams to answer as absent/closed to restore preflight HEADs.
@@ -1335,8 +1359,15 @@ pub(crate) mod testing {
                                     .and_then(|value| value.as_array().cloned())
                                     .is_some_and(|items| items.iter().any(|item| item["t"] == "retired"));
                                 if is_retired && st.block_retired.load(Ordering::SeqCst) {
+                                    let release_generation = st.retired_release_generation.load(Ordering::SeqCst);
                                     st.retired_started.notify_one();
-                                    st.release_retired.notified().await;
+                                    wait_while_blocked(
+                                        &st.block_retired,
+                                        &st.retired_release_generation,
+                                        release_generation,
+                                        &st.release_retired,
+                                    )
+                                    .await;
                                 }
                                 st.appends.fetch_add(1, Ordering::SeqCst);
                                 if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&body) {
@@ -1355,10 +1386,22 @@ pub(crate) mod testing {
                             },
                         )
                         .delete(|State(st): State<Arc<FakeDsState>>| async move {
+                            let release_generation = st.delete_release_generation.load(Ordering::SeqCst);
                             st.deletes.fetch_add(1, Ordering::SeqCst);
                             st.delete_started.notify_one();
+                            if st.pause_delete_after_start.load(Ordering::SeqCst) {
+                                st.delete_after_start_paused.notify_one();
+                                st.continue_delete_after_start.notified().await;
+                            }
                             if st.block_deletes.load(Ordering::SeqCst) {
-                                st.release_delete.notified().await;
+                                st.delete_blocked.notify_one();
+                                wait_while_blocked(
+                                    &st.block_deletes,
+                                    &st.delete_release_generation,
+                                    release_generation,
+                                    &st.release_delete,
+                                )
+                                .await;
                             }
                             if st
                                 .fail_deletes
@@ -1414,7 +1457,27 @@ pub(crate) mod testing {
             self.state.delete_started.notified().await;
         }
 
+        /// Wait until a DELETE has observed the closed gate and is about to wait for its release.
+        pub(crate) async fn wait_delete_blocked(&self) {
+            self.state.delete_blocked.notified().await;
+        }
+
+        /// Stop a DELETE just after it has published its arrival, before it registers its blocking
+        /// release waiter. This lets lifecycle tests exercise the no-lost-wakeup contract.
+        pub(crate) fn pause_delete_after_start(&self, pause: bool) {
+            self.state.pause_delete_after_start.store(pause, Ordering::SeqCst);
+        }
+
+        pub(crate) async fn wait_delete_after_start_paused(&self) {
+            self.state.delete_after_start_paused.notified().await;
+        }
+
+        pub(crate) fn continue_delete_after_start(&self) {
+            self.state.continue_delete_after_start.notify_one();
+        }
+
         pub(crate) fn release_delete(&self) {
+            self.state.delete_release_generation.fetch_add(1, Ordering::SeqCst);
             self.state.release_delete.notify_waiters();
         }
 
@@ -1427,6 +1490,7 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn release_retired(&self) {
+            self.state.retired_release_generation.fetch_add(1, Ordering::SeqCst);
             self.state.release_retired.notify_waiters();
         }
 
