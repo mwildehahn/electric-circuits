@@ -1,0 +1,59 @@
+{
+  "schema_version": "evidence-v2",
+  "baseline_id": "TST-000-inherited-2026-08-23-a3",
+  "generated_at": "2026-08-23T13:30:36Z",
+  "proof_kind": "inherited_control",
+  "source": {
+    "strategy": "fresh_detached_worktree",
+    "commit": "5b93492b84d9a14348e259f15d16b67fd2d4f4fc",
+    "tree": "1b32ec808ab1a73c6ddf7a614c5afde7125c1061",
+    "source_attestation": "a3338cb9561041816c43e173addd44614b864c36da5abc5d2630a9df563b4a65",
+    "external_input_manifest_sha256": "cad4aa653bdbae54de3affe897d1a9d57f5c084cb0fb713bab12e976f169e1d9",
+    "mount_topology_sha256": "c947536eb60a96969c6379c447e65d55121811a87981c77a9ec246101f527fcd",
+    "effective_config_sha256": "eec33175e8ee2dcd76cb384d763fc925397cbbd5315da6985776bc3470e6778c",
+    "toolchain_lock_sha256": "48e4cb0de2e5a03ca9d23144033df6af7cb740498047d8f30c9dea08ff3f8e46"
+  },
+  "toolchains": {
+    "node": "v25.2.1",
+    "pnpm": "10.15.1",
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "swift": "Apple Swift 6.3.3"
+  },
+  "commands": [
+    { "id": "format", "argv": ["cargo", "fmt", "--check"], "status": "pass", "result": "exit 0" },
+    { "id": "typecheck", "argv": ["pnpm", "typecheck"], "status": "pass", "result": "exit 0" },
+    { "id": "engine-tests", "argv": ["pnpm", "engine:test"], "status": "pass", "result": "cargo test completed successfully (unit and integration suites; exit 0)" },
+    { "id": "vitest", "argv": ["ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1", "pnpm", "test"], "status": "fail", "result": "inherited 284/285 characterization; force-purge retention assertion diverges", "blocker": "ENG-014-force-purge-retirement-contract" },
+    { "id": "conformance", "argv": ["pnpm", "test:conformance"], "status": "fail", "result": "46 files passed, 1 failed; 204/205 tests passed; retention force-purge expected stream 404, received 200", "blocker": "ENG-014-force-purge-retirement-contract" },
+    { "id": "fuzz", "argv": ["pnpm", "test:fuzz"], "status": "blocked", "result": "not promoted independently in inherited baseline; requires fixed-seed evidence runner", "blocker": "TST-000-fuzz-reproduction-pending" },
+    { "id": "swift-boundaries", "argv": ["../electric-sync-swift/Scripts/check-dependency-boundaries.sh"], "status": "pass", "result": "exit 0" },
+    { "id": "swift-tests", "argv": ["swift", "test"], "status": "pass", "result": "351 tests passed" },
+    { "id": "electric-oracle", "argv": ["./electric-conformance/run.sh", "oracle"], "status": "blocked", "result": "mix: command not found", "blocker": "TST-000-electric-mix-unavailable" },
+    { "id": "electric-property", "argv": ["./electric-conformance/run.sh", "property"], "status": "blocked", "result": "mix: command not found", "blocker": "TST-000-electric-mix-unavailable" },
+    { "id": "electric-subqueries", "argv": ["./electric-conformance/run.sh", "subqueries"], "status": "blocked", "result": "mix: command not found", "blocker": "TST-000-electric-mix-unavailable" },
+    { "id": "browser-demo", "argv": ["pnpm", "demo:linearlite"], "status": "blocked", "result": "browser/demo evidence unavailable in detached baseline run", "blocker": "TST-000-browser-lane-not-runnable" }
+  ],
+  "named_blockers": [
+    { "id": "ENG-014-force-purge-retirement-contract", "kind": "deterministic_failure", "detail": "purge returns before durable stream retirement; shape is 404 while stream remains 200" },
+    { "id": "TST-000-electric-mix-unavailable", "kind": "external_dependency", "detail": "electric-conformance requires mix, unavailable in this environment" },
+    { "id": "TST-000-fuzz-reproduction-pending", "kind": "evidence_gap", "detail": "fixed-seed fuzz/replay must be rerun through the clean evidence runner" },
+    { "id": "TST-000-browser-lane-not-runnable", "kind": "external_dependency", "detail": "browser demo requires an interactive deployment/browser lane" }
+  ],
+  "runner": {
+    "path": "scripts/readiness-evidence.ts",
+    "self_tests": "scripts/readiness-evidence.test.ts",
+    "self_test_result": "5 passed, 0 failed",
+    "mutations_rejected": ["tracked_change", "staged_change", "untracked_change", "ignored_overlay", "writable_overlay", "changed_dependency", "mutable_cache", "reused_run_root", "nonempty_run_root", "source_mutation", "wrong_commit_tree", "wrong_effective_config"]
+  },
+  "attempt": {
+    "packet_sha256": "ecdbf91fd56e94493dbf18764b468c85f8bc6dececd61f16b9d4648d54e3d370",
+    "lease_id": "242ae21d-0a02-4275-ae90-e414ffe42e27",
+    "scheduler_generation": 15,
+    "source_commit": "5b93492b84d9a14348e259f15d16b67fd2d4f4fc",
+    "source_tree": "1b32ec808ab1a73c6ddf7a614c5afde7125c1061",
+    "run_root": "/tmp/electric-circuits-tst-000-a3-run",
+    "run_root_identity": "331f34b22f0199c4f3035721bee99b4417810062a5a499cc4a569413098669b3",
+    "run_root_initial_empty_attestation_sha256": "1261be88522ac01cbb001e9168516ae667ce37105ffaaf4cd8d010220a54615e"
+  }
+}

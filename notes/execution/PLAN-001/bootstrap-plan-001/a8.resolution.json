@@ -1,0 +1,18 @@
+{
+  "attempt_key": ["PLAN-001", "bootstrap-plan-001", 8],
+  "candidate_commit": null,
+  "controller_event_log_sha256": "48f1df30fc9266f8b1bae96965f9d92fdabaefef889ab7e2e72ac5068f82f61c",
+  "controller_generation": 7,
+  "controller_head": "9d1aa23b13cd9ed5f291bfdbe7e46de0e7c51f0a",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_commit": null,
+  "integration_sha": null,
+  "last_acknowledged_nonce": 24,
+  "packet_sha256": "be4639f89bf12cb5414382f4c32f9ae7950ace6298edef8d210dba6b7701fb94",
+  "reason": "The initial implementation encoded the 169 task headings and 36 conditional groups but failed the canonical PLAN-001 contract: it had shallow schemas, no bootstrap or ordinary packet semantics, no typed red-artifact topology or scenario/profile identities, placeholder resources and gates, no enforceable evidence or lease state machine, and vacuous scheduler/mutation tests. The controller stopped evidence before any gate ran; the author then exhausted its execution budget during a requested rewrite. No candidate, evidence, handoff, or product behavior was committed or integrated, and the uncommitted outputs are inadmissible for the superseding attempt.",
+  "regression_report_sha256": "3b4f5fe528ef03b89a5919ce3782469c35a13ac3f0f55c1b5f7fd9e23e4b00f9",
+  "regression_test_sha256": "f3b355aef7a9a360d8040306fc36fa87f471b22b6588e8df8857412cf6c1ecc9",
+  "semantic_review_sha256": "2fa85cb06cb6545d42083cfd078cd8ebbdac834e247411704558cdc724464647",
+  "superseding_attempt": 9,
+  "terminal_status": "fail"
+}

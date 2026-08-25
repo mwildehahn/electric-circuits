@@ -1,0 +1,26 @@
+{
+  "attempt_key": [
+    "CMP-000",
+    "shared-02d624bd9f690cf5c18907355704e2f5649582bb43f1b85acc1da119e8345bed",
+    1
+  ],
+  "candidate_commit": null,
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "7b9b851d512e40795262f3bf4556444d3cef137b4ae900a372bc04135be9115a",
+  "controller_generation": 16,
+  "controller_head": "a0e733be36c2855494fe898b43dd63d494d14566",
+  "controller_tree": "e0c7af27d4d333b3bf1df4dff9b1ff4a7e505d62",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "6201c17dbf736a13067471bba3e3523cf84461ef003be96a7d8f34c5a85289fd",
+  "packet_sha256": "1bec21a72f42c65c3e74b6996820069624948404ad40813662a044c46ce7ecc3",
+  "review_sha256": "fe1cbf107dd3c5b2910a2e93c769aaab48faacf8dc3c07aee91c194ec65f7dd1",
+  "gates": {
+    "json_parse": "pass",
+    "git_diff_check": "pass",
+    "pnpm_typecheck_author": "blocked_missing_dependencies",
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 2,
+  "reason": "The reservation lease expired before the required independent review/integration window. The detached review also found the repository typecheck gate blocked and the regeneration guard remained declarative rather than executable. The prepared candidate is not admissible; reissue after the base is refreshed.",
+  "terminal_status": "invalidated"
+}

@@ -1,0 +1,16 @@
+{
+  "attempt_key": ["PLAN-001", "bootstrap-plan-001", 7],
+  "candidate_commit": null,
+  "controller_event_log_sha256": "f9872baa67b753dfa43822e3652330d5a6fe01f35dedcbe5c33dbc61be6e9493",
+  "controller_generation": 6,
+  "controller_head": "c92f4e00aa2c0f3225e8a38294514e73e05c9279",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_commit": null,
+  "integration_sha": null,
+  "last_acknowledged_nonce": 0,
+  "lease_expired_at": "2026-08-23T10:33:37Z",
+  "packet_sha256": "cdff145752bce559798eea96acc12b772044f2c3814f65141714061ea4dffb81",
+  "reason": "A newly spawned high-reasoning worker did not emit its initial authenticated heartbeat within the packet interval, before creating any output or starting the verified sidecar. The attempt is invalidated. The superseding attempt uses an already-warm worker and makes sidecar startup the sole initial turn objective.",
+  "superseding_attempt": 8,
+  "terminal_status": "invalidated"
+}

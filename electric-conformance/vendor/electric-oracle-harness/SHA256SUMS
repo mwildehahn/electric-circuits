@@ -1,0 +1,3 @@
+1afad1859c75c84641bfbfdd504094dcfdc403dc5a1d922dd3447ef40ecb569d  packages/sync-service/test/support/oracle_harness.ex
+532b236b20398fab90cec7b7950a8a2a324c26a4ed87aa81cb8e4da2a2d7c34d  packages/sync-service/test/support/oracle_harness/shape_checker.ex
+0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594  LICENSE

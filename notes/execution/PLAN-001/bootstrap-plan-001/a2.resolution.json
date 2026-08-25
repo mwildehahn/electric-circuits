@@ -1,0 +1,15 @@
+{
+  "attempt_key": ["PLAN-001", "bootstrap-plan-001", 2],
+  "controller_event_log_sha256": "1b0408ecd3c657e53dbdfad51a82959b0e9b5413a3762f92fd4a248de6220296",
+  "controller_generation": 1,
+  "controller_head": "a94acbed14e6bbb3ed84c1816c593538fd146508",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_blob_sha": "bfbdd997cae26a9898e58933b1e47c745561c401",
+  "handoff_commit": "e95f2fbcee1af01c5ae60cca384c9d4023287148",
+  "handoff_sha256": "ca3a5b2539ecc7c1d338d63cc447dad1c324cc1445969af486bd7efc6a5a8253",
+  "integration_sha": null,
+  "packet_sha256": "2cae9dd36977c645ebea77bd038f2211e82e73f33e82ebc0ea680b45233ba6b2",
+  "reason": "The corrected PLAN-001 unit, standalone TypeScript, and validator gates passed, but the controller-declared dependency topology mounted only the root pnpm tree. The exact root typecheck could not resolve workspace-local dependencies, so no candidate artifacts or product behavior were integrated.",
+  "superseding_attempt": 3,
+  "terminal_status": "fail"
+}

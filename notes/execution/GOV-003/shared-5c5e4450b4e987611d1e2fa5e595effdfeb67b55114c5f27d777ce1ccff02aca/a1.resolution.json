@@ -1,0 +1,24 @@
+{
+  "attempt_key": [
+    "GOV-003",
+    "shared-5c5e4450b4e987611d1e2fa5e595effdfeb67b55114c5f27d777ce1ccff02aca",
+    1
+  ],
+  "candidate_commit": null,
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "701cdc81746b6967eb7def7f43c313f693717907af5927034be2e34b36f471a9",
+  "controller_generation": 16,
+  "controller_head": "a0e733be36c2855494fe898b43dd63d494d14566",
+  "controller_tree": "e0c7af27d4d333b3bf1df4dff9b1ff4a7e505d62",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "85d6a7076b7113ea0b9487ae969c59accfebbd7e162521cd61c8338636ff5fa7",
+  "packet_sha256": "c0840cbbe124b7b149e4daed7909777cf9ddeb9b4d0b61a84d168e02174dace6",
+  "gates": {
+    "git_diff_check": "pass",
+    "tracker_tests": "pass",
+    "pnpm_typecheck": "pass"
+  },
+  "superseding_attempt": 2,
+  "reason": "The worker continued editing packet-owned artifacts after the attempt was frozen and after the lease/base became stale (map and validator hashes changed). Post-freeze mutation invalidates the packet identity and its evidence, regardless of green task-local gates. No candidate was integrated; reissue from a fresh packet.",
+  "terminal_status": "invalidated"
+}

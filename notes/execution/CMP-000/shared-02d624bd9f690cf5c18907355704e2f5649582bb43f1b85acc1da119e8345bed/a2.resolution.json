@@ -1,0 +1,17 @@
+{
+  "attempt_key": [
+    "CMP-000",
+    "shared-02d624bd9f690cf5c18907355704e2f5649582bb43f1b85acc1da119e8345bed",
+    2
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "shasum:",
+  "controller_generation": 17,
+  "controller_head": "b301a0c61b1bc453cc0e35f7f335985dc98b8be6",
+  "controller_tree": "b4b4d3516a98638cab62e20a6b0b664d8a52de24",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "packet_sha256": "c3a6a8f676f3e538f403c94bd4c0e7e577a8b0cf38efb1c79942eebd106fbcdd",
+  "superseding_attempt": 3,
+  "reason": "Invalidated before author work began: the first reservation event was written with a pre-correction packet hash, while the controller later acknowledged the corrected packet hash. The append-only event identity is inconsistent, so the attempt is inadmissible under the packet/lease protocol. No candidate artifact was integrated.",
+  "terminal_status": "invalidated"
+}

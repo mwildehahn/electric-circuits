@@ -4,8 +4,9 @@ defmodule Electric.Integration.ElectricIvmOracleTest do
   logic) against an EXTERNAL sync server: the `electric-circuits` engine's Electric `/v1/shape` adapter.
 
   We boot the electric-circuits stack (durable-streams + engine + adapter) via its launcher, point
-  `Electric.Client` at it, and reuse `Support.OracleHarness.test_against_oracle/4` unchanged. This proves
-  electric-circuits speaks Electric's wire protocol well enough for the official client + oracle checks.
+  `Electric.Client` at it, and use the formerly-official `Support.OracleHarness.test_against_oracle/4`.
+  The harness takes a flat mutation sequence and map options, so this compatibility test flattens only its
+  legacy zero-restart batches before invoking the unmodified upstream Postgres oracle.
 
   Target the launcher with `ELECTRIC_CIRCUITS_DIR` (default ../../../dbsp-ds relative to this repo).
   """
@@ -95,12 +96,12 @@ defmodule Electric.Integration.ElectricIvmOracleTest do
       ]
     ]
 
+    mutations = List.flatten(batches)
+
     assert :ok =
-             OracleHarness.test_against_oracle(ctx, shapes, batches,
-               timeout_ms: 15_000,
-               restart_server_every: 0,
-               restart_client_every: 0
-             )
+             OracleHarness.test_against_oracle(ctx, shapes, mutations, %{
+               timeout_ms: 15_000
+             })
   end
 
   # --- boot the electric-circuits adapter via its launcher; read discovery lines off stdout ----------

@@ -22,7 +22,7 @@ The as-built system architecture. Companion documents:
                                DURABLE STREAMS  changes            (ONE ordered change log, commit order)
                                   │ tail (single LSN-ordered sequencer; global (lsn,seq) de-dup)
                                   ▼
-                               ENGINE (engine/)
+                               ENGINE (engine/ + Axum native API)
                                   │ Z-set delta → key routing ⊕ stateless filters
                                   │              ⊕ subquery registry ⊕ aggregations
                                   │ reliable append (retry-until-landed)
@@ -33,6 +33,8 @@ The as-built system architecture. Companion documents:
                                CLIENTS
                                   ├─ @electric-circuits/client  (shapes, subset queries, aggregations)
                                   └─ ElectricSQL client     (GET /v1/shape on the engine)
+
+  Swift/native clients ── /v1 REST + /v1/openapi.json ──▶ ENGINE (direct; no tRPC hop)
 ```
 
 Three ideas carry the whole design:
@@ -59,10 +61,12 @@ Three ideas carry the whole design:
   one `shape/<id>` stream per distinct shape (the
   result feed). The decoupling boundary between write and read paths.
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
-  shapes/subqueries/aggregations, the control-plane HTTP API, and the Electric-compatible
-  `GET /v1/shape` endpoint.
-- **API** (`apps/api`, tRPC) — the extended surface used by `@electric-circuits/client`: `schema.define`,
-  `ingest.write` (library mode), `shapes.create/get/delete`, `subset.query/live`, `aggregate`.
+  shapes/subqueries/aggregations, the native versioned REST/OpenAPI surface (`/v1/*`), and the
+  Electric-compatible `GET /v1/shape` endpoint.
+- **API** (`apps/api`, tRPC) — a TypeScript compatibility adapter used by
+  `@electric-circuits/client`: `schema.define`, `ingest.write` (library mode),
+  `shapes.create/get/delete`, `subset.query/live`, `aggregate`. Lifecycle/query calls cross the
+  Rust boundary through its native `/v1` routes; Swift does not use this gateway.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
   windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
 - **oracle + conformance** (`packages/oracle`, `packages/conformance`) — a Postgres/pglite reference

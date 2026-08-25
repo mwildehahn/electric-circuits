@@ -1,0 +1,3 @@
+interface:
+  display_name: "Electric Circuits Rust Code"
+  short_description: "Write safe, bounded production Rust"

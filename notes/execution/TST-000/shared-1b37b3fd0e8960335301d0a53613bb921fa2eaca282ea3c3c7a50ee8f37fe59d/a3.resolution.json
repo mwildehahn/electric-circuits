@@ -1,0 +1,46 @@
+{
+  "attempt_key": [
+    "TST-000",
+    "shared-1b37b3fd0e8960335301d0a53613bb921fa2eaca282ea3c3c7a50ee8f37fe59d",
+    3
+  ],
+  "candidate_commit": "08c9c17daf055c1f18cb776cdb46a3f8d10a2ed7",
+  "candidate_tree": "b6263b7c8b147494d8c77ca0e2a57bfdd29853e6",
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "66edefc3029e271115ec67ed169fb6d190eac6e28d32864456529f0b887eab31",
+  "controller_generation": 15,
+  "controller_head": "5b93492b84d9a14348e259f15d16b67fd2d4f4fc",
+  "controller_tree": "1b32ec808ab1a73c6ddf7a614c5afde7125c1061",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_commit": null,
+  "integration_sha": "08c9c17daf055c1f18cb776cdb46a3f8d10a2ed7",
+  "integration_tree": "b6263b7c8b147494d8c77ca0e2a57bfdd29853e6",
+  "last_acknowledged_nonce": 99,
+  "lease_expired_at": null,
+  "packet_sha256": "ecdbf91fd56e94493dbf18764b468c85f8bc6dececd61f16b9d4648d54e3d370",
+  "prepared_patch_sha256": "a8b4a744d08e355aafed3c9f583450ad05ddcdb25c791e0d6d5f6e902a0b4a36",
+  "review_sha256": "b75955441199ff58bcee30560d4ba09c2db104e2d687764b821c4f8def68a4f6",
+  "artifacts": {
+    "docs/production/validation-baseline.json": "757b8ccaa748b2bc54e17847ae90e45f14f83b3c59f02af919d7ba6129171778",
+    "scripts/readiness-evidence.ts": "e7c06e58cec557f9a0eee26c75791de1126a177876d3c029e08a8ca3b081b3e9",
+    "scripts/readiness-evidence.test.ts": "39f190dcc6562ab2c31c7b4c4fddc65c29d2dfb8626f964c3397442b3e50f3ea"
+  },
+  "gates": {
+    "readiness_evidence_self_tests": "pass:5/5",
+    "git_diff_check": "pass",
+    "pnpm_typecheck": "pass",
+    "pnpm_engine_test": "pass:369 unit plus integration suites",
+    "independent_review": "pass"
+  },
+  "inherited_blockers": [
+    "readiness-plan: stale_controller_state x3",
+    "readiness-plan: invalid_red_artifact x1",
+    "ENG-014-force-purge-retirement-contract",
+    "TST-000-fuzz-reproduction-pending",
+    "TST-000-electric-mix-unavailable",
+    "TST-000-browser-lane-not-runnable"
+  ],
+  "reason": "Independent detached review passed and the packet-owned baseline/evidence runner was integrated as one serialized logical task. The inherited failures and unavailable lanes remain explicitly characterized; none were promoted to pass.",
+  "superseding_attempt": null,
+  "terminal_status": "integrated"
+}

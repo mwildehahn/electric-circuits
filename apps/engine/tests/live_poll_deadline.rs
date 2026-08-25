@@ -1,8 +1,9 @@
 //! End-to-end proof of the idle live long-poll deadline (the >60s-hang bug the docker agent found in
-//! the container): an idle `GET /v1/shape?live=true` must return **204** with the electric headers at
-//! `ELECTRIC_LIVE_TIMEOUT_MS`, even though the durable-streams server holds an idle long-poll far
-//! longer. Driven through the real axum router against a fake ds server whose live reads park for 10s
-//! (mode 0) or return data immediately (mode 1).
+//! the container): an idle `GET /v1/shape?live=true` must return current Electric's **200**
+//! `up-to-date` control body and electric headers at `ELECTRIC_LIVE_TIMEOUT_MS`, even though the
+//! durable-streams server holds an idle long-poll far longer. Driven through the real axum router
+//! against a fake ds server whose live reads park for 10s and internally return 204 (mode 0), or
+//! return data immediately (mode 1).
 //!
 //! Own test binary so the process-global `live_timeout()` `OnceLock` initializes to this test's short
 //! value (set before the first live request, which is the first call that reads it).
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -65,7 +66,7 @@ async fn spawn_fake_ds() -> String {
 }
 
 #[tokio::test]
-async fn idle_live_poll_returns_204_at_deadline_then_data_promptly() {
+async fn idle_live_poll_returns_up_to_date_control_at_deadline_then_data_promptly() {
     // Short deadline; must be set before the first live_timeout() read (cached). This is the only test
     // in this binary and only live requests read it, so the OnceLock initializes to 300ms.
     // SAFETY: single-threaded setup before any other thread reads the env.
@@ -93,14 +94,21 @@ async fn idle_live_poll_returns_204_at_deadline_then_data_promptly() {
     let offset = snap.headers().get("electric-offset").unwrap().to_str().unwrap().to_string();
     let live_uri = format!("/v1/shape?table=t&handle={handle}&offset={offset}&live=true");
 
-    // 2) Idle live poll: the fake ds parks for 10s, but we must 204 at ~300ms with the electric headers.
+    // 2) Idle live poll: the fake ds parks for 10s, but the Electric-compatible adapter returns
+    // the current server's 200 up-to-date control body at ~300ms with the normal cursor headers.
     MODE.store(0, Ordering::SeqCst);
     let start = Instant::now();
     let res = app.clone().oneshot(Request::builder().uri(&live_uri).body(Body::empty()).unwrap()).await.unwrap();
     let elapsed = start.elapsed();
-    assert_eq!(res.status(), StatusCode::NO_CONTENT, "idle live poll must return 204 at the deadline");
-    assert!(res.headers().contains_key("electric-handle"), "204 must carry electric-handle");
-    assert!(res.headers().contains_key("electric-offset"), "204 must carry electric-offset");
+    assert_eq!(res.status(), StatusCode::OK, "idle live poll must return an up-to-date control body at the deadline");
+    assert!(res.headers().contains_key("electric-handle"), "idle response must carry electric-handle");
+    assert!(res.headers().contains_key("electric-offset"), "idle response must carry electric-offset");
+    assert!(res.headers().contains_key("electric-up-to-date"), "idle response must carry electric-up-to-date");
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!([{"headers": {"control": "up-to-date", "global_last_seen_lsn": "0"}}])
+    );
     assert!(elapsed >= Duration::from_millis(250), "should wait ~the deadline, waited {elapsed:?}");
     assert!(elapsed < Duration::from_secs(3), "must NOT hang for the ds server's 10s park, took {elapsed:?}");
 

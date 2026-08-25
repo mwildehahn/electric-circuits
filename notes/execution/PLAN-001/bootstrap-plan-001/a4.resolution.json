@@ -1,0 +1,16 @@
+{
+  "attempt_key": ["PLAN-001", "bootstrap-plan-001", 4],
+  "candidate_commit": null,
+  "controller_event_log_sha256": "bfe4b3c29a8151046b20ba64a92f6eb5b5236b6fe8a70758008d9ae54065bb4b",
+  "controller_generation": 3,
+  "controller_head": "cc352c794f9c9cd7f934b055d2d63c1d70618ab2",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_commit": null,
+  "integration_sha": null,
+  "last_acknowledged_nonce": 2,
+  "lease_expired_at": "2026-08-23T10:13:00Z",
+  "packet_sha256": "3bf7d1157a0b82cd87e1edcd14d555a711efff2b95368ce75c912e2d2a88f01f",
+  "reason": "The worker missed the packet's authenticated 90-second heartbeat interval during authority-derived design, before creating any task output. The lease expired by protocol; no artifact from this attempt is admissible or reusable.",
+  "superseding_attempt": 5,
+  "terminal_status": "invalidated"
+}

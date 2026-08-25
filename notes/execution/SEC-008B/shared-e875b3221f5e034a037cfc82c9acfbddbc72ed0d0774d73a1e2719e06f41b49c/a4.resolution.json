@@ -1,0 +1,26 @@
+{
+  "attempt_key": [
+    "SEC-008B",
+    "shared-e875b3221f5e034a037cfc82c9acfbddbc72ed0d0774d73a1e2719e06f41b49c",
+    4
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "3071c4446f090f442d6ac7aa4cd97b46620a18c54fba5727a2baaef05866eafd",
+  "controller_generation": 20,
+  "controller_head": "6da5a5eedda89bc0efaaf445669ca15de57a724e",
+  "controller_tree": "518c64db9b75d7ac2b56983363a314993b982af1",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "6834068f6c52871d68a17a8e4b84e5086d9f678730c9bc97de131f90d263b3a3",
+  "packet_sha256": "6875209d3ced985e9fa4400498325bada2578e3c1a9766d23cc76a217d8bcc4d",
+  "prepared_patch_sha256": "b7b9a63d40e0d54b0860f5c949ecd6a64a97ccac681ce4c354f91183c17daabe",
+  "review_sha256": "be0e85700d9375b50f28ba2857dab70928dd7bc81a7126fe942d1cb68475a427",
+  "gates": {
+    "mutation_tests": "pass_21",
+    "git_diff_check": "pass",
+    "pnpm_typecheck": "fail_missing_workspace_dependencies",
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 5,
+  "reason": "Independent review rejected the candidate because the required packet-bound pnpm typecheck exited 1 with missing workspace/external dependencies and no declared baseline exception. Review also found that Date normalization accepts impossible calendar timestamps such as 2099-02-30T00:00:00Z. A fresh packet must add component-level UTC round-trip validation and a complete read-only dependency mount/evidence bundle.",
+  "terminal_status": "invalidated"
+}

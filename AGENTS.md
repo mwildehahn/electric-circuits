@@ -7,12 +7,62 @@ client surfaces: the Electric-compatible `GET /v1/shape` (works with the Electri
 the extended `@electric-circuits/client` API (shapes + subset queries + live aggregations — the surface
 the project is growing toward).
 
+## Current state, target state and authority
+
+This repository is an active implementation, not yet a production-ready successor deployment. Keep
+these statement types separate:
+
+- Architecture, runbook and invariant statements describe the **as-built repository**. Sections
+  explicitly introduced as policy or target define how agents must work or what must be built and
+  qualified; they are requirements, not claims that the capability exists today.
+- [`notes/18-production-readiness-spec-reviewed.md`](notes/18-production-readiness-spec-reviewed.md)
+  is the canonical production-readiness task/dependency authority. Notes 23 and 24 supply stable
+  Swift/app and PG18/E2E scenarios; they do not define a second task graph.
+- The production target is PostgreSQL 18 behind one authenticated gateway with an explicit
+  publication and durable storage. The current development Compose stack still uses PostgreSQL 16,
+  current CI selects the highest host-installed PostgreSQL, and direct engine/API routes remain
+  available. A green current suite is inherited regression evidence, not PG18, gateway or release
+  qualification.
+- Until `PLAN-001` generates and validates the checked-in task manifest, it is the only initially
+  merge-ready production-readiness packet. Its one typed bootstrap packet pins this specification's
+  blob/tree with `profile_scope: uncompiled_all`; it cannot claim a future release-profile or scenario
+  registry hash. Every later packet requires generated identities and the ordinary no-placeholder
+  rules. Section order, disjoint files or an agent's local green run do not make another task ready.
+
+No agent may describe a target contract as implemented, production-ready or qualified without the
+selected profile's generated dependency closure and exact candidate evidence.
+
+## Mandatory skill routing
+
+Repository-local skills live under `.agents/skills/`. Read the matching `SKILL.md` completely before
+acting, then load only the references it routes to:
+
+- Any implementation, debugging, refactor or review of Rust under `apps/engine`, including Tokio,
+  unsafe/FFI, failure semantics, observability or resource bounds: read
+  [electric-circuits-rust-code](.agents/skills/electric-circuits-rust-code/SKILL.md).
+- Any crate/module/workspace boundary, `Cargo.toml`, feature, visibility/public API, toolchain/MSRV,
+  dependency graph, platform seam, build script or proc-macro decision: also read
+  [electric-circuits-rust-structure](.agents/skills/electric-circuits-rust-structure/SKILL.md).
+- Any behavior change, bug fix, test authoring/review, acceptance harness, fault injection,
+  qualification or flake investigation: read
+  [electric-circuits-testing](.agents/skills/electric-circuits-testing/SKILL.md) **before** writing
+  implementation code.
+
+For behavior-changing Rust structure work, the order is testing contract → structural boundary →
+Rust implementation. These skills operationalize this file; they never override the invariants below.
+When maintaining a skill, run the installed skill-creator validator through an interpreter that
+provides PyYAML and verify local links. In this environment the runnable form is
+`uv run --with pyyaml python /Users/bozilabs/.codex/skills/.system/skill-creator/scripts/quick_validate.py
+<skill-dir>`; do not rely on the script's executable bit or host Python dependencies. Validate
+`agents/openai.yaml` with the Codex-distributed schema/tool when one is available; until then require
+valid YAML with string `interface.display_name` and `interface.short_description` fields.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
-| `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
+| `apps/api` | TypeScript tRPC compatibility adapter (`router.ts` + historical `core.ts`); lifecycle/query calls forward to the Rust engine's native `/v1` API. |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
 | `packages/conformance` | The real test suite — engine vs oracle, incl. live replication, fuzz, NULLs, concurrency, shape sharing. |
@@ -35,6 +85,171 @@ the project is growing toward).
 - `docs/live-queries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
 - Each package has its own `README.md` (surface, commands, env knobs).
+
+## Contract-first TDD
+
+**Development policy and target qualification rule:** the red/green loop applies now. The PG18,
+gateway, causal-receipt and immutable-candidate topology below is target infrastructure until its
+named production-readiness tasks land.
+
+The default development loop is **public contract → genuine red → minimal green → refactor**. We
+prefer a small set of stable high-level E2E contracts because they let the engine, gateway and client
+internals change without rewriting the product specification. Focused tests explain failures and
+exhaust small state spaces; they do not replace the public contract.
+
+For every behavior-changing task:
+
+1. Name the supported profile/capability, stable scenario, public inputs/outcomes, independent oracle,
+   failure cuts and resource limits before implementation. After `E2E-000S`, production-readiness
+   behavior packets use its registered scenario ID and semantic hash. Before then, only the typed
+   bootstrap, `non_behavioral` work and explicitly declared inherited controls are legal; no
+   implementation packet may invent an unregistered product contract.
+2. Add the highest stable boundary regression that can falsify the promised behavior. For a local-only
+   parser, codec, algebra or state-machine law, that boundary is a focused unit/property/model test;
+   do not manufacture E2E. For a product behavior, run the stable black-box test on the exact frozen
+   red-patch tree descended from the pinned base and record a failure at the intended semantic
+   assertion. A compile/setup error,
+   timeout, skip, broad expected failure, disabled assertion or mock returning its own expected value
+   is not red evidence.
+3. Add the smallest focused test that localizes the mechanism when useful: unit, golden corpus,
+   property/model state machine, deterministic concurrency schedule, fault cut or fuzz regression.
+4. Make the smallest implementation change that turns the **unchanged** contract green. Do not edit
+   the oracle, exclusions, scenario hash or qualification runner to accommodate the implementation.
+5. Refactor only while the contract and focused tests remain green. A discovered seed/operation trace
+   is minimized, retained in the task patch/evidence and replayed before novel generation.
+6. Run the adjacent scenario matrix and the applicable repository gates. Record exact commands,
+   candidate SHA/config/profile/digests, test counts and raw failures. `blocked`, flaky, filtered,
+   zero-test, under-run or wrong-input evidence is never a pass.
+
+Use these identities consistently:
+
+| Term | Meaning and admissible evidence |
+|---|---|
+| **base** | Clean pinned starting commit/tree before the new contract test. |
+| **red patch** | Test-only descendant of the base whose intended semantic assertion demonstrably fails before implementation. |
+| **green candidate** | Task-scoped descendant of the red patch (or base for typed non-behavioral work) where the unchanged contract passes. |
+| **qualification candidate** | Exact integrated, immutable artifact/config/profile/platform tuple on which qualification is rerun; author-worktree evidence does not transfer automatically. |
+
+`genuine_red`, `inherited_control` and `non_behavioral` are distinct proof kinds. A passing inherited
+control is characterization, never `red_proved` and never authority for a behavior implementation.
+
+### What the high-level E2E contract observes
+
+Production acceptance crosses real PostgreSQL 18, replication, the engine, file-backed durable
+streams, the public gateway/client and the real materializer/cache selected by the profile. It asserts
+only public effects and an independent result—not circuit nodes, Rust tasks, private offsets, retry
+counts or log text.
+
+The reusable causal fence is:
+
+```text
+source transaction + SourceCommitID
+  -> server drainedThrough(SourceCommitID), including deferred work
+  -> public read/event begins after that receipt
+  -> target materializer/cache commits appliedTailAfter(SourceCommitID)
+  -> compare with independently authored SQL/reference state at the same source prefix
+```
+
+The target `E2E-000A` protocol writes `SourceCommitID` as the final change in the **same PostgreSQL
+transaction** as the mutations. The marker lives in a harness-only relation included in the immutable
+explicit test publication and excluded from public templates. The server observes it only after the
+transaction-end envelope and emits `drainedThrough` only after all causally prior direct and deferred
+work completes. The target receipt is keyed by principal, template and generation. An unpublished or
+early marker, a receipt that skips deferred work, a later SQL query, a separate sentinel feed, byte
+arrival, a private LSN/offset or a server-only drain is not proof that the client applied the same
+prefix. Until `E2E-000A` supplies and mutation-tests this infrastructure, the current conformance drain
+helper is valuable characterization/regression evidence but not final release qualification.
+
+Use named gates/events to create order: arrived → held → released → terminal. Every wait has a
+diagnostic deadline, but sleeps and ad-hoc polling never establish correctness. Qualification uses
+real collaborators and externally controlled process/network/storage cuts; test doubles are for
+focused deterministic failure paths, not proof of the deployed topology. Qualification has zero
+retry tolerance: a retry-pass is a flaky failure whose attempts remain evidence.
+
+High-level E2E is not the primary tool for pure parsers, codecs, predicate algebra, fold laws or all
+thread interleavings. Test those exhaustively with golden/property/model/fuzz tests and Loom/Miri where
+supported, plus one real-stack contract when the local law participates in a product promise. Every
+bug fix keeps a regression at the highest stable boundary that would have caught it.
+
+## Parallel implementation protocol
+
+**Target execution policy:** this governs production-readiness subagents once the foundation and
+`PLAN-001` control plane are present in a clean, authorized integration history. It does not make the
+current dirty checkout or a prose task list launchable.
+
+Parallelism is dependency- and ownership-bounded. Follow
+[`notes/skills-research/05-parallel-agent-execution-protocol.md`](notes/skills-research/05-parallel-agent-execution-protocol.md);
+the generated `PLAN-001` manifest remains the scheduler and source of truth.
+
+- The sole pre-validator exception is the typed `PLAN-001` bootstrap packet described above. Every
+  other launch is a task/execution-scope/profile pair emitted `ready` by the validator. A packet pins
+  its injective identity and attempt, complete evaluated predecessors, base/tree and declared read/
+  write/semantic resources, proof kind and contract, exact gates, artifact/config/toolchain/platform
+  identities, the validator-generated gate-matrix hash, scheduler generation, reservation lease,
+  reviewers and integration destination. Packets may add stricter gates but cannot rephase or omit a
+  generated one. A `TBD`, mutable tag or prose alternative is not launchable.
+- One author owns one principal write boundary in one clean linked worktree/branch based on the pinned
+  integration SHA. The shared checkout is control/integration state, not a parallel author worktree.
+  Agents do not opportunistically fix adjacent files, edit `AGENTS.md`, or claim another packet's
+  contract/fixture/schema/lockfile. A packet records whether the user/delegated operator authorized
+  task commits; without it, the agent prepares a patch and note but does not commit or push. Push and
+  integration require separate authority. A prepared patch is canonical, content-addressed and bound
+  to its base/tree, expected result tree, changed-file manifest and evidence hashes; review and apply
+  verify those exact bytes.
+- Editing and evidence use different directories. Every red, green, direct, merge-preview,
+  qualification and reviewer command runs from a newly created evidence source: a clean detached
+  worktree at the exact commit, or a newly empty export of a prepared patch's verified expected Git
+  tree. Immediately before each command, bind the exact commit/tree, empty tracked/index and pre-mount
+  untracked/ignored state (or the exported tree's complete file/mode/content manifest), and canonical
+  effective config to the evidence. Immutable dependencies/tools/fixture inputs use a content-digested
+  read-only manifest plus resolver/mount-topology hash; a source-visible dependency mount is allowed
+  only when that exact absent-from-Git read-only mapping is declared, is the entire post-mount overlay
+  inventory, and remains unchanged in the post-command attestation. Every command gets
+  a unique, newly empty external output/cache/fixture/artifact root keyed by its packet/candidate/gate.
+  A run from the author/control checkout, an undeclared or writable overlay, stale/mutable dependency
+  input, reused/nonempty output root, source mutation or missing attestation is `fail`; the reviewer
+  independently recreates the source, resolver mapping and empty run root.
+- Behavior work is a stacked red/green pair with two packets. A scenario/scope/consumer-bound
+  `red_artifact` packet creates the failing commit; an independent reviewer reruns it before the
+  implementation packet may consume that exact SHA. Even one author crosses this packet/review
+  boundary. Neither implementation nor qualification may weaken the scenario, oracle, exclusions or
+  hash, and only the green stack merges.
+- Every attempt writes an immutable handoff at
+  `notes/execution/<task-id>/<execution-scope-or-profile-hash>/a<attempt>.md` with packet/lease hashes,
+  starting and candidate/patch identities, paths, decisions, commands/results/counts, raw artifact
+  hashes, remaining risks and `ready_for_review|fail|blocked`. The controller alone writes the
+  distinct content-addressed `a<attempt>.resolution.json` with terminal
+  `pass|fail|blocked|invalidated`; it never amends the reviewed candidate. A task declared once as a
+  shared producer cannot also run concurrently per profile.
+- Agents check the current scheduler generation and reservation lease at each phase boundary. An
+  input/resource collision, changed predecessor/contract/profile/config/image/toolchain, or revoked
+  lease hard-invalidates the attempt. Leases have a packet-bounded TTL (at most 300 seconds) and an
+  authenticated agent heartbeat at most one-third of that TTL; the controller rechecks inputs before
+  renewal, the agent must observe the acknowledgement, and control-plane loss expires rather than
+  silently extending ownership. A green stale candidate is never reviewable or mergeable.
+- The integration operator accepts one reviewed logical task at a time. For a candidate based before
+  an unrelated merge, it may preserve the reviewed task commits through a machine-checked merge
+  preview only when intervening paths/read sets/semantic resources and all declared inputs are
+  disjoint; direct and affected gates rerun on that preview and an independent reviewer accepts the
+  refreshed evidence. Never rewrite/rebase the reviewed commits or reuse qualification evidence.
+  Otherwise issue a new packet. After integration, regenerate the DAG/profile/ownership report and
+  atomically refresh or revoke outstanding leases before emitting the next ready set.
+- Contract authors, implementers, qualification authors and integration reviewers are distinct for
+  high-risk/cross-boundary tasks. A qualification agent cannot repair the behavior it judges.
+
+Author/merge gates and release qualification are separate. Direct task gates must pass. A manifest-
+declared baseline-repair packet may consume only its exact recorded base failure and must turn that
+assertion green; unrelated inherited failures must remain identical and visible. An unavailable lane
+may block release qualification without deadlocking the task that installs or repairs that lane. No
+profile promotes until every generated qualification gate is green on the exact qualification
+candidate. `PLAN-001` owns the per-task gate phases, commands, applicability and baseline assertions;
+a packet author cannot classify its own inconvenient gate as inherited or qualification-only.
+
+Stop a task rather than broadening it when it needs an unowned shared surface, a required genuine red
+cannot be demonstrated, a pinned input changed, a direct gate fails, its lease is revoked, or an
+external dependency is absent.
+No calendar-duration monitoring requirement substitutes for fixed operations, event floors, named
+cuts, deterministic terminal conditions and explicit resource bounds.
 
 ## Designing dbsp circuits: pipelines vs shapes
 
@@ -71,6 +286,38 @@ The recipe for capturing an app's query set in one circuit:
    fingerprint) or `Mode::Persistent` bootstrap. Ad-hoc predicates that match no template fall
    back to the dynamic-shape path (standalone evaluator / KeyRouter / registry) — the circuit
    is an optimization tier, never a correctness dependency.
+
+## PostgreSQL 18 production target
+
+**Target contract, not current connector support:** current Compose and CI facts remain those stated
+above. Production traffic is forbidden until the generated PG18 tasks and qualification close.
+
+Production-readiness work targets the content-addressed PostgreSQL 18 image and configuration pinned
+by the selected release profile. Image evidence includes the OCI index digest, OS/architecture/
+variant and resolved platform-manifest digest; an index alone does not identify tested bytes. Do not
+silently substitute PostgreSQL 16, a host-default major, another platform image or a mutable
+`postgres:18` tag and reuse the evidence. The initial topology is one writable primary, one explicit
+immutable table publication, one `pgoutput` slot, one active engine and file-backed durable streams;
+failover is a separate qualified profile, not implied by a same-named slot.
+
+The production bootstrap/admin role owns publication/slot DDL. The runtime role is non-superuser and
+must not create `FOR ALL TABLES` publications. Admission, snapshot SQL, pgoutput decode, schema drift,
+reactivation and restore must use one canonical publishable-column schema. Until their named PG18
+tasks prove otherwise, reject virtual generated columns, tracked-table RLS, missing/unpublished stored
+generated or identity columns, inadequate replica identity, and publication drift. Production-mode
+preflight rejects every connector until bootstrap/admin, pooled query/backfill/query-back and walsender
+paths each have a documented TLS backend, CA/SAN/hostname verification, channel-binding disposition
+and `pg_stat_ssl` proof for SCRAM plus `verify-full`; accepting an `sslmode` token is not evidence that
+the connector enforces it. `sslmode=disable` is development-only. Slot invalidation or unproven
+cluster/frontier continuity fails closed or uses the one authorized whole-generation reset path; it
+never silently recreates the slot while serving shapes.
+
+See [`notes/24-postgres18-and-e2e-tdd-addendum.md`](notes/24-postgres18-and-e2e-tdd-addendum.md)
+for the stable `PG18-E2E-*` contract matrix. An earlier exploratory local run reported ordinary and
+stored generated snapshot/live success but virtual-generated snapshot/live divergence. Treat that as
+an unverified blocker hypothesis—not inherited evidence—until `PG18-000`/the harness retain the exact
+platform digest, fixture, source/engine/DS SHAs, replay command and raw result. Virtual generated
+columns remain rejected in the first profile regardless; representation drift is never tolerated.
 
 ## Build & test
 
@@ -112,6 +359,12 @@ same way. (Our own image can also be the target — `pnpm docker:up`, then point
 files; CI runs it right after install, before the suite). The browser/Vite apps — `apps/pipeline-viz`
 and `examples/**` — are excluded: they are React 18 / TS 5 trees with their own configs. Always run
 `pnpm typecheck` + `pnpm engine:test` + `pnpm test` before claiming done.
+
+**Strict Clippy is a known non-green baseline, not a current inherited gate.** `TST-000` must retain
+the exact source/toolchain command and raw result before a dedicated baseline/CI task makes it
+mandatory. Do not hide the gap with blanket `allow`s or make unrelated feature packets fix the whole
+tree. Changed Rust should still avoid new compiler/Clippy debt, and every task must report the strict
+command honestly if its packet asks for it.
 
 ## Running the stack (sizes, explorer, load testing)
 
@@ -182,13 +435,14 @@ polling it never keeps a shape alive. To exercise dormancy/eviction fast, boot w
 knobs (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=1 ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS=1 …`) — see
 `packages/conformance/src/conformance-retention.test.ts` for the canonical sequence.
 
-### Testing checklist before claiming done
+### Testing checklist before handoff or qualification
 
-**This is a task-completion requirement, not a suggestion: an engine-touching task is not
-"done" until all three suites below have run green, and agents must run them (or report exactly
-which ran and why the rest could not) before closing the task.**
+**This is a task-completion requirement, not a suggestion.** Every engine-touching author runs and
+reports each lane the packet classifies as direct or inherited. Direct/affected task gates must be
+green; missing tooling is never a silent waiver.
 
 ```bash
+cargo fmt --check                         # root rustfmt.toml; CI enforces it
 pnpm typecheck                            # tsc --noEmit over the TS workspace (vitest cannot see type errors)
 pnpm engine:test                          # Rust unit + integration (fast)
 ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
@@ -203,6 +457,19 @@ versus which fall through to the routing/fallback tiers. The `electric-conforman
 Electric's *own* oracle suite pointed at our `/v1/shape` — a separate tier from our conformance
 package; run both. (The ASDF pins matter: `../electric` asks for an Elixir that may not be
 installed locally.)
+
+Gate phases prevent a red inherited baseline from deadlocking the task that repairs or hermeticizes
+it. `TST-000` freezes every existing failure/blocker. A validator-declared baseline-repair task must
+show genuine red on the exact owned assertion and green on the candidate; unrelated inherited results
+must remain identical. A task that installs an unavailable external/browser lane may integrate after
+its runnable direct gates pass and its named blocker is preserved, but that lane remains `blocked`.
+These are sequencing rules, not release waivers: no profile is qualified or production-ready until
+the full generated qualification matrix is green on the exact qualification candidate.
+
+Evidence provenance is part of every lane above. Run it from the packet's fresh clean evidence source,
+not the editing checkout, and retain the pre/post source, external-input/resolver-topology, empty-run-
+root and effective-config hashes with the raw result. A passing assertion on dirty, undeclared,
+mutable, reused or unidentified bytes is a failed gate.
 
 **E2E (browser) tier:** for anything touching the engine's live path, shapes, or the visualizer,
 finish by **driving the demo as above** (Playwright MCP runbook, §"Demo + visualizer") — the
@@ -441,7 +708,9 @@ canvas update, screenshot.
   offset captured *before* the page snapshot.
 - **Aggregations follow SQL NULL semantics** (ignore NULLs; `COUNT(col)` = non-NULLs; empty
   SUM/AVG/MIN/MAX = NULL). Extended API only — the Electric surface doesn't cover them.
-- Branch before committing if on the default branch.
+- Do not commit or push unless the Git Policy below and the user explicitly authorize it. If
+  authorized for a parallel task, use its pinned task branch/worktree; never author on the shared
+  integration checkout.
 
 ## Gotchas (know these before touching the respective areas)
 
@@ -460,8 +729,9 @@ canvas update, screenshot.
   (`pg.rs::row_json_expr`). If you add a read path, match it.
 - **Ingest is streaming pgoutput** (walsender protocol via `pgwire-replication` + our own
   `pgoutput.rs` decoder, text-mode tuples, never the `binary` option — binary values would break
-  the byte-identity above). The slot is `pgoutput`-plugin; a publication `<slot>_pub` (FOR ALL
-  TABLES, needs superuser) is created at setup.
+  the byte-identity above). The slot is `pgoutput`-plugin. **Current development setup** creates a
+  `<slot>_pub` `FOR ALL TABLES` publication and therefore needs superuser; this is not the production
+  PG18 contract. Production bootstrap owns an explicit table publication and runtime DDL is refused.
 - **Read raw stream envelopes, not stream-db's reconciled view, when you need every delta.** A
   subset's live feed must apply *move-outs*; stream-db no-ops a delete for a key it never inserted.
   (`packages/client/subset.ts` reads raw `StreamEnvelope`s.)

@@ -1,0 +1,16 @@
+{
+  "attempt_key": ["PLAN-001", "bootstrap-plan-001", 6],
+  "candidate_commit": null,
+  "controller_event_log_sha256": "a74831b824fc0642d601f9542e5607938cbea47938b3c4d64c2bfd5be6f90dd1",
+  "controller_generation": 5,
+  "controller_head": "392c888c4da856b72c51810630fce9641b259606",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_commit": null,
+  "integration_sha": null,
+  "last_acknowledged_nonce": 2,
+  "lease_expired_at": "2026-08-23T10:26:49.847Z",
+  "packet_sha256": "796b3bb107484aed7ae3a42ecb84a44f196c58c49c5c89445416103ce3583a25",
+  "reason": "The controller-provided heartbeat sidecar emitted its first request and then exited because its only timer was unreferenced. A keepalive restart also exited, and nonce 3 arrived after the heartbeat deadline. The controller invalidated the lease and the worker stopped; its one uncommitted partial script is inadmissible and will not be read or reused. The corrected sidecar bytes are separately tested and will be pinned only by the superseding packet.",
+  "superseding_attempt": 7,
+  "terminal_status": "invalidated"
+}

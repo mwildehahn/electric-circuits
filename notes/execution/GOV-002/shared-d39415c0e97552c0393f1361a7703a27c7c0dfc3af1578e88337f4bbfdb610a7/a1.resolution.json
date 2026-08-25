@@ -1,0 +1,27 @@
+{
+  "attempt_key": [
+    "GOV-002",
+    "shared-d39415c0e97552c0393f1361a7703a27c7c0dfc3af1578e88337f4bbfdb610a7",
+    1
+  ],
+  "candidate_commit": "750b6903b05533bd37c74c3783048737c07734b2",
+  "candidate_tree": "9deebc4bb6066f91519d13b8bd5169ac3fc731fe",
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "206f9b5960b15ef8c683c44afe26215dd8a7b94d81c39c0b08f4f6828cb1d38b",
+  "controller_generation": 16,
+  "controller_head": "a0e733be36c2855494fe898b43dd63d494d14566",
+  "controller_tree": "e0c7af27d4d333b3bf1df4dff9b1ff4a7e505d62",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "c924beaae52a221ab70bc60ecc37b8d0b610b50ad9b0b369740babc1a445a055",
+  "packet_sha256": "0c53a85035b0cc4be0c1d2e6110cfe954e03e3ad12c8187b8e78b9087e1ebcaf",
+  "review_sha256": "77902d7d7b4015d38f9a2cfd3da235a869d77b2683c4e0d0c5621ca9e8c588e4",
+  "gates": {
+    "json_parse": "pass",
+    "git_diff_check": "pass",
+    "pnpm_typecheck_root": "pass",
+    "independent_review": "pass"
+  },
+  "superseding_attempt": 2,
+  "reason": "The candidate was briefly applied as 750b690, but the controller lease expired at 2026-08-23T15:04:03Z before review/integration completed. Lease expiry makes the attempt inadmissible even though the independent review passed. The candidate was reverted by ef6076e8bb2d8f0b27c5cb4596930a49f6f23aa6; no artifact remains integrated. Reissue from a fresh packet/base.",
+  "terminal_status": "invalidated"
+}

@@ -72,6 +72,18 @@ pub(crate) enum SequencerCmd {
         table: TableRef,
         shape_id: String,
     },
+    /// Restore rollback barrier: acknowledge after all preceding shape removals have been applied.
+    Barrier {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Release the boot replay gate after every catalog shape has resumed successfully.
+    ResumeReads {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Pause the change-log reader before a retrying Resume attempt.
+    PauseReads {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
     /// Schema drift (ADR-0005): forget everything the sequencer holds for this table. The executor
     /// is keyed by the OLD `TableSchema`, so it is dropped outright rather than patched; the next
     /// envelope for the table lazily rebuilds it from the (already swapped) shared schema view.
@@ -129,6 +141,8 @@ pub(crate) fn spawn_sequencer(
     // and carry no replication old-image, so the sequencer keeps the current row per key itself
     // (see `TableExec::library_rows`).
     library_mode: bool,
+    start_paused: bool,
+    pause_gate: Arc<std::sync::atomic::AtomicBool>,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -153,6 +167,8 @@ pub(crate) fn spawn_sequencer(
         arr,
         arr_gates,
         library_mode,
+        start_paused,
+        pause_gate,
         shutdown,
         party,
     ));
@@ -347,11 +363,14 @@ pub(crate) async fn sequencer_loop(
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
     library_mode: bool,
+    start_paused: bool,
+    pause_gate: Arc<std::sync::atomic::AtomicBool>,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
+    let mut paused = start_paused;
     let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
     // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
@@ -497,6 +516,17 @@ pub(crate) async fn sequencer_loop(
                     emitted.remove(&shape_id);
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
+                Some(SequencerCmd::Barrier { done }) => {
+                    let _ = done.send(());
+                }
+                Some(SequencerCmd::ResumeReads { done }) => {
+                    paused = false;
+                    let _ = done.send(());
+                }
+                Some(SequencerCmd::PauseReads { done }) => {
+                    paused = true;
+                    let _ = done.send(());
+                }
                 Some(SequencerCmd::ResetTable { table }) => {
                     if execs.remove(table.as_str()).is_some() {
                         tracing::warn!("sequencer: dropped the executor for '{table}' (schema drift)");
@@ -539,8 +569,14 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true) => match res {
+            res = ds.read(&read_path, &read_off, true), if !paused => match res {
                 Ok(rr) => {
+                    // A PauseReads command may win immediately after an in-flight HTTP read returns.
+                    // Discard that page before touching the cursor or checkpoint so an existing
+                    // sequencer can be fenced without advancing the retry boundary.
+                    if pause_gate.load(std::sync::atomic::Ordering::Acquire) {
+                        continue;
+                    }
                     let next = rr.next_offset.clone();
                     // How much this read delivered, BEFORE control envelopes are filtered out: a
                     // closed segment is only left once a read comes back empty, which is the proof
@@ -559,6 +595,10 @@ pub(crate) async fn sequencer_loop(
                         rotate_to = Some(n);
                     }
                     envs.retain(|e| !crate::changelog::is_control(e));
+                    // Keep the pre-page replay boundary separately from `held_from`, which is
+                    // cleared when a held transaction completes on this page. If a later
+                    // transaction then fails, replay must still include that completed prefix.
+                    let held_replay_from = held_from.clone();
                     // Re-attach the run held from an earlier page (ADR-0003).
                     //
                     // A re-delivery complicates this: when the ingestor fails part-way through a
@@ -665,8 +705,13 @@ pub(crate) async fn sequencer_loop(
                     // envelope carrying `headers.last`, so a commit appended in several chunks
                     // (ADR-0003) is processed once, whole, not chunk by chunk.
                     let mut touched = false;
+                    let mut processing_failed = false;
                     let mut i = 0;
                     while i < envs.len() {
+                        // Commit highwater only after the complete transaction succeeds. If an
+                        // envelope fails, staged output is discarded and replay must retry the
+                        // whole transaction rather than skipping an earlier prefix.
+                        let txn_highwater = highwater;
                         let txid = envs[i].headers.txid.clone();
                         let lsn = envs[i].headers.lsn.clone();
                         let mut j = i + 1;
@@ -677,12 +722,12 @@ pub(crate) async fn sequencer_loop(
                         // circuit BEFORE fanning it out, so circuit-served aggregates emit
                         // within the transaction that changed them. The counts layer re-checks
                         // its own (lsn, seq) highwater, so feeding pre-dedup envelopes is safe.
-                        let txn_count_deltas = if let Some(arr) = &arr {
+                        let txn_arr_deltas = if let Some(arr) = &arr {
                             let deltas: Vec<_> = envs[i..j]
                                 .iter()
                                 .filter_map(|env| stamped_delta_for_arrangements(&tables, arr, &arr_gates, env))
                                 .collect();
-                            arr.apply_batch(deltas).await
+                            deltas
                         } else {
                             Vec::new()
                         };
@@ -732,7 +777,10 @@ pub(crate) async fn sequencer_loop(
                             )
                             .await
                             {
-                                tracing::error!("process_envelope failed: {e:#}");
+                                tracing::error!("process_envelope failed: {e:#}; stopping before publishing this transaction");
+                                highwater = txn_highwater;
+                                processing_failed = true;
+                                break;
                             }
                             exec.envelopes_total += 1;
                             touched = true;
@@ -740,6 +788,18 @@ pub(crate) async fn sequencer_loop(
                                 highwater = Some(p);
                             }
                         }
+                        if processing_failed {
+                            // Do not run the count fold or flush the partial transaction. The
+                            // failed transaction is retried from its page boundary on restart.
+                            break;
+                        }
+                        // Do not mutate the arrangement until every envelope has fanned out
+                        // successfully; a failed transaction must leave no circuit-side prefix.
+                        let txn_count_deltas = if let Some(arr) = &arr {
+                            arr.apply_batch(txn_arr_deltas).await
+                        } else {
+                            Vec::new()
+                        };
                         // Counts pipeline → circuit-served aggregates.
                         if !txn_count_deltas.is_empty() {
                             apply_count_deltas(
@@ -755,6 +815,19 @@ pub(crate) async fn sequencer_loop(
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
                         i = j;
+                    }
+                    if processing_failed {
+                        // The read cursor advances before processing; rewind it to the page that
+                        // began any held transaction, not merely this page. A completed held
+                        // prefix may have been staged before the failure and must be replayed.
+                        if let Some(from) = held_replay_from {
+                            pos = from.clone();
+                            held_from = Some(from);
+                        } else {
+                            pos.offset = read_off;
+                        }
+                        shutdown.begin();
+                        break;
                     }
                     // Publish the processed position only after the whole batch is fanned out +
                     // flushed — and never past a run still being HELD (ADR-0003): a restart must
@@ -854,9 +927,13 @@ pub(crate) async fn sequencer_loop(
     // de-duplication highwater riding with it) durable. Without it, everything since the last lazy
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
-    let ckpt = published(&pos, &held_from);
-    catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
-    tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
+    if !paused {
+        let ckpt = published(&pos, &held_from);
+        catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
+        tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
+    } else {
+        tracing::info!("sequencer: stopped while replay was paused; no checkpoint published");
+    }
 }
 
 /// Wait out a read-error backoff, cut short by a shutdown. The backoff exists to stop a failing

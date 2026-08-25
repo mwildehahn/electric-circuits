@@ -1,0 +1,22 @@
+{
+  "attempt_key": [
+    "GOV-003",
+    "shared-5c5e4450b4e987611d1e2fa5e595effdfeb67b55114c5f27d777ce1ccff02aca",
+    3
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "01a9f8acc85b2daa8ffa5acbd7f26948c82594bbf6c01a8c0df5a99024772cb4",
+  "controller_generation": 18,
+  "controller_head": "0f94a029dc82a29c6f0f36ff82d262f49572c232",
+  "controller_tree": "3367b528690875a8dc6c2195ae17db696b8ebe62",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "762a91d37323e9bc5f025aef498fed8e65488de82bdc03e2a7a56b25fe28f634",
+  "packet_sha256": "396378e18ac2019c44b502be031e84aa2afdd62695237b452a01948dd861e5ff",
+  "review_sha256": "432c57df5ea8b6d4bc23f388eca51d70e10b58e2239b0d2f17c9ba96e7b2bdc0",
+  "gates": {
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 4,
+  "reason": "Independent review failed the packet-bound full typecheck gate: the fresh evidence run produced 184 unresolved-module errors and omitted raw output identity. Task-local tests pass, but a blocked required gate is not a pass. No candidate was integrated; reissue with a complete reproducible dependency mount.",
+  "terminal_status": "invalidated"
+}

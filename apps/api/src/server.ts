@@ -1,6 +1,8 @@
 import type { AddressInfo } from 'node:net'
-import { createHTTPServer } from '@trpc/server/adapters/standalone'
+import { createServer } from 'node:http'
+import { createHTTPHandler } from '@trpc/server/adapters/standalone'
 import { createCore, type ElectricCore } from './core.js'
+import { handleRestRequest } from './rest.js'
 import { appRouter } from './router.js'
 
 export interface ApiServer {
@@ -10,8 +12,10 @@ export interface ApiServer {
 }
 
 /**
- * Start a standalone tRPC HTTP server. `createHTTPServer` returns a Node `http.Server`, so we
- * listen (port 0 = a free port) and read the bound port from `server.address()`.
+ * Start the API gateway. The tRPC adapter is the primary gateway surface; the `/v1` handler is a
+ * compatibility facade for callers that still address the gateway. The canonical native `/v1`
+ * contract (and OpenAPI document) lives on the Rust engine, so Swift clients should use the engine
+ * URL directly. Both gateway adapters receive the same TypeScript service adapter.
  */
 export async function createApiServer(opts: {
   dsUrl: string
@@ -21,7 +25,15 @@ export async function createApiServer(opts: {
   host?: string
 }): Promise<ApiServer> {
   const core = createCore({ dsUrl: opts.dsUrl, engineUrl: opts.engineUrl })
-  const server = createHTTPServer({ router: appRouter, createContext: () => ({ core }) })
+  const trpcHandler = createHTTPHandler({ router: appRouter, createContext: () => ({ core }) })
+  const server = createServer((req, res) => {
+    const pathname = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`).pathname
+    if (pathname === '/v1' || pathname.startsWith('/v1/')) {
+      void handleRestRequest(req, res, core)
+      return
+    }
+    trpcHandler(req, res)
+  })
   const bind = opts.host ?? '127.0.0.1'
   await new Promise<void>((resolve) => server.listen(opts.port ?? 0, bind, () => resolve()))
   const addr = server.address() as AddressInfo

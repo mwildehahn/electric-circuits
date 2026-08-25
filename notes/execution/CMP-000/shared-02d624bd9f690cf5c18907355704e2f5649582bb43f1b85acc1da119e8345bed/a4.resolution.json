@@ -1,0 +1,25 @@
+{
+  "attempt_key": [
+    "CMP-000",
+    "shared-02d624bd9f690cf5c18907355704e2f5649582bb43f1b85acc1da119e8345bed",
+    4
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "6cefdff235d9bf5a97f58d633861e7fa307ef84cbe39493e5e5ba5bd8e867d72",
+  "controller_generation": 20,
+  "controller_head": "6da5a5eedda89bc0efaaf445669ca15de57a724e",
+  "controller_tree": "518c64db9b75d7ac2b56983363a314993b982af1",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "d196f5ec84d2b6698e682d95a0d0e58fd0d7bab016d71a5ef002877681792ae3",
+  "packet_sha256": "c6cd051807a757ffb371e42b5295a4c21c3cc490de31253dde21d45b68bf6c36",
+  "prepared_patch_sha256": "89231b18e68515f123495764226fc0340c1bc4b9992f4987a0e2cb4f4e4b4591",
+  "review_sha256": "f629e32de168f71d05e6f0275767d09c48a8062c243bc5216ef98d2d0260feee",
+  "gates": {
+    "git_diff_check": "pass",
+    "pnpm_typecheck": "pass",
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 5,
+  "reason": "The author changed the prepared patch and handoff after publishing ready_for_review: the reviewed patch/hash/tree and manifest identity changed from 89231b18.../4bffd7bc.../6ac818... to 00926b9c.../074e767f.../ec5cef.... Protocol v2 treats a prepared patch as immutable review input; the technically useful dirty-source guard is inadmissible until a fresh packet, evidence run and independent review.",
+  "terminal_status": "invalidated"
+}

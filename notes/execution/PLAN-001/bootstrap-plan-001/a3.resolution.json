@@ -1,0 +1,26 @@
+{
+  "attempt_key": ["PLAN-001", "bootstrap-plan-001", 3],
+  "candidate_commit": "b7fe33bd9ad0e2fef7d7398da792c0af6e9dedef",
+  "candidate_tree": "0aa9935d2c952bef3a06ba5e8c4a59d4778d01be",
+  "controller_event_log_sha256": "39ef0c60857e5a44c589e76ecc5ba0075e91ef211468725afb255dec9aca1795",
+  "controller_generation": 2,
+  "controller_head": "4b70515de20196af7cb5551feff682d31da4d49c",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_blob_sha": "068eab5321d0f2bf0f4ce8e3a4f0ef3a56b00d1c",
+  "handoff_commit": "d66507635dc06de617b93c398fe7ffc0293a875e",
+  "handoff_sha256": "6ad48fe1788cb9e9a6f27bdd19567d2fc79c82af504381a711be20b84b7133e1",
+  "integration_sha": null,
+  "packet_sha256": "8e62a1b9892cee89176eed1bbb9e31f974729497e00fb6331c7f7ea52acd4b51",
+  "reason": "Independent review rejected the generated planning authority. It encoded only 16 of 36 normative conditional rows, duplicated profile/feature dependencies as unconditional edges, provided a shallow schema and validator, implemented no profile-aware scheduler or protocol state machine, replaced exact per-task artifacts/resources/gates with generic placeholders, and supplied only three tests instead of the required mutation, randomized scheduling, lease, packet, and clean-evidence fixtures. The four declared commands passed independently, but green self-tests did not establish the canonical PLAN-001 contract.",
+  "review_report_sha256": "ed9321bb6f4a32052e0fb46cb085eee408cdf9462d399e08d3cbd00f6b3a7935",
+  "reviewed_commit": "d66507635dc06de617b93c398fe7ffc0293a875e",
+  "reviewed_tree": "8e970b7cc1bbb716582d8873e06044d963e7a286",
+  "reviewer_gate_outcomes": {
+    "PLAN-001-ROOT-TYPECHECK": "pass",
+    "PLAN-001-TEST": "pass_3_tests",
+    "PLAN-001-TSC": "pass",
+    "PLAN-001-VALIDATE": "pass"
+  },
+  "superseding_attempt": 4,
+  "terminal_status": "fail"
+}

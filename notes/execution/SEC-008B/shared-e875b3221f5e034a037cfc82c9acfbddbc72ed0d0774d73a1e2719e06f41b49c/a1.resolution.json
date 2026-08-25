@@ -1,0 +1,25 @@
+{
+  "attempt_key": [
+    "SEC-008B",
+    "shared-e875b3221f5e034a037cfc82c9acfbddbc72ed0d0774d73a1e2719e06f41b49c",
+    1
+  ],
+  "candidate_role": "prepared_patch",
+  "controller_event_log_sha256": "9a89914bb2b8d7488735483b1f0a0f93b83bb4d81cb95189e75f21ddc7ed0a66",
+  "controller_generation": 16,
+  "controller_head": "a0e733be36c2855494fe898b43dd63d494d14566",
+  "controller_tree": "e0c7af27d4d333b3bf1df4dff9b1ff4a7e505d62",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_sha256": "e8f6fac1f73738d480d7dbf86c979ba7c930e66a050021600d0348c9fa79538d",
+  "packet_sha256": "53ea0d0084324e284a942318c2775ce1c910977bbe81c2905f92aa68bfe7e233",
+  "review_sha256": "377a7abd0368c2fc705d87954ebc54182e4e4ba61155264b55538edd2012034d",
+  "gates": {
+    "git_diff_check": "pass",
+    "mutation_tests": "pass",
+    "pnpm_typecheck": "blocked_missing_dependencies",
+    "independent_review": "fail"
+  },
+  "superseding_attempt": 2,
+  "reason": "Independent review found four fail-open policy defects (review SPDX, empty exception id, missing base-image integrity enforcement, and arbitrary source-pin acceptance). The reservation lease also expired before integration. The candidate is rejected/inadmissible; corrections require a fresh packet and red/green rerun.",
+  "terminal_status": "invalidated"
+}

@@ -1,0 +1,15 @@
+{
+  "attempt_key": ["PLAN-001", "bootstrap-plan-001", 1],
+  "controller_event_log_sha256": "f59e16af9dd92f92d7258a10f7710f0726f1bd1a277d57cfd866c6e2afb3d3d4",
+  "controller_generation": 0,
+  "controller_head": "6cec05f22f5f99ec274f1214e4f8f49934cc501f",
+  "git_authority_ref": "user-2026-08-23-kick-off-first-set",
+  "handoff_blob_sha": "03817727c0671f32d25801713b21a9a2d2320b10",
+  "handoff_commit": "a017cce43eeb8479d926849545090384b184bab5",
+  "handoff_sha256": "711e846837d574909642ea14fdbdd6358a234a898aa7da081656c43880577004",
+  "integration_sha": null,
+  "packet_sha256": "09ec45508c01f18ebcd65b24d561c03a760699af724ccc800e9cce1921020ed3",
+  "reason": "The controller-issued direct gates were internally unfulfillable: Vitest's bundle config loader required a write beneath the declared read-only dependency mount, and TypeScript 7 rejected explicit file arguments without --ignoreConfig. No candidate artifacts or product behavior were integrated.",
+  "superseding_attempt": 2,
+  "terminal_status": "fail"
+}
