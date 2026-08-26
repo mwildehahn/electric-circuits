@@ -172,18 +172,18 @@ function aggregateInput(body: JsonObject): { def: AggregateDef; subscription?: s
 
 function route(pathname: string): { resource: string; id?: string } | null {
   const parts = pathname.split('/').filter(Boolean)
-  if (parts[0] !== 'v1') return null
-  if (parts.length === 2 && parts[1] === 'shapes') return { resource: 'shapes' }
-  if (parts.length === 3 && parts[1] === 'shapes') return { resource: 'shape', id: decodeURIComponent(parts[2]!) }
-  if (parts.length === 3 && parts[1] === 'subsets' && parts[2] === 'query') return { resource: 'subset_query' }
-  if (parts.length === 2 && parts[1] === 'subset-feeds') return { resource: 'subset_feed' }
-  if (parts.length === 2 && parts[1] === 'aggregates') return { resource: 'aggregate' }
+  if (parts[0] !== 'compat' || parts[1] !== 'v1') return null
+  if (parts.length === 3 && parts[2] === 'shapes') return { resource: 'shapes' }
+  if (parts.length === 4 && parts[2] === 'shapes') return { resource: 'shape', id: decodeURIComponent(parts[3]!) }
+  if (parts.length === 4 && parts[2] === 'subsets' && parts[3] === 'query') return { resource: 'subset_query' }
+  if (parts.length === 3 && parts[2] === 'subset-feeds') return { resource: 'subset_feed' }
+  if (parts.length === 3 && parts[2] === 'aggregates') return { resource: 'aggregate' }
   return null
 }
 
 export async function handleRestRequest(req: IncomingMessage, res: ServerResponse, core: ElectricCore): Promise<void> {
   try {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+    const url = new URL(req.url ?? '/', 'http://localhost')
     const matched = route(url.pathname)
     if (!matched) {
       writeJson(res, 404, { type: 'about:blank', title: 'not_found', status: 404, code: 'not_found' })

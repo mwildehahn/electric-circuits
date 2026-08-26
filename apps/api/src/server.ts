@@ -12,7 +12,7 @@ export interface ApiServer {
 }
 
 /**
- * Start the API gateway. The tRPC adapter is the primary gateway surface; the `/v1` handler is a
+ * Start the API gateway. The tRPC adapter is the primary gateway surface; the `/compat/v1` handler is a
  * compatibility facade for callers that still address the gateway. The canonical native `/v1`
  * contract (and OpenAPI document) lives on the Rust engine, so Swift clients should use the engine
  * URL directly. Both gateway adapters receive the same TypeScript service adapter.
@@ -27,8 +27,10 @@ export async function createApiServer(opts: {
   const core = createCore({ dsUrl: opts.dsUrl, engineUrl: opts.engineUrl })
   const trpcHandler = createHTTPHandler({ router: appRouter, createContext: () => ({ core }) })
   const server = createServer((req, res) => {
-    const pathname = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`).pathname
-    if (pathname === '/v1' || pathname.startsWith('/v1/')) {
+    // `req.url` is the origin-form request target; no client-controlled Host header is needed
+    // to route it. Avoid constructing a URL from Host, which can throw on malformed input.
+    const pathname = (req.url ?? '/').split('?', 1)[0] ?? '/'
+    if (pathname === '/compat/v1' || pathname.startsWith('/compat/v1/')) {
       void handleRestRequest(req, res, core)
       return
     }

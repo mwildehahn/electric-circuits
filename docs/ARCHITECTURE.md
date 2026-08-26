@@ -66,7 +66,14 @@ Three ideas carry the whole design:
 - **API** (`apps/api`, tRPC) — a TypeScript compatibility adapter used by
   `@electric-circuits/client`: `schema.define`, `ingest.write` (library mode),
   `shapes.create/get/delete`, `subset.query/live`, `aggregate`. Lifecycle/query calls cross the
-  Rust boundary through its native `/v1` routes; Swift does not use this gateway.
+  Rust boundary through its native `/v1` routes; Swift does not use this gateway. The native
+  `/v1` surface is currently unauthenticated and development-only: production traffic must pass
+  through the authenticated gateway/edge, and native clients must not be granted the operator,
+  introspection, or `/table/{table}/rows` mutation routes. The TypeScript gateway's REST adapter,
+  where retained for migration compatibility, is explicitly noncanonical under `/compat/v1`.
+  The native OpenAPI document intentionally omits the destructive `purge=true` delete query; it
+  remains a legacy visualizer/operator escape hatch on the shared handler pending a separately
+  authorizable admin route.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
   windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
 - **oracle + conformance** (`packages/oracle`, `packages/conformance`) — a Postgres/pglite reference

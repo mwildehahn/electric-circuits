@@ -6,7 +6,8 @@ forwards lifecycle/query calls to the Rust engine's native Axum contract. The ga
 tRPC compatibility adapter and an optional REST/JSON compatibility adapter:
 
 - tRPC procedures remain the surface used by `@electric-circuits/client`.
-- REST resources under `/v1` on this gateway are a compatibility facade for existing integrations.
+- REST resources under `/compat/v1` on this gateway are a noncanonical compatibility facade for
+  existing integrations. They intentionally do not claim the native Rust `/v1` contract.
 - Swift and other native clients should call the Rust engine directly, where `/v1` and
   `/v1/openapi.json` are canonical.
 - Both gateway adapters call the same TypeScript adapter; neither adapter owns synchronization logic.
@@ -43,12 +44,12 @@ leaf comparisons, `isNull`, `and`/`or`/`not`, and `IN (SELECT …)` subqueries.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/shapes` | create or renew a materialized shape |
-| `GET` | `/v1/shapes/{id}` | look up a shape handle |
-| `DELETE` | `/v1/shapes/{id}?subscription=…` | release a named subscription |
-| `POST` | `/v1/subsets/query` | run a one-shot subset query |
-| `POST` | `/v1/subset-feeds` | open a changes-only subset feed |
-| `POST` | `/v1/aggregates` | create a live scalar aggregate |
+| `POST` | `/compat/v1/shapes` | create or renew a materialized shape |
+| `GET` | `/compat/v1/shapes/{id}` | look up a shape handle |
+| `DELETE` | `/compat/v1/shapes/{id}?subscription=…` | release a named subscription |
+| `POST` | `/compat/v1/subsets/query` | run a one-shot subset query |
+| `POST` | `/compat/v1/subset-feeds` | open a changes-only subset feed |
+| `POST` | `/compat/v1/aggregates` | create a live scalar aggregate |
 
 The Rust engine publishes the canonical contract and generated document at
 `GET <engineUrl>/v1/openapi.json`. The gateway facade uses ordinary JSON bodies and

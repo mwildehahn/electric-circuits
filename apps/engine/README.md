@@ -12,6 +12,14 @@ compatibility routes from one process:
   retained for existing tooling and conformance fixtures;
 - the **Electric-compatible `GET /v1/shape`**, so an unmodified ElectricSQL client can sync from it.
 
+The native `/v1` control plane is currently unauthenticated and development-only. Production
+deployments must put the engine behind the authenticated gateway/edge; do not expose native clients
+to `/epoch/reset`, introspection/debug routes, or `/table/{table}/rows` mutation endpoints. The
+TypeScript gateway's migration facade, when needed, is explicitly noncanonical at `/compat/v1`.
+The generated `/v1/openapi.json` deliberately documents subscription release only; `purge=true`
+remains an undocumented legacy visualizer/operator escape hatch on the shared delete handler until
+it moves to a separately authorizable admin route.
+
 Design and execution model: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) and
 [docs/ivm-engine-internals.md](../../docs/ivm-engine-internals.md).
 

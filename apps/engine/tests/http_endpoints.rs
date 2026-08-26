@@ -4,15 +4,49 @@
 //! The router is driven in-process via `Service::oneshot`; no Postgres or durable-streams server is
 //! needed (the health phase is set at Engine construction).
 
+use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::extract::{Request as AxumRequest, State};
+use axum::http::{Method, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
 use electric_circuits_engine::http::router;
+use electric_circuits_engine::schema::Schema;
+use tokio::sync::oneshot;
 use tower::ServiceExt; // for `oneshot`
 
 fn library_engine() -> Engine {
     Engine::new(DsClient::new("http://127.0.0.1:1"))
+}
+
+#[derive(Clone, Default)]
+struct FeedDs;
+
+async fn feed_ds_handler(State(_): State<FeedDs>, request: AxumRequest) -> Response {
+    match *request.method() {
+        Method::HEAD => [("stream-next-offset", "tip")].into_response(),
+        Method::GET => ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response(),
+        Method::PUT | Method::POST | Method::DELETE => StatusCode::OK.into_response(),
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
+async fn feed_engine() -> (Engine, oneshot::Sender<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, wait) = oneshot::channel();
+    tokio::spawn(async move {
+        let server = axum::serve(listener, Router::new().fallback(feed_ds_handler).with_state(FeedDs));
+        tokio::select! { _ = server => {}, _ = wait => {} }
+    });
+    let engine = Engine::new(DsClient::new(format!("http://{address}")));
+    let schema: Schema = serde_json::from_value(serde_json::json!({
+        "tables": { "items": { "columns": { "id": {"type":"int"} }, "primaryKey": "id" } }
+    }))
+    .unwrap();
+    engine.define_schema(&schema).await.unwrap();
+    (engine, stop)
 }
 
 async fn body_string(res: axum::response::Response) -> String {
@@ -91,13 +125,125 @@ async fn native_openapi_document_describes_the_public_routes() {
     for path in ["/v1/shapes", "/v1/shapes/{id}", "/v1/subsets/query", "/v1/subset-feeds", "/v1/aggregates"] {
         assert!(document["paths"].get(path).is_some(), "missing documented path {path}");
     }
-    let predicate = &document["components"]["schemas"]["OpenApiPredicate"];
+    let predicate = &document["components"]["schemas"]["Predicate"];
     assert!(predicate.is_object());
     assert!(predicate["oneOf"].is_array(), "predicate schema must preserve its alternatives");
     assert!(
-        serde_json::to_string(predicate).unwrap().contains("OpenApiPredicate"),
+        serde_json::to_string(predicate).unwrap().contains("#/components/schemas/Predicate"),
         "recursive predicate references must be present in the generated document"
     );
+    let leaf = predicate["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"].get("value").is_some())
+        .expect("predicate schema must include its leaf value");
+    assert_eq!(leaf["properties"]["value"], serde_json::json!({}));
+    let create = &document["paths"]["/v1/shapes"]["post"];
+    assert_eq!(
+        create["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ShapeRequest"
+    );
+    assert_eq!(
+        create["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ShapeCreatedResponse"
+    );
+    let get = &document["paths"]["/v1/shapes/{id}"]["get"];
+    assert_eq!(
+        get["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ShapeMetadataResponse"
+    );
+    let delete = &document["paths"]["/v1/shapes/{id}"]["delete"];
+    assert!(!delete["parameters"].as_array().unwrap().iter().any(|p| p["name"] == "purge"));
+    assert!(delete["responses"].get("404").is_none());
+    assert!(delete["responses"].get("503").is_none());
+    let feed = &document["paths"]["/v1/subset-feeds"]["post"];
+    assert_eq!(
+        feed["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SubsetFeedRequest"
+    );
+    assert!(document["components"]["schemas"]["SubsetFeedRequest"]["properties"].get("changesOnly").is_none());
+    let aggregate = &document["components"]["schemas"]["AggregateRequest"];
+    assert_eq!(aggregate["properties"]["fn"]["$ref"], "#/components/schemas/AggregateFunction");
+    assert!(document["paths"]["/v1/subsets/query"]["post"]["responses"].get("503").is_some());
+    for path in ["/v1/shapes", "/v1/subsets/query", "/v1/subset-feeds", "/v1/aggregates"] {
+        let responses = &document["paths"][path]["post"]["responses"];
+        for status in ["400", "415", "422"] {
+            assert_eq!(
+                responses[status]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorResponse"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_native_json_uses_documented_error_contract() {
+    let cases = [
+        ("{}", Some("application/json"), StatusCode::UNPROCESSABLE_ENTITY),
+        ("{", Some("application/json"), StatusCode::BAD_REQUEST),
+        (r#"{"table":"items"}"#, Some("text/plain"), StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    ];
+    for (body, content_type, expected) in cases {
+        let mut builder = Request::builder().method(Method::POST).uri("/v1/shapes");
+        if let Some(content_type) = content_type {
+            builder = builder.header("content-type", content_type);
+        }
+        let res = router(library_engine()).oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(res.status(), expected);
+        assert!(res.headers().get("content-type").unwrap().to_str().unwrap().starts_with("application/json"));
+        let body: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+        assert!(body["error"].as_str().is_some_and(|message| !message.is_empty()));
+    }
+}
+
+#[tokio::test]
+async fn electric_shape_extractor_rejection_keeps_compatibility_body() {
+    let res = router(library_engine())
+        .oneshot(Request::builder().uri("/v1/shape").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        res.headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/plain")),
+        "Electric extractor failures retain their existing response media type"
+    );
+    let body = body_string(res).await;
+    assert!(body.contains("Failed to deserialize query string"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subset_feed_route_forces_changes_only() {
+    let (engine, stop) = feed_engine().await;
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        router(engine.clone()).oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/subset-feeds")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"table":"items","changesOnly":false,"subscription":"feed-test"}"#))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("subset feed request must complete")
+    .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+    let id = body["shapeId"].as_str().unwrap();
+
+    let rows = router(engine)
+        .oneshot(Request::builder().uri(format!("/shapes/{id}/rows")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rows.status(), StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body_string(rows).await).unwrap();
+    assert_eq!(rows["changesOnly"], true, "the subset-feed endpoint must override changesOnly=false");
+    let _ = stop.send(());
 }
 
 #[tokio::test]
