@@ -45,7 +45,7 @@ remaining lanes a substitute.
 The checked-in conformance harness is strong process-level regression evidence: it uses a real
 Postgres database, logical slot, engine child process, test durable-stream server and TypeScript
 client, then compares materialized state with source SQL. It currently uses direct internal
-surfaces and host-selected/Postgres-16-ish development defaults. It does not establish a pinned
+surfaces and the PostgreSQL 18 development baseline. It does not establish a pinned
 PG18 major, file-backed durable storage, authenticated public gateway, Swift/app target receipt,
 immutable candidate image, or release-profile qualification.
 

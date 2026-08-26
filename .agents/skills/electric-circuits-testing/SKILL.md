@@ -10,7 +10,7 @@ test plans, fault injection, flake investigations, or qualification work. It app
 TypeScript, protocol, conformance, and real-stack work; the contract decides the test location, not
 the implementation language.
 
-This repository is **not production-ready today**. Current direct-engine surfaces, the PostgreSQL 16
+This repository is **not production-ready today**. Current direct-engine surfaces, the PostgreSQL 18
 Compose fixture, and host-selected CI PostgreSQL are characterization tools. The target launch
 acceptance profile is pinned PostgreSQL 18 with file-backed storage and an authenticated gateway.
 Never turn a current green regression into a PG18, gateway, Swift/app, or release claim without that

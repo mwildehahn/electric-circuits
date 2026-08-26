@@ -49,7 +49,7 @@ identical either way.)
 
 ### Postgres prerequisites
 
-- **PostgreSQL 16** with `wal_level = logical`.
+- **PostgreSQL 18** with `wal_level = logical`.
 - Each replicated table needs `REPLICA IDENTITY FULL` so updates/deletes carry the **old** row
   (the engine sets this during setup; see `docs/deployment-postgres.md`).
 - Each replicated table needs a **primary key** (single or composite — composite keys are

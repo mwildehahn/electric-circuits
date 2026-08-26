@@ -19,10 +19,10 @@ these statement types separate:
   is the canonical production-readiness task/dependency authority. Notes 23 and 24 supply stable
   Swift/app and PG18/E2E scenarios; they do not define a second task graph.
 - The production target is PostgreSQL 18 behind one authenticated gateway with an explicit
-  publication and durable storage. The current development Compose stack still uses PostgreSQL 16,
-  current CI selects the highest host-installed PostgreSQL, and direct engine/API routes remain
-  available. A green current suite is inherited regression evidence, not PG18, gateway or release
-  qualification.
+  publication and durable storage; the development baseline is also PostgreSQL 18. Compose uses the
+  pinned `postgres:18.6` image, ephemeral demo/test launchers require PostgreSQL 18 binaries, and
+  direct engine/API routes remain available. A green current suite is inherited regression evidence,
+  not gateway or release qualification.
 - Until `PLAN-001` generates and validates the checked-in task manifest, it is the only initially
   merge-ready production-readiness packet. Its one typed bootstrap packet pins this specification's
   blob/tree with `profile_scope: uncompiled_all`; it cannot claim a future release-profile or scenario

@@ -12,7 +12,7 @@ UI updates through the sync engine**, never by local mutation.
 
 ## Run
 
-Requires Node ≥ 22, pnpm 10, Rust stable, and PostgreSQL 16 binaries on `PATH`
+Requires Node ≥ 22, pnpm 10, Rust stable, and PostgreSQL 18 binaries on `PATH`
 (`initdb`/`pg_ctl` — the demo boots its own ephemeral cluster). From the repo root:
 
 ```bash

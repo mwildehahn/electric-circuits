@@ -17,6 +17,8 @@ import type { Schema } from '@electric-circuits/protocol'
 import { faker } from '@faker-js/faker'
 import pgpkg from 'pg'
 
+import { postgres18Tools } from '../../../scripts/postgres18.js'
+
 export const STATUSES = ['backlog', 'todo', 'in_progress', 'done', 'canceled'] as const
 export const PRIORITIES = ['none', 'low', 'medium', 'high', 'urgent'] as const
 export const SEED_PRIORITIES = ['none', 'low', 'medium', 'high'] as const
@@ -121,6 +123,7 @@ export async function bootInfra(seedIssues: number, opts: InfraOpts = {}, log = 
   const listen = bindHost === '0.0.0.0' ? '*' : bindHost
   const work = mkdtempSync(join(tmpdir(), 'el-loadgen-'))
   const pgData = join(work, 'pg')
+  const postgres = postgres18Tools()
   const dsDir = join(work, 'ds')
   mkdirSync(dsDir, { recursive: true })
 
@@ -139,7 +142,7 @@ export async function bootInfra(seedIssues: number, opts: InfraOpts = {}, log = 
       await pg.end().catch(() => {})
     }
     try {
-      execFileSync('pg_ctl', ['-D', pgData, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
+      execFileSync(postgres.pgCtl, ['-D', pgData, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
     } catch {
       /* ignore */
     }
@@ -154,7 +157,7 @@ export async function bootInfra(seedIssues: number, opts: InfraOpts = {}, log = 
 
   try {
     // 1. Ephemeral Postgres with logical replication.
-    execFileSync('initdb', ['-D', pgData, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
+    execFileSync(postgres.initdb, ['-D', pgData, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
     // Allow connections from other hosts/containers when bound externally (ephemeral demo PG, trust auth).
     if (bindHost !== '127.0.0.1') appendFileSync(join(pgData, 'pg_hba.conf'), `\nhost all all 0.0.0.0/0 trust\n`)
     const fixedPg = opts.pgPort && opts.pgPort > 0 ? opts.pgPort : undefined
@@ -169,7 +172,7 @@ export async function bootInfra(seedIssues: number, opts: InfraOpts = {}, log = 
           `listen_addresses = '${listen}'\nunix_socket_directories = '/tmp'\nport = ${pgPort}\nfsync = off\n`,
       )
       try {
-        execFileSync('pg_ctl', ['-D', pgData, '-l', join(work, 'pg.log'), '-w', 'start'], { stdio: 'ignore' })
+        execFileSync(postgres.pgCtl, ['-D', pgData, '-l', join(work, 'pg.log'), '-w', 'start'], { stdio: 'ignore' })
         started = true
       } catch {
         /* port in use; retry */
