@@ -83,7 +83,7 @@ max_wal_senders = 10
 
 | service | port | role |
 |---|---|---|
-| `postgres` (16, `wal_level=logical`) | 5432 | system of record — run the DDL above here |
+| `postgres` (18.6, `wal_level=logical`) | 5432 | system of record — run the DDL above here |
 | `ds` (durable-streams server) | 8791 | the change log; live query feeds are read from here |
 | `engine` (Rust) | 7010 | replication ingest + live query maintenance + `/v1/shape` |
 | `api` (extended API) | 8790 | live queries / subset queries / aggregations |

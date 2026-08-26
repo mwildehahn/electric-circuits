@@ -21,6 +21,7 @@
     "demo": "pnpm --filter @electric-circuits/examples demo",
     "demo:web": "pnpm --filter @electric-circuits/web start",
     "demo:linearlite": "pnpm --filter @electric-circuits/linearlite start",
+    "linearlite:seed": "pnpm --filter @electric-circuits/linearlite seed-tasks",
     "bench": "pnpm --filter @electric-circuits/bench bench",
     "bench:fleet": "pnpm --filter @electric-circuits/bench electric-fleet",
     "docker:build": "docker compose -f docker/compose.yaml build",

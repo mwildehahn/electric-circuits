@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "tsx start.ts",
+    "seed-tasks": "tsx seed-tasks.ts",
     "vite": "vite"
   },
   "dependencies": {

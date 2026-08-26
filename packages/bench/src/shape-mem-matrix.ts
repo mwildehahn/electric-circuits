@@ -25,6 +25,8 @@ import { fileURLToPath } from 'node:url'
 import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import pgpkg from 'pg'
 
+import { postgres18Tools } from '../../../scripts/postgres18.js'
+
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
   let d = here
@@ -70,9 +72,10 @@ function mustHaveBin() {
 
 // --- Ephemeral Postgres (logical replication), mirroring examples/linearlite/start.ts ----------------
 function bootPg(): { pgUrl: string; dir: string; data: string } {
+  const postgres = postgres18Tools()
   const dir = mkdtempSync(join(tmpdir(), 'el-shapemem-pg-'))
   const data = join(dir, 'data')
-  execFileSync('initdb', ['-D', data, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
+  execFileSync(postgres.initdb, ['-D', data, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
   let port = 0
   let started = false
   for (let attempt = 0; attempt < 8 && !started; attempt++) {
@@ -83,7 +86,7 @@ function bootPg(): { pgUrl: string; dir: string; data: string } {
         `listen_addresses = '127.0.0.1'\nunix_socket_directories = '/tmp'\nport = ${port}\nfsync = off\n`,
     )
     try {
-      execFileSync('pg_ctl', ['-D', data, '-l', join(dir, 'log'), '-w', 'start'], { stdio: 'ignore' })
+      execFileSync(postgres.pgCtl, ['-D', data, '-l', join(dir, 'log'), '-w', 'start'], { stdio: 'ignore' })
       started = true
     } catch {
       /* retry */
@@ -94,8 +97,9 @@ function bootPg(): { pgUrl: string; dir: string; data: string } {
 }
 
 function stopPg(dir: string, data: string) {
+  const postgres = postgres18Tools()
   try {
-    execFileSync('pg_ctl', ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
+    execFileSync(postgres.pgCtl, ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
   } catch {
     /* already down */
   }

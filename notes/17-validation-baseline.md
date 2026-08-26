@@ -1,41 +1,39 @@
 # Validation baseline
 
-As of 2026-08-22 (America/Los_Angeles), against local Circuits `474577a` and
-`../electric-sync-swift` `0.1.12`. This records fresh execution evidence for the research/spec turn;
-no production implementation was changed.
+As of 2026-08-25 (America/Los_Angeles), the current integrated recovery candidate before this
+evidence-note commit is `f977f10`. It contains the merged durable-stream provider, PostgreSQL 18
+launcher baseline, native Axum `/v1` hardening, and the LinearLite task seeder/client UUID changes.
+This is regression evidence for that candidate; it is not production-release qualification.
 
 ## Results
 
 | Check | Result | Evidence / limitation |
 | --- | --- | --- |
-| `cargo fmt --check` | **Pass** | Completed with exit 0. |
-| `pnpm typecheck` | **Pass** | The first attempt could not start because workspace dependencies were absent (`tsc: command not found`). `pnpm install --frozen-lockfile` completed, then typecheck exited 0. The lockfile was not changed. |
-| `pnpm engine:test` | **Pass** | 426 Rust tests listed/executed across unit and integration targets; zero failures. |
-| `ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test` | **Fail: 284/285 passed** | 53/54 files passed. `conformance-retention.test.ts` expected the backing stream to be 404 immediately after `DELETE /shapes/{id}?purge=true`; the engine record was 404 but the stream returned 200. |
-| Focused retention rerun | **Same deterministic failure** | `ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm exec vitest run packages/conformance/src/conformance-retention.test.ts --reporter=verbose` passed 6/7 and repeated the exact force-purge assertion failure at line 188. |
-| Electric external oracle | **Not runnable in current environment** | `ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 ./electric-conformance/run.sh oracle` built the release engine, then exited 127 at `mix deps.get`: `mix: command not found`. The harness copied five fixtures into `../electric` before failing; only those known copies were restored/deleted, and the sibling checkout is clean again. |
-| Swift dependency boundary | **Pass** | `../electric-sync-swift/Scripts/check-dependency-boundaries.sh` passed. |
-| `swift test` | **Pass** | 351 tests in 23 suites passed with zero failures. |
+| `cargo fmt --check` | **Pass** | Completed with exit 0 on the integrated candidate. |
+| `pnpm typecheck` | **Pass** | `tsc --noEmit -p tsconfig.json` completed with exit 0. |
+| `pnpm test:node` | **Pass: 8/8** | Includes the static PostgreSQL image/launcher contract: Compose and tutorials use `postgres:18.6`, and ephemeral launchers resolve PostgreSQL 18 tools explicitly. |
+| `pnpm engine:test` | **Pass** | 393 library unit tests plus 69 runnable integration tests passed (462 total); 3 real-Postgres RLS tests remained explicitly ignored because `ELECTRIC_CIRCUITS_TEST_PG_URL` was unset. |
+| `ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test` | **Pass: 63 files / 304 tests** | Full Vitest/conformance run completed in 873.90 seconds. It includes PG18 promotion, schema drift, WAL recovery, pgxsinkit provider contract, native subscriptions, negative controls, fuzz/oracle comparisons, and the LinearLite seeder tests. |
+| Native API focused review gates | **Pass** | Rust HTTP endpoint tests passed 21/21; API REST/server tests passed 2 files / 6 tests. Independent Sol-high review passed the typed 400 mapping for unknown table/output columns and the canonical-Axum-vs-gateway dispatch contract. |
+| Testing skill validation | **Pass** | `uv run --with pyyaml python /Users/bozilabs/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/skills/electric-circuits-testing` completed successfully. |
+| Electric external oracle | **Not rerun on this exact candidate** | The full repository suite includes the in-repo oracle comparisons, but the separate `electric-conformance/run.sh oracle` lane was not rerun. No exact-candidate external-oracle claim is made. |
 
-## Force-purge contract mismatch
+## Resolved prior baseline failure
 
-This is not treated as a flaky test:
-
-- `apps/engine/src/engine/lifecycle.rs::purge_shape_inner` deliberately removes the engine record,
-  waits for durable `Dropped`, then spawns `finish_purge`; its documentation says the stream may still
-  be deleting when the HTTP call returns.
-- `packages/conformance/src/conformance-retention.test.ts` and the HTTP handler documentation describe
-  `purge=true` as immediate/full teardown and assert a 404 stream immediately after the response.
-
-The implementation, endpoint promise, and test must choose one contract. A production API must not
-answer ambiguously: either wait for `Retired`/confirmed delete before returning success, or return an
-accepted/pending result and provide a durable completion/status contract. The reviewed specification
-chooses terminal success only after retirement completion in `ENG-014`.
+The 2026-08-22 baseline recorded a deterministic force-purge mismatch: the engine record was gone
+when `DELETE /shapes/{id}?purge=true` returned, but the backing durable stream could still exist. The
+current integrated history includes the terminal-retirement completion fix, and the full retention
+and retirement-completion conformance suites now pass, including immediate purge visibility,
+long-poll release, crash recovery, and non-reuse of a still-retiring shape ID.
 
 ## What this baseline does not establish
 
-- No security penetration, production TLS/gateway, backup/restore, failover, capacity, or migration
-  workload was run.
-- No Electric external conformance result is claimed because Elixir/Mix is absent.
-- A green Rust/Swift baseline does not override the deterministic Vitest failure or any static
-  production-readiness finding.
+- It does not substitute for the generated production-readiness profile closure or immutable
+  qualification evidence required by `notes/18-production-readiness-spec-reviewed.md`.
+- No production gateway/authentication, TLS, backup/restore, capacity, or multi-node failover profile
+  is claimed by this run.
+- The native API's payload-limit `413` response is still a documented non-blocking hardening item: an
+  oversized Axum body currently uses the framework's plain-text envelope rather than the native JSON
+  error envelope.
+- The Indexed Today/Calendar iOS prototype is being qualified separately in its own repository and
+  worktree; this server baseline is not evidence that the app integration is complete.

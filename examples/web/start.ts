@@ -17,6 +17,7 @@ import pgpkg from 'pg'
 import { createServer as createViteServer, type Plugin, type ViteDevServer } from 'vite'
 
 import { schema } from './src/schema.js'
+import { type Postgres18Tools, postgres18Tools } from '../../scripts/postgres18.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
@@ -34,6 +35,7 @@ const SLOT = 'electric_circuits_web'
 let pgDir: string | undefined
 let pgData: string | undefined
 let pg: pgpkg.Client | undefined
+let pgTools: Postgres18Tools | undefined
 let ds: DurableStreamTestServer | undefined
 let engineProc: ChildProcess | undefined
 let api: ApiServer | undefined
@@ -53,7 +55,7 @@ async function shutdown(code = 0): Promise<void> {
   }
   if (pgData) {
     try {
-      execFileSync('pg_ctl', ['-D', pgData, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
+      pgTools && execFileSync(pgTools.pgCtl, ['-D', pgData, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
     } catch {
       /* already down */
     }
@@ -95,9 +97,10 @@ let maxId = 0
 
 try {
   // --- 1. Ephemeral Postgres with logical replication ----------------------------------------------
+  pgTools = postgres18Tools()
   pgDir = mkdtempSync(join(tmpdir(), 'el-web-pg-'))
   pgData = join(pgDir, 'data')
-  execFileSync('initdb', ['-D', pgData, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
+  execFileSync(pgTools.initdb, ['-D', pgData, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
   let pgPort = 0
   let pgStarted = false
   for (let attempt = 0; attempt < 8 && !pgStarted; attempt++) {
@@ -108,7 +111,7 @@ try {
         `listen_addresses = '127.0.0.1'\nunix_socket_directories = '/tmp'\nport = ${pgPort}\nfsync = off\n`,
     )
     try {
-      execFileSync('pg_ctl', ['-D', pgData, '-l', join(pgDir, 'log'), '-w', 'start'], { stdio: 'ignore' })
+      execFileSync(pgTools.pgCtl, ['-D', pgData, '-l', join(pgDir, 'log'), '-w', 'start'], { stdio: 'ignore' })
       pgStarted = true
     } catch {
       /* port in use; retry */

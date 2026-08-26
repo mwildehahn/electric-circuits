@@ -53,13 +53,22 @@ describe('REST adapter', () => {
     server = undefined
   })
 
+  it('does not claim the canonical native /v1 prefix', async () => {
+    const core = fakeCore()
+    const listening = await listen(core)
+    server = listening.server
+    const response = await fetch(`${listening.url}/v1/shapes`, { method: 'POST', body: '{}' })
+    expect(response.status).toBe(404)
+    expect(core.createShape).not.toHaveBeenCalled()
+  })
+
   it('passes the canonical predicate through shape creation', async () => {
     const core = fakeCore()
     const listening = await listen(core)
     server = listening.server
     const where = { and: [{ col: 'status', op: 'eq', value: 'open' }] }
 
-    const response = await fetch(`${listening.url}/v1/shapes`, {
+    const response = await fetch(`${listening.url}/compat/v1/shapes`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ table: 'issues', where, columns: ['id', 'status'], subscription: 'ios-client' }),
@@ -78,11 +87,11 @@ describe('REST adapter', () => {
     const listening = await listen(core)
     server = listening.server
 
-    const get = await fetch(`${listening.url}/v1/shapes/s1`)
+    const get = await fetch(`${listening.url}/compat/v1/shapes/s1`)
     expect(get.status).toBe(200)
     expect(await get.json()).toEqual(handle)
 
-    const deleted = await fetch(`${listening.url}/v1/shapes/s1?subscription=ios-client`, { method: 'DELETE' })
+    const deleted = await fetch(`${listening.url}/compat/v1/shapes/s1?subscription=ios-client`, { method: 'DELETE' })
     expect(deleted.status).toBe(204)
     expect(core.dropShape).toHaveBeenCalledWith('s1', 'ios-client')
   })
@@ -93,7 +102,7 @@ describe('REST adapter', () => {
     const listening = await listen(core)
     server = listening.server
 
-    const invalid = await fetch(`${listening.url}/v1/shapes`, {
+    const invalid = await fetch(`${listening.url}/compat/v1/shapes`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ columns: ['id'] }),
@@ -101,7 +110,7 @@ describe('REST adapter', () => {
     expect(invalid.status).toBe(400)
     expect(((await invalid.json()) as { code: string }).code).toBe('invalid_argument')
 
-    const missing = await fetch(`${listening.url}/v1/shapes/missing`)
+    const missing = await fetch(`${listening.url}/compat/v1/shapes/missing`)
     expect(missing.status).toBe(404)
     expect(((await missing.json()) as { code: string }).code).toBe('not_found')
   })

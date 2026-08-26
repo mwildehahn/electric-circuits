@@ -116,7 +116,7 @@ metadata and the shared inner sets. Full design:
 
 ## Try it
 
-Requirements: Node ≥ 22, pnpm 10, Rust stable, and PostgreSQL 16 binaries on `PATH`
+Requirements: Node ≥ 22, pnpm 10, Rust stable, and PostgreSQL 18 binaries on `PATH`
 (`initdb`/`pg_ctl` — the demos boot their own ephemeral cluster).
 
 ```bash

@@ -37,7 +37,7 @@ Comparison (`src/compare.ts`) is set equality over declared columns, keyed by st
 
 ## Running
 
-Requires PostgreSQL 16 binaries on `PATH` (`initdb`/`pg_ctl`) — the suite boots its own cluster.
+Requires PostgreSQL 18 binaries on `PATH` (`initdb`/`pg_ctl`) — the suite boots its own cluster.
 From the repo root:
 
 ```bash

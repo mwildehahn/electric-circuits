@@ -29,6 +29,8 @@ const execFileP = promisify(execFile)
 import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import pgpkg from 'pg'
 
+import { postgres18Tools } from '../../../scripts/postgres18.js'
+
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
   let d = here
@@ -71,11 +73,12 @@ const MIB = 1024 * 1024
 // --- infra (same shapes as shape-mem-matrix) ---------------------------------------------------
 
 function bootPgSimple(): { pgUrl: string; dir: string; port: number } {
+  const postgres = postgres18Tools()
   const dir = mkdtempSync(join(tmpdir(), 'el-scale-pg-'))
   const dataDir = join(dir, 'data')
-  execFileSync('initdb', ['-D', dataDir, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
+  execFileSync(postgres.initdb, ['-D', dataDir, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
   const port = 20000 + Math.floor(Math.random() * 20000)
-  execFileSync('pg_ctl', ['-D', dataDir, '-o', `-p ${port} -c listen_addresses=127.0.0.1 -c wal_level=logical -c fsync=off -c synchronous_commit=off -c max_wal_senders=8 -c max_replication_slots=8`, '-w', 'start'], { stdio: 'ignore' })
+  execFileSync(postgres.pgCtl, ['-D', dataDir, '-o', `-p ${port} -c listen_addresses=127.0.0.1 -c wal_level=logical -c fsync=off -c synchronous_commit=off -c max_wal_senders=8 -c max_replication_slots=8`, '-w', 'start'], { stdio: 'ignore' })
   return { pgUrl: `postgres://postgres@127.0.0.1:${port}/postgres`, dir, port }
 }
 
@@ -440,7 +443,7 @@ async function main() {
   for (const p of liveProcs) p.kill('SIGKILL')
   engine.proc.kill('SIGKILL')
   await client.end()
-  try { execFileSync('pg_ctl', ['-D', join(pg.dir, 'data'), '-m', 'immediate', 'stop'], { stdio: 'ignore' }) } catch {}
+  try { execFileSync(postgres18Tools().pgCtl, ['-D', join(pg.dir, 'data'), '-m', 'immediate', 'stop'], { stdio: 'ignore' }) } catch {}
   rmSync(pg.dir, { recursive: true, force: true })
   await ds.stop()
 }

@@ -2,7 +2,7 @@
 
 Status: **research and reviewed execution specification complete**
 
-As-of date: 2026-08-23
+As-of date: 2026-08-25
 
 The canonical deliverable is
 [`18-production-readiness-spec-reviewed.md`](18-production-readiness-spec-reviewed.md). It defines 169
@@ -37,6 +37,13 @@ Current command/test evidence is in [`17-validation-baseline.md`](17-validation-
   chunk/checkpoint boundary receives explicit 199/200/201/400/maximum crash tests.
 - Rollout advancement is based on fixed mutations, lifecycle/reset operations, per-template event
   floors and enumerated fault cuts—not elapsed-day monitoring.
+- The reusable Swift library has a separate direct-native profile: no gateway is required for the
+  library/example milestone, but cursor/materialization atomicity, scope isolation, mobile lifecycle,
+  provider migrations, optimistic identity, restart/reconnect, and epoch rehydration must be proven.
+- Durable-stream storage is a private provider port, not a ds-rust engine dependency. Target and
+  qualify only the owned ds-rust server for the first narrow production profile; second-provider
+  implementation is deferred. A provider generation is fixed for an engine epoch and can only
+  change through an explicit reset/re-snapshot or a separately proven offline migration.
 
 ## Execution packet inventory
 
@@ -83,6 +90,8 @@ from its generated ready set rather than from section order.
 | [`23-swift-app-e2e-tdd-map.md`](23-swift-app-e2e-tdd-map.md) | Swift/package/real-app scenario inventory and TDD order |
 | [`24-postgres18-and-e2e-tdd-addendum.md`](24-postgres18-and-e2e-tdd-addendum.md) | **Integrated PG18 decision, stable E2E cases and new execution packets** |
 | [`25-pg18-e2e-differential-review-disposition.md`](25-pg18-e2e-differential-review-disposition.md) | **PG18/E2E differential finding→task/exclusion traceability** |
+| [`28-swift-library-production-readiness-punchlist.md`](28-swift-library-production-readiness-punchlist.md) | **Direct-native Swift library production punchlist and integration-test matrix** |
+| [`29-durable-stream-provider-evaluation.md`](29-durable-stream-provider-evaluation.md) | **Generic provider boundary, ds-rust target and TDD qualification matrix; PicoMQ research deferred** |
 
 ## Independent differential reviews
 
