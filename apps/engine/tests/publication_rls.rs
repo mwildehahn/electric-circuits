@@ -8,7 +8,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::Engine;
+use electric_circuits_engine::engine::{Engine, PostgresSetup};
 use electric_circuits_engine::{
     pg,
     table_ref::{TableRef, TableSelector},
@@ -115,6 +115,56 @@ async fn setup_refuses_rls_before_creating_publication() -> anyhow::Result<()> {
         .batch_execute(&format!(
             "drop table if exists public.{table_name}; \
              select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '{slot}';"
+        ))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real PostgreSQL instance via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+async fn externally_managed_setup_validates_without_mutating_replica_identity() -> anyhow::Result<()> {
+    let url = std::env::var("ELECTRIC_CIRCUITS_TEST_PG_URL")?;
+    let client = pg::connect(&url).await?;
+    let table_name = format!("circuits_managed_{}", std::process::id());
+    let slot = format!("circuits_managed_{}", std::process::id());
+    let publication = format!("{slot}_pub");
+    client
+        .batch_execute(&format!(
+            "drop publication if exists {publication}; \
+             select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '{slot}'; \
+             drop table if exists public.{table_name}; \
+             create table public.{table_name} (id integer primary key); \
+             create publication {publication} for table public.{table_name}"
+        ))
+        .await?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let ds_url = format!("http://{}", listener.local_addr()?);
+    let app = Router::new().fallback(empty_ds).with_state(DsProbe::default());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let engine = Engine::new_pg_with_setup(DsClient::new(&ds_url), url.clone(), PostgresSetup::ExternallyManaged);
+    let table = TableRef::new("public", &table_name)?;
+    let error = engine
+        .setup_postgres(&[TableSelector::One(table)], &slot)
+        .await
+        .expect_err("the host must provision FULL identity before activation");
+    let replident: String = client
+        .query_one(
+            "select relreplident::text from pg_class where oid = $1::regclass",
+            &[&format!("public.{table_name}")],
+        )
+        .await?
+        .get(0);
+    assert_eq!(replident, "d", "Engine must not acquire DDL ownership");
+    assert!(format!("{error:#}").contains("must already use REPLICA IDENTITY FULL"));
+
+    client
+        .batch_execute(&format!(
+            "select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '{slot}'; \
+             drop publication if exists {publication}; \
+             drop table if exists public.{table_name}"
         ))
         .await?;
     Ok(())
