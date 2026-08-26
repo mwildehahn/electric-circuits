@@ -693,11 +693,46 @@ async fn create_shape(
     State(engine): State<Engine>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
+    // Degradation outranks request validation: a degraded engine cannot safely answer for any
+    // membership request, even one whose table name is invalid.
+    engine.ensure_not_degraded()?;
+    validate_create_shape_request(&engine, &req).await?;
     let subscription = validate_new_subscription(req.subscription)?;
     // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
     let (rec, sub) =
         engine.create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription).await?;
     Ok(Json(ShapeResp::created(&engine, rec, sub)))
+}
+
+enum CreateShapeRequestError {
+    UnknownTable(TableRef),
+    UnknownColumn { table: TableRef, column: String },
+}
+
+impl CreateShapeRequestError {
+    fn into_app_error(self) -> AppError {
+        let msg = match self {
+            Self::UnknownTable(table) => format!("unknown table '{table}'"),
+            Self::UnknownColumn { table, column } => format!("unknown column '{column}' on table '{table}'"),
+        };
+        AppError { status: StatusCode::BAD_REQUEST, msg }
+    }
+}
+
+/// Reject deterministic, caller-controlled schema-name errors before shape creation can acquire a
+/// subscription or perform durable-stream work. Generic engine errors remain internal failures.
+async fn validate_create_shape_request(engine: &Engine, req: &CreateShapeReq) -> Result<(), AppError> {
+    let table = engine
+        .table_schema(&req.table)
+        .await
+        .ok_or_else(|| CreateShapeRequestError::UnknownTable(req.table.clone()).into_app_error())?;
+    for column in req.columns.as_deref().into_iter().flatten() {
+        if !table.index.contains_key(column) {
+            return Err(CreateShapeRequestError::UnknownColumn { table: req.table.clone(), column: column.clone() }
+                .into_app_error());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]

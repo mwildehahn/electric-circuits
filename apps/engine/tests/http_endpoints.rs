@@ -197,6 +197,39 @@ async fn malformed_native_json_uses_documented_error_contract() {
     }
 }
 
+/// Semantic request errors are client-correctable native API errors, not internal failures. The
+/// router must preserve both the documented status and the JSON error contract before shape
+/// creation can allocate a subscription or touch durable-streams state.
+#[tokio::test]
+async fn native_shape_rejects_unknown_schema_names_with_documented_error_contract() {
+    let (engine, stop) = feed_engine().await;
+    let cases = [
+        (r#"{"table":"missing"}"#, serde_json::json!({ "error": "unknown table 'public.missing'" })),
+        (
+            r#"{"table":"items","columns":["missing"]}"#,
+            serde_json::json!({ "error": "unknown column 'missing' on table 'public.items'" }),
+        ),
+    ];
+    for (body, expected) in cases {
+        let res = router(engine.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/shapes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+        assert_eq!(body, expected);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let _ = stop.send(());
+}
+
 #[tokio::test]
 async fn electric_shape_extractor_rejection_keeps_compatibility_body() {
     let res = router(library_engine())

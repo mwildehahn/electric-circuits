@@ -56,7 +56,7 @@ describe('API server dispatch', () => {
     engine = undefined
   })
 
-  it('routes compat/v1 through REST while leaving canonical /v1 to tRPC', async () => {
+  it('routes compat/v1 through REST while leaving canonical /v1 unclaimed by REST', async () => {
     const listening = await listenEngine()
     engine = listening.server
     api = await createApiServer({ dsUrl: listening.url, engineUrl: listening.url })
@@ -69,8 +69,12 @@ describe('API server dispatch', () => {
     expect(compat.status).toBe(200)
     expect(await compat.json()).toEqual(handle)
 
-    const canonical = await fetch(`${api.url}/v1/shapes`, { method: 'POST', body: '{}' })
-    expect(canonical.status).toBe(415)
+    const canonical = await fetch(`${api.url}/v1/shapes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    expect(canonical.status).toBe(404)
     expect(listening.requests).toEqual(['POST /v1/shapes'])
   })
 
