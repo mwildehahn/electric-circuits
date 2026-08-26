@@ -92,6 +92,7 @@ from its generated ready set rather than from section order.
 | [`25-pg18-e2e-differential-review-disposition.md`](25-pg18-e2e-differential-review-disposition.md) | **PG18/E2E differential finding→task/exclusion traceability** |
 | [`28-swift-library-production-readiness-punchlist.md`](28-swift-library-production-readiness-punchlist.md) | **Direct-native Swift library production punchlist and integration-test matrix** |
 | [`29-durable-stream-provider-evaluation.md`](29-durable-stream-provider-evaluation.md) | **Generic provider boundary, ds-rust target and TDD qualification matrix; PicoMQ research deferred** |
+| [`30-swift-collection-framework.md`](30-swift-collection-framework.md) | Provider-neutral collection/demand/materialization terminology and Swift store framework proposal |
 
 ## Independent differential reviews
 
