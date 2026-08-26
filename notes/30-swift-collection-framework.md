@@ -386,6 +386,21 @@ Snapshot replacement must be scoped to one materialization. If an October refres
 remove October's claim; it may not delete a row still claimed by September, Today or another assignee
 view. Failed or cancelled loads do not replace prior successful coverage with an empty result.
 
+A live shape `delete` means "this key is no longer a member of this materialization"; it does not say
+whether the source row was deleted, moved outside the predicate or left the authorization scope. This
+matters when an inactive overlapping materialization still claims the old canonical row: merely
+releasing the active claim can leave stale field values that still satisfy the application's direct
+GRDB predicate. Production observation must close that gap in one of two proved ways:
+
+1. enrich/resolve the leave against the collection's base authorization scope, atomically updating
+   the canonical row when it still exists and removing every claim when it no longer exists; or
+2. make active-view observation join the demanded materialization's current row claims instead of
+   treating every retained canonical row as active membership.
+
+The current prototype does neither yet. Row-claim retention is therefore cache/storage evidence, not
+by itself a proof that direct canonical-table predicates remain exact across inactive overlapping
+windows.
+
 ## Demand and coverage rules
 
 Do not build a general predicate theorem prover or import TanStack's internal DNF machinery for v1.
@@ -485,17 +500,20 @@ The framework should be built from public high-level contracts in this order:
 3. Two disjoint windows: one canonical domain table, two materializations, correct union of rows.
 4. Two overlapping windows: one canonical row, two row claims; releasing or refreshing one cannot
    remove the other's row.
-5. Cancelled/failed refresh: prior successful rows and coverage survive; cursor does not advance.
-6. Atomic crash/replay: rows, claims and cursor advance together and replay idempotently.
-7. Cached revisit: cached rows render first, then refresh/renew reaches live state.
-8. Account switch/generation reset: old private rows, claims, cursors and optimistic overlays cannot
+5. Overlapping-window move-out: keep one overlap inactive, move a row out of the active predicate,
+   and prove the active local query stops returning it before its applied cursor advances; cover both
+   surviving-base-row and actual-delete/authorization-loss outcomes.
+6. Cancelled/failed refresh: prior successful rows and coverage survive; cursor does not advance.
+7. Atomic crash/replay: rows, claims and cursor advance together and replay idempotently.
+8. Cached revisit: cached rows render first, then refresh/renew reaches live state.
+9. Account switch/generation reset: old private rows, claims, cursors and optimistic overlays cannot
    leak into the new scope.
-9. Ordered top-N: an insertion, update, deletion or move across the boundary produces the same final
+10. Ordered top-N: an insertion, update, deletion or move across the boundary produces the same final
    local result as an independent PostgreSQL query, including refill.
-10. Optimistic UUIDv4 insert: overlay appears immediately and reconciles exactly once with the
+11. Optimistic UUIDv4 insert: overlay appears immediately and reconciles exactly once with the
     authoritative stream event.
-11. Store portability: run the same coordinator contracts against in-memory and GRDB providers.
-12. Entity portability: register `issues` after `calendarEvents` without adding framework schema or
+12. Store portability: run the same coordinator contracts against in-memory and GRDB providers.
+13. Entity portability: register `issues` after `calendarEvents` without adding framework schema or
     lifecycle code.
 
 These tests observe collection demand, local rows and public load state. They should not assert private
