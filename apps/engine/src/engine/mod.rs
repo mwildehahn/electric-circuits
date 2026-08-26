@@ -182,6 +182,11 @@ pub struct Engine {
     /// Postgres connection string when running in Postgres mode (logical replication + query-back
     /// backfill, no in-memory `table_state`). `None` keeps the engine usable only as a library shell.
     pg_url: Option<String>,
+    /// Which authority owns PostgreSQL publication and replica-identity
+    /// mutation for this source. Hosted control planes provision those
+    /// objects before handing the narrowed source to the Engine, so the
+    /// Engine validates them without acquiring DDL authority.
+    postgres_setup: PostgresSetup,
     /// Last commit LSN the replication ingestor has appended (observability).
     repl_lsn: Arc<std::sync::Mutex<String>>,
     /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended. The drain barrier
@@ -284,6 +289,18 @@ pub struct Engine {
     /// (ADR-0008). The counter alone would not do: the catalog outlives the process, so a restart
     /// would re-mint ids a restored shape still holds.
     sub_nonce: Arc<str>,
+}
+
+/// PostgreSQL authority boundary selected when a source Engine is composed.
+///
+/// The standalone binary preserves its historical self-provisioning behavior.
+/// Multi-source hosts instead select `ExternallyManaged` after their trusted
+/// control plane has reconciled the exact publication, slot, and identities.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PostgresSetup {
+    #[default]
+    EngineManaged,
+    ExternallyManaged,
 }
 
 pub(crate) struct PurgeBarrier {
@@ -850,19 +867,26 @@ fn sid_of_path(stream_path: &str) -> &str {
 
 impl Engine {
     pub fn new(ds: DsClient) -> Self {
-        Self::new_inner(ds, None)
+        Self::new_inner(ds, None, PostgresSetup::EngineManaged)
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
     /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
     pub fn new_pg(ds: DsClient, pg_url: String) -> Self {
-        let e = Self::new_inner(ds, Some(pg_url));
+        Self::new_pg_with_setup(ds, pg_url, PostgresSetup::EngineManaged)
+    }
+
+    /// Engine in Postgres mode where a trusted control plane owns DDL.
+    /// `setup_postgres` validates the exact existing publication and replica
+    /// identity rather than trying to broaden the Engine's database grants.
+    pub fn new_pg_with_setup(ds: DsClient, pg_url: String, setup: PostgresSetup) -> Self {
+        let e = Self::new_inner(ds, Some(pg_url), setup);
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
     }
 
-    fn new_inner(ds: DsClient, pg_url: Option<String>) -> Self {
+    fn new_inner(ds: DsClient, pg_url: Option<String>, postgres_setup: PostgresSetup) -> Self {
         let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), pg_url.clone())));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
@@ -911,6 +935,7 @@ impl Engine {
                 next_minted_sub: 1,
             })),
             pg_url,
+            postgres_setup,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1343,7 +1368,9 @@ impl Engine {
         // obtained do we perform the Postgres setup writes. A busy, foreign, lost, or mismatched
         // slot therefore cannot cause publication/identity mutation before boot refuses or parks.
         let publication = format!("{slot}_pub");
-        crate::pg::ensure_publication(&client, &publication).await?;
+        if self.postgres_setup == PostgresSetup::EngineManaged {
+            crate::pg::ensure_publication(&client, &publication).await?;
+        }
         let pubinfo = crate::pg::inspect_publication(&client, &publication, &tables).await?;
         crate::pg::set_publish_generated(pubinfo.publish_generated);
         if pubinfo.publish_generated {
@@ -1355,8 +1382,18 @@ impl Engine {
             // includes `relreplident`, and reading it before the ALTER would record the pre-boot
             // identity — which the ingestor's first `Relation` message would then report as drift
             // on every single boot (ADR-0005).
-            crate::pg::ensure_replica_identity_full(&client, t).await?;
+            if self.postgres_setup == PostgresSetup::EngineManaged {
+                crate::pg::ensure_replica_identity_full(&client, t).await?;
+            }
             let def = crate::pg::introspect(&client, t).await?;
+            if self.postgres_setup == PostgresSetup::ExternallyManaged
+                && def
+                    .fingerprint
+                    .as_ref()
+                    .is_none_or(|fingerprint| fingerprint.replident != crate::schema::REPLICA_IDENTITY_FULL)
+            {
+                bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
+            }
             let ts = TableSchema::from_def(t, &def)?;
             compiled.insert(t.clone(), ts);
         }
