@@ -9,6 +9,7 @@ export const schema: Schema = {
     issues: {
       columns: {
         id: { type: 'int' },
+        client_id: { type: 'text' }, // client-generated UUIDv4 for optimistic-write reconciliation
         title: { type: 'text' },
         description: { type: 'text' },
         status: { type: 'text' }, // STATUSES below

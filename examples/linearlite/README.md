@@ -29,6 +29,23 @@ in Postgres mode, durable-streams, the API, and Vite. Open the printed Local URL
 |---|---|---|
 | `DEMO_SEED_COUNT` | `512` | Number of issues to generate (faker), matching the upstream default. ~50% get one comment. |
 
+### Insert live tasks while the demo is running
+
+The startup log prints the throwaway Postgres URL (`postgres → ...`). Copy it into
+`DATABASE_URL` and run the bounded seeder from another terminal:
+
+```sh
+DATABASE_URL='postgres://postgres@127.0.0.1:<port>/postgres' \
+  pnpm linearlite:seed -- --count 3 --title-prefix 'Swift handoff' --status todo --priority high
+```
+
+`--count` is required and limited to 1,000. `--project <id>` selects an existing project;
+otherwise the first project with a member is used, and that member is assigned so the issue is
+visible to a connected user. Status and priority accept the values shown by `--help`.
+Issue IDs come from Postgres's identity sequence (safe alongside browser writes); timestamps are
+monotonic within the batch. The command prints only the inserted IDs and never echoes the connection
+string or credentials. `LINEARLITE_DATABASE_URL` may be used instead of `DATABASE_URL`.
+
 ## What it shows
 
 - **List view** — issues filtered by the engine. The status/priority filter builds a shape predicate
