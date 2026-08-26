@@ -1,6 +1,6 @@
 # Swift collection framework for Electric Circuits
 
-Status: **design proposal; not an implemented or qualified production contract**
+Status: **prototype core implemented; not a qualified production contract**
 
 As-of date: 2026-08-26
 
@@ -263,10 +263,11 @@ and makes schema drift a build/test failure instead of a dynamic lookup failure.
 8. Account/principal changes cancel observations and leases, purge private rows and metadata, and never
    render the prior principal's cached rows.
 
-The current Indexed prototype implements this initial typed-AST slice in `ServicesElectric`. It is a
-validation vehicle, not the final package boundary. Extraction belongs in the provider-neutral
-`ElectricCircuitsCollections` layer after the value grammar, error model and schema-generation choice
-are exercised by a second entity.
+`ElectricCircuitsCollections` now owns the typed AST, demand identity, exact-demand coordinator,
+lease lifecycle, Circuits subset source and in-memory reference store. Indexed owns the first GRDB
+provider and its Calendar Today/Full Day integration. This remains a validation vehicle: a second
+entity, account-generation reset and a SwiftUI query wrapper are still required before treating the
+package boundary as stable.
 
 ## Framework layers
 
@@ -404,7 +405,9 @@ an uncertain equivalence must cause a redundant fetch rather than false coverage
 A live feed alone never proves ordered/limited coverage. For a top-N demand, the materialization stays
 live only if the client or server maintains the ordered window, including refill when an unchanged row
 crosses the boundary. The existing snapshot-plus-feed-and-refresh approach is a valid simple
-materialization strategy.
+materialization strategy only when it performs that bounded refresh. The current
+`CircuitsSubsetSource` therefore rejects limited live demands before creating a server resource; use
+the one-shot subset API for a limited snapshot until a top-N-maintaining adapter lands.
 
 ## Lifecycle semantics
 
@@ -506,15 +509,15 @@ shape IDs, retry counts, task structure or log text.
   materialization metadata and row claims. Migration should rename/consolidate their concepts rather
   than recreate calendar-specific tables.
 - `ElectricCircuitsSwift.MaterializationScope`, `StreamCursor`, `ShapeMaterializer` and
-  `ShapeSubscriptionCoordinator` are useful low-level primitives. They are not yet the high-level
-  collection/demand/lease framework.
+  `ShapeSubscriptionCoordinator` remain low-level primitives. The separate
+  `ElectricCircuitsCollections` product now supplies the higher-level collection/demand/lease layer.
 - The TypeScript Circuits client currently exposes a separate TanStack collection for each shape or
   subset call. It is a protocol reference, not yet the desired stable business-scoped collection
   facade.
 
-## Recommended implementation boundary
+## Implemented prototype boundary
 
-Add a provider-neutral `ElectricCircuitsCollections` layer with:
+The provider-neutral `ElectricCircuitsCollections` layer now contains:
 
 - `CollectionDefinition<Model, Key>`;
 - `CollectionDemand<Model>`;
