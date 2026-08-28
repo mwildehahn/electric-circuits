@@ -123,6 +123,9 @@ pub(crate) enum CatalogEvent {
         table: TableRef,
         fingerprint: crate::schema::SchemaFingerprint,
     },
+    /// Durable deployment-handoff receipt. It is appended only after the sequencer processed the
+    /// complete source transaction and every direct and deferred shape append caused by it landed.
+    SourceDrained(SourceDrainReceipt),
     /// The engine created (or first adopted) its replication slot: the **epoch** every shape after
     /// this point in the log belongs to (ADR-0004). The LAST one wins — a reset appends a new one
     /// after the `Dropped` records of the epoch it ended, so a fold reads "these shapes, in this
@@ -197,6 +200,7 @@ struct CatalogSend {
 #[derive(Clone)]
 pub(crate) struct CatalogWriter {
     tx: mpsc::UnboundedSender<CatalogSend>,
+    shutdown: crate::shutdown::ShutdownToken,
     in_flight: Arc<std::sync::atomic::AtomicI64>,
     /// This process's half of every `eid` it mints: a boot nonce, so two engines writing to the
     /// same catalog (a restart, or the same storage adopted by another process) can never mint the
@@ -228,7 +232,10 @@ impl CatalogWriter {
     /// use [`Self::send_durable`] instead: an acknowledged mutation the durable record does not
     /// contain is a shape that vanishes at the next restart.
     pub(crate) fn send(&self, ev: CatalogEvent) {
-        self.enqueue(ev, None);
+        if !self.enqueue(ev, None) {
+            tracing::error!("durable catalog writer stopped before accepting an event; beginning fail-closed shutdown");
+            self.shutdown.begin();
+        }
     }
 
     /// Enqueue an event and hand back a future that resolves once it has **landed in storage**.
@@ -237,43 +244,74 @@ impl CatalogWriter {
     /// log order still matches the state-mutation order; only the WAIT moves to the caller's own
     /// await point (after the lock is released, immediately before it answers its client).
     ///
-    /// It always resolves or the process exits: the writer retries a transient failure forever and
-    /// exits [`EXIT_CATALOG_REFUSED`] on a definite refusal. There is deliberately no timeout — a
-    /// create while storage is down waits, because the alternative is telling a client about a shape
-    /// that will not exist after a restart. The client has its own timeout; if it gives up and the
-    /// record lands anyway, the shape has no subscriber and retention evicts it.
-    pub(crate) fn send_durable(&self, ev: CatalogEvent) -> impl std::future::Future<Output = ()> + Send + 'static {
+    /// It resolves successfully only after the append lands. The writer retries a transient failure
+    /// forever and exits [`EXIT_CATALOG_REFUSED`] on a definite refusal; if the writer task itself is
+    /// lost, the typed error prevents any caller from manufacturing durability. There is deliberately
+    /// no timeout — a create while storage is down waits, because the alternative is telling a client
+    /// about a shape that will not exist after a restart.
+    pub(crate) fn send_durable(
+        &self,
+        ev: CatalogEvent,
+    ) -> impl std::future::Future<Output = std::result::Result<(), CatalogWriterGone>> + Send + 'static {
         let (done, wait) = tokio::sync::oneshot::channel();
-        self.enqueue(ev, Some(done));
+        let queued = self.enqueue(ev, Some(done));
+        let shutdown = self.shutdown.clone();
         async move {
-            // An `Err` means the writer task is gone, i.e. the process is on its way out; there is
-            // nothing better to do than let the caller finish.
-            let _ = wait.await;
+            if !queued {
+                tracing::error!(
+                    "durable catalog writer stopped before accepting an acknowledged append; beginning fail-closed shutdown"
+                );
+                shutdown.begin();
+                return Err(CatalogWriterGone);
+            }
+            wait.await.map_err(|_| {
+                tracing::error!(
+                    "durable catalog writer stopped before acknowledging an append; beginning fail-closed shutdown"
+                );
+                shutdown.begin();
+                CatalogWriterGone
+            })
         }
     }
 
     /// Assign the event's `eid` and queue it. The id is minted HERE, once, so a retry-in-place
     /// re-appends the same identity — the fold then applies it exactly once however many copies of
     /// the record a lost response left in the log (ADR-0008).
-    fn enqueue(&self, ev: CatalogEvent, done: Option<tokio::sync::oneshot::Sender<()>>) {
+    fn enqueue(&self, ev: CatalogEvent, done: Option<tokio::sync::oneshot::Sender<()>>) -> bool {
         let n = self.next_eid.fetch_add(1, Ordering::SeqCst);
         let eid = format!("{}-{n:x}", self.eid_nonce);
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         if self.tx.send(CatalogSend { ev, seq: n, eid, done }).is_err() {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            false
+        } else {
+            true
         }
     }
 
     /// Wait until every event enqueued before this call is durable. Used by an idempotent retry
     /// whose first request already changed memory and is still waiting on its own catalog append.
-    pub(crate) async fn wait_durable(&self) {
+    pub(crate) async fn wait_durable(&self) -> std::result::Result<(), CatalogWriterGone> {
         let target = self.next_eid.load(Ordering::SeqCst).saturating_sub(1);
         loop {
             let notified = self.landed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.landed_seq.load(Ordering::SeqCst) >= target {
-                return;
+                return Ok(());
             }
-            notified.await;
+            if self.shutdown.is_shutting_down() {
+                return Err(CatalogWriterGone);
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = self.shutdown.wait() => {
+                    if self.landed_seq.load(Ordering::SeqCst) >= target {
+                        return Ok(());
+                    }
+                    return Err(CatalogWriterGone);
+                }
+            }
         }
     }
 
@@ -324,6 +362,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
     let writer_landed_seq = landed_seq.clone();
     let landed_notify = Arc::new(tokio::sync::Notify::new());
     let writer_landed_notify = landed_notify.clone();
+    let writer_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut ensured = false;
         // Latches the "catalog stream create failed" line to once per outage (see
@@ -416,6 +455,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
     });
     CatalogWriter {
         tx,
+        shutdown: writer_shutdown,
         in_flight,
         durable,
         eid_nonce: process_nonce(),
@@ -466,6 +506,7 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
         CatalogEvent::ChangesRotated { .. } => "changesRotated",
         CatalogEvent::ChangesSegmentDeleted { .. } => "changesSegmentDeleted",
         CatalogEvent::SchemaChanged { .. } => "schemaChanged",
+        CatalogEvent::SourceDrained(_) => "sourceDrained",
         CatalogEvent::SlotBound(_) => "slotBound",
     }
 }
@@ -518,6 +559,10 @@ impl std::fmt::Display for CatalogStoreBindingError {
 }
 
 impl std::error::Error for CatalogStoreBindingError {}
+
+#[derive(Debug, thiserror::Error)]
+#[error("durable catalog writer stopped before acknowledging the append")]
+pub(crate) struct CatalogWriterGone;
 
 fn validate_store_binding(events: &[serde_json::Value], expected: &crate::store_identity::StoreBound) -> Result<()> {
     let Some(first) = events.first() else {
@@ -763,6 +808,10 @@ pub(crate) struct CatalogFold {
     /// The last `SlotBound`: the epoch these shapes belong to. `None` = nothing ever claimed one,
     /// which is a genuine first boot.
     pub(crate) binding: Option<crate::engine::epoch::SlotBinding>,
+    /// Durable source-fence receipts restored independently of shape state. A repeated event for
+    /// the same commit id is idempotent; a controller asks for the exact id it wrote.
+    source_receipts: HashMap<String, SourceDrainReceipt>,
+    last_source_receipt: Option<SourceDrainReceipt>,
     /// Every `eid` this fold has already applied (ADR-0008). The writer retries a failed append in
     /// place, so a response lost after the append committed leaves the SAME event in the log twice;
     /// applying the second copy is exactly the double-count this set exists to prevent.
@@ -781,6 +830,8 @@ impl Default for CatalogFold {
             start_pos: LogPosition::start(),
             start_highwater: None,
             binding: None,
+            source_receipts: HashMap::new(),
+            last_source_receipt: None,
             current_segment: 0,
             segment_starts: std::collections::BTreeMap::new(),
             seen: HashSet::new(),
@@ -872,6 +923,12 @@ impl CatalogFold {
             // Audit only (see the variant): the shapes it explains are already `Dropped`,
             // and the boot's own introspection is the authority on the schema.
             CatalogEvent::SchemaChanged { .. } => {}
+            CatalogEvent::SourceDrained(receipt) => {
+                if !self.source_receipts.contains_key(&receipt.source_commit_id) {
+                    self.source_receipts.insert(receipt.source_commit_id.clone(), receipt.clone());
+                    self.last_source_receipt = Some(receipt);
+                }
+            }
             // The LAST binding is the epoch in force. A reset appends its new one after the
             // `Dropped` records of the epoch it ended, so the two always agree.
             CatalogEvent::SlotBound(binding) => self.binding = Some(binding),
@@ -960,7 +1017,7 @@ impl Engine {
             if !initialize_namespace {
                 return Err(anyhow::Error::new(CatalogStoreBindingError::EmptyWithoutInitialization));
             }
-            self.catalog_tx.send_durable(CatalogEvent::StoreBound(expected.clone())).await;
+            self.catalog_tx.send_durable(CatalogEvent::StoreBound(expected.clone())).await?;
             let written = self.read_catalog_events().await?;
             validate_store_binding(&written, &expected)?;
         } else {
@@ -1062,6 +1119,16 @@ impl Engine {
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
+        // A re-fold can race a receipt appended after its read snapshot. Merge the durable snapshot
+        // instead of replacing live receipts, and preserve the live `last` when the fold did not
+        // contain it; otherwise the fold's last event is the newer durable order authority.
+        let live_last = self.last_source_receipt.lock().unwrap().clone();
+        let preserve_live_last =
+            live_last.as_ref().is_some_and(|receipt| !fold.source_receipts.contains_key(&receipt.source_commit_id));
+        self.source_receipts.lock().unwrap().extend(fold.source_receipts.clone());
+        if !preserve_live_last {
+            *self.last_source_receipt.lock().unwrap() = fold.last_source_receipt.clone().or(live_last);
+        }
         // Resume must prove every retained stream is still appendable before any record, share or
         // sequencer state is installed. Park intentionally skips this: it records old-epoch shapes
         // for the reset's close-then-delete path and must preserve that existing semantics.
@@ -1777,6 +1844,84 @@ mod tests {
         assert!(CatalogFold::default().is_empty());
     }
 
+    #[test]
+    fn source_drain_receipts_are_durable_and_idempotent_by_commit_id() {
+        let first = SourceDrainReceipt {
+            source_commit_id: "018f5f4d-70c2-7d70-a4d5-5f7355078f85".to_string(),
+            commit_lsn: "0/16B6C50".to_string(),
+        };
+        let second = SourceDrainReceipt {
+            source_commit_id: "018f5f4d-70c2-7d70-a4d5-5f7355078f86".to_string(),
+            commit_lsn: "0/16B6D00".to_string(),
+        };
+        let fold = fold_of(vec![
+            CatalogEvent::SourceDrained(first.clone()),
+            CatalogEvent::SourceDrained(first.clone()),
+            CatalogEvent::SourceDrained(second.clone()),
+            CatalogEvent::SourceDrained(first.clone()),
+        ]);
+        assert_eq!(fold.source_receipts.len(), 2);
+        assert_eq!(fold.source_receipts.get(&first.source_commit_id), Some(&first));
+        assert_eq!(fold.source_receipts.get(&second.source_commit_id), Some(&second));
+        assert_eq!(fold.last_source_receipt, Some(second));
+    }
+
+    #[test]
+    fn source_drain_receipt_wire_shape_is_stable() {
+        let receipt = SourceDrainReceipt {
+            source_commit_id: "018f5f4d-70c2-7d70-a4d5-5f7355078f85".to_string(),
+            commit_lsn: "0/16B6C50".to_string(),
+        };
+        let json = serde_json::to_value(CatalogEvent::SourceDrained(receipt.clone())).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "t": "sourceDrained",
+                "sourceCommitId": receipt.source_commit_id,
+                "commitLsn": receipt.commit_lsn,
+            })
+        );
+        match serde_json::from_value::<CatalogEvent>(json).unwrap() {
+            CatalogEvent::SourceDrained(decoded) => assert_eq!(decoded, receipt),
+            _ => panic!("sourceDrained decoded as the wrong catalog event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn source_drain_receipt_restores_even_without_any_shape_state() {
+        let receipt = SourceDrainReceipt {
+            source_commit_id: "018f5f4d-70c2-7d70-a4d5-5f7355078f85".to_string(),
+            commit_lsn: "0/16B6C50".to_string(),
+        };
+        let fold = fold_of(vec![CatalogEvent::SourceDrained(receipt.clone())]);
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+        assert_eq!(engine.source_drain_receipt(&receipt.source_commit_id), Some(receipt.clone()));
+        assert_eq!(engine.last_source_drain_receipt(), Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn stale_catalog_refold_does_not_erase_a_newer_live_source_receipt() {
+        let first = SourceDrainReceipt {
+            source_commit_id: "018f5f4d-70c2-7d70-a4d5-5f7355078f85".to_string(),
+            commit_lsn: "0/16B6C50".to_string(),
+        };
+        let newer = SourceDrainReceipt {
+            source_commit_id: "018f5f4d-70c2-7d70-a4d5-5f7355078f86".to_string(),
+            commit_lsn: "0/16B6D00".to_string(),
+        };
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        engine.source_receipts.lock().unwrap().insert(newer.source_commit_id.clone(), newer.clone());
+        *engine.last_source_receipt.lock().unwrap() = Some(newer.clone());
+
+        let stale_fold = fold_of(vec![CatalogEvent::SourceDrained(first.clone())]);
+        engine.apply_catalog(stale_fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+
+        assert_eq!(engine.source_drain_receipt(&first.source_commit_id), Some(first));
+        assert_eq!(engine.source_drain_receipt(&newer.source_commit_id), Some(newer.clone()));
+        assert_eq!(engine.last_source_drain_receipt(), Some(newer));
+    }
+
     /// The de-duplication highwater is checkpointed WITH the position (ADR-0003), and the fold's
     /// last `Offset` wins for both together.
     ///
@@ -2037,8 +2182,40 @@ mod tests {
         assert!(server.catalog_kinds().is_empty(), "nothing has landed yet");
         tokio::time::timeout(std::time::Duration::from_secs(20), landed)
             .await
-            .expect("the append lands once storage recovers");
+            .expect("the append lands once storage recovers")
+            .expect("the catalog writer remains alive");
         assert_eq!(server.catalog_kinds(), vec!["joined".to_string()]);
+    }
+
+    /// Losing the writer task is not a successful append. In particular, a source-fence caller must
+    /// never continue on to publish an in-memory receipt merely because its acknowledgement sender
+    /// disappeared.
+    #[tokio::test]
+    async fn writer_loss_cannot_satisfy_a_durable_wait() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let writer = CatalogWriter {
+            tx,
+            shutdown: shutdown.clone(),
+            in_flight: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            eid_nonce: "writer-gone".to_string(),
+            next_eid: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            landed_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            landed_notify: Arc::new(tokio::sync::Notify::new()),
+            durable: Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(25), writer.send_durable(joined("s1", "sub-a", 100)))
+                .await
+                .expect("writer loss must be reported rather than hanging");
+        assert!(outcome.is_err(), "a dropped writer acknowledgement must not manufacture durability");
+        assert!(shutdown.is_shutting_down(), "writer loss must begin fail-closed process shutdown");
+        let barrier = tokio::time::timeout(std::time::Duration::from_millis(25), writer.wait_durable())
+            .await
+            .expect("a failed enqueue must not leave an unreachable durability barrier");
+        assert!(barrier.is_err(), "the barrier must report writer loss rather than manufacturing durability");
     }
 
     // --- retirement: intent and completion ------------------------------------------------------

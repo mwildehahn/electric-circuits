@@ -38,6 +38,7 @@ feldera-macros = "0.318"
 # impl; rkyv_64 matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
 ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
 anyhow = "1"
+constant_time_eq = "0.3"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.
 serde = { version = "1", features = ["derive"] }

@@ -15,6 +15,7 @@
 //! |---|---|
 //! | `0` | clean exit: a graceful shutdown completed inside its grace period |
 //! | `70` | the shutdown was **forced** — a second signal arrived, or the grace period elapsed with work still in flight ([`shutdown::EXIT_SHUTDOWN_FORCED`]). A catalog append being retried through an outage is a named party here |
+//! | `71` | shutdown reached its final durable-catalog drain but the checkpoint or source receipt did not land inside the remaining grace; the next boot may replay, so this is explicitly incomplete rather than a clean exit |
 //! | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered, and the answer will not change. Memory and storage disagree and only a re-fold at boot can reconcile them, so the process exits instead of serving state its record does not describe |
 //! | `75` | a counts pipeline must be rebuilt (schema drift or an epoch reset on a circuit-served table); restart to re-seed it |
 //! | `78` | **boot refused** (`EX_CONFIG`): a misconfiguration retrying cannot fix — a setting the config resolver rejected (an unparseable `ELECTRIC_CIRCUITS_PG_URL`, an unusable `ELECTRIC_CIRCUITS_PG_TABLES`, an out-of-range byte budget, a missing `ELECTRIC_CIRCUITS_DS_URL`, an unwritable spill directory), or a fatal Postgres condition — bad credentials, a missing privilege, an unknown database, `wal_level` ≠ `logical`, a publication with a column list, an unreadable durable catalog |
@@ -57,9 +58,14 @@ async fn main() -> Result<()> {
     }
     tracing::info!("resolved config: {}", config.redacted());
 
-    // Publish request-path globals (instance id, stack id, /v1/shape secret). Metrics transport is
-    // initialized only after storage admission, so readiness stays the first network operation.
-    config::set_globals(&config.instance_id, &config.stack_id, config.secret.as_deref());
+    // Publish request-path globals. Metrics transport is initialized only after storage admission,
+    // so readiness stays the first network operation.
+    config::set_globals(
+        &config.instance_id,
+        &config.stack_id,
+        config.secret.as_deref(),
+        config.control_secret.as_deref(),
+    );
     if config.prometheus_port.is_some() {
         tracing::info!(
             "ELECTRIC_PROMETHEUS_PORT is set, but the dedicated Prometheus listener is not implemented; \
@@ -143,7 +149,7 @@ async fn main() -> Result<()> {
     // Kept past the router so the Postgres setup and the shutdown path still have a handle.
     let engine_at_exit = engine.clone();
     let boot_engine = engine.clone();
-    let app = electric_circuits_engine::http::router_with_introspection(engine, config.trace);
+    let app = electric_circuits_engine::http::router_with_introspection(engine.clone(), config.trace);
 
     let listener =
         tokio::net::TcpListener::bind(&config.bind).await.with_context(|| format!("binding {}", config.bind))?;
@@ -157,11 +163,14 @@ async fn main() -> Result<()> {
     tracing::info!("electric-circuits engine listening on http://{addr}, ds={ds_base}");
 
     let serve_shutdown = shutdown.clone();
+    let serve_engine = engine.clone();
     let ready_drain = config.shutdown_ready_drain;
     let grace = config.shutdown_grace;
     let serve = tokio::spawn(
         axum::serve(listener, app)
-            .with_graceful_shutdown(async move { await_signal_and_begin(serve_shutdown, ready_drain, grace).await })
+            .with_graceful_shutdown(async move {
+                await_signal_and_begin(serve_engine, serve_shutdown, ready_drain, grace).await
+            })
             .into_future(),
     );
 
@@ -194,7 +203,11 @@ async fn main() -> Result<()> {
     // The accept loop is closed and every in-flight request has finished (the `/v1/shape` live poll
     // joined the token, so that took milliseconds, not its 20 s window). Now let the engine's own
     // tasks reach their safe points.
-    finish_shutdown(&engine_at_exit, &shutdown, config.shutdown_grace).await;
+    let outcome = finish_shutdown(&engine_at_exit, &shutdown, config.shutdown_grace).await;
+    if outcome != shutdown::ShutdownOutcome::Complete {
+        std::io::stderr().flush().ok();
+        std::process::exit(outcome.exit_code());
+    }
     Ok(())
 }
 
@@ -274,9 +287,18 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
 /// exits [`shutdown::EXIT_SHUTDOWN_FORCED`] immediately, without finishing an in-flight commit
 /// (unacknowledged, so Postgres re-delivers it) and without a final checkpoint (the last lazy one
 /// stands, so the next boot replays a little more).
-async fn await_signal_and_begin(shutdown: ShutdownToken, ready_drain: Duration, grace: Duration) {
-    let sig = shutdown::first_signal().await;
-    shutdown.begin();
+async fn await_signal_and_begin(engine: Engine, shutdown: ShutdownToken, ready_drain: Duration, grace: Duration) {
+    let mut first_signal = Box::pin(shutdown::first_signal());
+    let external_trigger = tokio::select! {
+        sig = &mut first_signal => {
+            shutdown.begin();
+            Some(sig)
+        }
+        _ = shutdown.wait() => None,
+    };
+    let trigger =
+        external_trigger.map_or_else(|| "engine initiated shutdown".to_string(), |sig| format!("{sig} received"));
+    engine.close_control_admission();
     // The grace is a bound on the PROCESS, not on one await point, so it is armed the instant the
     // token flips and runs on its own task. `finish_shutdown` is the happy path and normally gets
     // there first; this is what makes the bound hold when `main` is somewhere else entirely — a
@@ -284,19 +306,26 @@ async fn await_signal_and_begin(shutdown: ShutdownToken, ready_drain: Duration, 
     // between chunks. Every one of those now joins the token as well, so this should never fire;
     // "should never fire" is exactly what a watchdog is for.
     let watchdog = shutdown.clone();
+    let watchdog_budget = grace.saturating_sub(shutdown.elapsed().unwrap_or_default());
     tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
+        tokio::time::sleep(watchdog_budget).await;
         let msg = shutdown::grace_expiry_message(&watchdog.outstanding(), grace);
         tracing::error!("{msg}");
         std::io::stderr().flush().ok();
         std::process::exit(shutdown::EXIT_SHUTDOWN_FORCED);
     });
     tracing::info!(
-        "{sig} received: draining. GET /ready is now 503 shutting_down; the port stays open for \
+        "{trigger}: draining. GET /ready is now 503 shutting_down; the port stays open for \
          {ready_drain:?} so a load balancer's probe sees it. Streams are left open (a restored shape \
          continues its stream) — send another signal to stop immediately."
     );
     tokio::spawn(async move {
+        if external_trigger.is_none() {
+            let sig = first_signal.await;
+            tracing::warn!(
+                "{sig} received during an engine-initiated shutdown; continuing the grace. Send another signal to stop immediately."
+            );
+        }
         let sig = shutdown::first_signal().await;
         tracing::warn!(
             "second {sig} during the shutdown grace: exiting {} without finishing. Nothing is \
@@ -321,7 +350,7 @@ async fn await_signal_and_begin(shutdown: ShutdownToken, ready_drain: Duration, 
 /// The whole thing is bounded by `grace`. Running out of it is not silent: the parties still
 /// outstanding are named and the process exits [`shutdown::EXIT_SHUTDOWN_FORCED`], because "exited
 /// 0" must mean "everything got to a clean point".
-async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Duration) {
+async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Duration) -> shutdown::ShutdownOutcome {
     let started = std::time::Instant::now();
     // Measured from the SIGNAL, not from here: the readiness-drain window already spent part of it.
     let left = grace.saturating_sub(shutdown.elapsed().unwrap_or_default());
@@ -332,8 +361,7 @@ async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Durat
             shutdown.outstanding(),
             shutdown::EXIT_SHUTDOWN_FORCED
         );
-        std::io::stderr().flush().ok();
-        std::process::exit(shutdown::EXIT_SHUTDOWN_FORCED);
+        return shutdown::ShutdownOutcome::Forced;
     }
     // The sequencer's final `Offset` is queued, not written: draining is what makes the checkpoint
     // durable, and with it the restart point the next boot resumes from.
@@ -341,10 +369,13 @@ async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Durat
     if !engine.drain_catalog(catalog_budget).await {
         tracing::error!(
             "the durable catalog writer did not drain within {catalog_budget:?}; the final checkpoint may be \
-             missing and the next boot will replay from the previous one"
+             missing and the next boot will replay from the previous one; exiting {}",
+            shutdown::EXIT_SHUTDOWN_INCOMPLETE
         );
+        return shutdown::ShutdownOutcome::CatalogIncomplete;
     }
     tracing::info!("shutdown complete in {:?}", started.elapsed());
+    shutdown::ShutdownOutcome::Complete
 }
 
 /// Refuse the boot: name the class of failure, print the whole error chain, exit [`pg::EXIT_CONFIG`].
@@ -372,4 +403,25 @@ fn init_tracing(filter: &str) {
     // `filter` already reflects ELECTRIC_CIRCUITS_LOG / ELECTRIC_LOG_LEVEL precedence (see config.rs).
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_engine_initiated_shutdown_stops_the_http_graceful_shutdown_future() {
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let shutdown = engine.shutdown_token();
+        let waiting =
+            tokio::spawn(await_signal_and_begin(engine, shutdown.clone(), Duration::ZERO, Duration::from_secs(30)));
+
+        tokio::task::yield_now().await;
+        shutdown.begin();
+
+        tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("the graceful-shutdown future ignored the engine shutdown token")
+            .expect("the graceful-shutdown task panicked");
+    }
 }

@@ -72,8 +72,9 @@ fn test_subq() -> SubqueryHandle {
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
-    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), DegradeState::new(), trace_tx);
-    SubqueryHandle { registry, flip_tx, pending_flips }
+    let degrade = DegradeState::new();
+    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), degrade.clone(), trace_tx);
+    SubqueryHandle { registry, flip_tx, pending_flips, degrade }
 }
 
 fn agg_shape(func: AggFn, col: Option<usize>, ts: &TableSchema) -> AggShape {
@@ -1561,5 +1562,50 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
     assert!(
         engine.create_shape(&"outer_t".into(), None, None, false, true).await.is_err(),
         "a degraded engine must not create shapes"
+    );
+}
+
+#[tokio::test]
+async fn control_admission_is_independent_of_read_health() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    assert_eq!(engine.readiness_status(), "active");
+    let admitted = engine.admit_control().unwrap();
+    engine.close_control_admission();
+    assert!(engine.ensure_control_admitted().is_err());
+    assert_eq!(engine.readiness_status(), "active", "existing reads stay healthy during handoff");
+    let waiter = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.wait_for_control_drain().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished(), "close waits for already-admitted mutations");
+    drop(admitted);
+    waiter.await.unwrap();
+    engine.open_control_admission();
+    assert!(engine.ensure_control_admitted().is_ok());
+}
+
+#[tokio::test]
+async fn purge_barrier_never_reports_success_after_catalog_writer_loss() {
+    let barrier = PurgeBarrier::new();
+    barrier.mark_dropped_failed();
+    barrier.complete();
+    assert!(barrier.wait_dropped_durable().await.is_err());
+    assert!(barrier.wait().await.is_err());
+}
+
+#[tokio::test]
+async fn ingest_progress_checkpoint_and_task_exit_are_not_source_receipts() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let source_commit_id = "018f5f4d-70c2-7d70-a4d5-5f7355078f85";
+    engine.repl_sync.store(i64::MAX, Ordering::Release);
+    *engine.repl_lsn.lock().unwrap() = "FFFFFFFF/FFFFFFFF".to_string();
+    *engine.seq_highwater.lock().unwrap() = Some((u64::MAX, u64::MAX));
+    engine.close_control_admission();
+    engine.shutdown.begin();
+    assert_eq!(
+        engine.source_drain_receipt(source_commit_id),
+        None,
+        "only a durable SourceDrained catalog event can satisfy drained-through"
     );
 }

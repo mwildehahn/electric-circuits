@@ -55,6 +55,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_PG_POLL_MS` | `50` | Replication-slot poll interval |
 | `ELECTRIC_CIRCUITS_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |
 | `ELECTRIC_CIRCUITS_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `electric_circuits_engine=debug`) |
+| `ELECTRIC_CIRCUITS_CONTROL_SECRET` | *(unset; private admin disabled)* | Dedicated bearer token for `/_admin/control-admission/{close,open}` and `/_admin/drained-through/{source_commit_id}`. This must be a controller-only secret distinct from client-facing `ELECTRIC_SECRET`; when unset the routes fail closed with 503 |
 | `ELECTRIC_CIRCUITS_TRACE` | `1` (on) | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc) |
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). It is also the **subscription lease window** — a claim not renewed within it is released (see "Subscriptions"). `0` disables both |
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
@@ -75,6 +76,32 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` (Electric parity) retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
 | `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before its **handle state** is evicted and its shape subscription released (the shape + stream are retained and follow the retention lifecycle); a late request gets `409 must-refetch` and rejoins the retained shape |
 | `ELECTRIC_LIVE_TIMEOUT_MS` | `20000` | Overall deadline for a `live=true` `/v1/shape` long-poll, then `204` |
+
+### Deployment handoff source fence
+
+The stop-confirm-start deployment controller requires this bookkeeping table in the same database
+and publication as the application tables:
+
+```sql
+CREATE TABLE public.circuits_source_fence (
+  source_commit_id uuid PRIMARY KEY
+);
+ALTER TABLE public.circuits_source_fence REPLICA IDENTITY FULL;
+```
+
+An engine-created publication uses `FOR ALL TABLES`, so a table created before engine boot is
+included automatically. If the publication is operator-managed with an explicit table list, add it
+before the handoff protocol is enabled:
+
+```sql
+ALTER PUBLICATION <slot>_pub ADD TABLE public.circuits_source_fence;
+```
+
+The controller closes `/_admin/control-admission`, inserts one canonical UUID row, then polls
+`/_admin/drained-through/{source_commit_id}` with the controller-only bearer token. `drained: true`
+is emitted only after that complete PostgreSQL transaction and all derived stream/catalog appends
+are durable. The controller owns the poll timeout; task exit, slot release, and an attempted
+checkpoint are not receipts.
 
 ### Benchmarking-fleet surface (`ELECTRIC_*`)
 

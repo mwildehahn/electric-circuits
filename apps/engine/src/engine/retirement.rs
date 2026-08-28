@@ -40,6 +40,7 @@ struct Retirement {
 
 pub(crate) struct RetirementCompletion {
     done: std::sync::atomic::AtomicBool,
+    failed: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
     durable: bool,
 }
@@ -54,7 +55,12 @@ impl RetirementCompletion {
     }
 
     fn new_with_durability(durable: bool) -> Arc<Self> {
-        Arc::new(Self { done: std::sync::atomic::AtomicBool::new(false), notify: tokio::sync::Notify::new(), durable })
+        Arc::new(Self {
+            done: std::sync::atomic::AtomicBool::new(false),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+            durable,
+        })
     }
 
     fn complete(&self) {
@@ -62,15 +68,45 @@ impl RetirementCompletion {
         self.notify.notify_waiters();
     }
 
-    pub(crate) async fn wait(&self) {
+    fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.complete();
+    }
+
+    pub(crate) async fn wait(&self) -> std::result::Result<(), catalog::CatalogWriterGone> {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.done.load(Ordering::Acquire) {
-                return;
+                return if self.failed.load(Ordering::Acquire) { Err(catalog::CatalogWriterGone) } else { Ok(()) };
             }
             notified.await;
         }
     }
+}
+
+fn abandon_retirements(
+    current: Option<Retirement>,
+    queue: &mut std::collections::VecDeque<Retirement>,
+    receiver: &mut mpsc::UnboundedReceiver<Retirement>,
+    pending: &std::sync::atomic::AtomicU64,
+) {
+    receiver.close();
+    if let Some(current) = current {
+        queue.push_front(current);
+    }
+    while let Ok(item) = receiver.try_recv() {
+        queue.push_back(item);
+    }
+    let abandoned = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+    for item in queue.drain(..) {
+        if let Some(completion) = item.completion {
+            completion.fail();
+        }
+    }
+    pending.fetch_sub(abandoned, Ordering::SeqCst);
+    crate::metrics::metrics().retirements_pending.store(pending.load(Ordering::SeqCst), Ordering::Relaxed);
 }
 
 /// The engine's background retirement queue (see the module docs). Cheap to clone: a sender plus the
@@ -151,6 +187,7 @@ pub(crate) fn spawn_retirement_queue(
                      `Dropped` records are durable)",
                     queue.len()
                 );
+                abandon_retirements(None, &mut queue, &mut rx, &counter);
                 return;
             }
             let mut item = queue.pop_front().expect("non-empty above");
@@ -161,7 +198,11 @@ pub(crate) fn spawn_retirement_queue(
                     if let Some(id) = &item.shape_id {
                         let retired = CatalogEvent::Retired { id: id.clone() };
                         if item.completion.as_ref().is_some_and(|completion| completion.durable) {
-                            catalog_tx.send_durable(retired).await;
+                            if let Err(error) = catalog_tx.send_durable(retired).await {
+                                tracing::error!(error = %error, "retirement completion could not reach the catalog");
+                                abandon_retirements(Some(item), &mut queue, &mut rx, &counter);
+                                return;
+                            }
                         } else {
                             catalog_tx.send(retired);
                         }
@@ -223,16 +264,18 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn retire_shape_stream_wait(&self, id: &str, stream_path: &str) {
+    pub(crate) async fn retire_shape_stream_wait(
+        &self,
+        id: &str,
+        stream_path: &str,
+    ) -> std::result::Result<(), catalog::CatalogWriterGone> {
         match self.ds.retire_stream(stream_path).await {
-            Ok(()) => {
-                self.catalog_tx.send_durable(CatalogEvent::Retired { id: id.to_string() }).await;
-            }
+            Ok(()) => self.catalog_tx.send_durable(CatalogEvent::Retired { id: id.to_string() }).await,
             Err(e) => {
                 tracing::warn!("retiring stream {stream_path} for shape {id} failed ({e:#}); queued and awaited");
                 let completion = RetirementCompletion::new();
                 self.retirements.enqueue_with_completion(stream_path, Some(id), Some(completion.clone()));
-                completion.wait().await;
+                completion.wait().await
             }
         }
     }
@@ -323,5 +366,31 @@ mod tests {
         assert_eq!(server.deletes(), 1);
         assert!(catalog.drain(std::time::Duration::from_secs(5)).await);
         assert!(server.catalog_kinds().is_empty(), "nothing to record");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_fails_retirement_completion_instead_of_stranding_its_waiter() {
+        let server = FakeDs::start().await;
+        server.fail_deletes(10);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let ds = DsClient::new_for_in_process_test(server.url());
+        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone());
+        let queue = spawn_retirement_queue(ds, catalog, shutdown.clone());
+        let completion = RetirementCompletion::new();
+        queue.enqueue_with_completion("shape/blocked", Some("blocked"), Some(completion.clone()));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while server.deletes() == 0 {
+            assert!(std::time::Instant::now() < deadline, "retirement attempt never started");
+            tokio::task::yield_now().await;
+        }
+        shutdown.begin();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), completion.wait())
+                .await
+                .expect("completion waiter must be released")
+                .is_err()
+        );
+        assert_eq!(queue.pending(), 0);
     }
 }

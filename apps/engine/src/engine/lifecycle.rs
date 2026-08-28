@@ -248,7 +248,10 @@ impl Engine {
                         return Err(e);
                     }
                     if let Some(durable) = joined_durable {
-                        durable.await;
+                        if let Err(error) = durable.await {
+                            joining.rollback().await;
+                            return Err(error.into());
+                        }
                     }
                     // ...and the same check ONCE MORE, after the wait: the target may have been
                     // purged or retired while this join was blocked on storage (see
@@ -368,7 +371,11 @@ impl Engine {
                     // any other cancellation, and the `Created` that lands anyway is followed by the
                     // rollback's `Dropped`. With storage down this waits — the client's own timeout
                     // is the bound — and it never returns a shape the catalog lacks.
-                    created.await;
+                    if let Err(error) = created.await {
+                        let _ = ready_tx.send(ShareOutcome::Failed);
+                        creating.rollback().await;
+                        return Err(error.into());
+                    }
                     // The wait is an interval of its own: re-check before acknowledging.
                     if let Err(e) = self.recheck_after_durability(&id, &stream_path, &gens).await {
                         // `Raced`, not `Failed`: this creator is about to redo the create, and a
@@ -502,7 +509,11 @@ impl Engine {
                     return Err(e);
                 }
                 // Durable before the guard is disarmed — see the subquery path above.
-                created.await;
+                if let Err(error) = created.await {
+                    let _ = share_tx.send(ShareOutcome::Failed);
+                    creating.rollback().await;
+                    return Err(error.into());
+                }
                 // The wait is an interval of its own: re-check before acknowledging.
                 if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
                     // `Raced`, not `Failed` — see the subquery path.
@@ -634,7 +645,10 @@ impl Engine {
                 }
                 self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
                 if let Some(durable) = joined {
-                    durable.await;
+                    if let Err(error) = durable.await {
+                        joining.rollback().await;
+                        return Err(error.into());
+                    }
                 }
                 // ...and again after the wait — see `recheck_after_durability`.
                 if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
@@ -727,7 +741,11 @@ impl Engine {
                                     creating.rollback().await;
                                     return Err(e);
                                 }
-                                created.await;
+                                if let Err(error) = created.await {
+                                    let _ = share_tx.send(ShareOutcome::Failed);
+                                    creating.rollback().await;
+                                    return Err(error.into());
+                                }
                                 // The wait is an interval of its own: re-check before acknowledging.
                                 if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
                                     // `Raced`, not `Failed` — see the subquery path.
@@ -843,7 +861,11 @@ impl Engine {
                     creating.rollback().await;
                     return Err(e);
                 }
-                created.await;
+                if let Err(error) = created.await {
+                    let _ = share_tx.send(ShareOutcome::Failed);
+                    creating.rollback().await;
+                    return Err(error.into());
+                }
                 // The wait is an interval of its own: re-check before acknowledging.
                 if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
                     // `Raced`, not `Failed` — see the subquery path.
@@ -897,7 +919,9 @@ impl Engine {
     /// [`Self::release_subscription_durable`] instead: an acknowledged release must survive even
     /// when leases are disabled with `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`.
     pub async fn release_subscription(&self, id: &str, sub: Option<&str>) {
-        self.release_subscription_inner(id, sub, false).await;
+        if let Err(error) = self.release_subscription_inner(id, sub, false).await {
+            tracing::error!(%error, "engine-internal subscription release lost its catalog writer");
+        }
     }
 
     /// Native client-facing release: do not acknowledge until `Left` is in the restart contract.
@@ -906,11 +930,11 @@ impl Engine {
     /// plus the record, both of which happen BEFORE the wait, and nothing runs after it. A client
     /// that times out and drops this future therefore loses only its answer — the `Left` is the
     /// writer's from the moment it was enqueued, and lands regardless.
-    pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) {
-        self.release_subscription_inner(id, sub, true).await;
+    pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) -> Result<()> {
+        self.release_subscription_inner(id, sub, true).await
     }
 
-    async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) {
+    async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
         let released = match sub {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
@@ -929,10 +953,11 @@ impl Engine {
         drop(st);
         self.touch_shape(id);
         if let Some(wait) = wait {
-            wait.await;
+            wait.await?;
         } else if needs_barrier {
-            self.catalog_tx.wait_durable().await;
+            self.catalog_tx.wait_durable().await?;
         }
+        Ok(())
     }
 
     /// Force-drop a shape NOW, bypassing the retention lifecycle: full teardown (record, share
@@ -1004,11 +1029,11 @@ impl Engine {
             } else if let Some(barrier) = self.purge_barriers.lock().unwrap().get(id).cloned() {
                 (barrier, false)
             } else {
-                self.catalog_tx.wait_durable().await;
+                self.catalog_tx.wait_durable().await?;
                 return Ok(());
             };
             if !owner {
-                self.catalog_tx.wait_durable().await;
+                self.catalog_tx.wait_durable().await?;
                 return Ok(());
             }
             // The teardown this purge promised must NOT depend on the request that asked for it.
@@ -1023,24 +1048,30 @@ impl Engine {
             tokio::spawn(async move {
                 // ADR-0007 order is preserved inside the task: `Dropped` durable, then close/delete.
                 if let Some(wait) = wait {
-                    wait.await;
+                    if let Err(error) = wait.await {
+                        tracing::error!(%error, shape_id = %owned, "purge intent could not reach the catalog");
+                        task_barrier.mark_dropped_failed();
+                        task_barrier.complete();
+                        engine.purge_barriers.lock().unwrap().remove(&owned);
+                        return;
+                    }
                 }
                 task_barrier.mark_dropped_durable();
                 // A native purge promises a durable `Dropped` intent before it answers. Retirement
                 // itself remains process-owned and eventually retried by `RetirementQueue`; making
                 // the HTTP request wait for that external recovery turns a durable-stream outage
                 // into an unnecessary, unbounded acknowledgment delay.
-                engine.finish_purge(&owned, removed, false, None).await;
+                let _ = engine.finish_purge(&owned, removed, false, None).await;
                 task_barrier.complete();
                 engine.purge_barriers.lock().unwrap().remove(&owned);
             });
             // The request waits only for the restart contract: `Dropped` must be durable before a
             // successful response. A concurrent retry finds `removed == None`, enqueues nothing,
             // and waits for that same catalog barrier; the owned task completes retirement.
-            barrier.wait_dropped_durable().await;
+            barrier.wait_dropped_durable().await?;
         } else {
             if let Some(barrier) = owned_barrier {
-                self.finish_purge(id, removed, false, Some(barrier.clone())).await;
+                self.finish_purge(id, removed, false, Some(barrier.clone())).await?;
                 let barrier_done = barrier.is_done();
                 if barrier_done {
                     self.purge_barriers.lock().unwrap().remove(id);
@@ -1048,16 +1079,16 @@ impl Engine {
                     let barriers = self.purge_barriers.clone();
                     let owned = id.to_string();
                     tokio::spawn(async move {
-                        barrier.wait().await;
+                        let _ = barrier.wait().await;
                         barriers.lock().unwrap().remove(&owned);
                     });
                 }
             } else {
                 let existing = self.purge_barriers.lock().unwrap().get(id).cloned();
                 if let Some(barrier) = existing {
-                    barrier.wait().await;
+                    barrier.wait().await?;
                 } else {
-                    self.finish_purge(id, removed, false, None).await;
+                    self.finish_purge(id, removed, false, None).await?;
                 }
             }
         }
@@ -1073,19 +1104,21 @@ impl Engine {
         removed: Option<ShapeRecord>,
         wait_retirement: bool,
         completion_barrier: Option<Arc<crate::engine::PurgeBarrier>>,
-    ) {
+    ) -> std::result::Result<(), crate::engine::catalog::CatalogWriterGone> {
         // Subquery shapes live in the registry (a no-op for plain shapes).
         self.subqueries.lock().await.drop_subquery_shape(id).await;
         if let Some(rec) = removed {
             // Retirement: close (releasing any tailing long-poll with `stream-closed`) then delete,
             // and record the completion. A storage failure is queued, never forgotten.
             if wait_retirement {
-                self.retire_shape_stream_wait(id, &rec.stream_path).await;
+                self.retire_shape_stream_wait(id, &rec.stream_path).await?;
             } else if let Some(barrier) = completion_barrier {
                 let completion = crate::engine::retirement::RetirementCompletion::new_non_durable();
                 let completion_wait = completion.clone();
                 tokio::spawn(async move {
-                    completion_wait.wait().await;
+                    if completion_wait.wait().await.is_err() {
+                        barrier.mark_dropped_failed();
+                    }
                     barrier.complete();
                 });
                 self.retire_shape_stream_with_completion(id, &rec.stream_path, completion).await;
@@ -1095,6 +1128,7 @@ impl Engine {
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("purged shape {id} (forced)");
         }
+        Ok(())
     }
 
     /// Renew a subscription's lease **in memory only** — no catalog event (ADR-0008).
@@ -1157,6 +1191,7 @@ impl Engine {
                             LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
                             LifeState::Reactivating { done, .. } => Step::WaitReactivate(done.clone()),
                             LifeState::Dormant { resume, gate, .. } => {
+                                let control = self.admit_control()?;
                                 // Kick off the replay in a DETACHED task: `ensure_active` futures
                                 // are dropped when an HTTP client disconnects, and a cancelled
                                 // in-place replay would strand the shape in `Reactivating`. The
@@ -1170,6 +1205,7 @@ impl Engine {
                                 let engine = self.clone();
                                 let id = id.to_string();
                                 tokio::spawn(async move {
+                                    let _control = control;
                                     let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
                                     let err = match res {
                                         Ok(()) => {

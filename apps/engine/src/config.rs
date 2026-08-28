@@ -69,6 +69,9 @@ pub struct Config {
     pub metrics_period: Duration,
     /// If set, `/v1/shape` requires a matching `secret`/`api_secret` query param.
     pub secret: Option<String>,
+    /// Bearer token for deployment-controller endpoints. Deliberately distinct from
+    /// `ELECTRIC_SECRET`, which is distributed to the client-facing gateway.
+    pub control_secret: Option<String>,
     /// Root dir of durable-streams file storage, for `electric.storage.used.bytes` (`du`).
     pub storage_dir: Option<String>,
     /// Optional second listener serving Prometheus text (`ELECTRIC_PROMETHEUS_PORT`).
@@ -328,6 +331,12 @@ impl Config {
         // ELECTRIC_INSECURE is accepted; it is a no-op unless a secret is also set (then it does not
         // override the secret — an explicit secret always takes effect).
         let secret = g("ELECTRIC_SECRET");
+        let control_secret = nonempty(g("ELECTRIC_CIRCUITS_CONTROL_SECRET"));
+        if secret.as_deref().is_some_and(|secret| control_secret.as_deref() == Some(secret)) {
+            bail!(
+                "ELECTRIC_CIRCUITS_CONTROL_SECRET must be distinct from ELECTRIC_SECRET: the gateway credential must not authorize deployment-controller endpoints"
+            );
+        }
 
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
@@ -451,6 +460,7 @@ impl Config {
             statsd,
             metrics_period,
             secret,
+            control_secret,
             storage_dir,
             prometheus_port,
             db_pool_size,
@@ -472,11 +482,11 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The bind host:port with the `DATABASE_URL`/`ELECTRIC_SECRET` credentials redacted — safe to log.
+    /// The bind host:port with URL and bearer credentials redacted — safe to log.
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} storage_dir={} prometheus_port={:?} trace={} initialize_namespace={} log={} \
+             secret={} control_secret={} storage_dir={} prometheus_port={:?} trace={} initialize_namespace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
@@ -488,6 +498,7 @@ impl Config {
             self.statsd.as_ref().map(|s| s.addr()).unwrap_or_else(|| "<off>".into()),
             self.metrics_period,
             if self.secret.is_some() { "<redacted>" } else { "<none>" },
+            if self.control_secret.is_some() { "<redacted>" } else { "<none>" },
             self.storage_dir.as_deref().unwrap_or("<none>"),
             self.prometheus_port,
             self.trace,
@@ -534,12 +545,14 @@ use std::sync::OnceLock;
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 static STACK_ID: OnceLock<String> = OnceLock::new();
 static SECRET: OnceLock<Option<String>> = OnceLock::new();
+static CONTROL_SECRET: OnceLock<Option<String>> = OnceLock::new();
 
-/// Publish the request-path globals (instance id, stack id, `/v1/shape` secret) once at boot.
-pub fn set_globals(instance_id: &str, stack_id: &str, secret: Option<&str>) {
+/// Publish the request-path globals once at boot.
+pub fn set_globals(instance_id: &str, stack_id: &str, secret: Option<&str>, control_secret: Option<&str>) {
     let _ = INSTANCE_ID.set(instance_id.to_string());
     let _ = STACK_ID.set(stack_id.to_string());
     let _ = SECRET.set(secret.map(str::to_string));
+    let _ = CONTROL_SECRET.set(control_secret.map(str::to_string));
 }
 
 pub fn instance_id() -> &'static str {
@@ -552,6 +565,15 @@ pub fn stack_id() -> &'static str {
 
 pub fn secret() -> Option<&'static str> {
     SECRET.get().and_then(|s| s.as_deref())
+}
+
+pub fn control_secret() -> Option<&'static str> {
+    CONTROL_SECRET.get().and_then(|s| s.as_deref())
+}
+
+/// Compare bearer credentials without an early return on the first differing byte.
+pub fn secret_matches(expected: &str, provided: &str) -> bool {
+    constant_time_eq::constant_time_eq(expected.as_bytes(), provided.as_bytes())
 }
 
 /// Does the configured secret authorize a request carrying these `secret`/`api_secret` params?
@@ -749,12 +771,24 @@ mod tests {
 
     #[test]
     fn secret_and_noop() {
-        assert_eq!(cfg(&[("ELECTRIC_SECRET", "sekret")]).secret.as_deref(), Some("sekret"));
+        let resolved =
+            cfg(&[("ELECTRIC_SECRET", "gateway-secret"), ("ELECTRIC_CIRCUITS_CONTROL_SECRET", "controller-secret")]);
+        assert_eq!(resolved.secret.as_deref(), Some("gateway-secret"));
+        assert_eq!(resolved.control_secret.as_deref(), Some("controller-secret"));
         assert!(secret_ok(None, None, None));
         assert!(secret_ok(Some("s"), Some("s"), None));
         assert!(secret_ok(Some("s"), None, Some("s")));
         assert!(!secret_ok(Some("s"), Some("nope"), None));
         assert!(!secret_ok(Some("s"), None, None));
+        assert!(secret_matches("controller-secret", "controller-secret"));
+        assert!(!secret_matches("controller-secret", "gateway-secret"));
+        assert!(!secret_matches("controller-secret", "controller-secret-extra"));
+        assert!(
+            try_cfg(&[("ELECTRIC_SECRET", "same-secret"), ("ELECTRIC_CIRCUITS_CONTROL_SECRET", "same-secret")])
+                .unwrap_err()
+                .to_string()
+                .contains("must be distinct")
+        );
     }
 
     #[test]

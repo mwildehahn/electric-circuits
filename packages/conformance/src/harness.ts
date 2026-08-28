@@ -319,6 +319,8 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     await c.connect()
     await c.query('CREATE TABLE __el_sync (id int PRIMARY KEY, n bigint NOT NULL)')
     await c.query('INSERT INTO __el_sync (id, n) VALUES (1, 0)')
+    await c.query('CREATE TABLE circuits_source_fence (source_commit_id uuid PRIMARY KEY)')
+    await c.query('ALTER TABLE circuits_source_fence REPLICA IDENTITY FULL')
     await c.end()
 
     await opts.beforeEngine?.({ pgUrl, slot })

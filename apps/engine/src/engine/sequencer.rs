@@ -133,6 +133,8 @@ pub(crate) fn spawn_sequencer(
     start: LogPosition,
     restore_highwater: Option<(u64, u64)>,
     catalog_tx: CatalogWriter,
+    source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
+    last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
@@ -158,6 +160,8 @@ pub(crate) fn spawn_sequencer(
         start,
         restore_highwater,
         catalog_tx,
+        source_receipts,
+        last_source_receipt,
         cmd_rx,
         processed.clone(),
         stats.clone(),
@@ -354,6 +358,8 @@ pub(crate) async fn sequencer_loop(
     // The `(lsn, seq)` de-duplication highwater restored with `start` (ADR-0003).
     restore_highwater: Option<(u64, u64)>,
     catalog_tx: CatalogWriter,
+    source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
+    last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<LogPosition>>,
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
@@ -714,6 +720,7 @@ pub(crate) async fn sequencer_loop(
                         let txn_highwater = highwater;
                         let txid = envs[i].headers.txid.clone();
                         let lsn = envs[i].headers.lsn.clone();
+                        let mut source_fence: Option<String> = None;
                         let mut j = i + 1;
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
@@ -743,6 +750,21 @@ pub(crate) async fn sequencer_loop(
                                     tracing::debug!("sequencer: skipping duplicate change at {p:?}");
                                     continue;
                                 }
+                            }
+                            if envs[k].type_ == crate::replication::SOURCE_FENCE_ENVELOPE {
+                                if source_fence.replace(envs[k].key.clone()).is_some() {
+                                    tracing::error!(
+                                        "sequencer: transaction {txid:?} at {lsn:?} contains more than one source fence"
+                                    );
+                                    highwater = txn_highwater;
+                                    processing_failed = true;
+                                    break;
+                                }
+                                touched = true;
+                                if let Some(position) = pos {
+                                    highwater = Some(position);
+                                }
+                                continue;
                             }
                             let Some(exec) = exec_for(&mut execs, &tables, &envs[k].type_) else {
                                 tracing::error!("sequencer: change for unknown table '{}'", envs[k].type_);
@@ -814,6 +836,37 @@ pub(crate) async fn sequencer_loop(
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
+                        if let Some(source_commit_id) = source_fence {
+                            if !wait_for_source_effects(&subq, &shutdown).await {
+                                tracing::error!(
+                                    source_commit_id,
+                                    "sequencer: source fence could not reach a durable receipt before shutdown/degradation"
+                                );
+                                highwater = txn_highwater;
+                                processing_failed = true;
+                                break;
+                            }
+                            let receipt = SourceDrainReceipt {
+                                source_commit_id: source_commit_id.clone(),
+                                commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
+                            };
+                            if let Err(error) = catalog_tx
+                                .send_durable(CatalogEvent::SourceDrained(receipt.clone()))
+                                .await
+                            {
+                                tracing::error!(
+                                    source_commit_id,
+                                    error = %error,
+                                    "sequencer: source fence catalog receipt was not acknowledged"
+                                );
+                                highwater = txn_highwater;
+                                processing_failed = true;
+                                break;
+                            }
+                            source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
+                            *last_source_receipt.lock().unwrap() = Some(receipt);
+                            tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
+                        }
                         i = j;
                     }
                     if processing_failed {
@@ -933,6 +986,28 @@ pub(crate) async fn sequencer_loop(
         tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
     } else {
         tracing::info!("sequencer: stopped while replay was paused; no checkpoint published");
+    }
+}
+
+/// A source receipt is stronger than "the sequencer task exited" or "the slot was released": it
+/// waits for every deferred propagation/emission batch to land and refuses to publish after the
+/// engine has degraded. The wait is rare (one handoff fence), so a short poll keeps the hot paths
+/// and emission lanes unchanged.
+async fn wait_for_source_effects(subq: &SubqueryHandle, shutdown: &crate::shutdown::ShutdownToken) -> bool {
+    loop {
+        if shutdown.is_shutting_down() {
+            return false;
+        }
+        if subq.degrade.degraded.load(Ordering::Acquire) {
+            return false;
+        }
+        if subq.pending_flips.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            _ = shutdown.wait() => return false,
+        }
     }
 }
 
@@ -1836,5 +1911,50 @@ mod txn_boundary_tests {
 
         let held_from = LogPosition { segment: 2, offset: "40".into() };
         assert_eq!(published(&cursor, &Some(held_from.clone())), held_from);
+    }
+}
+
+#[cfg(test)]
+mod source_fence_tests {
+    use super::*;
+
+    fn handle(pending: i64) -> SubqueryHandle {
+        let (flip_tx, _flip_rx) = mpsc::unbounded_channel();
+        SubqueryHandle {
+            registry: Arc::new(Mutex::new(SubqueryRegistry::new(
+                DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+                None,
+            ))),
+            flip_tx,
+            pending_flips: Arc::new(std::sync::atomic::AtomicI64::new(pending)),
+            degrade: DegradeState::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_shutdown_cannot_manufacture_a_source_receipt() {
+        let subquery = handle(0);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        shutdown.begin();
+        assert!(!wait_for_source_effects(&subquery, &shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn source_fence_waits_until_deferred_writes_land() {
+        let subquery = handle(1);
+        let pending = subquery.pending_flips.clone();
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let wait = tokio::spawn(async move { wait_for_source_effects(&subquery, &shutdown).await });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "a pending deferred write must hold the receipt barrier");
+        pending.store(0, Ordering::Release);
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), wait).await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn degraded_effects_cannot_manufacture_a_source_receipt() {
+        let subquery = handle(0);
+        subquery.degrade.mark();
+        assert!(!wait_for_source_effects(&subquery, &crate::shutdown::ShutdownToken::new()).await);
     }
 }

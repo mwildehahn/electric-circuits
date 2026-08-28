@@ -41,6 +41,27 @@ use std::time::Duration;
 /// period elapsed with a party still outstanding. Distinct from `0` (clean) and from
 /// [`crate::pg::EXIT_CONFIG`] / the circuit-rebuild `75`.
 pub const EXIT_SHUTDOWN_FORCED: i32 = 70;
+/// Grace elapsed far enough for background tasks to stop, but the durable catalog did not land its
+/// final checkpoint/receipt. Exit is non-zero so an orchestrator never treats replay-required state
+/// as a clean handoff.
+pub const EXIT_SHUTDOWN_INCOMPLETE: i32 = 71;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    Complete,
+    Forced,
+    CatalogIncomplete,
+}
+
+impl ShutdownOutcome {
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Self::Complete => 0,
+            Self::Forced => EXIT_SHUTDOWN_FORCED,
+            Self::CatalogIncomplete => EXIT_SHUTDOWN_INCOMPLETE,
+        }
+    }
+}
 
 /// How long the whole grace period may take, by default. Below a typical Kubernetes
 /// `terminationGracePeriodSeconds: 30`, so the engine always gets to finish on its own terms rather
@@ -318,6 +339,14 @@ mod tests {
         assert_eq!(resolve_ready_drain(|_| Some("0".into())).unwrap(), Duration::ZERO);
         assert_eq!(resolve_ready_drain(|_| Some("7".into())).unwrap(), Duration::from_secs(7));
         assert!(resolve_ready_drain(|_| Some("later".into())).is_err());
+    }
+
+    #[test]
+    fn shutdown_outcomes_have_distinct_process_statuses() {
+        assert_eq!(ShutdownOutcome::Complete.exit_code(), 0);
+        assert_eq!(ShutdownOutcome::Forced.exit_code(), EXIT_SHUTDOWN_FORCED);
+        assert_eq!(ShutdownOutcome::CatalogIncomplete.exit_code(), EXIT_SHUTDOWN_INCOMPLETE);
+        assert_ne!(ShutdownOutcome::CatalogIncomplete.exit_code(), 0);
     }
 
     /// The grace period is measured from the FLIP, so the readiness-drain window and the tasks'

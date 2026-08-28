@@ -377,6 +377,20 @@ async fn a_new_live_poll_during_the_drain_is_told_to_come_back() {
     assert!(body_string(res).await.contains("shutting down"));
 }
 
+#[tokio::test]
+async fn an_electric_snapshot_while_control_admission_is_closed_is_retryable() {
+    let (engine, stop) = feed_engine().await;
+    engine.close_control_admission();
+    let res = router(engine)
+        .oneshot(Request::builder().uri("/v1/shape?table=items&offset=-1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.headers().get("retry-after").unwrap(), "1");
+    assert!(body_string(res).await.contains("control admission is closed"));
+    let _ = stop.send(());
+}
+
 /// ...and a NON-live request is not: the drain window exists precisely so requests the engine has
 /// already accepted still get served.
 #[tokio::test]

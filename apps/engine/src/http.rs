@@ -339,6 +339,9 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
+        .route("/_admin/control-admission/close", post(close_control_admission))
+        .route("/_admin/control-admission/open", post(open_control_admission))
+        .route("/_admin/drained-through/{source_commit_id}", get(drained_through))
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
         .route("/aggregate", post(create_aggregate))
@@ -479,6 +482,75 @@ async fn ready(State(engine): State<Engine>) -> Response {
     (code, headers, health_json(status)).into_response()
 }
 
+fn require_private_admin(headers: &HeaderMap) -> Result<(), AppError> {
+    require_private_admin_with_secret(headers, crate::config::control_secret())
+}
+
+fn require_private_admin_with_secret(headers: &HeaderMap, secret: Option<&str>) -> Result<(), AppError> {
+    let Some(secret) = secret else {
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: "private admin authentication is not configured".to_string(),
+        });
+    };
+    let authorized = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|provided| crate::config::secret_matches(secret, provided));
+    if authorized {
+        Ok(())
+    } else {
+        Err(AppError { status: StatusCode::UNAUTHORIZED, msg: "private admin authentication failed".to_string() })
+    }
+}
+
+async fn close_control_admission(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    engine.close_control_admission();
+    engine.wait_for_control_drain().await;
+    Ok(Json(serde_json::json!({ "controlAdmission": "closed" })))
+}
+
+async fn open_control_admission(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    engine.open_control_admission();
+    engine.ensure_control_admitted()?;
+    Ok(Json(serde_json::json!({ "controlAdmission": "open" })))
+}
+
+async fn drained_through(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+    Path(source_commit_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    let parsed = uuid::Uuid::parse_str(&source_commit_id).map_err(|_| AppError {
+        status: StatusCode::BAD_REQUEST,
+        msg: "source_commit_id must be a UUID".to_string(),
+    })?;
+    if parsed.to_string() != source_commit_id {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "source_commit_id must be a canonical lowercase UUID".to_string(),
+        });
+    }
+    let receipt = engine.source_drain_receipt(&source_commit_id);
+    let last_receipt = engine.last_source_drain_receipt();
+    Ok(Json(serde_json::json!({
+        "sourceCommitId": source_commit_id,
+        "drained": receipt.is_some(),
+        "receipt": receipt,
+        "lastReceipt": last_receipt,
+    })))
+}
+
 /// `OPTIONS /v1/shape` — CORS preflight: 204 advertising the methods the adapter serves.
 async fn shape_options() -> Response {
     let mut headers = HeaderMap::new();
@@ -544,6 +616,7 @@ async fn define_schema(
     State(engine): State<Engine>,
     Json(req): Json<DefineSchemaReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _control = engine.admit_control()?;
     engine.define_schema(&req.schema).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -696,6 +769,7 @@ async fn create_shape(
     // Degradation outranks request validation: a degraded engine cannot safely answer for any
     // membership request, even one whose table name is invalid.
     engine.ensure_not_degraded()?;
+    let _control = engine.admit_control()?;
     validate_create_shape_request(&engine, &req).await?;
     let subscription = validate_new_subscription(req.subscription)?;
     // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
@@ -754,6 +828,7 @@ async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
+    let _control = engine.admit_control()?;
     let subscription = validate_new_subscription(req.subscription)?;
     let (rec, sub) = engine.create_aggregate_as(&req.table, req.where_, req.func, req.col, subscription).await?;
     Ok(Json(ShapeResp::created(&engine, rec, sub)))
@@ -971,11 +1046,12 @@ async fn release_shape(
     Path(id): Path<String>,
     Query(q): Query<ReleaseShapeQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _control = engine.admit_control()?;
     if q.purge {
         engine.purge_shape_durable(&id).await?;
     } else {
         let subscription = validate_subscription(q.subscription)?;
-        engine.release_subscription_durable(&id, subscription.as_deref()).await;
+        engine.release_subscription_durable(&id, subscription.as_deref()).await?;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1048,6 +1124,7 @@ async fn insert_table_row(
     Path(table): Path<String>,
     Json(req): Json<InsertRowReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _control = engine.admit_control()?;
     let table = path_table(&table)?;
     let values = req.columns.or(req.values).unwrap_or_default();
     match engine.insert_row(&table, &values).await {
@@ -1072,6 +1149,7 @@ async fn delete_table_rows(
     Path(table): Path<String>,
     Json(req): Json<DeleteRowsReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _control = engine.admit_control()?;
     let table = path_table(&table)?;
     match engine.delete_rows(&table, &req.keys).await {
         Ok(v) => Ok(Json(v)),
@@ -1170,6 +1248,7 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
 /// stream is closed and deleted), and on a healthy engine there is nothing it could fix — the slot
 /// it would drop is the one the ingestor is streaming from.
 async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Value>, AppError> {
+    let _control = engine.admit_control()?;
     let Some(reason) = engine.epoch_broken() else {
         return Err(AppError {
             status: StatusCode::CONFLICT,
@@ -1230,6 +1309,7 @@ impl From<anyhow::Error> for AppError {
             // A create that kept losing the same race is not a server fault either: the request is
             // valid, the engine is busy retiring things underneath it (`CreateRaced`).
             || e.downcast_ref::<crate::engine::CreateRaced>().is_some()
+            || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
         {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
@@ -1251,8 +1331,16 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json};
+    use axum::body::Body;
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    use super::{
+        CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json, require_private_admin_with_secret,
+        router_with_introspection,
+    };
     use crate::predicate::PredicateJson;
+    use crate::{ds::DsClient, engine::Engine};
 
     // The fleet's healthcheck does an awk string-compare against the exact body, so byte-for-byte
     // exactness (no whitespace) matters more than JSON equivalence.
@@ -1261,6 +1349,58 @@ mod tests {
         assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);
         assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
+    }
+
+    #[test]
+    fn private_admin_requires_its_dedicated_control_secret() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer gateway-secret"));
+        assert_eq!(
+            require_private_admin_with_secret(&headers, Some("controller-secret")).unwrap_err().status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer controller-secret"));
+        assert!(require_private_admin_with_secret(&headers, Some("controller-secret")).is_ok());
+        assert_eq!(
+            require_private_admin_with_secret(&headers, None).unwrap_err().status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn private_admin_routes_reject_the_gateway_secret_and_accept_the_control_secret() {
+        crate::config::set_globals(
+            "http-route-test",
+            "http-route-test",
+            Some("gateway-secret"),
+            Some("controller-secret"),
+        );
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let app = router_with_introspection(engine, false);
+
+        let gateway_response = app
+            .clone()
+            .oneshot(
+                Request::post("/_admin/control-admission/close")
+                    .header(header::AUTHORIZATION, "Bearer gateway-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gateway_response.status(), StatusCode::UNAUTHORIZED);
+
+        let control_response = app
+            .oneshot(
+                Request::post("/_admin/control-admission/close")
+                    .header(header::AUTHORIZATION, "Bearer controller-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_response.status(), StatusCode::OK);
     }
 
     #[test]

@@ -142,6 +142,61 @@ impl std::fmt::Display for SubscriptionConflict {
 
 impl std::error::Error for SubscriptionConflict {}
 
+/// New control-plane mutations are paused for a deployment handoff while existing stream reads
+/// remain healthy. Typed so HTTP answers 503 without conflating the gate with read readiness.
+#[derive(Debug)]
+pub struct ControlAdmissionClosed;
+
+impl std::fmt::Display for ControlAdmissionClosed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("control admission is closed for deployment handoff; retry")
+    }
+}
+
+impl std::error::Error for ControlAdmissionClosed {}
+
+struct ControlAdmission {
+    open: std::sync::atomic::AtomicBool,
+    in_flight: std::sync::atomic::AtomicU64,
+    drained: tokio::sync::Notify,
+}
+
+impl ControlAdmission {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: std::sync::atomic::AtomicBool::new(true),
+            in_flight: std::sync::atomic::AtomicU64::new(0),
+            drained: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn release(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
+/// Held for the complete lifetime of an admitted control mutation. Closing admission first flips
+/// the gate, then waits for these guards to drop before a deployment writes its source fence.
+pub struct ControlPermit {
+    admission: Arc<ControlAdmission>,
+}
+
+impl Drop for ControlPermit {
+    fn drop(&mut self) {
+        self.admission.release();
+    }
+}
+
+/// Durable proof that the named source transaction was completely derived into shape streams.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceDrainReceipt {
+    pub source_commit_id: String,
+    pub commit_lsn: String,
+}
+
 /// Fail-closed degradation state, latched when a flip batch exhausts its retries.
 ///
 /// The inner-set node was already reconciled under the registry lock before the batch's query-backs
@@ -194,6 +249,14 @@ pub struct Engine {
     /// `starting` (connected; introspecting / creating slot / spawning ingest), 2 = `active` (ingest
     /// loop running). Library mode (no Postgres) is `active` from construction.
     health: Arc<std::sync::atomic::AtomicU8>,
+    /// Independent of read health: false refuses new control-plane mutations while restored stream
+    /// reads continue. The deployment controller closes this before writing a source fence.
+    control_admission: Arc<ControlAdmission>,
+    /// Source-fence receipts that have landed in the durable catalog, restored at boot. The map is
+    /// the only authority behind the private drained-through endpoint; task exit and slot state do
+    /// not populate it.
+    source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
+    last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
     /// Cross-table subquery registry: maintained inner-set nodes (shared by canonical signature) + the
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
@@ -290,6 +353,7 @@ pub struct Engine {
 
 pub(crate) struct PurgeBarrier {
     dropped_durable: std::sync::atomic::AtomicBool,
+    dropped_failed: std::sync::atomic::AtomicBool,
     dropped_notify: tokio::sync::Notify,
     done: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
@@ -307,6 +371,7 @@ impl PurgeBarrier {
     fn new() -> Self {
         Self {
             dropped_durable: std::sync::atomic::AtomicBool::new(false),
+            dropped_failed: std::sync::atomic::AtomicBool::new(false),
             dropped_notify: tokio::sync::Notify::new(),
             done: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
@@ -318,11 +383,21 @@ impl PurgeBarrier {
         self.dropped_notify.notify_waiters();
     }
 
-    async fn wait_dropped_durable(&self) {
+    fn mark_dropped_failed(&self) {
+        self.dropped_failed.store(true, Ordering::Release);
+        self.dropped_notify.notify_waiters();
+    }
+
+    async fn wait_dropped_durable(&self) -> std::result::Result<(), catalog::CatalogWriterGone> {
         loop {
             let notified = self.dropped_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.dropped_durable.load(Ordering::Acquire) {
-                return;
+                return Ok(());
+            }
+            if self.dropped_failed.load(Ordering::Acquire) {
+                return Err(catalog::CatalogWriterGone);
             }
             notified.await;
         }
@@ -337,11 +412,17 @@ impl PurgeBarrier {
         self.done.load(Ordering::Acquire)
     }
 
-    async fn wait(&self) {
+    async fn wait(&self) -> std::result::Result<(), catalog::CatalogWriterGone> {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.done.load(Ordering::Acquire) {
-                return;
+                return if self.dropped_failed.load(Ordering::Acquire) {
+                    Err(catalog::CatalogWriterGone)
+                } else {
+                    Ok(())
+                };
             }
             notified.await;
         }
@@ -382,6 +463,7 @@ struct SubqueryHandle {
     registry: Arc<Mutex<SubqueryRegistry>>,
     flip_tx: mpsc::UnboundedSender<FlipWork>,
     pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    degrade: Arc<DegradeState>,
 }
 
 /// Spawn the flip-propagation dispatcher: FlipWork batches run **concurrently**, bounded by a
@@ -935,6 +1017,9 @@ impl Engine {
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Library mode: no Postgres to wait on, so report `active` immediately.
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
+            control_admission: ControlAdmission::new(),
+            source_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            last_source_receipt: Arc::new(std::sync::Mutex::new(None)),
             subqueries,
             trace_tx,
             flip_tx,
@@ -975,6 +1060,57 @@ impl Engine {
     /// long-running part of the engine joins it (see [`crate::shutdown`]).
     pub fn shutdown_token(&self) -> crate::shutdown::ShutdownToken {
         self.shutdown.clone()
+    }
+
+    /// Refuse new control mutations while leaving health/readiness unchanged for existing readers.
+    pub fn ensure_control_admitted(&self) -> Result<()> {
+        if self.control_admission.open.load(Ordering::Acquire) && !self.shutdown.is_shutting_down() {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(ControlAdmissionClosed))
+        }
+    }
+
+    pub fn admit_control(&self) -> Result<ControlPermit> {
+        self.ensure_control_admitted()?;
+        self.control_admission.in_flight.fetch_add(1, Ordering::AcqRel);
+        // Close can race between the first check and the increment. Re-check after publishing the
+        // guard; a loser gives its count back and no mutation starts after close returned.
+        if self.ensure_control_admitted().is_err() {
+            self.control_admission.release();
+            return Err(anyhow::Error::new(ControlAdmissionClosed));
+        }
+        Ok(ControlPermit { admission: self.control_admission.clone() })
+    }
+
+    pub fn close_control_admission(&self) {
+        self.control_admission.open.store(false, Ordering::Release);
+    }
+
+    pub async fn wait_for_control_drain(&self) {
+        loop {
+            let notified = self.control_admission.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.control_admission.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn open_control_admission(&self) {
+        if !self.shutdown.is_shutting_down() {
+            self.control_admission.open.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn source_drain_receipt(&self, source_commit_id: &str) -> Option<SourceDrainReceipt> {
+        self.source_receipts.lock().unwrap().get(source_commit_id).cloned()
+    }
+
+    pub fn last_source_drain_receipt(&self) -> Option<SourceDrainReceipt> {
+        self.last_source_receipt.lock().unwrap().clone()
     }
 
     /// Wait for every durable-catalog event sent so far to be appended (or `timeout`). The last
@@ -1166,6 +1302,7 @@ impl Engine {
             registry: self.subqueries.clone(),
             flip_tx: self.flip_tx.clone(),
             pending_flips: self.pending_flips.clone(),
+            degrade: self.degrade.clone(),
         }
     }
 
@@ -1180,6 +1317,8 @@ impl Engine {
                 start,
                 highwater,
                 self.catalog_tx.clone(),
+                self.source_receipts.clone(),
+                self.last_source_receipt.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),

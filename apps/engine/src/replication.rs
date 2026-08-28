@@ -257,6 +257,16 @@ fn sync_table() -> &'static TableRef {
     T.get_or_init(|| TableRef::public("__el_sync").expect("valid sentinel table ref"))
 }
 
+/// The deployment controller writes one canonical UUID row here after closing control admission.
+/// The pgoutput message is carried through the ordered change log as a control envelope, never as
+/// application data, so the sequencer observes it at the exact transaction boundary it fences.
+fn source_fence_table() -> &'static TableRef {
+    static TABLE: std::sync::OnceLock<TableRef> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| TableRef::public("circuits_source_fence").expect("valid source fence table ref"))
+}
+
+pub(crate) const SOURCE_FENCE_ENVELOPE: &str = "__circuits.source_fence";
+
 /// Long-running ingestor. Reconnects on any connection-level failure; the server resends
 /// everything after the last acknowledged commit.
 ///
@@ -706,7 +716,7 @@ impl Decoder {
                 .iter()
                 .filter_map(|id| self.rels.get(id))
                 .filter_map(|r| r.table.clone())
-                .filter(|t| t != sync_table() && tracked.contains_key(t))
+                .filter(|t| t != sync_table() && t != source_fence_table() && tracked.contains_key(t))
                 .collect()
         };
         if !tables.is_empty() {
@@ -732,6 +742,9 @@ impl Decoder {
             }
             return Decoded::None;
         }
+        if table == source_fence_table() {
+            return source_fence_envelope(rel, &msg).map(Decoded::Env).unwrap_or(Decoded::None);
+        }
         let tables = self.tables.read().unwrap();
         let Some(ts) = tables.get(table) else { return Decoded::None };
         match build_envelope(table, ts, &rel.columns, msg) {
@@ -739,6 +752,41 @@ impl Decoder {
             None => Decoded::None,
         }
     }
+}
+
+fn source_fence_envelope(rel: &RelMeta, message: &Message) -> Option<Envelope> {
+    let tuple = match message {
+        Message::Insert { new, .. } | Message::Update { new, .. } => new,
+        Message::Delete { .. } => return None,
+        _ => return None,
+    };
+    let index = rel.columns.iter().position(|column| column == "source_commit_id")?;
+    let Cell::Text(source_commit_id) = tuple.get(index)? else {
+        tracing::error!("replicator: source fence has no textual source_commit_id; refusing to acknowledge a receipt");
+        return None;
+    };
+    let parsed = match uuid::Uuid::parse_str(source_commit_id) {
+        Ok(parsed) if parsed.to_string() == *source_commit_id => parsed,
+        Ok(_) | Err(_) => {
+            tracing::error!(source_commit_id, "replicator: source fence id is not a canonical lowercase UUID");
+            return None;
+        }
+    };
+    let source_commit_id = parsed.to_string();
+    Some(Envelope {
+        type_: SOURCE_FENCE_ENVELOPE.to_string(),
+        key: source_commit_id,
+        value: None,
+        old: None,
+        headers: EnvelopeHeaders {
+            operation: "source_fence".to_string(),
+            txid: None,
+            offset: None,
+            lsn: None,
+            seq: None,
+            last: None,
+        },
+    })
 }
 
 /// Extract the `n` counter from an `__el_sync` tuple.
@@ -1181,6 +1229,25 @@ mod tests {
         d.on_relation(rel_msg(3, "other", sync_table().name(), &[("id", 23), ("n", 20)]), ev.as_ref(), None).await;
         let s = d.on_change(Message::Update { rel_id: 3, old: None, new: vec![t("1"), t("999")] });
         assert!(matches!(s, Decoded::None), "other.__el_sync must not bump the drain barrier");
+    }
+
+    #[tokio::test]
+    async fn source_fence_is_an_ordered_control_envelope_not_application_data() {
+        let tables = shared(users());
+        let (mut decoder, events) = decoder(&tables).await;
+        decoder
+            .on_relation(
+                rel_msg(4, "public", "circuits_source_fence", &[("source_commit_id", 2950)]),
+                events.as_ref(),
+                None,
+            )
+            .await;
+        let envelope = env_of(
+            decoder.on_change(Message::Insert { rel_id: 4, new: vec![t("018f5f4d-70c2-7d70-a4d5-5f7355078f85")] }),
+        );
+        assert_eq!(envelope.type_, SOURCE_FENCE_ENVELOPE);
+        assert_eq!(envelope.key, "018f5f4d-70c2-7d70-a4d5-5f7355078f85");
+        assert!(envelope.value.is_none(), "the fence is control metadata, never an application row");
     }
 
     /// Changes for relations that are not tracked (and not the sentinel) are ignored.

@@ -206,11 +206,13 @@ PostgreSQL `circuits_source_fence` table included in the Circuits publication. T
 effect. The engine records the observed fence only after the complete source transaction has passed
 the sequencer and every resulting catalog/output append is durable.
 
-The durable catalog event is `SourceDrained { source_commit_id, commit_lsn }`. A private authenticated
-engine endpoint returns the last durable receipt and answers whether a requested ID is drained. The
-controller, not ECS, calls this endpoint. A handoff timeout aborts new control admission and leaves
-the incumbent Electric provider selected; it never treats task exit or slot release as a drain
-receipt.
+The durable catalog event is `SourceDrained { source_commit_id, commit_lsn }`. Private engine
+endpoints close/open control admission and return the last durable receipt plus whether a requested
+ID is drained. They require a controller-only bearer token from
+`ELECTRIC_CIRCUITS_CONTROL_SECRET`; the client-facing `ELECTRIC_SECRET` must not authorize them, and
+an unset control secret disables them. The controller, not ECS, calls these endpoints. A handoff
+timeout aborts new control admission and leaves the incumbent Electric provider selected; it never
+treats task exit or slot release as a drain receipt.
 
 ## 3. Delivery graph
 

@@ -227,6 +227,9 @@ fn ensure_evictor(engine: &Engine) {
                     if entry.last_access.lock().unwrap().elapsed() <= ttl {
                         continue; // touched between the scan and now
                     }
+                    let Ok(_control) = engine.admit_control() else {
+                        continue; // deployment handoff: keep the handle and its subscription intact
+                    };
                     handles().lock().unwrap().remove(&id);
                     drop(guard);
                     engine.release_subscription(&entry.shape_id, Some(&entry.subscription)).await;
@@ -392,7 +395,9 @@ impl From<anyhow::Error> for ApiError {
         // the same race is not a server fault — the request is valid and the engine is busy retiring
         // things underneath it — so an Electric client is told to come back rather than to treat the
         // shape as broken.
-        if e.downcast_ref::<crate::engine::CreateRaced>().is_some() {
+        if e.downcast_ref::<crate::engine::CreateRaced>().is_some()
+            || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
+        {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: format!("{e:#}"),
@@ -901,6 +906,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
 
     // ---- Snapshot: offset=-1 -> create the shape and emit the current rows as inserts.
     if offset == "-1" {
+        let _control = engine.admit_control()?;
         // Resolve + validate `params` (Electric-compatible), then substitute `$N` into the where clause
         // BEFORE parsing, so the predicate/subquery machinery — and the shape's identity/signature —
         // are derived from the substituted text (distinct param values never collide onto one shape).
