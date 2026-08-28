@@ -93,6 +93,7 @@ from its generated ready set rather than from section order.
 | [`28-swift-library-production-readiness-punchlist.md`](28-swift-library-production-readiness-punchlist.md) | **Direct-native Swift library production punchlist and integration-test matrix** |
 | [`29-durable-stream-provider-evaluation.md`](29-durable-stream-provider-evaluation.md) | **Generic provider boundary, ds-rust target and TDD qualification matrix; PicoMQ research deferred** |
 | [`30-swift-collection-framework.md`](30-swift-collection-framework.md) | Provider-neutral collection/demand/materialization terminology and Swift store framework proposal |
+| [`31-multi-stack-namespace-and-handoff.md`](31-multi-stack-namespace-and-handoff.md) | **Multi-stack stream namespacing, explicit deploy handoff, future warm-generation architecture, and disposable-volume boundary** |
 
 ## Independent differential reviews
 
