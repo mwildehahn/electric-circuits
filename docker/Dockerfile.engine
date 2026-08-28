@@ -5,22 +5,28 @@
 # Build context is the repo root:
 #   docker build -f docker/Dockerfile.engine -t electric-circuits-engine .
 #
-# The engine speaks plain HTTP to the durable-streams server (reqwest is built with no TLS
-# backend), so the runtime image needs no OpenSSL — just certs-free debian slim.
+# The engine speaks HTTPS with mTLS to the durable-streams access boundary. PostgreSQL query and
+# logical-replication connections use rustls with an explicit CA bundle; no OpenSSL runtime is
+# required.
 
-FROM rust:1-bookworm AS build
+FROM rust:1.96.0-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY apps/engine apps/engine
-RUN cargo build --release -p electric-circuits-engine
+RUN cargo build --release --locked -p electric-circuits-engine
 
 FROM debian:bookworm-slim
 COPY --from=build /repo/target/release/electric-circuits-engine /usr/local/bin/electric-circuits-engine
+COPY docker/aws-rds-us-east-1-bundle.pem /etc/ssl/certs/aws-rds-us-east-1-bundle.pem
 
 # Required:
 #   ELECTRIC_CIRCUITS_DS_URL   durable-streams base URL (e.g. http://ds:8791)
 #   ELECTRIC_CIRCUITS_PG_URL   Postgres URL (wal_level=logical; the engine creates its slot)
+#                              Nonlocal hosts require sslmode=verify-full.
+#   ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE
+#                              Absolute CA bundle path for nonlocal Postgres. This image includes
+#                              /etc/ssl/certs/aws-rds-us-east-1-bundle.pem for RDS us-east-1.
 # Optional:
 #   ELECTRIC_CIRCUITS_PG_TABLES  comma list of `schema.name` / bare `name` (= public.<name>) /
 #                           `schema.*`; `*` (the default here) = every `public` table with a PK

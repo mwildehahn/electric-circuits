@@ -21,6 +21,11 @@ ingestor.
 the pilot can qualify later profiles, but the profile name itself must never be used as evidence that
 the system is ready for general customer traffic.
 
+Deploying the services with both product flags off is permitted before cohort enablement. Enabling
+employee traffic remains blocked until `INTERNAL_PILOT_V1` is emitted ready by the generated
+production-readiness manifest governed by `notes/18-production-readiness-spec-reviewed.md`; this task
+list does not independently authorize the pilot.
+
 ## 2. Decisions closed for implementation
 
 ### 2.1 Engine and ingestor boundary
@@ -76,6 +81,11 @@ use `meta/catalog`, `changes/<segment>`, and `shape/<id>`. A path already beginn
 an empty component, `.` or `..`, a backslash, a query/fragment marker, or a percent escape is rejected
 before HTTP I/O.
 
+The agent product/API contract similarly retains the logical path `agent-runs/v1/{run_ref}`. The
+authenticated gateway maps that logical identity exactly once to the normalized physical request path
+`/agent-runs/v1/<stack>/stores/<store-generation>/runs/<run-ref>`; neither producers nor clients choose
+the stack, generation, or physical prefix.
+
 ### 2.3 Storage identity authority
 
 Pulumi creates `store_id` and `store_generation` as explicit per-environment values and stores them in
@@ -83,15 +93,21 @@ protected SSM parameters. Pulumi also records the expected volume ID, KMS key, s
 UUID, protocol/layout version, durability mode, WAL shards, and stream lanes. Those values are the
 independent expected configuration; the on-volume manifest is the observed state.
 
-A one-shot host operation initializes a new volume using the explicit expected values. Ordinary
-server startup only validates. A reset allocates a new `store_generation` and uses a newly empty or
-explicitly replaced filesystem; it never rewrites the identity of a live store in place. Neither the
-ECS task entrypoint nor an empty stream inventory may auto-initialize a store.
+A one-shot host operation initializes a new volume using the explicit expected values. Its Pulumi
+authorization defaults off in every stack, is enabled only for the exact volume/store/generation
+tuple being initialized, and is returned to off before ECS registration and ordinary service
+admission. Ordinary server startup only validates. A reset allocates a new `store_generation` and
+uses a newly empty or explicitly replaced filesystem; it never rewrites the identity of a live store
+in place. Neither the ECS task entrypoint nor an empty stream inventory may auto-initialize a store.
 
 The first manifest format is JSON at `/data/.durable-streams-store-v1.json`, written via temporary
 file, file `fsync`, atomic rename, and parent-directory `fsync`. It contains every field named in the
 architecture specification. Unknown fields are tolerated; missing required fields, duplicate keys,
 type mismatches, or expected/observed mismatches are fatal.
+
+`artifact_digest` is not a bootstrap argument or manifest field. It is supplied only to ordinary
+server startup and echoed by readiness so operators and consumers can attest the running artifact
+without coupling a deploy to persistent storage lineage.
 
 ### 2.3.1 `StoreReadinessV1` contract
 
@@ -173,10 +189,11 @@ storage reserve state all fail closed.
 
 Agent producers do not connect directly. The authenticated Indexed API/gateway owns run assignment
 and writes on the producer's behalf using the `agent-writer` service identity. The storage boundary
-then enforces `agent-writer -> agent-runs/v1/<store-generation>/` and the gateway enforces the exact
-assigned opaque run ID. Similarly, the client gateway resolves a public handle before using its
-read-only storage identity. This avoids inventing per-run storage credentials while preserving both
-application authorization and storage prefix isolation.
+then enforces
+`agent-writer -> /agent-runs/v1/<stack>/stores/<store-generation>/runs/` and the gateway enforces the
+exact assigned opaque run ID. Similarly, the client gateway resolves a public handle before using
+its read-only storage identity. This avoids inventing per-run storage credentials while preserving
+both application authorization and storage prefix isolation.
 
 ### 2.5 Pilot capacity reservations
 
@@ -292,13 +309,17 @@ handlers, `tests/cli_durability_guards.rs`, and new focused integration tests.
 
 Implement:
 
-- an explicit `bootstrap-store` CLI operation accepting every expected manifest field;
+- an explicit `bootstrap-store` CLI operation accepting every expected manifest field but no
+  artifact digest;
 - atomic/fsynced creation that refuses any existing manifest, WAL, stream, segment, or cold-tier
   state and never starts a listener;
 - a non-blocking exclusive advisory lock at `<data-dir>/.durable-streams.lock`
   (`/data/.durable-streams.lock` in deployment), acquired before bootstrap, manifest validation,
   store construction, WAL recovery, mutation, or listener bind and held for the process lifetime;
-- required expected-identity startup arguments in WAL mode and strict comparison with the manifest;
+- required expected-identity startup arguments in WAL mode and strict comparison with the manifest:
+  `--store-id`, `--store-generation`, `--protocol-version`, `--layout-version`, and
+  `--filesystem-uuid`; ordinary server startup also requires `--artifact-digest`, which is reported
+  through readiness but is never written into the manifest;
 - loopback-only `/_admin/ready` reporting `starting`, `recovering`, `ready`, or `stopping`, plus the
   manifest, canonical running `artifact_digest`, recovery result, durable frontier, free bytes/inodes,
   and reserve state; the digest is a required immutable startup value injected from the built image
@@ -379,8 +400,14 @@ Deliver:
 
 - one environment-specific dedicated ECS EC2 capacity provider in the selected AZ;
 - a separately owned encrypted gp3 volume with delete-on-termination disabled and no Multi-Attach;
-- fail-closed host mount gate and explicit bootstrap runbook/automation;
+- fail-closed host mount gate that mounts the filesystem at `/mnt/durable-streams` and bind-mounts
+  only `/mnt/durable-streams/data` to container `/data`, leaving ext4 `lost+found` outside the server
+  data directory;
+- explicit bootstrap runbook/automation guarded by a per-stack one-shot authorization that defaults
+  off, is scoped to the exact volume/store/generation tuple, and is off before ECS registration;
 - singleton Durable Streams service with the server and access-boundary containers;
+- a server task command that supplies `--store-id`, `--store-generation`, `--protocol-version`,
+  `--layout-version`, `--filesystem-uuid`, and `--artifact-digest` on every ordinary start;
 - engine service using stop-confirm-start, source-fence polling, and rollback to the incumbent provider;
 - security groups exposing only the proxy, plus exact service identities and prefix policy;
 - the proxy HTTPS endpoint, CA bundle, and engine client-certificate/key mounts rendered into the
@@ -470,10 +497,12 @@ do not subtract independently aggregated percentiles.
 **Depends on:** `QUAL-01`  
 **Repository:** `indexed`
 
-Enable dev staff first. Then deploy the same pinned images and versioned profile to the production
-account with flags off, run smoke/recovery checks, and enable a named employee cohort. Roll back the
-two flags independently. A rollback never deletes the DS volume, resets a store generation, drops the
-incumbent Electric slot, or rebinds an old client offset to a new physical stream.
+Enable dev staff first only after the generated production-readiness manifest emits
+`INTERNAL_PILOT_V1` ready. Then deploy the same pinned images and versioned profile to the production
+account with flags off, run smoke/recovery checks, and enable a named employee cohort only while that
+generated gate remains satisfied. Roll back the two flags independently. A rollback never deletes
+the DS volume, resets a store generation, drops the incumbent Electric slot, or rebinds an old client
+offset to a new physical stream.
 
 ## 5. First execution wave
 

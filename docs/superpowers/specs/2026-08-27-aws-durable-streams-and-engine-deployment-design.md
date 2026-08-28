@@ -26,6 +26,11 @@ The pilot is internal testing, not an external-customer cutover. Because it runs
 account, it still follows the production transport, identity, storage, and recovery boundaries from
 the canonical production-readiness note.
 
+Provisioning resources with product flags off does not authorize employee traffic. Employee pilot
+enablement remains gated on `INTERNAL_PILOT_V1` being emitted ready by the generated
+production-readiness manifest governed by the canonical note; this prose contract and a successful
+infrastructure deployment are not substitutes for that generated closure.
+
 ## 2. Locked decisions
 
 1. PostgreSQL is authoritative for committed application rows. Durable Streams is authoritative for
@@ -83,7 +88,7 @@ cohort.
 | Component | Canonical state | Local storage |
 | --- | --- | --- |
 | PostgreSQL | Application rows; Circuits deployment registry; durable producer-epoch allocation | Provider-managed database storage |
-| Durable Streams | Stream bytes and metadata, WAL, on-volume store manifest | Persistent gp3 EBS at `/data` |
+| Durable Streams | Stream bytes and metadata, WAL, on-volume store manifest | Container `/data`, backed by host `/mnt/durable-streams/data` on persistent gp3 EBS |
 | Circuits engine | No irreplaceable state beyond PostgreSQL and Durable Streams | Ephemeral transaction spill and rebuildable DBSP state |
 | Future ingestor | No irreplaceable state beyond its durable registry/catalog, slot, and acknowledged input streams | Ephemeral bounded transaction spill |
 | Gateway | Public-handle registry and generation routing | Separately qualified durable registry |
@@ -148,14 +153,16 @@ The ingest catalog contains the PostgreSQL/slot binding, envelope version, segme
 and last complete transaction acknowledged by Durable Streams. Query catalogs bind to exactly one
 ingest epoch.
 
-Agent streams live outside the Circuits prefix:
+Agent streams live outside the Circuits prefix. The product/API contract keeps its logical name while
+the gateway qualifies it exactly once with the stack and storage generation:
 
 ```text
-agent-runs/v1/<store-generation>/<opaque-run-id>
+agent-runs/v1/{run_ref}
+  -> /agent-runs/v1/<stack>/stores/<store-generation>/runs/<run-ref>
 ```
 
-Prefixes prevent accidental naming collision. Only the access boundary makes them an authorization
-boundary.
+The leading slash denotes the normalized physical HTTP request path. Prefixes prevent accidental
+naming collision. Only the access boundary makes them an authorization boundary.
 
 ### 4.3 Store and handle binding
 
@@ -179,10 +186,12 @@ Ordinary startup never invents one. The expected identity comes from independent
 configuration; reading an empty catalog is not evidence that an empty store is intended.
 
 A new-volume bootstrap is a separate, explicitly authorized one-shot host operation executed before
-ECS registration. It verifies that the selected ext4 filesystem contains no prior store, atomically
-writes and fsyncs the manifest and its parent directory, and exits without starting a listener. A
-reset creates a new `store_generation`; it never overwrites an existing store identity in place.
-Ordinary task startup cannot perform either operation.
+ECS registration. Its IaC authorization defaults off in every stack, is enabled only for the exact
+volume/store/generation tuple being initialized, and is returned to off before ordinary service
+admission. Bootstrap verifies that the selected ext4 data directory contains no prior store,
+atomically writes and fsyncs the manifest and its parent directory, and exits without starting a
+listener. A reset creates a new `store_generation`; it never overwrites an existing store identity in
+place. Ordinary task startup cannot perform either operation.
 
 Each Circuits catalog contains a `StoreBound` event with the storage identity plus
 `stack_namespace`, `ingest_epoch`, and `query_generation`. Every public handle is immutable to:
@@ -240,6 +249,12 @@ durable-streams-server
   --port 4437
   --durability wal
   --data-dir /data
+  --store-id <store-id>
+  --store-generation <store-generation>
+  --protocol-version 1
+  --layout-version 1
+  --filesystem-uuid <filesystem-uuid>
+  --artifact-digest sha256:<64-lowercase-hex>
   --worker-threads 2
   --wal-shards 2
   --stream-lanes 1
@@ -250,8 +265,11 @@ boundary. The `tier` feature remains off.
 
 ### 5.2 EBS, mount, singleton, and host lifecycle
 
-- One encrypted gp3 EBS volume is mounted on the dedicated EC2 host at
-  `/mnt/durable-streams`; the ECS task bind-mounts it to `/data`.
+- One encrypted gp3 EBS filesystem is mounted on the dedicated EC2 host at
+  `/mnt/durable-streams`. The storage data directory is the dedicated child
+  `/mnt/durable-streams/data`, which the ECS task bind-mounts to container `/data`. The ext4
+  `lost+found` directory therefore remains at the filesystem root, outside the server data directory
+  and its strict blank-store/bootstrap checks.
 - Delete-on-termination is disabled for the volume. EBS Multi-Attach is disabled.
 - The capacity provider is constrained to the volume's AZ.
 - Before store construction or WAL recovery, the server acquires a non-blocking exclusive lock on
@@ -269,7 +287,8 @@ The host does not register with ECS, and the task cannot start, until a mount ga
 - expected EBS volume ID and filesystem UUID;
 - ext4 and the pinned mount options;
 - `/mnt/durable-streams` is a mount point rather than an ordinary root-volume directory;
-- expected ownership and permissions;
+- `/mnt/durable-streams/data` exists only beneath that verified mount and has the expected ownership
+  and permissions;
 - the immutable on-volume store manifest; and
 - minimum free-byte and inode reserves.
 
@@ -291,6 +310,9 @@ discovery. Prefix/verb policy is specified in section 11.
 
 After WAL recovery, an authenticated admin-readiness endpoint returns the on-volume manifest plus
 recovery state, durable frontier, free bytes/inodes, reserve state, and running artifact digest.
+The artifact digest is an ordinary server-start argument and readiness attestation only. Bootstrap
+does not accept it and never persists it in the store manifest, so updating server bytes does not
+rewrite storage lineage.
 `GET /_admin/ready` is available only to the storage-administrator and configured pilot
 Circuits-engine identities; it is read-only, bounded, contains no credentials or inventory, and
 grants no other admin verb. Inventory remains restricted to storage-administrator/retention
@@ -605,7 +627,7 @@ endpoint and uses TLS/mTLS service identities. It enforces both verb and prefix:
 - a future ingestor identity can mutate only its ingest-epoch paths;
 - the authenticated Indexed API/gateway owns exact agent-run assignment and writes on a producer's
   behalf; its `agent-writer` storage identity can ensure, append, and close only
-  `agent-runs/v1/<store-generation>/...` paths;
+  `/agent-runs/v1/<stack>/stores/<store-generation>/runs/...` paths;
 - the gateway has read-only access only to physical streams selected by its authorized handle
   registry; and
 - only a storage-administrator/retention identity can enumerate across prefixes or perform

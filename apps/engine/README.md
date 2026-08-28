@@ -112,7 +112,7 @@ unknown `ELECTRIC_*` var is accepted and logged once as "accepted (no-op)" — i
 
 | Var | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | *(unset)* | Postgres URL (tolerates `?sslmode=disable`); `ELECTRIC_CIRCUITS_PG_URL` wins |
+| `DATABASE_URL` | *(unset)* | Postgres URL; nonlocal hosts require `sslmode=verify-full` and `ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE`; `sslmode=disable` is local-development-only; `ELECTRIC_CIRCUITS_PG_URL` wins |
 | `ELECTRIC_PORT` | `3000` when set / under `DATABASE_URL` | Binds `0.0.0.0:<port>`; `ELECTRIC_CIRCUITS_BIND` wins |
 | `ELECTRIC_LOG_LEVEL` | `info` | `error`/`warning`/`info`/`debug` → log filter; `ELECTRIC_CIRCUITS_LOG` wins |
 | `ELECTRIC_REPLICATION_STREAM_ID` | *(unset)* | Slot name `electric_slot_<id>`; also the `stack_id` metric tag |

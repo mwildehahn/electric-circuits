@@ -4,11 +4,19 @@
 //! arrive via logical replication (see `replication.rs`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::BufReader;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
+use pgwire_replication::{ReplicationConfig, TlsConfig};
+use rustls::{ClientConfig, RootCertStore};
 use tokio_postgres::{Client, NoTls};
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tokio_stream::StreamExt;
+use url::Url;
 
 use crate::heap_size::HeapSize;
 use crate::predicate::CompiledPredicate;
@@ -26,6 +34,264 @@ use crate::value::Row;
 /// A `connect_timeout` in the URL wins — an operator who set one meant it.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+const PG_TLS_CA_BUNDLE_ENV: &str = "ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE";
+const PG_TLS_SERVER_NAME_ENV: &str = "ELECTRIC_CIRCUITS_PG_TLS_SERVER_NAME";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PgTlsPolicy {
+    Disabled,
+    VerifyFull { ca_bundle: PathBuf, server_name: Option<String> },
+}
+
+/// One validated Postgres connection policy shared by ordinary queries and logical replication.
+///
+/// Production/nonlocal connections are accepted only with `sslmode=verify-full` plus an explicit
+/// CA bundle. Plaintext is limited to loopback, `.local`, and single-label development service
+/// names. The query connector translates verified TLS to tokio-postgres's transport-level
+/// `require` mode while rustls performs chain and hostname verification; the replication connector
+/// receives the equivalent pgwire `VerifyFull` policy.
+#[derive(Clone)]
+pub struct PgConnectionConfig {
+    query: tokio_postgres::Config,
+    url: Url,
+    connect_host: String,
+    tls: PgTlsPolicy,
+}
+
+impl PgConnectionConfig {
+    pub fn resolve(url: &str, ca_bundle: Option<&str>, server_name: Option<&str>) -> Result<Self> {
+        let mut parsed = Url::parse(url).map_err(|error| {
+            anyhow::anyhow!(
+                "unusable Postgres URL '{}': {error}. Expected a postgres:// or postgresql:// URL",
+                redact_pg_url(url)
+            )
+        })?;
+        if !matches!(parsed.scheme(), "postgres" | "postgresql") || parsed.host_str().is_none() {
+            bail!(
+                "unusable Postgres URL '{}': expected a postgres:// or postgresql:// URL with one host",
+                redact_pg_url(url)
+            );
+        }
+
+        let ssl_modes: Vec<String> =
+            parsed.query_pairs().filter(|(name, _)| name == "sslmode").map(|(_, value)| value.into_owned()).collect();
+        if ssl_modes.len() > 1 {
+            bail!("Postgres URL must contain at most one sslmode parameter");
+        }
+        let host = parsed.host_str().expect("host checked above").to_string();
+        let configured_mode = ssl_modes.first().map(String::as_str);
+        let tls = match configured_mode {
+            Some("verify-full") => {
+                let ca_bundle = ca_bundle
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from)
+                    .context("sslmode=verify-full requires ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE")?;
+                if !ca_bundle.is_absolute() {
+                    bail!("ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE must be an absolute path");
+                }
+                let server_name = server_name.filter(|value| !value.trim().is_empty()).map(str::to_string);
+                if let Some(name) = server_name.as_deref() {
+                    validate_server_name(name)?;
+                    if name != host {
+                        let address = host.parse::<IpAddr>().with_context(|| {
+                            format!(
+                                "{PG_TLS_SERVER_NAME_ENV} may override only an IP-address Postgres host; DNS host '{host}' already supplies its verification name"
+                            )
+                        })?;
+                        parsed
+                            .set_host(Some(name))
+                            .map_err(|_| anyhow::anyhow!("{PG_TLS_SERVER_NAME_ENV} is not a valid URL host"))?;
+                        let mut pairs: Vec<(String, String)> = parsed
+                            .query_pairs()
+                            .filter(|(key, _)| key != "hostaddr")
+                            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                            .collect();
+                        pairs.push(("hostaddr".into(), address.to_string()));
+                        replace_query_pairs(&mut parsed, pairs);
+                    }
+                }
+                PgTlsPolicy::VerifyFull { ca_bundle, server_name }
+            }
+            None | Some("disable") if is_local_development_host(&host) => {
+                if ca_bundle.is_some() || server_name.is_some() {
+                    bail!("{PG_TLS_CA_BUNDLE_ENV} and {PG_TLS_SERVER_NAME_ENV} require sslmode=verify-full");
+                }
+                PgTlsPolicy::Disabled
+            }
+            None | Some("disable") => {
+                bail!("nonlocal Postgres host '{host}' requires sslmode=verify-full and {PG_TLS_CA_BUNDLE_ENV}")
+            }
+            Some("prefer" | "require" | "verify-ca") => bail!(
+                "Postgres sslmode={} is not accepted; use sslmode=verify-full with {PG_TLS_CA_BUNDLE_ENV}, or sslmode=disable only for local development",
+                configured_mode.expect("matched mode")
+            ),
+            Some(other) => bail!("unsupported Postgres sslmode={other}; use verify-full for nonlocal connections"),
+        };
+
+        let query_mode = match tls {
+            PgTlsPolicy::Disabled => "disable",
+            PgTlsPolicy::VerifyFull { .. } => "require",
+        };
+        let pairs = parsed
+            .query_pairs()
+            .filter(|(name, _)| name != "sslmode")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .chain(std::iter::once(("sslmode".to_string(), query_mode.to_string())))
+            .collect();
+        replace_query_pairs(&mut parsed, pairs);
+
+        let mut query = parsed.as_str().parse::<tokio_postgres::Config>().map_err(|error| {
+            anyhow::anyhow!(
+                "unusable Postgres URL '{}': {error}. Expected a postgres:// or postgresql:// URL",
+                redact_pg_url(url)
+            )
+        })?;
+        if query.get_connect_timeout().is_none() {
+            query.connect_timeout(CONNECT_TIMEOUT);
+        }
+        Ok(Self { query, url: parsed, connect_host: host, tls })
+    }
+
+    pub fn from_process_env(url: &str) -> Result<Self> {
+        let ca_bundle = std::env::var(PG_TLS_CA_BUNDLE_ENV).ok();
+        let server_name = std::env::var(PG_TLS_SERVER_NAME_ENV).ok();
+        Self::resolve(url, ca_bundle.as_deref(), server_name.as_deref())
+    }
+
+    async fn connect(&self) -> Result<Client> {
+        match &self.tls {
+            PgTlsPolicy::Disabled => {
+                let (client, connection) = self.query.connect(NoTls).await.context("connect postgres")?;
+                tokio::spawn(async move {
+                    if let Err(error) = connection.await {
+                        tracing::error!("postgres connection error: {error}");
+                    }
+                });
+                Ok(client)
+            }
+            PgTlsPolicy::VerifyFull { ca_bundle, .. } => {
+                let connector = MakeRustlsConnect::new(rustls_client_config(ca_bundle)?);
+                let (client, connection) =
+                    self.query.connect(connector).await.context("connect postgres with verified TLS")?;
+                tokio::spawn(async move {
+                    if let Err(error) = connection.await {
+                        tracing::error!("postgres TLS connection error: {error}");
+                    }
+                });
+                Ok(client)
+            }
+        }
+    }
+
+    pub(crate) fn replication_config(&self, slot: &str, publication: &str) -> Result<ReplicationConfig> {
+        let user = match self.url.username() {
+            "" => "postgres".to_string(),
+            value => percent_decode(value),
+        };
+        let database = match self.url.path().trim_start_matches('/') {
+            "" => user.clone(),
+            value => percent_decode(value),
+        };
+        let tls = match &self.tls {
+            PgTlsPolicy::Disabled => TlsConfig::disabled(),
+            PgTlsPolicy::VerifyFull { ca_bundle, server_name } => {
+                let mut tls = TlsConfig::verify_full(Some(ca_bundle.clone()));
+                if let Some(name) = server_name {
+                    tls = tls.with_sni_hostname(name.clone());
+                }
+                tls
+            }
+        };
+        Ok(ReplicationConfig {
+            host: self.connect_host.clone(),
+            port: self.url.port().unwrap_or(5432),
+            user,
+            password: self.url.password().map(percent_decode).unwrap_or_default(),
+            database,
+            tls,
+            slot: slot.to_string(),
+            publication: publication.to_string(),
+            start_lsn: pgwire_replication::Lsn::ZERO,
+            stop_at_lsn: None,
+            status_interval: std::time::Duration::from_secs(1),
+            idle_wakeup_interval: std::time::Duration::from_secs(10),
+            buffer_events: 8192,
+        })
+    }
+}
+
+fn replace_query_pairs(parsed: &mut Url, pairs: Vec<(String, String)>) {
+    parsed.set_query(None);
+    parsed.query_pairs_mut().extend_pairs(pairs);
+}
+
+fn is_local_development_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || !host.contains('.')
+        || host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_server_name(value: &str) -> Result<()> {
+    if value.parse::<IpAddr>().is_ok()
+        || value.is_empty()
+        || value.len() > 253
+        || value.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        bail!("{PG_TLS_SERVER_NAME_ENV} must be a valid DNS name");
+    }
+    Ok(())
+}
+
+fn rustls_client_config(ca_bundle: &Path) -> Result<ClientConfig> {
+    let file = File::open(ca_bundle).with_context(|| format!("open Postgres TLS CA bundle {}", ca_bundle.display()))?;
+    let certificates = rustls_pemfile::certs(&mut BufReader::new(file))
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("parse Postgres TLS CA bundle {}", ca_bundle.display()))?;
+    if certificates.is_empty() {
+        bail!("Postgres TLS CA bundle {} contains no certificates", ca_bundle.display());
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .with_context(|| format!("load certificate from Postgres TLS CA bundle {}", ca_bundle.display()))?;
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Ok(ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("configure Postgres TLS protocol versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                ((bytes[index + 1] as char).to_digit(16), (bytes[index + 2] as char).to_digit(16))
+            {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Connect and drive the connection on a background task. Returns the query `Client`.
 /// For per-request work (backfills, query-backs, subset queries) prefer [`pool_for`] — a fresh
 /// TCP+auth handshake per shape creation is the fleet benchmark's p99 driver, and thousands of
@@ -34,17 +300,7 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// The pool dials through here too, so the boot connection and every pooled one share one config
 /// path — including the connect timeout.
 pub async fn connect(url: &str) -> Result<Client> {
-    let mut cfg = parse_pg_url(url)?;
-    if cfg.get_connect_timeout().is_none() {
-        cfg.connect_timeout(CONNECT_TIMEOUT);
-    }
-    let (client, conn) = cfg.connect(NoTls).await.context("connect postgres")?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("postgres connection error: {e}");
-        }
-    });
-    Ok(client)
+    PgConnectionConfig::from_process_env(url)?.connect().await
 }
 
 // ---- boot-time error taxonomy (issue #13) ------------------------------------------------------
@@ -206,13 +462,7 @@ pub fn boot_failure_name(e: &anyhow::Error) -> &'static str {
 /// broken string every 30 s forever. Parsing is pure and has no I/O, so it belongs in
 /// `Config::resolve` where every other unusable setting is refused.
 pub fn parse_pg_url(url: &str) -> Result<tokio_postgres::Config> {
-    url.parse::<tokio_postgres::Config>().map_err(|e| {
-        anyhow::anyhow!(
-            "unusable Postgres URL '{}': {e}. Expected a libpq connection string, e.g. \
-             postgres://user:password@host:5432/dbname",
-            redact_pg_url(url)
-        )
-    })
+    PgConnectionConfig::from_process_env(url).map(|config| config.query)
 }
 
 /// A Postgres URL with its password replaced, for a message an operator will paste into a ticket.
@@ -1434,6 +1684,40 @@ mod tests {
         // ...and it is NOT a `tokio_postgres::Error` in the chain, so `boot_disposition` — which
         // only ever sees it if this check were removed — would call it fatal too.
         assert_eq!(boot_disposition(&e), BootFailure::Fatal);
+    }
+
+    #[test]
+    fn query_pool_and_replication_share_the_same_verified_tls_policy() {
+        let config = PgConnectionConfig::resolve(
+            "postgresql://repl:p%40ss@example.cluster.us-east-1.rds.amazonaws.com/app?sslmode=verify-full",
+            Some("/run/secrets/postgres/rds-ca.pem"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.query.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require,
+            "tokio-postgres must negotiate TLS; rustls owns full verification"
+        );
+        let replication = config.replication_config("circuits", "circuits_pub").unwrap();
+        assert_eq!(replication.host, "example.cluster.us-east-1.rds.amazonaws.com");
+        assert_eq!(replication.user, "repl");
+        assert_eq!(replication.password, "p@ss");
+        assert_eq!(replication.database, "app");
+        assert_eq!(replication.tls.mode, pgwire_replication::SslMode::VerifyFull);
+        assert_eq!(replication.tls.ca_pem_path.as_deref(), Some(Path::new("/run/secrets/postgres/rds-ca.pem")));
+    }
+
+    #[test]
+    fn local_development_uses_explicit_plaintext_on_both_paths() {
+        let config =
+            PgConnectionConfig::resolve("postgresql://postgres:password@postgres:5432/app", None, None).unwrap();
+        assert_eq!(config.query.get_ssl_mode(), tokio_postgres::config::SslMode::Disable);
+        assert_eq!(
+            config.replication_config("circuits", "circuits_pub").unwrap().tls.mode,
+            pgwire_replication::SslMode::Disable
+        );
     }
 
     /// A boot failure that is not a Postgres failure at all — an unusable `PG_TABLES` entry, an

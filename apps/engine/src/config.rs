@@ -198,7 +198,10 @@ impl Config {
         // this a typo would back off and re-parse the same broken string every 30 s for ever.
         let pg_url = g("ELECTRIC_CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL"));
         if let Some(url) = pg_url.as_deref() {
-            crate::pg::parse_pg_url(url).context("ELECTRIC_CIRCUITS_PG_URL / DATABASE_URL")?;
+            let ca_bundle = g("ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE");
+            let server_name = g("ELECTRIC_CIRCUITS_PG_TLS_SERVER_NAME");
+            crate::pg::PgConnectionConfig::resolve(url, ca_bundle.as_deref(), server_name.as_deref())
+                .context("ELECTRIC_CIRCUITS_PG_URL / DATABASE_URL")?;
         }
         let ds_url = g("ELECTRIC_CIRCUITS_DS_URL");
         let ds_connection = match ds_url.clone() {
@@ -685,6 +688,28 @@ mod tests {
         let url = "postgresql://postgres:password@proxy:5433/postgres?sslmode=disable";
         let c = cfg(&[("DATABASE_URL", url)]);
         assert_eq!(c.pg_url.as_deref(), Some(url));
+    }
+
+    #[test]
+    fn nonlocal_postgres_requires_verify_full_with_an_explicit_ca() {
+        let rds_url = "postgresql://user:password@example.cluster.us-east-1.rds.amazonaws.com/app";
+        let resolve = |entries: &[(&str, &str)]| {
+            Config::resolve(|key| entries.iter().find_map(|(name, value)| (*name == key).then(|| (*value).to_string())))
+        };
+
+        let missing_mode = resolve(&[("ELECTRIC_CIRCUITS_PG_URL", rds_url)])
+            .expect_err("a nonlocal database must not silently use plaintext or opportunistic TLS");
+        assert!(format!("{missing_mode:#}").contains("sslmode=verify-full"));
+
+        let unverified = resolve(&[("ELECTRIC_CIRCUITS_PG_URL", &format!("{rds_url}?sslmode=require"))])
+            .expect_err("encryption without server verification must be refused");
+        assert!(format!("{unverified:#}").contains("sslmode=verify-full"));
+
+        resolve(&[
+            ("ELECTRIC_CIRCUITS_PG_URL", &format!("{rds_url}?sslmode=verify-full")),
+            ("ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE", "/run/secrets/postgres/rds-ca.pem"),
+        ])
+        .expect("full verification with an explicit CA is the production contract");
     }
 
     #[test]

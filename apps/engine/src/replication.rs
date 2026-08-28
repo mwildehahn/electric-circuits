@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Context, Result};
-use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
+use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent};
 use serde_json::{Map, Value as Json};
 
 use crate::changelog::ChangeLogWriter;
@@ -368,59 +368,9 @@ enum StreamEnd {
     ShuttingDown,
 }
 
-/// Build the walsender connection config from a `postgres://` URL. TLS is disabled — parity with
-/// the engine's other connections (`pg::connect` uses `NoTls`).
+/// Build the walsender connection from the same validated TLS policy used by query connections.
 fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<ReplicationConfig> {
-    let u = url::Url::parse(pg_url).context("parse postgres url")?;
-    let user = match u.username() {
-        "" => "postgres".to_string(),
-        s => percent_decode(s),
-    };
-    let database = match u.path().trim_start_matches('/') {
-        "" => user.clone(),
-        s => percent_decode(s),
-    };
-    Ok(ReplicationConfig {
-        host: u.host_str().unwrap_or("127.0.0.1").to_string(),
-        port: u.port().unwrap_or(5432),
-        user,
-        password: u.password().map(percent_decode).unwrap_or_default(),
-        database,
-        tls: TlsConfig::default(),
-        slot: slot.to_string(),
-        publication: publication.to_string(),
-        // 0/0: the server streams from the slot's confirmed_flush_lsn when asked for an older
-        // position, which is exactly "resume where we left off".
-        start_lsn: Lsn::ZERO,
-        stop_at_lsn: None,
-        // How often acknowledged progress is flushed to the server. Bounds the duplicate window
-        // after a reconnect (the tailer de-duplicates anyway).
-        status_interval: std::time::Duration::from_secs(1),
-        idle_wakeup_interval: std::time::Duration::from_secs(10),
-        buffer_events: 8192,
-    })
-}
-
-fn percent_decode(s: &str) -> String {
-    // Minimal %XX decoding for URL userinfo/path segments (connection strings rarely need more).
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() + 1 && i + 2 < b.len() + 1 {
-            if let (Some(h), Some(l)) = (
-                b.get(i + 1).and_then(|c| (*c as char).to_digit(16)),
-                b.get(i + 2).and_then(|c| (*c as char).to_digit(16)),
-            ) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::pg::PgConnectionConfig::from_process_env(pg_url)?.replication_config(slot, publication)
 }
 
 /// One replication connection's lifetime: decode pgoutput frames, buffer per transaction, append
