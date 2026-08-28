@@ -59,7 +59,7 @@ async fn ds_handler(State(ds): State<FakeDs>, request: Request) -> Response {
         Method::POST => StatusCode::OK.into_response(),
         // The change log's boot walk HEADs the current segment (ADR-0006): present, never closed.
         Method::HEAD => {
-            if request.uri().path().starts_with("/shape/") {
+            if request.uri().path().contains("/shape/") {
                 ds.shape_heads.fetch_add(1, Ordering::SeqCst);
                 while ds.park_heads.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -83,7 +83,7 @@ async fn engine_on_fake_ds() -> (Engine, FakeDs) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let engine = Engine::new(DsClient::new(format!("http://{address}")));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(format!("http://{address}")));
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": {
             "parent": { "columns": { "id": {"type":"int"}, "active": {"type":"bool"} }, "primaryKey": "id" },

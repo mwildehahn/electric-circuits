@@ -42,7 +42,12 @@ struct RecordingDs {
 }
 
 async fn ds_handler(State(ds): State<RecordingDs>, req: Request) -> Response {
-    let path = req.uri().path().trim_start_matches('/').to_string();
+    let path = req
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .rsplit_once("/queries/test-query/")
+        .map_or_else(|| req.uri().path().trim_start_matches('/').to_string(), |(_, logical)| logical.to_string());
     match *req.method() {
         Method::PUT => StatusCode::OK.into_response(),
         Method::HEAD => ([("stream-next-offset", "tip")]).into_response(),
@@ -80,7 +85,7 @@ async fn recording_ds() -> (DsClient, RecordingDs) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (DsClient::new(format!("http://{address}")), state)
+    (DsClient::new_for_in_process_test(format!("http://{address}")), state)
 }
 
 /// A writer that never rotates, so every chunk of the commit is expected on `changes/0`.

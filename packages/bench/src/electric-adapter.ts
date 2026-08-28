@@ -17,6 +17,7 @@ import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import pgpkg from 'pg'
 
 import { postgres18Tools } from '../../../scripts/postgres18.js'
+import { mtlsAccess } from '../../conformance/src/ds-mtls-access.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
@@ -55,6 +56,7 @@ let pgDir: string | undefined
 let pgData: string | undefined
 let engineProc: ChildProcess | undefined
 let ds: DurableStreamTestServer | undefined
+let dsAccess: Awaited<ReturnType<typeof mtlsAccess>> | undefined
 let dsDataDir: string | undefined
 let selectedEngineBin: string | undefined
 const cleanupFile = process.env.ADAPTER_CLEANUP_FILE
@@ -157,6 +159,7 @@ async function main() {
   dsDataDir = mkdtempSync(join(tmpdir(), 'el-econf-ds-'))
   ds = new DurableStreamTestServer({ port: 0, dataDir: dsDataDir, longPollTimeout: longPollMs })
   const dsUrl = await ds.start()
+  dsAccess = await mtlsAccess(dsUrl)
   writeCleanupManifest()
 
   // The adapter's *overall* live deadline (how long a live=true request re-polls before its
@@ -169,8 +172,9 @@ async function main() {
   engineProc = spawn(selectedEngineBin, [], {
     env: {
       ...process.env,
+      ...dsAccess.env,
       ELECTRIC_LIVE_TIMEOUT_MS: String(liveTimeoutMs),
-      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_DS_URL: dsAccess.url,
       ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
       ELECTRIC_CIRCUITS_LOG: process.env.ADAPTER_LOG || 'warn',
       ELECTRIC_CIRCUITS_PG_URL: pgUrl,
@@ -222,8 +226,10 @@ async function shutdown(): Promise<void> {
   shuttingDown = (async () => {
     await stopEngine()
     try {
+      await dsAccess?.close()
       await ds?.stop()
     } finally {
+      dsAccess = undefined
       ds = undefined
       if (dsDataDir) {
         rmSync(dsDataDir, { recursive: true, force: true })

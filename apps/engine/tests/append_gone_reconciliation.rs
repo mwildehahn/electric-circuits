@@ -38,7 +38,7 @@ struct FakeDs {
 
 async fn ds_handler(State(ds): State<FakeDs>, request: Request) -> Response {
     let path = request.uri().path().to_string();
-    let is_shape = path.starts_with("/shape/");
+    let is_shape = path.contains("/shape/");
     // A close is a POST with `stream-closed: true` and no body (ADR-0007); record the ATTEMPT even
     // when the stream is gone, so the close-then-delete order stays observable.
     let closing = request.method() == Method::POST && request.headers().get("stream-closed").is_some();
@@ -83,8 +83,8 @@ async fn engine_with_one_shape() -> (Engine, DsClient, FakeDs) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let client = DsClient::new(format!("http://{address}"));
-    let engine = Engine::new(client.clone());
+    let client = DsClient::new_for_in_process_test(format!("http://{address}"));
+    let engine = Engine::new_for_in_process_test(client.clone());
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": { "items": { "columns": { "id": {"type":"int"} }, "primaryKey": "id" } }
     }))

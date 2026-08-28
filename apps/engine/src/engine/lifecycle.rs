@@ -2395,7 +2395,7 @@ mod cancellation_tests {
     /// A subquery-capable engine with no durable-streams server behind it: the rollback's stream
     /// DELETE fails and is ignored, which leaves exactly the in-memory state these tests assert on.
     async fn engine_with_subquery_tables() -> (Engine, PredicateJson) {
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         let schema: Schema = serde_json::from_value(serde_json::json!({
             "tables": {
                 "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },
@@ -2732,7 +2732,7 @@ mod subscription_tests {
     /// engine does in production while storage is down — and none of the behaviour under test waits
     /// on it.
     async fn engine_with_share(id: &str, subs: &[(&str, u64)]) -> Engine {
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         let mut st = engine.state.lock().await;
         st.shapes.insert(
             id.to_string(),
@@ -2964,7 +2964,7 @@ mod subscription_tests {
     async fn durable_purge_returns_after_dropped_without_waiting_for_stream_retirement() {
         let server = FakeDs::start().await;
         server.block_deletes(true);
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(
@@ -3004,7 +3004,7 @@ mod subscription_tests {
     async fn concurrent_durable_purge_retries_join_the_original_teardown() {
         let server = FakeDs::start().await;
         server.block_deletes(true);
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(
@@ -3055,7 +3055,7 @@ mod subscription_tests {
     async fn durable_purge_returns_after_dropped_while_retirement_retries() {
         let server = FakeDs::start().await;
         server.fail_deletes(1);
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(
@@ -3100,7 +3100,7 @@ mod subscription_tests {
     async fn durable_purge_does_not_wait_for_retired_catalog_event() {
         let server = FakeDs::start().await;
         server.block_retired(true);
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(
@@ -3140,7 +3140,7 @@ mod subscription_tests {
         let server = FakeDs::start().await;
         server.block_deletes(true);
         server.pause_delete_after_start(true);
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(
@@ -3185,7 +3185,7 @@ mod subscription_tests {
         let server = FakeDs::start().await;
         server.block_deletes(true);
         server.fail_deletes(1);
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(
@@ -3240,7 +3240,7 @@ mod subscription_tests {
     async fn durable_purge_joining_internal_waits_for_retired_durability() {
         let server = FakeDs::start().await;
         server.block_retired(true);
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(
@@ -3279,7 +3279,7 @@ mod subscription_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn internal_purge_during_durable_purge_joins_existing_barrier() {
         let server = FakeDs::start().await;
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(

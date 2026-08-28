@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
+import { testPhysicalPath } from './ds-mtls-access.js'
 
 const schema: Schema = {
   tables: {
@@ -40,7 +41,7 @@ async function startRetirementFaultProxy(upstreamUrl: string): Promise<Retiremen
     // ordinary append is a bare `POST`, and it must keep working, or "retirements fail" would also
     // mean "no shape can be created", which is a different fault.
     const closing = String(incoming.headers['stream-closed'] ?? '').toLowerCase() === 'true'
-    if (fail && target.pathname.startsWith('/shape/') && (incoming.method === 'DELETE' || closing)) {
+    if (fail && target.pathname.startsWith(`/${testPhysicalPath('shape/')}`) && (incoming.method === 'DELETE' || closing)) {
       failures += 1
       incoming.resume()
       outgoing.writeHead(503, { 'content-type': 'text/plain' })

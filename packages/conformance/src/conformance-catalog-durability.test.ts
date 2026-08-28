@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery, type ShapeResp, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
+import { testPhysicalPath } from './ds-mtls-access.js'
 
 const schema: Schema = {
   tables: {
@@ -52,7 +53,7 @@ async function startCatalogFaultProxy(upstreamUrl: string): Promise<CatalogFault
   const upstream = new URL(upstreamUrl)
   const server = createServer((incoming, outgoing) => {
     const target = new URL(incoming.url ?? '/', upstream)
-    if (fail && incoming.method === 'POST' && target.pathname === '/meta/catalog') {
+    if (fail && incoming.method === 'POST' && target.pathname === `/${testPhysicalPath('meta/catalog')}`) {
       failures += 1
       incoming.resume()
       outgoing.writeHead(503, { 'content-type': 'text/plain' })
@@ -61,7 +62,7 @@ async function startCatalogFaultProxy(upstreamUrl: string): Promise<CatalogFault
     }
     if (
       failRetirements &&
-      target.pathname.startsWith('/shape/') &&
+      target.pathname.startsWith(`/${testPhysicalPath('shape/')}`) &&
       (incoming.method === 'POST' || incoming.method === 'DELETE')
     ) {
       retirementFailures += 1
@@ -72,7 +73,7 @@ async function startCatalogFaultProxy(upstreamUrl: string): Promise<CatalogFault
     }
 
     const loseThisResponse =
-      loseNextCatalogResponse && incoming.method === 'POST' && target.pathname === '/meta/catalog'
+      loseNextCatalogResponse && incoming.method === 'POST' && target.pathname === `/${testPhysicalPath('meta/catalog')}`
     if (loseThisResponse) loseNextCatalogResponse = false
     const forwarded = request(
       target,
@@ -130,7 +131,7 @@ async function readCatalogEvents(dsUrl: string): Promise<Array<{ t?: string; id?
   const events: Array<{ t?: string; id?: string }> = []
   let offset = '-1'
   for (let i = 0; i < 100; i++) {
-    const response = await fetch(`${dsUrl}/meta/catalog?offset=${encodeURIComponent(offset)}`)
+    const response = await fetch(`${dsUrl}/${testPhysicalPath('meta/catalog')}?offset=${encodeURIComponent(offset)}`)
     if (response.status === 204) break
     if (!response.ok) throw new Error(`GET meta/catalog -> ${response.status}`)
     const body = (await response.text()).trim()

@@ -10,6 +10,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { cleanupOwnedAdapterResources } from './electric-adapter-cleanup.js'
 
 const repo = dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url)))))
+const cargoMetadata = JSON.parse(
+  execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1'], {
+    cwd: repo,
+    encoding: 'utf8',
+  }),
+) as { target_directory: string }
+const engineBinary = join(cargoMetadata.target_directory, 'debug', 'electric-circuits-engine')
 const runs: AdapterRun[] = []
 
 interface CleanupManifest {
@@ -90,9 +97,10 @@ async function startAdapter(): Promise<AdapterRun> {
       ...process.env,
       ADAPTER_CLEANUP_FILE: manifestPath,
       ADAPTER_LONGPOLL_MS: '50',
+      NODE_EXTRA_CA_CERTS: join(repo, 'packages', 'conformance', 'test-pki', 'ca.pem'),
       // `pnpm engine:test` builds this debug artifact; do not make the product test gate depend
       // on a separate release build.
-      ELECTRIC_CIRCUITS_ADAPTER_ENGINE_BIN: join(repo, 'target', 'debug', 'electric-circuits-engine'),
+      ELECTRIC_CIRCUITS_ADAPTER_ENGINE_BIN: engineBinary,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -162,7 +170,7 @@ describe('electric adapter durable-stream ownership', () => {
     expect(run.manifest.dsPid).toEqual(expect.any(Number))
     expect(run.manifest.dsUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
     expect(run.manifest.dsDataDir).toEqual(expect.any(String))
-    expect(run.manifest.engineBin).toBe(join(repo, 'target', 'debug', 'electric-circuits-engine'))
+    expect(run.manifest.engineBin).toBe(engineBinary)
     expect(existsSync(run.manifest.dsDataDir!)).toBe(true)
 
     process.kill(run.manifest.adapterPid!, 'SIGTERM')
@@ -188,7 +196,7 @@ describe('electric adapter durable-stream ownership', () => {
     expect(run.manifest.dsPid).toEqual(expect.any(Number))
     expect(run.manifest.dsUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
     expect(run.manifest.dsDataDir).toEqual(expect.any(String))
-    expect(run.manifest.engineBin).toBe(join(repo, 'target', 'debug', 'electric-circuits-engine'))
+    expect(run.manifest.engineBin).toBe(engineBinary)
 
     process.kill(run.manifest.adapterPid!, 'SIGKILL')
     await waitForPidExit(run.manifest.adapterPid!)

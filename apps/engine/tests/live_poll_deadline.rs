@@ -75,7 +75,7 @@ async fn idle_live_poll_returns_up_to_date_control_at_deadline_then_data_promptl
     }
 
     let ds_url = spawn_fake_ds().await;
-    let engine = Engine::new(DsClient::new(&ds_url));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(&ds_url));
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": { "t": { "columns": { "id": { "type": "text" } }, "primaryKey": "id" } }
     }))

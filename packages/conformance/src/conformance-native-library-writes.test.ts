@@ -1,6 +1,4 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 import { createCore, type ElectricCore, type ShapeHandle } from '@electric-circuits/api'
 import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
@@ -8,7 +6,10 @@ import type { Schema } from '@electric-circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { foldStream, waitFor } from './engine-native.js'
-import { buildEngine } from './harness.js'
+import { buildEngine, engineBin } from './harness.js'
+import { mtlsAccess, testPhysicalPath } from './ds-mtls-access.js'
+
+const scopedEngineStreams = (dsUrl: string) => `${dsUrl}/${testPhysicalPath('')}`
 
 const schema: Schema = {
   tables: {
@@ -19,19 +20,19 @@ const schema: Schema = {
   },
 }
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '../../..')
-
 async function spawnLibraryEngine(
   dsUrl: string,
   extraEnv: Record<string, string> = {},
 ): Promise<{ url: string; proc: ChildProcess }> {
   buildEngine()
-  const proc = spawn(join(root, 'target/debug/electric-circuits-engine'), [], {
+  const access = await mtlsAccess(dsUrl)
+  const proc = spawn(engineBin(), [], {
     env: {
       ...process.env,
       DATABASE_URL: '',
       ELECTRIC_CIRCUITS_PG_URL: '',
-      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_DS_URL: access.url,
+      ...access.env,
       ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
       ELECTRIC_CIRCUITS_TRACE: '0',
       ELECTRIC_CIRCUITS_LOG: 'warn',
@@ -55,6 +56,7 @@ async function spawnLibraryEngine(
       reject(new Error(`library-mode engine exited early with code ${code}`))
     })
   })
+  proc.once('exit', () => void access.close())
   return { url, proc }
 }
 
@@ -82,7 +84,7 @@ describe('native library-mode writes', () => {
     const dsUrl = await ds.start()
     const started = await spawnLibraryEngine(dsUrl)
     engine = started.proc
-    core = createCore({ dsUrl, engineUrl: started.url })
+    core = createCore({ dsUrl: scopedEngineStreams(dsUrl), engineUrl: started.url })
     await core.defineSchema(schema)
 
     shape = await core.createShape({ table: 'items' })
@@ -110,7 +112,7 @@ describe('native library-mode writes', () => {
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
     })
     engine = started.proc
-    core = createCore({ dsUrl, engineUrl: started.url })
+    core = createCore({ dsUrl: scopedEngineStreams(dsUrl), engineUrl: started.url })
     await core.defineSchema(schema)
 
     shape = await core.createShape({ table: 'items' })
@@ -150,7 +152,7 @@ describe('native library-mode writes', () => {
     const dsUrl = await ds.start()
     const first = await spawnLibraryEngine(dsUrl)
     engine = first.proc
-    core = createCore({ dsUrl, engineUrl: first.url })
+    core = createCore({ dsUrl: scopedEngineStreams(dsUrl), engineUrl: first.url })
     await core.defineSchema(schema)
 
     const before = await core.createShape({ table: 'items' })
@@ -163,7 +165,7 @@ describe('native library-mode writes', () => {
     engine.kill('SIGKILL')
     const second = await spawnLibraryEngine(dsUrl)
     engine = second.proc
-    core = createCore({ dsUrl, engineUrl: second.url })
+    core = createCore({ dsUrl: scopedEngineStreams(dsUrl), engineUrl: second.url })
     await core.defineSchema(schema)
     const after = await core.createShape({ table: 'items' })
     shape = after

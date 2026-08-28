@@ -8,6 +8,7 @@ import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'
+import { testPhysicalPath } from './ds-mtls-access.js'
 
 const schema: Schema = {
   tables: {
@@ -78,7 +79,7 @@ describe('conformance: ds-rust WAL survives a storage crash and engine recovery'
 
     expect(shape.handle.shapeId).toBe(identity.shapeId)
     expect(shape.handle.streamPath).toBe(identity.streamPath)
-    expect((await fetch(`${h.dsUrl}/${identity.streamPath}`, { method: 'HEAD' })).status).toBe(200)
+    expect((await fetch(`${h.dsUrl}/${testPhysicalPath(identity.streamPath)}`, { method: 'HEAD' })).status).toBe(200)
 
     await insertUsers(h, [
       { id: 3, name: 'after-a', active: true },

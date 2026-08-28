@@ -38,6 +38,7 @@ pub mod schema;
 pub mod shutdown;
 pub mod sql;
 pub mod statsd;
+pub mod store_identity;
 pub mod subq_circuit;
 // Host-side per-feed key sets (`HashMap<feed_id, RoaringBitmap>`) — the delete gate, moved out of
 // the membership circuit (Task 2.2, dbsp-ds-dh6). See subq_feed.rs and

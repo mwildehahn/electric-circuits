@@ -20,6 +20,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import pgpkg from 'pg'
 import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import { buildEngine, spawnRawEngine, type RawEngine } from './harness.js'
+import { mtlsAccess } from './ds-mtls-access.js'
 
 /** A port nothing listens on — a connect here is refused at once (the retryable case). */
 const DEAD_PG_PORT = 5
@@ -69,11 +70,14 @@ function unreachableUrl(): string {
 
 let ds: DurableStreamTestServer | undefined
 let engine: RawEngine | undefined
+let access: Awaited<ReturnType<typeof mtlsAccess>> | undefined
 let scratchDb: string | undefined
 
 afterEach(async () => {
   engine?.proc.kill('SIGKILL')
   engine = undefined
+  await access?.close().catch(() => {})
+  access = undefined
   await ds?.stop().catch(() => {})
   ds = undefined
   if (scratchDb) {
@@ -121,8 +125,10 @@ async function spawnAgainst(pgUrl: string, opts: SpawnOpts = {}): Promise<RawEng
     ds = new DurableStreamTestServer({ port: 0 })
     dsUrl = await ds.start()
   }
+  access = await mtlsAccess(dsUrl)
   engine = spawnRawEngine({
-    ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+    ELECTRIC_CIRCUITS_DS_URL: access.url,
+    ...access.env,
     ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
     ELECTRIC_CIRCUITS_LOG: process.env.ELECTRIC_CIRCUITS_LOG ?? 'info',
     ELECTRIC_CIRCUITS_PG_URL: pgUrl,
@@ -201,24 +207,12 @@ describe('boot-time error taxonomy', () => {
     ).toBeLessThan(6000)
   })
 
-  it('waits for durable-streams that is not up yet instead of exiting EX_CONFIG', async () => {
-    // Storage coming up after the engine is as ordinary as a database coming up after it, and it
-    // used to be fatal: a catalog fold against a closed port carries no Postgres error, so the boot
-    // taxonomy called it "not a transient Postgres condition" and exited 78.
+  it('refuses unreachable durable-streams before binding or contacting Postgres', async () => {
     const e = await spawnAgainst(await scratchDbUrl(), { dsUrl: 'http://127.0.0.1:1' })
-    const url = await e.waitForBinding(20000)
-    await waitForReady(url, 'waiting')
-
-    // Retrying, and saying so by name.
-    expect(e.stderr()).toContain('durable-streams is unreachable')
-    expect(e.stderr()).toContain('retrying in')
-    expect(e.stderr()).not.toContain('boot refused')
-    // Liveness is unmoved, as with an absent database.
-    expect((await fetch(`${url}/health`)).status).toBe(200)
-
-    e.signal('SIGTERM')
     const exit = await e.waitForExit(30000)
-    expect(exit.code, `expected a clean exit, got ${JSON.stringify(exit)}\n${e.stderr()}`).toBe(0)
+    expect(exit.code, `expected EX_CONFIG, got ${JSON.stringify(exit)}\n${e.stderr()}`).toBe(78)
+    expect(e.stderr()).toContain('catalog store binding')
+    expect(e.stderr()).not.toContain('ENGINE_BINDING')
   })
 
   it('stays up retrying with /ready = 503 waiting when Postgres is unreachable, and exits 0 on SIGTERM', async () => {

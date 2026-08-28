@@ -6,6 +6,7 @@
 
 import type { Schema } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { testPhysicalPath } from './ds-mtls-access.js'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {
@@ -22,7 +23,7 @@ async function streamRows(dsUrl: string, streamPath: string): Promise<Map<string
   const rows = new Map<string, unknown>()
   let offset = '-1'
   for (;;) {
-    const res = await fetch(`${dsUrl}/${streamPath}?offset=${offset}`)
+    const res = await fetch(`${dsUrl}/${testPhysicalPath(streamPath)}?offset=${offset}`)
     if (!res.ok) throw new Error(`read ${streamPath} -> ${res.status}`)
     const next = res.headers.get('stream-next-offset')
     const body = res.status === 204 ? [] : ((await res.json()) as Array<{ key: string; value?: unknown; headers: { operation: string } }>)

@@ -46,7 +46,7 @@ async fn boot() -> Router {
     tokio::spawn(async move {
         let _ = axum::serve(listener, Router::new().fallback(ds_handler)).await;
     });
-    let engine = Engine::new(DsClient::new(&ds_url));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(&ds_url));
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": { "t": { "columns": { "id": {"type":"text"}, "owner_id": {"type":"text"} }, "primaryKey": "id" } }
     }))

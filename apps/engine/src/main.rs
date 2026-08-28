@@ -57,11 +57,9 @@ async fn main() -> Result<()> {
     }
     tracing::info!("resolved config: {}", config.redacted());
 
-    // Publish request-path globals (instance id, stack id, /v1/shape secret) and wire up StatsD.
+    // Publish request-path globals (instance id, stack id, /v1/shape secret). Metrics transport is
+    // initialized only after storage admission, so readiness stays the first network operation.
     config::set_globals(&config.instance_id, &config.stack_id, config.secret.as_deref());
-    if let Some(target) = &config.statsd {
-        statsd::init(target, &config.instance_id);
-    }
     if config.prometheus_port.is_some() {
         tracing::info!(
             "ELECTRIC_PROMETHEUS_PORT is set, but the dedicated Prometheus listener is not implemented; \
@@ -69,11 +67,24 @@ async fn main() -> Result<()> {
         );
     }
 
-    let Some(ds_url) = config.ds_url.clone() else {
+    let Some(ds_connection) = config.ds_connection.clone() else {
         refuse_boot(
             "configuration",
-            &anyhow::anyhow!("ELECTRIC_CIRCUITS_DS_URL must be set to the durable-streams server base URL"),
+            &anyhow::anyhow!("a complete ELECTRIC_CIRCUITS_DS_URL HTTPS/mTLS configuration is required"),
         )
+    };
+    let store_bound = electric_circuits_engine::store_identity::StoreBound::coupled_v1(&ds_connection.scope);
+    let ds = match DsClient::connect(ds_connection).await {
+        Ok(ds) => ds,
+        Err(e) => refuse_boot("Durable Streams mTLS configuration", &e),
+    };
+    if let Some(target) = &config.statsd {
+        statsd::init(target, &config.instance_id);
+    }
+    let ds_base = ds.base().to_string();
+    let admission = match Engine::admit_store(ds, store_bound, config.initialize_namespace).await {
+        Ok(admission) => admission,
+        Err(e) => refuse_boot("catalog store binding", &e),
     };
 
     // Large transactions spill to disk (ADR-0003), so the spill directory must exist, be private
@@ -99,7 +110,7 @@ async fn main() -> Result<()> {
     // backfill. Enabled by a resolved pg_url (ELECTRIC_CIRCUITS_PG_URL or DATABASE_URL).
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
-            let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
+            let engine = Engine::new_pg(admission, url.clone());
             // The dbsp arrangement circuit is mandatory infrastructure — always configured.
             tracing::info!("dbsp arrangements: dir {}", config.dbsp.dir.display());
             engine.set_dbsp_config(config.dbsp.clone());
@@ -111,7 +122,7 @@ async fn main() -> Result<()> {
         _ => {
             // Library mode: no Postgres source; the engine is `active` from construction. Shutdown
             // and readiness still apply — there is simply nothing Postgres-shaped to wait for.
-            let engine = Engine::new(DsClient::new(ds_url.clone()));
+            let engine = Engine::new(admission);
             statsd::consumers_ready(engine.table_count().await as u64);
             engine
         }
@@ -143,7 +154,7 @@ async fn main() -> Result<()> {
     // at all. `ENGINE_BINDING` says the port is open; readiness is a separate question.
     println!("ENGINE_BINDING http://{addr}");
     std::io::stdout().flush().ok();
-    tracing::info!("electric-circuits engine listening on http://{addr}, ds={ds_url}");
+    tracing::info!("electric-circuits engine listening on http://{addr}, ds={ds_base}");
 
     let serve_shutdown = shutdown.clone();
     let ready_drain = config.shutdown_ready_drain;

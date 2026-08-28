@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 use tower::ServiceExt; // for `oneshot`
 
 fn library_engine() -> Engine {
-    Engine::new(DsClient::new("http://127.0.0.1:1"))
+    Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"))
 }
 
 #[derive(Clone, Default)]
@@ -40,7 +40,7 @@ async fn feed_engine() -> (Engine, oneshot::Sender<()>) {
         let server = axum::serve(listener, Router::new().fallback(feed_ds_handler).with_state(FeedDs));
         tokio::select! { _ = server => {}, _ = wait => {} }
     });
-    let engine = Engine::new(DsClient::new(format!("http://{address}")));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(format!("http://{address}")));
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": { "items": { "columns": { "id": {"type":"int"} }, "primaryKey": "id" } }
     }))
@@ -69,7 +69,10 @@ async fn health_active_in_library_mode() {
 #[tokio::test]
 async fn health_waiting_returns_202_in_pg_mode_before_setup() {
     // new_pg starts `waiting`; without setup_postgres it stays there.
-    let engine = Engine::new_pg(DsClient::new("http://127.0.0.1:1"), "postgres://x/y".into());
+    let engine = Engine::new_pg_for_in_process_test(
+        DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        "postgres://x/y".into(),
+    );
     assert_eq!(engine.health_status(), "waiting");
     let res = router(engine).oneshot(Request::builder().uri("/v1/health").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::ACCEPTED);
@@ -304,7 +307,10 @@ async fn ready_is_200_active_in_library_mode() {
 /// fleet-parity 202 for the same phase. The two probes are deliberately different contracts.
 #[tokio::test]
 async fn ready_is_503_waiting_before_postgres_is_up() {
-    let engine = Engine::new_pg(DsClient::new("http://127.0.0.1:1"), "postgres://x/y".into());
+    let engine = Engine::new_pg_for_in_process_test(
+        DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        "postgres://x/y".into(),
+    );
     assert_eq!(engine.readiness_status(), "waiting");
     let res = router(engine).oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);

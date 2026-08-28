@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { postgres18Tools, type Postgres18Tools } from '../../../scripts/postgres18.js'
 import { buildEngine, spawnRawEngine, type RawEngine } from './harness.js'
+import { mtlsAccess } from './ds-mtls-access.js'
 import { foldStream } from './engine-native.js'
 
 const MARKER_TABLE = '__el_sync'
@@ -54,6 +55,7 @@ interface PromotionFixture {
   pg: Postgres18Tools
   ds: DurableStreamTestServer
   dsUrl: string
+  access: Awaited<ReturnType<typeof mtlsAccess>>
   engine: RawEngine | undefined
   engineUrl: string | undefined
   gates: string[]
@@ -150,7 +152,8 @@ function processAlive(pid: number): boolean {
 
 function engineEnv(fx: PromotionFixture, pgUrl: string): Record<string, string> {
   return {
-    ELECTRIC_CIRCUITS_DS_URL: fx.dsUrl,
+    ELECTRIC_CIRCUITS_DS_URL: fx.access.url,
+    ...fx.access.env,
     ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
     ELECTRIC_CIRCUITS_LOG: 'warn',
     ELECTRIC_CIRCUITS_PG_URL: pgUrl,
@@ -345,6 +348,7 @@ async function bootFixture(): Promise<PromotionFixture> {
     const standbyUrl = `postgres://postgres@127.0.0.1:${standbyPort}/${dbName}`
     ds = new DurableStreamTestServer({ port: 0, dataDir: join(root, 'durable-streams') })
     const dsUrl = await ds.start()
+    const access = await mtlsAccess(dsUrl)
 
     fx = {
       root,
@@ -358,6 +362,7 @@ async function bootFixture(): Promise<PromotionFixture> {
       pg,
       ds,
       dsUrl,
+      access,
       engine: undefined,
       engineUrl: undefined,
       gates: [],
@@ -375,6 +380,7 @@ async function bootFixture(): Promise<PromotionFixture> {
           // Primary was deliberately isolated before promotion.
         }
         await ds?.stop().catch(() => {})
+        await access.close().catch(() => {})
         rmSync(root, { recursive: true, force: true })
         await waitFor(
           fx!,

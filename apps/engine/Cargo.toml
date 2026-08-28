@@ -9,6 +9,12 @@ license.workspace = true
 name = "electric_circuits_engine"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Explicitly opt into in-process HTTP stores used by Rust test binaries. Production builds never
+# compile their constructor.
+test-support = []
+
 [[bin]]
 name = "electric-circuits-engine"
 path = "src/main.rs"
@@ -42,8 +48,9 @@ tokio = { version = "1", features = ["full"] }
 # BroadcastStream adapter for the /trace SSE endpoint.
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
-# http to a localhost durable-streams server only -> no TLS backend needed.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# Production Durable Streams traffic is authenticated HTTPS; in-process test stores are the only
+# HTTP exception and never use this transport configuration.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Postgres source: logical-replication slot polling (test_decoding) + backfill queries.
@@ -66,6 +73,7 @@ libc = "0.2.186"
 # synchronous `remove()`-returns-`true` check, no longer an in-circuit relation. Already in the
 # tree transitively (dbsp -> roaring 0.11.3). See docs/notes/2026-07-16-feed-set-representation-spike.md.
 roaring = "0.11"
+time = { version = "0.3", features = ["parsing"] }
 
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the /v1/health + endpoint tests.

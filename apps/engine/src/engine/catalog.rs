@@ -24,6 +24,9 @@ pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "camelCase")]
 pub(crate) enum CatalogEvent {
+    /// The immutable storage and namespace identity. It is event zero for every coupled-pilot
+    /// catalog and never changes within that physical namespace.
+    StoreBound(crate::store_identity::StoreBound),
     /// A shape was created, with the **subscription** that created it (ADR-0008) and the wall-clock
     /// second it was taken at — the lease's start, restored by the fold so a restart does not hand
     /// every subscription a fresh window.
@@ -367,7 +370,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                 if !ensured {
                     ensured = self::ensure_catalog(&ds, &mut ensure_logged).await;
                 }
-                match ds.append_json(CATALOG_STREAM, &[json.clone()]).await {
+                match ds.append_json(CATALOG_STREAM, std::slice::from_ref(&json)).await {
                     Ok(()) => break,
                     Err(e) => match if ensured { classify_append(&e) } else { AppendVerdict::Retry } {
                         AppendVerdict::Refused => refuse(&ev, &e),
@@ -451,6 +454,7 @@ fn refuse(ev: &CatalogEvent, e: &anyhow::Error) -> ! {
 /// The event's variant name, for the refusal message (`serde` tags it, but only on the way out).
 fn event_kind(ev: &CatalogEvent) -> &'static str {
     match ev {
+        CatalogEvent::StoreBound(_) => "storeBound",
         CatalogEvent::Created { .. } => "created",
         CatalogEvent::Joined { .. } => "joined",
         CatalogEvent::Left { .. } => "left",
@@ -464,6 +468,80 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
         CatalogEvent::SchemaChanged { .. } => "schemaChanged",
         CatalogEvent::SlotBound(_) => "slotBound",
     }
+}
+
+/// A catalog cannot be adopted unless its first event is the one immutable binding expected by
+/// this engine. These are typed boot errors because they are operator decisions, not transient
+/// storage failures: retrying cannot turn one namespace's history into another's.
+#[derive(Debug)]
+pub(crate) enum CatalogStoreBindingError {
+    EmptyWithoutInitialization,
+    Missing,
+    DuplicateOrReordered,
+    Malformed(String),
+    Mismatch { expected: crate::store_identity::StoreBound, observed: Box<crate::store_identity::StoreBound> },
+}
+
+/// Linear proof that a ready Durable Streams client owns the expected catalog event zero.
+pub struct StoreAdmission {
+    pub(crate) ds: DsClient,
+    pub(crate) binding: crate::store_identity::StoreBound,
+}
+
+async fn read_catalog_events_from(ds: &DsClient) -> Result<Vec<serde_json::Value>> {
+    let mut events = Vec::new();
+    let mut off = "-1".to_string();
+    loop {
+        let (page, next, up_to_date) = ds.read_json(CATALOG_STREAM, &off).await?;
+        events.extend(page);
+        match next {
+            Some(next) if !up_to_date && next != off => off = next,
+            _ => return Ok(events),
+        }
+    }
+}
+
+impl std::fmt::Display for CatalogStoreBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyWithoutInitialization => {
+                f.write_str("catalog is empty; explicit namespace initialization is required")
+            }
+            Self::Missing => f.write_str("catalog event zero is missing StoreBound"),
+            Self::DuplicateOrReordered => f.write_str("StoreBound must occur exactly once as catalog event zero"),
+            Self::Malformed(detail) => write!(f, "StoreBound is malformed: {detail}"),
+            Self::Mismatch { expected, observed } => {
+                write!(f, "StoreBound mismatch: expected {expected:?}, observed {observed:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CatalogStoreBindingError {}
+
+fn validate_store_binding(events: &[serde_json::Value], expected: &crate::store_identity::StoreBound) -> Result<()> {
+    let Some(first) = events.first() else {
+        return Err(anyhow::Error::new(CatalogStoreBindingError::Missing));
+    };
+    let observed = match serde_json::from_value::<CatalogEvent>(first.clone()) {
+        Ok(CatalogEvent::StoreBound(bound)) => bound,
+        Ok(_) => return Err(anyhow::Error::new(CatalogStoreBindingError::Missing)),
+        Err(error) => {
+            return Err(anyhow::Error::new(CatalogStoreBindingError::Malformed(error.to_string())));
+        }
+    };
+    if &observed != expected {
+        return Err(anyhow::Error::new(CatalogStoreBindingError::Mismatch {
+            expected: expected.clone(),
+            observed: Box::new(observed),
+        }));
+    }
+    for event in events.iter().skip(1) {
+        if event.get("t").and_then(serde_json::Value::as_str) == Some("storeBound") {
+            return Err(anyhow::Error::new(CatalogStoreBindingError::DuplicateOrReordered));
+        }
+    }
+    Ok(())
 }
 
 /// The durable catalog holds a record written **before** ADR-0002 (a bare `rec.table`).
@@ -727,6 +805,7 @@ impl CatalogFold {
     /// epoch and the offset, remove-on-drop for the shapes — are unit-testable.
     fn apply(&mut self, ev: CatalogEvent) {
         match ev {
+            CatalogEvent::StoreBound(_) => {}
             CatalogEvent::Created { rec, sig, subscription, at } => {
                 // Every create moves the id high-water mark, and nothing ever moves it back (see
                 // `max_shape_id`). `max`, not "the last one wins": the engine mints ids
@@ -841,6 +920,62 @@ pub(crate) enum RestoreMode {
 }
 
 impl Engine {
+    /// Admit a ready store namespace before an Engine can exist. The returned proof carries both
+    /// the admitted DS client and the immutable event-zero binding.
+    pub async fn admit_store(
+        ds: DsClient,
+        expected: crate::store_identity::StoreBound,
+        initialize_namespace: bool,
+    ) -> Result<StoreAdmission> {
+        let events = read_catalog_events_from(&ds).await?;
+        if events.is_empty() {
+            if !initialize_namespace {
+                return Err(anyhow::Error::new(CatalogStoreBindingError::EmptyWithoutInitialization));
+            }
+            ds.ensure_stream(CATALOG_STREAM).await?;
+            let mut event = serde_json::to_value(CatalogEvent::StoreBound(expected.clone()))?;
+            event
+                .as_object_mut()
+                .expect("catalog event serializes as object")
+                .insert("eid".to_string(), serde_json::Value::String("store-bound-init".to_string()));
+            ds.append_json(CATALOG_STREAM, std::slice::from_ref(&event)).await?;
+            validate_store_binding(&read_catalog_events_from(&ds).await?, &expected)?;
+        } else {
+            validate_store_binding(&events, &expected)?;
+        }
+        Ok(StoreAdmission { ds, binding: expected })
+    }
+
+    /// Establish the coupled-pilot catalog identity before any Postgres setup. A blank namespace is
+    /// not adoption evidence: only the explicit initialization flag licenses its first durable
+    /// `StoreBound` append.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn prepare_store_binding(
+        &self,
+        expected: crate::store_identity::StoreBound,
+        initialize_namespace: bool,
+    ) -> Result<()> {
+        let events = self.read_catalog_events().await?;
+        if events.is_empty() {
+            if !initialize_namespace {
+                return Err(anyhow::Error::new(CatalogStoreBindingError::EmptyWithoutInitialization));
+            }
+            self.catalog_tx.send_durable(CatalogEvent::StoreBound(expected.clone())).await;
+            let written = self.read_catalog_events().await?;
+            validate_store_binding(&written, &expected)?;
+        } else {
+            validate_store_binding(&events, &expected)?;
+        }
+        self.store_bound
+            .set(expected)
+            .map_err(|_| anyhow::anyhow!("store binding was already prepared for this engine"))?;
+        Ok(())
+    }
+
+    async fn read_catalog_events(&self) -> Result<Vec<serde_json::Value>> {
+        read_catalog_events_from(&self.ds).await
+    }
+
     /// Vouch for every stream that Resume would install before changing the registry, routing or
     /// sequencer. Schema-drift and subquery records are intentionally dropped by the existing
     /// restore path, so their streams are retired below rather than treated as resumable state.
@@ -883,41 +1018,37 @@ impl Engine {
     /// [`Self::apply_catalog`] for that half.
     pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
         let mut fold = CatalogFold::default();
-        let mut off = "-1".to_string();
-        loop {
-            let (events, next, up_to_date) = self.ds.read_json(CATALOG_STREAM, &off).await?;
-            for ev in events {
-                // The catalog is engine-written, so `rec.table` is ALWAYS the canonical
-                // `schema.name` (`ShapeRecord`'s strict deserializer enforces it). A bare one can
-                // only be a catalog written before ADR-0002: refuse the boot naming the record,
-                // rather than let the strict deserializer turn it into a silently skipped event.
-                if let Some(raw) = ev.pointer("/rec/table").and_then(serde_json::Value::as_str)
-                    && crate::table_ref::TableRef::parse(raw).is_ok_and(|t| t.as_str() != raw)
-                {
-                    let id = ev.pointer("/rec/id").and_then(serde_json::Value::as_str).unwrap_or("<unknown>");
-                    return Err(anyhow::Error::new(CatalogPredatesQualification {
-                        detail: format!("bare table name '{raw}' in shape {id}"),
-                    }));
-                }
-                // Same stance for a pre-segmentation change-log position (ADR-0006): refuse the
-                // boot naming it, rather than let the strict deserializer turn it into a silently
-                // skipped event.
-                if let Some(detail) = predates_segmentation(&ev) {
-                    return Err(anyhow::Error::new(CatalogPredatesSegmentation { detail }));
-                }
-                // ...and for an event written before ADR-0008 (no `eid`, no `subscription`): the
-                // fold cannot de-duplicate or rebuild the live set, and both failures are silent.
-                if let Some(detail) = predates_subscriptions(&ev) {
-                    return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
-                }
-                let eid = ev["eid"].as_str().unwrap_or_default().to_string();
-                let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
-                fold.apply_once(&eid, ev);
+        let events = self.read_catalog_events().await?;
+        if let Some(expected) = self.store_bound.get() {
+            validate_store_binding(&events, expected)?;
+        }
+        for ev in events {
+            // The catalog is engine-written, so `rec.table` is ALWAYS the canonical
+            // `schema.name` (`ShapeRecord`'s strict deserializer enforces it). A bare one can
+            // only be a catalog written before ADR-0002: refuse the boot naming the record,
+            // rather than let the strict deserializer turn it into a silently skipped event.
+            if let Some(raw) = ev.pointer("/rec/table").and_then(serde_json::Value::as_str)
+                && crate::table_ref::TableRef::parse(raw).is_ok_and(|t| t.as_str() != raw)
+            {
+                let id = ev.pointer("/rec/id").and_then(serde_json::Value::as_str).unwrap_or("<unknown>");
+                return Err(anyhow::Error::new(CatalogPredatesQualification {
+                    detail: format!("bare table name '{raw}' in shape {id}"),
+                }));
             }
-            match next {
-                Some(n) if !up_to_date && n != off => off = n,
-                _ => break,
+            // Same stance for a pre-segmentation change-log position (ADR-0006): refuse the
+            // boot naming it, rather than let the strict deserializer turn it into a silently
+            // skipped event.
+            if let Some(detail) = predates_segmentation(&ev) {
+                return Err(anyhow::Error::new(CatalogPredatesSegmentation { detail }));
             }
+            // ...and for an event written before ADR-0008 (no `eid`, no `subscription`): the
+            // fold cannot de-duplicate or rebuild the live set, and both failures are silent.
+            if let Some(detail) = predates_subscriptions(&ev) {
+                return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
+            }
+            let eid = ev["eid"].as_str().unwrap_or_default().to_string();
+            let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
+            fold.apply_once(&eid, ev);
         }
         Ok(fold)
     }
@@ -1277,6 +1408,10 @@ pub(crate) mod testing {
         }
     }
 
+    fn logical_path(path: &str) -> &str {
+        path.rsplit_once("/queries/test-query/").map_or(path, |(_, logical)| logical)
+    }
+
     #[derive(Default)]
     pub(crate) struct FakeDsState {
         /// Remaining `POST /meta/catalog` calls to answer 503 (transient).
@@ -1324,11 +1459,12 @@ pub(crate) mod testing {
                         .head(
                             |State(st): State<Arc<FakeDsState>>,
                              axum::extract::Path(path): axum::extract::Path<String>| async move {
-                                if st.missing_heads.lock().unwrap().contains(&path) {
+                                let logical = logical_path(&path);
+                                if st.missing_heads.lock().unwrap().contains(logical) {
                                     return (axum::http::StatusCode::NOT_FOUND, [("stream-next-offset", "-1")])
                                         .into_response();
                                 }
-                                let closed = st.closed_heads.lock().unwrap().contains(&path);
+                                let closed = st.closed_heads.lock().unwrap().contains(logical);
                                 let mut response =
                                     (axum::http::StatusCode::OK, [("stream-next-offset", "0")]).into_response();
                                 if closed {
@@ -1343,7 +1479,7 @@ pub(crate) mod testing {
                             |State(st): State<Arc<FakeDsState>>,
                              axum::extract::Path(path): axum::extract::Path<String>,
                              body: String| async move {
-                                if path != "meta/catalog" {
+                                if logical_path(&path) != "meta/catalog" {
                                     st.closes.fetch_add(1, Ordering::SeqCst);
                                     return axum::http::StatusCode::NO_CONTENT;
                                 }
@@ -1518,6 +1654,25 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
     use testing::FakeDs;
+
+    fn expected_store_bound() -> crate::store_identity::StoreBound {
+        crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope())
+    }
+
+    #[test]
+    fn store_bound_is_exactly_one_matching_event_zero() {
+        let expected = expected_store_bound();
+        let bound = serde_json::to_value(CatalogEvent::StoreBound(expected.clone())).unwrap();
+        validate_store_binding(&[bound.clone(), serde_json::json!({ "t": "offset" })], &expected).unwrap();
+        assert!(validate_store_binding(&[], &expected).is_err());
+        assert!(validate_store_binding(&[serde_json::json!({ "t": "offset" }), bound.clone()], &expected).is_err());
+        assert!(validate_store_binding(&[bound.clone(), bound], &expected).is_err());
+
+        let mut conflicting = expected.clone();
+        conflicting.query_generation = "other-query".to_string();
+        let conflicting = serde_json::to_value(CatalogEvent::StoreBound(conflicting)).unwrap();
+        assert!(validate_store_binding(&[conflicting], &expected).is_err());
+    }
 
     fn created_event(table: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1848,7 +2003,10 @@ mod tests {
     async fn a_refused_append_is_retried_in_place_and_lands_exactly_once() {
         let server = FakeDs::start().await;
         server.fail_appends(3);
-        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        let w = spawn_catalog_writer(
+            DsClient::new_for_in_process_test(server.url()),
+            crate::shutdown::ShutdownToken::new(),
+        );
         w.send(joined("s1", "sub-a", 100));
         w.send(left("s1", "sub-a"));
         assert!(w.drain(std::time::Duration::from_secs(20)).await, "the queue must drain");
@@ -1865,7 +2023,10 @@ mod tests {
     async fn send_durable_resolves_only_after_the_append_lands() {
         let server = FakeDs::start().await;
         server.fail_appends(2);
-        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        let w = spawn_catalog_writer(
+            DsClient::new_for_in_process_test(server.url()),
+            crate::shutdown::ShutdownToken::new(),
+        );
         let landed = w.send_durable(joined("s1", "sub-a", 100));
         tokio::pin!(landed);
         // 100 ms + 200 ms of backoff to go, so the ack cannot have happened yet.
@@ -1946,7 +2107,7 @@ mod tests {
         assert!(fold.is_empty(), "nothing to install — only an id that must not come back");
         // No durable-streams behind it: the queued retirement retries in the background and this
         // test does not depend on it (the id counter is engine state, decided before any IO).
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         engine.restore_reads_paused.store(true, std::sync::atomic::Ordering::Release);
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
         assert_eq!(engine.state.lock().await.next_shape_id, 2, "s1 is taken; the next shape is s2");
@@ -1959,7 +2120,7 @@ mod tests {
     async fn parking_a_broken_epoch_also_moves_the_id_counter() {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
         let fold = fold_of(vec![created, CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }]);
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         engine.restore_reads_paused.store(true, std::sync::atomic::Ordering::Release);
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Park).await.unwrap();
         let st = engine.state.lock().await;
@@ -2069,7 +2230,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_lost_response_leaves_two_records_with_one_event_id() {
         let server = FakeDs::start().await;
-        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        let w = spawn_catalog_writer(
+            DsClient::new_for_in_process_test(server.url()),
+            crate::shutdown::ShutdownToken::new(),
+        );
         server.lose_responses(1);
         w.send(joined("s1", "sub-b", 200));
         assert!(w.drain(std::time::Duration::from_secs(20)).await, "the queue must drain");
@@ -2095,7 +2259,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn every_enqueued_event_gets_its_own_id() {
         let server = FakeDs::start().await;
-        let w = spawn_catalog_writer(DsClient::new(server.url()), crate::shutdown::ShutdownToken::new());
+        let w = spawn_catalog_writer(
+            DsClient::new_for_in_process_test(server.url()),
+            crate::shutdown::ShutdownToken::new(),
+        );
         w.send(joined("s1", "sub-b", 200));
         w.send(joined("s1", "sub-c", 200));
         assert!(w.drain(std::time::Duration::from_secs(20)).await);
@@ -2123,7 +2290,7 @@ mod tests {
             CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
         ]);
         let server = FakeDs::start().await;
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
         let st = engine.state.lock().await;
         let share = st.feed_shares.get("s1").expect("the restored share entry");
@@ -2141,7 +2308,7 @@ mod tests {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
         let fold = fold_of(vec![created]);
         let server = FakeDs::start().await;
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
 
         let err = engine
             .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
@@ -2173,7 +2340,7 @@ mod tests {
                 .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
                 .collect(),
         );
-        let engine = Engine::new(DsClient::new(missing_server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(missing_server.url()));
         let err = engine
             .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
             .await
@@ -2196,7 +2363,7 @@ mod tests {
                 .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
                 .collect(),
         );
-        let closed_engine = Engine::new(DsClient::new(closed_server.url()));
+        let closed_engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(closed_server.url()));
         let err = closed_engine
             .apply_catalog(closed_fold, &HashMap::new(), RestoreMode::Resume)
             .await
@@ -2213,7 +2380,7 @@ mod tests {
                 .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
                 .collect(),
         );
-        let valid_engine = Engine::new(DsClient::new(valid_server.url()));
+        let valid_engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(valid_server.url()));
         valid_engine
             .apply_catalog(valid_fold, &HashMap::new(), RestoreMode::Resume)
             .await
@@ -2237,7 +2404,7 @@ mod tests {
             CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
         ]);
         let server = FakeDs::start().await;
-        let engine = Engine::new(DsClient::new(server.url()));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         let cmd = {
             let mut st = engine.state.lock().await;
             engine.ensure_sequencer(&mut st).cmd_tx.clone()
@@ -2272,7 +2439,7 @@ mod tests {
             CatalogEvent::Created { rec, .. } => rec,
             _ => unreachable!(),
         };
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         {
             let mut st = engine.state.lock().await;
             st.shapes.insert(first_rec.id.clone(), first_rec.clone());
@@ -2315,7 +2482,7 @@ mod tests {
                         let reads = reads.clone();
                         let notify = notify.clone();
                         async move {
-                            if path == "changes/0" {
+                            if path.ends_with("/changes/0") {
                                 reads.fetch_add(1, Ordering::SeqCst);
                                 notify.notify_waiters();
                                 (axum::http::StatusCode::OK, [("stream-next-offset", "1")], "[]".to_string())
@@ -2333,7 +2500,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let engine = Engine::new(DsClient::new(format!("http://{addr}")));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(format!("http://{addr}")));
         engine.restore_reads_paused.store(true, Ordering::Release);
         let cmd = {
             let mut st = engine.state.lock().await;

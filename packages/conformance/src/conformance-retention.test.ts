@@ -226,8 +226,9 @@ describe('shape retention lifecycle (active / dormant / evicted)', () => {
     // pending data returns 200 + the data, carrying the same header.
     expect([200, 204]).toContain(res.status)
 
-    // Retirement is close THEN delete: the stream is gone afterwards.
-    expect((await fetch(a.streamUrl)).status).toBe(404)
+    // Retirement is close THEN delete. The close resolves the parked read before the asynchronous
+    // delete is necessarily visible, so observe the promised terminal state instead of racing it.
+    await waitFor(async () => (await fetch(a.streamUrl)).status === 404, 'closed stream deletion')
   })
 
   it('TTL eviction closes the stream before deleting it: a tailing long-poll is released with stream-closed', async () => {

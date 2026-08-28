@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { DurableStreamTestServer, type TestServerOptions } from '@electric-circuits/ds-rust'
+import { mtlsAccess, testPhysicalPath } from './ds-mtls-access.js'
 import { type ApiServer, createApiServer } from '@electric-circuits/api'
 import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@electric-circuits/client'
 import { createPgOracle, createPgTables, type Oracle } from '@electric-circuits/oracle'
@@ -40,8 +41,14 @@ export function buildEngine(): void {
   engineBuilt = true
 }
 
-function engineBin(): string {
-  return join(repoRoot(), 'target', 'debug', 'electric-circuits-engine')
+let targetDirectory: string | undefined
+/** Cargo's configured target directory is workspace/toolchain state, never assumed to be `./target`. */
+export function engineBin(): string {
+  if (!targetDirectory) {
+    const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1'], { cwd: repoRoot(), encoding: 'utf8' })) as { target_directory: string }
+    targetDirectory = metadata.target_directory
+  }
+  return join(targetDirectory, 'debug', 'electric-circuits-engine')
 }
 
 /** How an engine process exited: `code` for a normal exit, `signal` when it was killed. */
@@ -283,11 +290,13 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
   let oracle: Oracle | undefined
   let client: ElectricIvmClient | undefined
   let engineDs: { url: string; close(): Promise<void> } | undefined
+  let access: Awaited<ReturnType<typeof mtlsAccess>> | undefined
   const teardown = async () => {
     await client?.close().catch(() => {})
     await api?.close().catch(() => {})
     proc?.kill('SIGKILL')
     await oracle?.close().catch(() => {})
+    await access?.close().catch(() => {})
     await engineDs?.close().catch(() => {})
     await server?.stop().catch(() => {})
     await dropPgArtifacts()
@@ -318,12 +327,16 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     server = new DurableStreamTestServer({ port: 0, durability: opts.durableStreamsDurability })
     const dsUrl = await server.start()
     engineDs = await opts.wrapEngineDs?.(dsUrl)
-    const engineDsUrl = engineDs?.url ?? dsUrl
+    access = await mtlsAccess(engineDs?.url ?? dsUrl)
+    const engineDsUrl = access.url
     const tables = Object.keys(schema.tables)
-    let spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
+    let spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, { ...(access?.env ?? {}), ...(opts.engineEnv ?? {}) })
     proc = spawned.proc
     const engineUrl = spawned.url
-    api = await createApiServer({ dsUrl, engineUrl })
+    // The product API writes the engine-owned change log directly in library mode. Its test-only
+    // raw durable-streams endpoint is rooted at the same physical test scope as the admitted
+    // engine; ordinary client reads still use response-provided stream URLs.
+    api = await createApiServer({ dsUrl: `${dsUrl}/${testPhysicalPath('')}`, engineUrl })
     oracle = await createPgOracle(schema, pgUrl)
     client = createClient({ apiUrl: api.url, schema })
     // No client.defineSchema: in Postgres mode the engine self-configures from introspection.
@@ -344,7 +357,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
       },
       waitForEngineExit: (timeoutMs = 30000) => spawned.raw.waitForExit(timeoutMs),
       startEngine: async () => {
-        spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
+        spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, { ...(access?.env ?? {}), ...(opts.engineEnv ?? {}) })
         proc = spawned.proc
         h.engineUrl = spawned.url
       },
@@ -397,7 +410,7 @@ export function positionReached(a: LogPosition, b: LogPosition): boolean {
 export async function changesTail(dsUrl: string, engineUrl: string): Promise<LogPosition | null> {
   const segment = await engineChangesSegment(engineUrl)
   if (segment === null) return null
-  const res = await fetch(`${dsUrl}/changes/${segment}`, { method: 'HEAD' })
+  const res = await fetch(`${dsUrl}/${testPhysicalPath(`changes/${segment}`)}`, { method: 'HEAD' })
   if (!res.ok) return null
   const off = res.headers.get('stream-next-offset')
   // A segment the ingestor has not written to yet — the usual state right after a rotation — has

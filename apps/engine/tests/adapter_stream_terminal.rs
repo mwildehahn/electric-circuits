@@ -26,7 +26,7 @@ struct FakeDs {
 
 async fn ds_handler(axum::extract::State(ds): axum::extract::State<FakeDs>, req: Request) -> Response {
     let path = req.uri().path();
-    let is_shape = path.starts_with("/shape/");
+    let is_shape = path.contains("/shape/");
     match *req.method() {
         Method::PUT | Method::POST | Method::DELETE => StatusCode::OK.into_response(),
         Method::HEAD => ([("stream-next-offset", "tip")], "").into_response(),
@@ -50,7 +50,7 @@ async fn app_with_ds() -> (Router, FakeDs) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let engine = Engine::new(DsClient::new(format!("http://{address}")));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(format!("http://{address}")));
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": { "items": { "columns": { "id": { "type": "text" } }, "primaryKey": "id" } }
     }))

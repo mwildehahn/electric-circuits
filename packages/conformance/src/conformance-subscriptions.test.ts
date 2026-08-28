@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, waitFor } from './engine-native.js'
 import { bootHarness, type Harness } from './harness.js'
+import { testPhysicalPath } from './ds-mtls-access.js'
 
 const schema: Schema = {
   tables: {
@@ -45,7 +46,7 @@ async function startLossProxy(upstreamUrl: string): Promise<LossProxy> {
   let lost = 0
   const server = createServer((incoming, outgoing) => {
     const target = new URL(incoming.url ?? '/', upstream)
-    const lose = loseNext && incoming.method === 'POST' && target.pathname === '/meta/catalog'
+    const lose = loseNext && incoming.method === 'POST' && target.pathname === `/${testPhysicalPath('meta/catalog')}`
     if (lose) loseNext = false
     const forwarded = request(
       target,
@@ -90,7 +91,7 @@ async function readCatalogEvents(dsUrl: string): Promise<Array<{ t?: string; id?
   const events: Array<{ t?: string; id?: string; subscription?: string }> = []
   let offset = '-1'
   for (let i = 0; i < 100; i++) {
-    const response = await fetch(`${dsUrl}/meta/catalog?offset=${encodeURIComponent(offset)}`)
+    const response = await fetch(`${dsUrl}/${testPhysicalPath('meta/catalog')}?offset=${encodeURIComponent(offset)}`)
     if (response.status === 204) break
     if (!response.ok) throw new Error(`GET meta/catalog -> ${response.status}`)
     const body = (await response.text()).trim()

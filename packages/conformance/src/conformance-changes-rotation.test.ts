@@ -19,6 +19,7 @@ import pgpkg from 'pg'
 import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { bootHarness, drainEngine, engineChangesOffset, engineChangesSegment, type Harness } from './harness.js'
+import { testPhysicalPath } from './ds-mtls-access.js'
 
 const schema: Schema = {
   tables: { items: { columns: { id: { type: 'int' }, n: { type: 'int' } }, primaryKey: 'id' } },
@@ -121,7 +122,7 @@ async function foldStream(streamUrl: string): Promise<Map<string, Row>> {
 }
 
 async function segmentStatus(n: number): Promise<number> {
-  return (await fetch(`${h.dsUrl}/changes/${n}`, { method: 'HEAD' })).status
+  return (await fetch(`${h.dsUrl}/${testPhysicalPath(`changes/${n}`)}`, { method: 'HEAD' })).status
 }
 
 async function waitFor(cond: () => Promise<boolean>, what: string, timeoutMs = 30000): Promise<void> {

@@ -48,7 +48,12 @@ impl FakeDs {
 }
 
 async fn ds_handler(State(ds): State<FakeDs>, req: Request) -> Response {
-    let path = req.uri().path().trim_start_matches('/').to_string();
+    let path = req
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .rsplit_once("/queries/test-query/")
+        .map_or_else(|| req.uri().path().trim_start_matches('/').to_string(), |(_, logical)| logical.to_string());
     match *req.method() {
         Method::PUT => {
             ds.present.lock().unwrap().insert(path);
@@ -99,7 +104,7 @@ async fn fake_ds_with(state: FakeDs) -> (DsClient, FakeDs) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (DsClient::new(format!("http://{address}")), state)
+    (DsClient::new_for_in_process_test(format!("http://{address}")), state)
 }
 
 /// A first boot has nothing in storage: the walk stops at the segment it was asked about (the

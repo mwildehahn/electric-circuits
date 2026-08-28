@@ -6,11 +6,86 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::heap_size::HeapSize;
 use serde::{Deserialize, Serialize};
+
+use crate::store_identity::{StoreIdentityV1, StreamScope};
+
+/// HTTPS and mTLS material for the production Durable Streams access boundary.
+#[derive(Clone, Debug)]
+pub struct DsConnectionConfig {
+    pub base_url: String,
+    pub ca_bundle_path: PathBuf,
+    pub client_certificate_path: PathBuf,
+    pub client_key_path: PathBuf,
+    pub scope: StreamScope,
+}
+
+impl DsConnectionConfig {
+    pub fn new(
+        base_url: String,
+        ca_bundle_path: PathBuf,
+        client_certificate_path: PathBuf,
+        client_key_path: PathBuf,
+        scope: StreamScope,
+    ) -> Result<Self> {
+        let url = url::Url::parse(&base_url).context("ELECTRIC_CIRCUITS_DS_URL must be an absolute URL")?;
+        if url.scheme() != "https" {
+            bail!("ELECTRIC_CIRCUITS_DS_URL must use https; HTTP is reserved for explicit in-process test stores");
+        }
+        if url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("ELECTRIC_CIRCUITS_DS_URL must be an HTTPS origin without credentials, query, or fragment");
+        }
+        if url.path() != "/" && !url.path().is_empty() {
+            bail!("ELECTRIC_CIRCUITS_DS_URL must not contain a path prefix");
+        }
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            ca_bundle_path,
+            client_certificate_path,
+            client_key_path,
+            scope,
+        })
+    }
+}
+
+/// Store readiness response decoded before any ordinary Durable Streams or Postgres operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreReadinessV1 {
+    pub identity: StoreIdentityV1,
+}
+
+#[derive(Debug)]
+pub enum StoreReadinessError {
+    Response { status: u16 },
+    Malformed { detail: String },
+    NotReady { status: String },
+    IdentityMismatch { expected: StoreIdentityV1, observed: StoreIdentityV1 },
+}
+
+impl std::fmt::Display for StoreReadinessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Response { status } => write!(f, "storage readiness endpoint refused the boot with HTTP {status}"),
+            Self::Malformed { detail } => write!(f, "storage readiness response is malformed: {detail}"),
+            Self::NotReady { status } => write!(f, "storage readiness status is '{status}', not 'ready'"),
+            Self::IdentityMismatch { expected, observed } => {
+                write!(f, "storage identity mismatch: expected {expected:?}, observed {observed:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoreReadinessError {}
 
 /// A State-Protocol change event, the JSON item on every table/shape stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +350,7 @@ type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send
 /// invariants and remain on [`DsClient`].  It is private because no external crate is entitled to
 /// rely on this first compatibility-shaped outcome representation.
 trait DurableStreamStore: Send + Sync {
+    fn ready<'a>(&'a self) -> StoreFuture<'a>;
     fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a>;
     fn append<'a>(
         &'a self,
@@ -297,7 +373,34 @@ struct HttpDurableStreamsStore {
 }
 
 impl HttpDurableStreamsStore {
-    fn new(base: String) -> Self {
+    fn new(config: &DsConnectionConfig) -> Result<Self> {
+        let ca = fs::read(&config.ca_bundle_path)
+            .with_context(|| format!("reading Durable Streams CA bundle {}", config.ca_bundle_path.display()))?;
+        let certificate = fs::read(&config.client_certificate_path).with_context(|| {
+            format!("reading Durable Streams client certificate {}", config.client_certificate_path.display())
+        })?;
+        let key = fs::read(&config.client_key_path)
+            .with_context(|| format!("reading Durable Streams client key {}", config.client_key_path.display()))?;
+        let ca = reqwest::Certificate::from_pem(&ca).context("parsing Durable Streams CA bundle")?;
+        let mut identity_pem = certificate;
+        if !identity_pem.ends_with(b"\n") {
+            identity_pem.push(b'\n');
+        }
+        identity_pem.extend(key);
+        let identity =
+            reqwest::Identity::from_pem(&identity_pem).context("parsing Durable Streams client certificate/key")?;
+        let http = reqwest::Client::builder()
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca)
+            .identity(identity)
+            .build()
+            .context("building Durable Streams mTLS client")?;
+        Ok(Self { base: config.base_url.clone(), http })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn new_in_process(base: String) -> Self {
         Self { base, http: reqwest::Client::new() }
     }
 
@@ -327,6 +430,13 @@ impl HttpDurableStreamsStore {
 }
 
 impl DurableStreamStore for HttpDurableStreamsStore {
+    fn ready<'a>(&'a self) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let res = self.http.get(format!("{}/_admin/ready", self.base)).send().await.context("GET /_admin/ready")?;
+            Ok(Self::response(res, BodyRead::Always).await)
+        })
+    }
+
     fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self
@@ -402,6 +512,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
 #[derive(Clone)]
 pub struct DsClient {
     base: String,
+    scope: StreamScope,
     store: Arc<dyn DurableStreamStore>,
     /// Shared across clones (installed after the engine exists, seen by every copy of the client
     /// from then on). See [`Self::set_gone_reconciler`].
@@ -414,21 +525,47 @@ pub struct DsClient {
 }
 
 impl DsClient {
-    pub fn new(base: impl Into<String>) -> Self {
-        let base = base.into();
-        Self::with_store(base.clone(), Arc::new(HttpDurableStreamsStore::new(base)))
+    /// Construct the production client. HTTPS, server verification, and a client certificate are
+    /// required; production code has no unscoped or HTTP fallback.
+    pub async fn connect(config: DsConnectionConfig) -> Result<Self> {
+        let expected = config.scope.store.clone();
+        let store = Arc::new(HttpDurableStreamsStore::new(&config)?);
+        let client = Self::with_store(config.base_url, config.scope, store);
+        // A production client is not constructible until the store has attested the exact identity.
+        client.preflight_readiness(&expected).await?;
+        Ok(client)
     }
 
     /// Construct the semantic facade over a supplied single-attempt store.  This is restricted to
     /// the engine crate so application callers cannot acquire a dependency on a provider or HTTP
     /// status behavior; deterministic stores belong in `ds.rs` unit tests.
-    fn with_store(base: String, store: Arc<dyn DurableStreamStore>) -> Self {
+    fn with_store(base: String, scope: StreamScope, store: Arc<dyn DurableStreamStore>) -> Self {
         DsClient {
             base,
+            scope,
             store,
             reconcile: std::sync::Arc::new(std::sync::OnceLock::new()),
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// An HTTP test double requires an explicit in-process test scope. This constructor is absent
+    /// from non-test builds so a deployment cannot accidentally use HTTP because an environment
+    /// happened to point at localhost.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new_for_in_process_test(base: impl Into<String>) -> Self {
+        let base = base.into();
+        Self::with_store(
+            base.clone(),
+            StreamScope::in_process_test_scope(),
+            Arc::new(HttpDurableStreamsStore::new_in_process(base)),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_test_store(base: String, store: Arc<dyn DurableStreamStore>) -> Self {
+        Self::with_store(base, StreamScope::in_process_test_scope(), store)
     }
 
     /// Install the reconciler [`Self::append_reliable`] consults before believing a terminal
@@ -461,12 +598,38 @@ impl DsClient {
     }
 
     pub fn stream_url(&self, path: &str) -> String {
-        format!("{}/{}", self.base.trim_end_matches('/'), path.trim_start_matches('/'))
+        match self.scope.qualify(path) {
+            Ok(path) => format!("{}/{path}", self.base.trim_end_matches('/')),
+            Err(_) => "<invalid-logical-path>".to_string(),
+        }
+    }
+
+    /// The first and only allowed preflight network operation. Any failure leaves ordinary stream
+    /// operations untouched and is therefore safe to run before engine or Postgres construction.
+    pub async fn preflight_readiness(&self, expected: &StoreIdentityV1) -> Result<StoreReadinessV1> {
+        let response = self.store.ready().await?;
+        if response.status != 200 {
+            return Err(anyhow::Error::new(StoreReadinessError::Response { status: response.status }));
+        }
+        let body = response.required_body()?;
+        let observed = decode_readiness(&body)?;
+        if &observed.identity != expected {
+            return Err(anyhow::Error::new(StoreReadinessError::IdentityMismatch {
+                expected: expected.clone(),
+                observed: observed.identity,
+            }));
+        }
+        Ok(observed)
+    }
+
+    fn physical_path(&self, logical_path: &str) -> Result<String> {
+        self.scope.qualify(logical_path)
     }
 
     /// Idempotently create a JSON stream (PUT). Existing stream with same config -> 200.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
-        let res = self.store.ensure(path, "application/json").await?;
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.ensure(&physical_path, "application/json").await?;
         if (200..300).contains(&res.status) {
             Ok(())
         } else {
@@ -482,7 +645,8 @@ impl DsClient {
             return Ok(());
         }
         let body = serde_json::to_vec(events).with_context(|| format!("serializing POST {path}"))?;
-        let res = self.store.append(path, "application/json", body, BodyRead::OnFailure).await?;
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.append(&physical_path, "application/json", body, BodyRead::OnFailure).await?;
         if !(200..300).contains(&res.status) {
             let status = res.status;
             return Err(status_error("POST", path, status, &res.body_or_default()));
@@ -492,7 +656,8 @@ impl DsClient {
 
     /// Read raw JSON events (non-envelope streams). Returns `(events, next_offset, up_to_date)`.
     pub async fn read_json(&self, path: &str, offset: &str) -> Result<(Vec<serde_json::Value>, Option<String>, bool)> {
-        let res = self.store.read(path, offset, false).await?;
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.read(&physical_path, offset, false).await?;
         if res.status == 204 || res.status == 404 {
             return Ok((Vec::new(), res.next_offset, true));
         }
@@ -622,8 +787,12 @@ impl DsClient {
         let payload = serde_json::to_vec(envelopes)
             .map_err(|e| AppendError::Other(anyhow::Error::new(e).context(format!("serializing POST {path}"))))?;
         let payload_len = payload.len() as u64;
-        let res =
-            self.store.append(path, "application/json", payload, BodyRead::Always).await.map_err(AppendError::Other)?;
+        let physical_path = self.physical_path(path).map_err(AppendError::Other)?;
+        let res = self
+            .store
+            .append(&physical_path, "application/json", payload, BodyRead::Always)
+            .await
+            .map_err(AppendError::Other)?;
         // A retired stream answers 404 (deleted), 410 (soft-deleted) or 409 + `stream-closed: true`
         // (closed, which retirement does before deleting).  The provider parses the header before
         // draining its response; the body text ("stream is closed") is not the contract.
@@ -712,7 +881,8 @@ impl DsClient {
     /// the read times out. Idempotent (`204` again for an already-closed stream); an absent (`404`)
     /// or soft-deleted (`410`) stream is a success, there is nothing left to close.
     pub async fn close_stream(&self, path: &str) -> Result<()> {
-        let res = self.store.close(path).await?;
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.close(&physical_path).await?;
         if (200..300).contains(&res.status) || res.status == 404 || res.status == 410 {
             Ok(())
         } else {
@@ -741,7 +911,8 @@ impl DsClient {
     /// success: deletion is idempotent, and a retry loop (the degraded reap) must not spin forever
     /// on a stream storage has already retired.
     pub async fn delete_stream(&self, path: &str) -> Result<()> {
-        let res = self.store.delete(path).await?;
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.delete(&physical_path).await?;
         if (200..300).contains(&res.status) || res.status == 404 || res.status == 410 {
             self.appended.lock().unwrap().remove(path);
             Ok(())
@@ -758,7 +929,8 @@ impl DsClient {
     /// (ADR-0006): a closed segment can be a gigabyte, and durable-streams offers no bounded tail
     /// read, so the successor is derived and *verified* rather than read back.
     pub async fn head(&self, path: &str) -> Result<Option<StreamHead>> {
-        let res = self.store.head(path).await?;
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.head(&physical_path).await?;
         if res.status == 404 || res.status == 410 {
             return Ok(None);
         }
@@ -770,7 +942,8 @@ impl DsClient {
 
     /// Read from `offset` (use "-1" for the beginning). `live` enables long-poll tailing.
     pub async fn read(&self, path: &str, offset: &str, live: bool) -> Result<ReadResult> {
-        let res = self.store.read(path, offset, live).await?;
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.read(&physical_path, offset, live).await?;
 
         // 204 = long-poll timeout / no new data / a close that woke this long-poll.
         if res.status == 204 {
@@ -806,6 +979,260 @@ fn header(res: &reqwest::Response, name: &str) -> Option<String> {
     res.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
 }
 
+#[derive(Deserialize)]
+struct ReadinessWire {
+    contract_version: String,
+    status: String,
+    artifact_digest: String,
+    manifest: ManifestWire,
+    recovery: RecoveryWire,
+    reserve: ReserveWire,
+}
+
+#[derive(Deserialize)]
+struct ManifestWire {
+    store_id: String,
+    store_generation: String,
+    protocol_version: u32,
+    layout_version: u32,
+    durability_mode: String,
+    wal_shard_count: u32,
+    stream_lane_count: u32,
+    filesystem_uuid: String,
+    creation_time: String,
+}
+
+#[derive(Deserialize)]
+struct RecoveryWire {
+    completed: bool,
+    wal_shards: Vec<WalShardWire>,
+}
+
+#[derive(Deserialize)]
+struct WalShardWire {
+    shard: u32,
+    durable_lsn: u64,
+    checkpoint_lsn: u64,
+}
+
+#[derive(Deserialize)]
+struct ReserveWire {
+    free_bytes: u64,
+    free_inodes: u64,
+    minimum_free_bytes: u64,
+    minimum_free_inodes: u64,
+    satisfied: bool,
+}
+
+fn decode_readiness(body: &str) -> Result<StoreReadinessV1> {
+    let strict: StrictJson = serde_json::from_str(body)
+        .map_err(|e| anyhow::Error::new(StoreReadinessError::Malformed { detail: e.to_string() }))?;
+    let wire: ReadinessWire = serde_json::from_value(strict.into_value())
+        .map_err(|e| anyhow::Error::new(StoreReadinessError::Malformed { detail: e.to_string() }))?;
+    if wire.contract_version != "durable-streams-store-ready-v1" {
+        return Err(anyhow::Error::new(StoreReadinessError::Malformed {
+            detail: format!("unsupported contract_version '{}'", wire.contract_version),
+        }));
+    }
+    if !matches!(wire.status.as_str(), "starting" | "recovering" | "ready" | "stopping") {
+        return Err(anyhow::Error::new(StoreReadinessError::Malformed {
+            detail: format!("invalid readiness status '{}'", wire.status),
+        }));
+    }
+    if wire.status != "ready" {
+        return Err(anyhow::Error::new(StoreReadinessError::NotReady { status: wire.status }));
+    }
+    if !is_artifact_digest(&wire.artifact_digest) {
+        return Err(anyhow::Error::new(StoreReadinessError::Malformed {
+            detail: "artifact_digest must be lowercase sha256:<64 hexadecimal digits>".to_string(),
+        }));
+    }
+    let creation_time =
+        time::OffsetDateTime::parse(&wire.manifest.creation_time, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| {
+                anyhow::Error::new(StoreReadinessError::Malformed {
+                    detail: "manifest.creation_time must be RFC 3339 UTC using Z".to_string(),
+                })
+            })?;
+    let canonical_seconds = wire.manifest.creation_time.as_bytes();
+    if canonical_seconds.len() != 20
+        || canonical_seconds[4] != b'-'
+        || canonical_seconds[7] != b'-'
+        || canonical_seconds[10] != b'T'
+        || canonical_seconds[13] != b':'
+        || canonical_seconds[16] != b':'
+        || canonical_seconds[19] != b'Z'
+        || ![0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+            .iter()
+            .all(|index| canonical_seconds[*index].is_ascii_digit())
+        || !creation_time.offset().is_utc()
+    {
+        return Err(anyhow::Error::new(StoreReadinessError::Malformed {
+            detail: "manifest.creation_time must be canonical whole-second YYYY-MM-DDTHH:MM:SSZ".to_string(),
+        }));
+    }
+    let identity = StoreIdentityV1::new(
+        wire.manifest.store_id,
+        wire.manifest.store_generation,
+        wire.manifest.protocol_version,
+        wire.manifest.layout_version,
+        wire.manifest.durability_mode,
+        wire.manifest.wal_shard_count,
+        wire.manifest.stream_lane_count,
+        wire.manifest.filesystem_uuid,
+    )
+    .map_err(|e| anyhow::Error::new(StoreReadinessError::Malformed { detail: e.to_string() }))?;
+    if !wire.recovery.completed || !wire.reserve.satisfied {
+        return Err(anyhow::Error::new(StoreReadinessError::NotReady {
+            status: "ready-with-incomplete-recovery-or-reserve".to_string(),
+        }));
+    }
+    if wire.recovery.wal_shards.len() != identity.wal_shard_count as usize {
+        return Err(anyhow::Error::new(StoreReadinessError::Malformed {
+            detail: "recovery.wal_shards does not contain one entry for every expected shard".to_string(),
+        }));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for shard in &wire.recovery.wal_shards {
+        if shard.shard >= identity.wal_shard_count || !seen.insert(shard.shard) {
+            return Err(anyhow::Error::new(StoreReadinessError::Malformed {
+                detail: "recovery.wal_shards has an out-of-range or duplicate shard index".to_string(),
+            }));
+        }
+        let _ = (shard.durable_lsn, shard.checkpoint_lsn);
+    }
+    let _ = (
+        wire.reserve.free_bytes,
+        wire.reserve.free_inodes,
+        wire.reserve.minimum_free_bytes,
+        wire.reserve.minimum_free_inodes,
+    );
+    Ok(StoreReadinessV1 { identity })
+}
+
+fn is_artifact_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else { return false };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A JSON value decoded with duplicate object keys rejected at every nesting level. `serde_json`
+/// otherwise follows its normal last-key-wins rule, which is unsafe for a storage identity
+/// attestation: two parsers could make different lineage decisions from the same bytes.
+#[derive(Debug)]
+enum StrictJson {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<Self>),
+    Object(serde_json::Map<String, serde_json::Value>),
+}
+
+impl StrictJson {
+    fn into_value(self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(value) => serde_json::Value::Bool(value),
+            Self::Number(value) => serde_json::Value::Number(value),
+            Self::String(value) => serde_json::Value::String(value),
+            Self::Array(values) => serde_json::Value::Array(values.into_iter().map(Self::into_value).collect()),
+            Self::Object(values) => serde_json::Value::Object(values),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StrictJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("valid JSON without duplicate object keys")
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(StrictJson::Null)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(StrictJson::Bool(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(StrictJson::Number(value.into()))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(StrictJson::Number(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(StrictJson::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(StrictJson::String(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(StrictJson::String(value))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(StrictJson::Array(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, StrictJson>()? {
+                    if values.insert(key.clone(), value.into_value()).is_some() {
+                        return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
+                    }
+                }
+                Ok(StrictJson::Object(values))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,7 +1240,10 @@ mod tests {
     #[derive(Default)]
     struct ScriptedStore {
         appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+        operations: std::sync::Mutex<Vec<String>>,
         fail_read_body: bool,
+        readiness_status: u16,
+        readiness_body: Option<String>,
     }
 
     fn response(status: u16) -> StoreResponse {
@@ -827,6 +1257,15 @@ mod tests {
     }
 
     impl DurableStreamStore for ScriptedStore {
+        fn ready<'a>(&'a self) -> StoreFuture<'a> {
+            Box::pin(async move {
+                self.operations.lock().unwrap().push("ready".to_string());
+                let mut response = response(if self.readiness_status == 0 { 200 } else { self.readiness_status });
+                response.body = Some(Ok(self.readiness_body.clone().unwrap_or_default()));
+                Ok(response)
+            })
+        }
+
         fn ensure<'a>(&'a self, _path: &'a str, _content_type: &'a str) -> StoreFuture<'a> {
             Box::pin(async { Ok(response(201)) })
         }
@@ -839,6 +1278,7 @@ mod tests {
             _response_body: BodyRead,
         ) -> StoreFuture<'a> {
             Box::pin(async move {
+                self.operations.lock().unwrap().push("append".to_string());
                 self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));
                 Ok(response(204))
             })
@@ -871,7 +1311,7 @@ mod tests {
     #[tokio::test]
     async fn facade_keeps_envelope_codec_and_byte_accounting_above_the_store_port() {
         let store = Arc::new(ScriptedStore::default());
-        let client = DsClient::with_store("scripted://provider".to_string(), store.clone());
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
         let envelope = Envelope {
             type_: "public.items".to_string(),
             key: "item-1".to_string(),
@@ -892,17 +1332,24 @@ mod tests {
 
         assert!(matches!(appended, Appended::Ok { next_offset: Some(ref token) } if token == "opaque-provider-token"));
         assert_eq!(client.appended_bytes("shape/s1"), expected.len() as u64);
-        assert_eq!(client.stream_url("shape/s1"), "scripted://provider/shape/s1");
+        assert_eq!(
+            client.stream_url("shape/s1"),
+            "scripted://provider/circuits/v1/test-stack/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/test-query/shape/s1"
+        );
         assert_eq!(
             *store.appended.lock().unwrap(),
-            vec![("shape/s1".to_string(), "application/json".to_string(), expected)]
+            vec![(
+                StreamScope::in_process_test_scope().qualify("shape/s1").unwrap(),
+                "application/json".to_string(),
+                expected
+            )]
         );
     }
 
     #[tokio::test]
     async fn successful_read_body_failure_never_accepts_the_advertised_next_offset() {
         let store = Arc::new(ScriptedStore { fail_read_body: true, ..Default::default() });
-        let client = DsClient::with_store("scripted://provider".to_string(), store);
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store);
 
         let envelope_err = match client.read("changes/0", "prior-offset", false).await {
             Ok(_) => panic!("a successful GET with an unreadable body must not produce a page"),
@@ -923,6 +1370,77 @@ mod tests {
         );
     }
 
+    fn readiness_json(identity: &StoreIdentityV1) -> String {
+        serde_json::json!({
+            "contract_version": "durable-streams-store-ready-v1",
+            "status": "ready",
+            "artifact_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "manifest": {
+                "store_id": identity.store_id,
+                "store_generation": identity.store_generation,
+                "protocol_version": identity.protocol_version,
+                "layout_version": identity.layout_version,
+                "durability_mode": identity.durability_mode,
+                "wal_shard_count": identity.wal_shard_count,
+                "stream_lane_count": identity.stream_lane_count,
+                "filesystem_uuid": identity.filesystem_uuid,
+                "creation_time": "2026-08-27T19:00:00Z"
+            },
+            "recovery": {
+                "completed": true,
+                "wal_shards": [
+                    { "shard": 0, "durable_lsn": 0, "checkpoint_lsn": 0 },
+                    { "shard": 1, "durable_lsn": 0, "checkpoint_lsn": 0 }
+                ]
+            },
+            "reserve": {
+                "free_bytes": 85899345920u64,
+                "free_inodes": 1000000u64,
+                "minimum_free_bytes": 21474836480u64,
+                "minimum_free_inodes": 10000u64,
+                "satisfied": true
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn readiness_mismatch_stops_before_any_normal_store_operation() {
+        let expected = StoreIdentityV1::in_process_test_identity();
+        let mut observed = expected.clone();
+        observed.store_generation = "aa8b5fa6-e786-4994-8da0-f14e9e79f318".to_string();
+        let store = Arc::new(ScriptedStore { readiness_body: Some(readiness_json(&observed)), ..Default::default() });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
+
+        let error =
+            client.preflight_readiness(&expected).await.expect_err("mismatched store identity must refuse boot");
+        assert!(error.downcast_ref::<StoreReadinessError>().is_some());
+        assert_eq!(*store.operations.lock().unwrap(), vec!["ready".to_string()]);
+        assert!(store.appended.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_logical_path_never_reaches_the_store() {
+        let store = Arc::new(ScriptedStore::default());
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
+
+        assert!(client.append_json("shape/../s1", &[serde_json::json!({"t": "x"})]).await.is_err());
+        assert!(store.operations.lock().unwrap().is_empty());
+        assert!(store.appended.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn readiness_rejects_duplicate_keys_and_noncanonical_values() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let duplicate =
+            readiness_json(&identity).replacen("\"status\":\"ready\"", "\"status\":\"ready\",\"status\":\"ready\"", 1);
+        assert!(decode_readiness(&duplicate).is_err());
+        let noncanonical = readiness_json(&identity).replace("2026-08-27T19:00:00Z", "2026-08-27T19:00:00+00:00");
+        assert!(decode_readiness(&noncanonical).is_err());
+        let fractional = readiness_json(&identity).replace("2026-08-27T19:00:00Z", "2026-08-27T19:00:00.001Z");
+        assert!(decode_readiness(&fractional).is_err());
+    }
+
     /// The boot classification of a durable-streams failure. Getting this wrong is expensive in
     /// both directions: forgiving too much hides a malformed catalog behind an infinite retry,
     /// forgiving too little exits `EX_CONFIG` for a storage pod that is merely slower to start than
@@ -931,7 +1449,8 @@ mod tests {
     async fn transport_failures_are_retryable_and_answers_are_not() {
         // A REAL connect refusal (nothing listens on port 1), not a fabricated one: `reqwest::Error`
         // has no public constructor, and a mock would only prove the mock.
-        let refused = match DsClient::new("http://127.0.0.1:1").read("changes/0", "-1", false).await {
+        let refused = match DsClient::new_for_in_process_test("http://127.0.0.1:1").read("changes/0", "-1", false).await
+        {
             Err(e) => e,
             Ok(_) => panic!("nothing listens on port 1"),
         };

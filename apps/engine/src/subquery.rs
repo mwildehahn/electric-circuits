@@ -2619,7 +2619,7 @@ mod tests {
     /// node_by_id, and a unit-bind template — so `on_table_delta`, `apply_node_evals`, and the
     /// `SubqueryEval` reads all work.
     fn registry_with_node(sig: &str) -> SubqueryRegistry {
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         insert_test_node(&mut reg, sig);
         reg
     }
@@ -2658,7 +2658,7 @@ mod tests {
             .unwrap();
             crate::schema::TableSchema::from_def(&"t".into(), &def).unwrap()
         };
-        let mut reg = SubqueryRegistry::new(crate::ds::DsClient::new("http://127.0.0.1:1"), None);
+        let mut reg = SubqueryRegistry::new(crate::ds::DsClient::new_for_in_process_test("http://127.0.0.1:1"), None);
         insert_test_node(&mut reg, "sig1");
 
         // A new row projects value 1 into the inner set -> Enter flip -> passed.
@@ -2730,7 +2730,7 @@ mod tests {
     async fn a_failed_propagation_leaves_its_work_for_the_retry() {
         let ts = issues_ts();
         // No `pg_url`: the first query-back fails, as an outage makes it fail.
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         insert_membership_shape(&mut reg, "s1", &sig, 1);
@@ -2764,7 +2764,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_exhausted_retry_still_returns_the_unfinished_work() {
         let ts = issues_ts();
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         insert_membership_shape(&mut reg, "s1", &sig, 1);
@@ -2813,7 +2813,7 @@ mod tests {
 
     /// A registry parked exactly where phase B runs: edges committed, shape not installed.
     fn registry_mid_create() -> (SubqueryRegistry, BeginCreate) {
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         reg.set_schemas(Arc::new(creating_schemas()));
         let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, false).unwrap();
         (reg, begin)
@@ -2898,7 +2898,7 @@ mod tests {
     /// the child→parent edge committed, no shape installed. Returns the registry, the deepest
     /// node's sig and the parent node's.
     fn registry_mid_nested_create() -> (SubqueryRegistry, SubquerySig, SubquerySig) {
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         reg.set_schemas(Arc::new(nested_schemas()));
         let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
             "col": "gid",
@@ -3009,7 +3009,7 @@ mod tests {
     async fn a_failed_deferred_item_is_restored_for_the_retry() {
         let ts = issues_ts();
         // No `pg_url`: the first query-back fails, as an outage makes it fail.
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         insert_membership_shape(&mut reg, "s1", &sig, 1);
@@ -3183,7 +3183,7 @@ mod tests {
         schemas.insert(TableRef::parse("outer_t").unwrap(), mk("outer_t"));
         schemas.insert(TableRef::parse("inner_t").unwrap(), mk("inner_t"));
         // No pg_url: node seeding must fail after collect() has already registered the node.
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         reg.set_schemas(Arc::new(schemas));
         let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
             "col":"gid","in":{"table":"inner_t","project":"gid"}
@@ -3220,7 +3220,7 @@ mod tests {
         }))
         .unwrap();
         let ts = crate::schema::TableSchema::from_def(&"t".into(), &def).unwrap();
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         // A shape whose predicate never matches (Not(MatchAll)): every candidate verdict is
         // "not a member".
         insert_outer_shape(&mut reg, "s1", "t", CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
@@ -3275,7 +3275,7 @@ mod tests {
         // A real (fake) DS server: the final phase genuinely emits an upsert, which would retry
         // forever against an unreachable URL.
         let (ds_url, _store) = spawn_fake_ds().await;
-        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
         insert_outer_shape(&mut reg, "s1", "t", CompiledPredicate::MatchAll);
         let row = |id: i64| Row(vec![Value::Int(id), Value::Int(0)]);
         assert_eq!(reg.pk_dict.len(), 0);
@@ -3343,7 +3343,10 @@ mod tests {
         match *req.method() {
             Method::PUT | Method::DELETE => StatusCode::OK.into_response(),
             Method::POST => {
-                let path = req.uri().path().trim_start_matches('/').to_string();
+                let path = req.uri().path().trim_start_matches('/').rsplit_once("/queries/test-query/").map_or_else(
+                    || req.uri().path().trim_start_matches('/').to_string(),
+                    |(_, logical)| logical.to_string(),
+                );
                 let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
                 if let Ok(envs) = serde_json::from_slice::<Vec<Envelope>>(&body) {
                     store.0.lock().unwrap().entry(path).or_default().extend(envs);
@@ -3447,7 +3450,7 @@ mod tests {
     async fn move_out_delete_survives_the_conjunct_index() {
         let ts = issues_ts();
         let (ds_url, store) = spawn_fake_ds().await;
-        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         // User 1 is a member of BOTH projects, so the only thing that moves the row is the
@@ -3489,7 +3492,7 @@ mod tests {
     /// candidate — skipping those would be unsound.
     #[tokio::test(flavor = "multi_thread")]
     async fn outer_candidates_do_not_scale_with_shape_count() {
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
 
@@ -3542,7 +3545,7 @@ mod tests {
     async fn never_member_delete_is_dropped() {
         let ts = issues_ts();
         let (ds_url, store) = spawn_fake_ds().await;
-        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         // The only project user 1 is a member of.
@@ -3576,7 +3579,7 @@ mod tests {
     async fn genuine_member_delete_is_never_dropped() {
         let ts = issues_ts();
         let (ds_url, store) = spawn_fake_ds().await;
-        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
@@ -3643,7 +3646,7 @@ mod tests {
     async fn recency_fixture() -> (TableSchema, DsStore, SubqueryRegistry) {
         let ts = issues_ts();
         let (ds_url, store) = spawn_fake_ds().await;
-        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;

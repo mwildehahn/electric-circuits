@@ -99,7 +99,7 @@ async fn setup_refuses_rls_before_creating_publication() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let engine = Engine::new_pg(DsClient::new(&ds_url), url.clone());
+    let engine = Engine::new_pg_for_in_process_test(DsClient::new_for_in_process_test(&ds_url), url.clone());
     let table = TableRef::new("public", &table_name)?;
     let result = engine.setup_postgres(&[TableSelector::One(table)], &slot).await;
     let publication_count: i64 =

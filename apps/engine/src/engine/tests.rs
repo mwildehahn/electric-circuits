@@ -67,7 +67,8 @@ fn standalone_index_candidates() {
 
 /// A SubqueryHandle over a fresh registry, with a live propagator task (tests run in tokio).
 fn test_subq() -> SubqueryHandle {
-    let registry = Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
+    let registry =
+        Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new_for_in_process_test("http://127.0.0.1:1"), None)));
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
@@ -267,7 +268,7 @@ fn circuit_ops_decompose_every_strategy() {
 /// for the visualizer, and an unchanged payload for older consumers.
 #[tokio::test]
 async fn graph_omits_arrangements_when_off() {
-    let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     let g = engine.graph().await;
     assert!(g.arrangements.is_none());
     let v = serde_json::to_value(&g).unwrap();
@@ -288,7 +289,7 @@ async fn graph_includes_counts_pipeline_and_consumers() {
     }])
     .unwrap();
 
-    let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     engine.state.lock().await.tables.insert("users".into(), ts.clone());
     *engine.arrangements.lock().unwrap() = Some(arr.clone());
     // A counts-served aggregate placement: the consumer edge for the visualizer.
@@ -1364,7 +1365,7 @@ async fn emission_lanes_order_and_barrier() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let ds = crate::ds::DsClient::new(&format!("http://{addr}"));
+    let ds = crate::ds::DsClient::new_for_in_process_test(&format!("http://{addr}"));
     let pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone());
 
@@ -1404,7 +1405,7 @@ async fn emission_lanes_order_and_barrier() {
     for stream in ["shape/a", "shape/b"] {
         let keys: Vec<usize> = entries
             .iter()
-            .filter(|(p, _)| p == stream)
+            .filter(|(p, _)| p.ends_with(stream))
             .map(|(_, body)| {
                 let v: Vec<serde_json::Value> = serde_json::from_str(body).unwrap();
                 v[0]["key"].as_str().unwrap().parse::<usize>().unwrap()
@@ -1423,7 +1424,7 @@ async fn emission_lanes_order_and_barrier() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sampler_cardinalities_never_populates_bytes_fields() {
     let ts = users();
-    let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     engine.state.lock().await.tables.insert("users".into(), ts.clone());
     engine.state.lock().await.shapes.insert(
         "s1".into(),
@@ -1489,7 +1490,7 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
 /// outage: `membership query-back requires postgres`, every attempt.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
-    let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": {
             "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },

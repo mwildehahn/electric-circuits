@@ -284,7 +284,7 @@ mod tests {
         let server = FakeDs::start().await;
         server.fail_deletes(2);
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let ds = DsClient::new(server.url());
+        let ds = DsClient::new_for_in_process_test(server.url());
         let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone());
         let q = spawn_retirement_queue(ds, catalog.clone(), shutdown);
         q.enqueue("shape/s1", Some("s1"));
@@ -311,7 +311,7 @@ mod tests {
     async fn an_anonymous_retirement_writes_no_record() {
         let server = FakeDs::start().await;
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let ds = DsClient::new(server.url());
+        let ds = DsClient::new_for_in_process_test(server.url());
         let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone());
         let q = spawn_retirement_queue(ds, catalog.clone(), shutdown);
         q.enqueue("shape/s9", None);

@@ -40,7 +40,12 @@ fn env_json(txid: u32, lsn: &str, key: &str, seq: u32, last: bool) -> String {
 }
 
 async fn ds_handler(State(log): State<FakeLog>, req: Request) -> Response {
-    let path = req.uri().path().trim_start_matches('/').to_string();
+    let path = req
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .rsplit_once("/queries/test-query/")
+        .map_or_else(|| req.uri().path().trim_start_matches('/').to_string(), |(_, logical)| logical.to_string());
     let query = req.uri().query().unwrap_or("").to_string();
     match *req.method() {
         Method::PUT | Method::DELETE => StatusCode::OK.into_response(),
@@ -106,7 +111,7 @@ async fn a_shape_parked_while_a_transaction_is_held_resumes_at_the_pinned_positi
         ),
     );
 
-    let engine = Engine::new(DsClient::new(&ds_url));
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(&ds_url));
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": { "t": { "columns": { "id": { "type": "text" } }, "primaryKey": "id" } }
     }))

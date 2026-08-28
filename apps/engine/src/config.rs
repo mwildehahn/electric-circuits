@@ -16,6 +16,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::table_ref::{TableRef, TableSelector};
 use crate::txn_buffer::TxnBufferConfig;
+use crate::{
+    ds::DsConnectionConfig,
+    store_identity::{StoreIdentityV1, StreamScope},
+};
 
 /// A StatsD destination (`host[:port]`, default port 8125).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +41,10 @@ pub struct Config {
     pub pg_url: Option<String>,
     /// Durable-streams base URL (`ELECTRIC_CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
     pub ds_url: Option<String>,
+    /// Fully validated HTTPS/mTLS storage connection and immutable path scope.
+    pub ds_connection: Option<DsConnectionConfig>,
+    /// Explicit one-shot authority to write the first namespace binding into an empty catalog.
+    pub initialize_namespace: bool,
     /// HTTP bind address for the control plane + `/v1/shape` + `/v1/health`.
     pub bind: String,
     /// `tracing` EnvFilter string.
@@ -190,6 +198,55 @@ impl Config {
             crate::pg::parse_pg_url(url).context("ELECTRIC_CIRCUITS_PG_URL / DATABASE_URL")?;
         }
         let ds_url = g("ELECTRIC_CIRCUITS_DS_URL");
+        let ds_connection = match ds_url.clone() {
+            Some(base_url) => {
+                let required = |name: &str| {
+                    g(name).ok_or_else(|| anyhow::anyhow!("{name} must be set when ELECTRIC_CIRCUITS_DS_URL is set"))
+                };
+                let parse_u32 = |name: &str| -> Result<u32> {
+                    let value = required(name)?;
+                    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                        bail!("{name} must be an unsigned decimal 32-bit integer, got '{value}'");
+                    }
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| anyhow::anyhow!("{name} must be an unsigned 32-bit integer, got '{value}'"))
+                };
+                let store = StoreIdentityV1::new(
+                    required("ELECTRIC_CIRCUITS_DS_STORE_ID")?,
+                    required("ELECTRIC_CIRCUITS_DS_STORE_GENERATION")?,
+                    parse_u32("ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION")?,
+                    parse_u32("ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION")?,
+                    required("ELECTRIC_CIRCUITS_DS_DURABILITY_MODE")?,
+                    parse_u32("ELECTRIC_CIRCUITS_DS_WAL_SHARDS")?,
+                    parse_u32("ELECTRIC_CIRCUITS_DS_STREAM_LANES")?,
+                    required("ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID")?,
+                )
+                .context("expected Durable Streams store identity")?;
+                let scope = StreamScope::new(
+                    required("ELECTRIC_CIRCUITS_DS_NAMESPACE")?,
+                    store,
+                    required("ELECTRIC_CIRCUITS_QUERY_GENERATION")?,
+                )
+                .context("Durable Streams namespace scope")?;
+                Some(DsConnectionConfig::new(
+                    base_url,
+                    std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CA_BUNDLE")?),
+                    std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_CERT")?),
+                    std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_KEY")?),
+                    scope,
+                )?)
+            }
+            None => None,
+        };
+        let initialize_namespace = match g("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE").as_deref() {
+            None => false,
+            Some("1") => true,
+            Some(value) => bail!("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE must be exactly '1' when set, got '{value}'"),
+        };
+        if initialize_namespace && ds_connection.is_none() {
+            bail!("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1 requires a complete Durable Streams configuration");
+        }
 
         // Bind address. ELECTRIC_CIRCUITS_BIND always wins (preserves 127.0.0.1:0 dev behavior). Otherwise,
         // if the fleet surface is present (ELECTRIC_PORT or DATABASE_URL) bind 0.0.0.0:<port|3000>.
@@ -331,7 +388,7 @@ impl Config {
 
         // Large transactions (ADR-0003). Boot-fatal on an unusable setting: a memory cap or append
         // budget that was meant to be applied and silently was not is the worst of both worlds.
-        let txn = TxnBufferConfig::resolve(&g).context("large-transaction configuration")?;
+        let txn = TxnBufferConfig::resolve(g).context("large-transaction configuration")?;
 
         // Streamed backfills. Same stance as the large-transaction knobs: a budget that was meant
         // to be applied and silently was not is worse than a refused boot.
@@ -367,8 +424,8 @@ impl Config {
         };
         let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms };
 
-        let shutdown_grace = crate::shutdown::resolve_grace(&g).context("shutdown configuration")?;
-        let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(&g).context("shutdown configuration")?;
+        let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
+        let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(g).context("shutdown configuration")?;
         if shutdown_ready_drain >= shutdown_grace {
             bail!(
                 "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS ({}s) must be less than \
@@ -382,6 +439,8 @@ impl Config {
         Ok(Config {
             pg_url,
             ds_url,
+            ds_connection,
+            initialize_namespace,
             bind,
             log_filter,
             slot,
@@ -417,7 +476,7 @@ impl Config {
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} storage_dir={} prometheus_port={:?} trace={} log={} \
+             secret={} storage_dir={} prometheus_port={:?} trace={} initialize_namespace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
@@ -432,6 +491,7 @@ impl Config {
             self.storage_dir.as_deref().unwrap_or("<none>"),
             self.prometheus_port,
             self.trace,
+            self.initialize_namespace,
             self.log_filter,
             self.txn.memory_bytes,
             self.txn.append_bytes,
@@ -516,6 +576,49 @@ mod tests {
     fn try_cfg(pairs: &[(&str, &str)]) -> Result<Config> {
         let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         Config::resolve(move |k| map.get(k).cloned())
+    }
+
+    fn pilot_ds_config() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("ELECTRIC_CIRCUITS_DS_URL", "https://durable-streams.internal"),
+            ("ELECTRIC_CIRCUITS_DS_NAMESPACE", "pilot-stack"),
+            ("ELECTRIC_CIRCUITS_DS_STORE_ID", "2bc96d0b-9740-4f50-97c6-754b2b27d6b0"),
+            ("ELECTRIC_CIRCUITS_DS_STORE_GENERATION", "ff8b5fa6-e786-4994-8da0-f14e9e79f318"),
+            ("ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION", "1"),
+            ("ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION", "1"),
+            ("ELECTRIC_CIRCUITS_DS_DURABILITY_MODE", "wal"),
+            ("ELECTRIC_CIRCUITS_DS_WAL_SHARDS", "2"),
+            ("ELECTRIC_CIRCUITS_DS_STREAM_LANES", "1"),
+            ("ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID", "253f14d5-cbee-4df8-9e3c-e44c6e41501b"),
+            ("ELECTRIC_CIRCUITS_QUERY_GENERATION", "query-one"),
+            ("ELECTRIC_CIRCUITS_DS_CA_BUNDLE", "/run/secrets/ds-ca.pem"),
+            ("ELECTRIC_CIRCUITS_DS_CLIENT_CERT", "/run/secrets/ds-client.pem"),
+            ("ELECTRIC_CIRCUITS_DS_CLIENT_KEY", "/run/secrets/ds-client.key"),
+        ]
+    }
+
+    #[test]
+    fn durable_streams_requires_complete_https_identity_and_scope() {
+        let config = pilot_ds_config();
+        let resolved = try_cfg(&config).expect("complete pilot configuration resolves");
+        assert_eq!(resolved.ds_connection.as_ref().unwrap().scope.stack_namespace, "pilot-stack");
+
+        let mut missing = config.clone();
+        missing.retain(|(key, _)| *key != "ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID");
+        assert!(try_cfg(&missing).is_err());
+        let mut http = pilot_ds_config();
+        http[0].1 = "http://127.0.0.1:4437";
+        assert!(try_cfg(&http).is_err());
+    }
+
+    #[test]
+    fn namespace_initialization_is_an_exact_opt_in() {
+        let mut config = pilot_ds_config();
+        config.push(("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE", "1"));
+        assert!(try_cfg(&config).unwrap().initialize_namespace);
+        config.pop();
+        config.push(("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE", "true"));
+        assert!(try_cfg(&config).is_err());
     }
 
     #[test]

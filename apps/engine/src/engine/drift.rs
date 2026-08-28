@@ -667,7 +667,7 @@ mod tests {
     /// A library-mode engine with one table compiled, wired into both schema holders the way
     /// `setup_postgres` does. No durable-streams server behind it: nothing here appends.
     async fn engine_with_items() -> (Engine, TableRef) {
-        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         let schema: Schema = serde_json::from_value(serde_json::json!({
             "tables": { "items": { "columns": { "id": {"type":"int"} }, "primaryKey": "id" } }
         }))

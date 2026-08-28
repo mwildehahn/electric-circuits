@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
+import { testMutualTlsRequest, testPhysicalPath } from './ds-mtls-access.js'
 
 const schema: Schema = {
   tables: {
@@ -38,7 +39,7 @@ function oneShotShapeAppendProxy(fault: AppendFault) {
     const upstream = new URL(upstreamUrl)
     const server = createServer((incoming, outgoing) => {
       const target = new URL(incoming.url ?? '/', upstream)
-      if (fault.headArmed && incoming.method === 'HEAD' && target.pathname.startsWith('/shape/')) {
+      if (fault.headArmed && incoming.method === 'HEAD' && target.pathname.startsWith(`/${testPhysicalPath('shape/')}`)) {
         fault.headArmed = false
         fault.headHits = (fault.headHits ?? 0) + 1
         incoming.resume()
@@ -46,7 +47,7 @@ function oneShotShapeAppendProxy(fault: AppendFault) {
         outgoing.end('one-shot HEAD failure')
         return
       }
-      if (fault.armed && incoming.method === 'POST' && target.pathname.startsWith('/shape/')) {
+      if (fault.armed && incoming.method === 'POST' && target.pathname.startsWith(`/${testPhysicalPath('shape/')}`)) {
         fault.armed = false
         fault.hits += 1
         incoming.resume()
@@ -107,7 +108,7 @@ describe('native shape storage loss', () => {
     await drainEngine(h)
 
     const first = await createShape(h, { table: 'items' })
-    expect((await fetch(first.streamUrl, { method: 'DELETE' })).ok).toBe(true)
+    expect((await testMutualTlsRequest(first.streamUrl, 'DELETE')).ok).toBe(true)
     expect((await fetch(first.streamUrl)).status).toBe(404)
 
     const replacement = await createShape(h, { table: 'items' })
@@ -119,7 +120,7 @@ describe('native shape storage loss', () => {
     const fault: AppendFault = { armed: false, status: 503, hits: 0 }
     h = await bootHarness(schema, { wrapEngineDs: oneShotShapeAppendProxy(fault) })
     const first = await createShape(h, { table: 'items' })
-    expect((await fetch(first.streamUrl, { method: 'DELETE' })).ok).toBe(true)
+    expect((await testMutualTlsRequest(first.streamUrl, 'DELETE')).ok).toBe(true)
     expect((await fetch(first.streamUrl)).status).toBe(404)
 
     // The stream is really gone, but the engine sees one ordinary transient failure while checking

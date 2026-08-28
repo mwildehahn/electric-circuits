@@ -276,6 +276,8 @@ pub struct Engine {
     /// Which replication slot, in which cluster, this engine is bound to — and what to do when that
     /// stops being true (see [`engine::epoch`], ADR-0004).
     epoch: Arc<EpochState>,
+    /// Expected event-zero storage binding, installed by the binary before Postgres setup.
+    store_bound: Arc<std::sync::OnceLock<crate::store_identity::StoreBound>>,
     /// The process's graceful-shutdown state (see [`crate::shutdown`]). Held here — not in a global
     /// — because every part that must join it (the sequencer's select, the ingestor, the `/v1/shape`
     /// live poll, `GET /ready`) already has an `Engine`.
@@ -849,20 +851,37 @@ fn sid_of_path(stream_path: &str) -> &str {
 }
 
 impl Engine {
-    pub fn new(ds: DsClient) -> Self {
-        Self::new_inner(ds, None)
+    /// Construct a production engine only from storage admission completed before engine setup.
+    pub fn new(admission: StoreAdmission) -> Self {
+        Self::new_inner(admission.ds, None, Some(admission.binding))
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
     /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
-    pub fn new_pg(ds: DsClient, pg_url: String) -> Self {
-        let e = Self::new_inner(ds, Some(pg_url));
+    pub fn new_pg(admission: StoreAdmission, pg_url: String) -> Self {
+        let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding));
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
     }
 
-    fn new_inner(ds: DsClient, pg_url: Option<String>) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_in_process_test(ds: DsClient) -> Self {
+        Self::new_inner(ds, None, None)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_pg_for_in_process_test(ds: DsClient, pg_url: String) -> Self {
+        let e = Self::new_inner(ds, Some(pg_url), None);
+        e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
+        e
+    }
+
+    fn new_inner(ds: DsClient, pg_url: Option<String>, binding: Option<crate::store_identity::StoreBound>) -> Self {
+        let store_bound = Arc::new(std::sync::OnceLock::new());
+        if let Some(binding) = binding {
+            store_bound.set(binding).expect("fresh store binding proof");
+        }
         let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), pg_url.clone())));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
@@ -942,6 +961,7 @@ impl Engine {
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
+            store_bound,
             shutdown,
             sub_nonce: crate::engine::catalog::process_nonce().into(),
         };
