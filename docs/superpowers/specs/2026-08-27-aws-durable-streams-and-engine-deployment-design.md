@@ -65,7 +65,7 @@ the canonical production-readiness note.
       v       |
  Circuits engine -------------------- mTLS ------------------+
                                                             |
- agent producers -------------------- mTLS ------------------+--> DS access boundary
+ Indexed API agent writer ----------- mTLS ------------------+--> DS access boundary
                                                             |      (prefix + verb auth)
  authenticated gateway -------------- mTLS, read only -------+             |
       ^                                                                    | loopback HTTP
@@ -291,9 +291,12 @@ discovery. Prefix/verb policy is specified in section 11.
 
 After WAL recovery, an authenticated admin-readiness endpoint returns the on-volume manifest plus
 recovery state, durable frontier, free bytes/inodes, reserve state, and running artifact digest.
-`/health` alone is only liveness. The engine compares the attested identity with its catalog and
-PostgreSQL/slot lineage before any mutation. Missing, mismatched, recovering, unexpectedly empty, or
-below-reserve storage refuses readiness.
+`GET /_admin/ready` is available only to the storage-administrator and configured pilot
+Circuits-engine identities; it is read-only, bounded, contains no credentials or inventory, and
+grants no other admin verb. Inventory remains restricted to storage-administrator/retention
+identities. `/health` alone is only liveness. The engine compares the attested identity with its
+catalog and PostgreSQL/slot lineage before any mutation. Missing, mismatched, recovering,
+unexpectedly empty, or below-reserve storage refuses readiness.
 
 ### 5.4 Storage updates and reconnects
 
@@ -600,7 +603,9 @@ endpoint and uses TLS/mTLS service identities. It enforces both verb and prefix:
   `circuits/v1/<stack>/stores/<store-generation>/...` paths; the future multi-generation profile also
   requires its current downstream-enforced writer token;
 - a future ingestor identity can mutate only its ingest-epoch paths;
-- an agent producer can ensure, append, and close only its assigned opaque run stream;
+- the authenticated Indexed API/gateway owns exact agent-run assignment and writes on a producer's
+  behalf; its `agent-writer` storage identity can ensure, append, and close only
+  `agent-runs/v1/<store-generation>/...` paths;
 - the gateway has read-only access only to physical streams selected by its authorized handle
   registry; and
 - only a storage-administrator/retention identity can enumerate across prefixes or perform
