@@ -7,7 +7,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, NoTls};
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tokio_stream::StreamExt;
 
 use crate::heap_size::HeapSize;
@@ -38,13 +44,80 @@ pub async fn connect(url: &str) -> Result<Client> {
     if cfg.get_connect_timeout().is_none() {
         cfg.connect_timeout(CONNECT_TIMEOUT);
     }
-    let (client, conn) = cfg.connect(NoTls).await.context("connect postgres")?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("postgres connection error: {e}");
+    match cfg.get_ssl_mode() {
+        SslMode::Require => {
+            let (client, connection) =
+                cfg.connect(require_tls_connector()?).await.context("connect postgres with required TLS")?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!("postgres TLS connection error: {error}");
+                }
+            });
+            Ok(client)
         }
-    });
-    Ok(client)
+        _ => {
+            let (client, connection) = cfg.connect(NoTls).await.context("connect postgres")?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!("postgres connection error: {error}");
+                }
+            });
+            Ok(client)
+        }
+    }
+}
+
+/// `sslmode=require` promises encrypted transport without the certificate and
+/// hostname verification semantics of libpq's `verify-ca` and `verify-full`.
+#[derive(Debug)]
+struct RequireTlsVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for RequireTlsVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn require_tls_connector() -> Result<MakeRustlsConnect> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .context("initialize PostgreSQL TLS protocols")?
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    config.dangerous().set_certificate_verifier(Arc::new(RequireTlsVerifier { provider }));
+    Ok(MakeRustlsConnect::new(config))
 }
 
 // ---- boot-time error taxonomy (issue #13) ------------------------------------------------------
@@ -206,6 +279,11 @@ pub fn boot_failure_name(e: &anyhow::Error) -> &'static str {
 /// broken string every 30 s forever. Parsing is pure and has no I/O, so it belongs in
 /// `Config::resolve` where every other unusable setting is refused.
 pub fn parse_pg_url(url: &str) -> Result<tokio_postgres::Config> {
+    if explicit_sslmode(url).as_deref() == Some("prefer") {
+        bail!(
+            "sslmode=prefer may downgrade to plaintext; use sslmode=require for TLS or sslmode=disable for local development"
+        );
+    }
     url.parse::<tokio_postgres::Config>().map_err(|e| {
         anyhow::anyhow!(
             "unusable Postgres URL '{}': {e}. Expected a libpq connection string, e.g. \
@@ -213,6 +291,10 @@ pub fn parse_pg_url(url: &str) -> Result<tokio_postgres::Config> {
             redact_pg_url(url)
         )
     })
+}
+
+fn explicit_sslmode(url: &str) -> Option<String> {
+    url::Url::parse(url).ok()?.query_pairs().find_map(|(name, value)| (name == "sslmode").then(|| value.into_owned()))
 }
 
 /// A Postgres URL with its password replaced, for a message an operator will paste into a ticket.
@@ -1347,6 +1429,31 @@ async fn query_subset_in_txn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sslmode=require` is the hosted/RDS contract: the connection must be
+    /// encrypted without silently falling back to plaintext. The fixture URL
+    /// is supplied only by the TLS integration lane.
+    #[tokio::test]
+    async fn sslmode_require_uses_an_encrypted_postgres_connection() {
+        let Ok(url) = std::env::var("ELECTRIC_CIRCUITS_TEST_PG_TLS_URL") else {
+            return;
+        };
+        let client = connect(&url).await.expect("connect to the TLS-only fixture");
+        let encrypted: bool = client
+            .query_one("select ssl from pg_stat_ssl where pid = pg_backend_pid()", &[])
+            .await
+            .expect("inspect the current PostgreSQL connection")
+            .get(0);
+        assert!(encrypted, "sslmode=require must negotiate TLS");
+    }
+
+    #[test]
+    fn an_explicit_downgrade_capable_sslmode_is_refused() {
+        let error = parse_pg_url("postgres://replication:secret@rds.example/app?sslmode=prefer")
+            .expect_err("sslmode=prefer may fall back to plaintext");
+        assert!(format!("{error:#}").contains("sslmode=prefer"));
+        assert!(parse_pg_url("postgres://replication:secret@rds.example/app?sslmode=require").is_ok());
+    }
 
     /// The snapshot gate must skip exactly the transactions the backfill snapshot could see:
     /// committed-before (`xid < xmin`) → skip; in-progress at snapshot (`xip`) → process; started

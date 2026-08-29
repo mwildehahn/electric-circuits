@@ -362,6 +362,14 @@ enum StreamEnd {
 /// the engine's other connections (`pg::connect` uses `NoTls`).
 fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<ReplicationConfig> {
     let u = url::Url::parse(pg_url).context("parse postgres url")?;
+    let tls = match u.query_pairs().find_map(|(name, value)| (name == "sslmode").then(|| value.into_owned())).as_deref()
+    {
+        Some("require") => TlsConfig::require(),
+        Some("prefer") => anyhow::bail!(
+            "sslmode=prefer may downgrade replication to plaintext; use sslmode=require for TLS or sslmode=disable for local development"
+        ),
+        _ => TlsConfig::disabled(),
+    };
     let user = match u.username() {
         "" => "postgres".to_string(),
         s => percent_decode(s),
@@ -376,7 +384,7 @@ fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<Rep
         user,
         password: u.password().map(percent_decode).unwrap_or_default(),
         database,
-        tls: TlsConfig::default(),
+        tls,
         slot: slot.to_string(),
         publication: publication.to_string(),
         // 0/0: the server streams from the slot's confirmed_flush_lsn when asked for an older
@@ -1332,6 +1340,27 @@ mod tests {
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
+
+    /// The long-lived replication connection must use the same TLS policy as
+    /// setup and query connections. `require` means encrypted with no
+    /// plaintext fallback; local Compose retains explicit `disable`.
+    #[test]
+    fn replication_config_preserves_the_dsn_tls_policy() {
+        let required =
+            replication_config("postgres://replication:secret@rds.example/app?sslmode=require", "slot", "publication")
+                .unwrap();
+        assert_eq!(required.tls, TlsConfig::require());
+
+        let local =
+            replication_config("postgres://replication:secret@postgres/app?sslmode=disable", "slot", "publication")
+                .unwrap();
+        assert_eq!(local.tls, TlsConfig::disabled());
+
+        let downgrade =
+            replication_config("postgres://replication:secret@rds.example/app?sslmode=prefer", "slot", "publication")
+                .expect_err("replication must not accept a downgrade-capable TLS mode");
+        assert!(format!("{downgrade:#}").contains("sslmode=prefer"));
+    }
 
     /// The setup wait must turn a worker that is stuck before its first frame (for example, a
     /// blackholed TCP endpoint) into a retryable timeout instead of pinning the ingestor forever.
