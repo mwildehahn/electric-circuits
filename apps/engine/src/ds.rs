@@ -58,6 +58,33 @@ impl DsConnectionConfig {
     }
 }
 
+/// Validate the loopback-only HTTP store used by the self-contained conformance image.
+///
+/// The constructor remains unavailable unless `test-support` is compiled in. Keeping the URL
+/// validation unconditional lets configuration fail closed even in a production engine binary.
+pub(crate) fn validate_in_process_test_url(base_url: &str) -> Result<()> {
+    let url = url::Url::parse(base_url).context("ELECTRIC_CIRCUITS_DS_URL must be an absolute URL")?;
+    let is_loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if url.scheme() != "http"
+        || !is_loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (url.path() != "/" && !url.path().is_empty())
+    {
+        bail!(
+            "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST=1 requires an HTTP loopback origin without credentials, path, query, or fragment"
+        );
+    }
+    Ok(())
+}
+
 /// Store readiness response decoded before any ordinary Durable Streams or Postgres operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreReadinessV1 {

@@ -34,6 +34,9 @@ use electric_circuits_engine::config::{self, Config};
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
 use electric_circuits_engine::shutdown::{self, ShutdownToken};
+use electric_circuits_engine::store_identity::StoreBound;
+#[cfg(feature = "test-support")]
+use electric_circuits_engine::store_identity::StreamScope;
 use electric_circuits_engine::{pg, statsd};
 
 #[tokio::main]
@@ -73,16 +76,38 @@ async fn main() -> Result<()> {
         );
     }
 
-    let Some(ds_connection) = config.ds_connection.clone() else {
-        refuse_boot(
-            "configuration",
-            &anyhow::anyhow!("a complete ELECTRIC_CIRCUITS_DS_URL HTTPS/mTLS configuration is required"),
-        )
-    };
-    let store_bound = electric_circuits_engine::store_identity::StoreBound::coupled_v1(&ds_connection.scope);
-    let ds = match DsClient::connect(ds_connection).await {
-        Ok(ds) => ds,
-        Err(e) => refuse_boot("Durable Streams mTLS configuration", &e),
+    let (ds, store_bound) = if let Some(base_url) = config.ds_in_process_test_url.clone() {
+        #[cfg(feature = "test-support")]
+        {
+            tracing::warn!(
+                "using the explicit loopback-only Durable Streams test store; this mode is for the self-contained conformance image"
+            );
+            let scope = StreamScope::in_process_test_scope();
+            (DsClient::new_for_in_process_test(base_url), StoreBound::coupled_v1(&scope))
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let _ = base_url;
+            refuse_boot(
+                "configuration",
+                &anyhow::anyhow!(
+                    "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST requires an engine built with the test-support feature"
+                ),
+            )
+        }
+    } else {
+        let Some(ds_connection) = config.ds_connection.clone() else {
+            refuse_boot(
+                "configuration",
+                &anyhow::anyhow!("a complete ELECTRIC_CIRCUITS_DS_URL HTTPS/mTLS configuration is required"),
+            )
+        };
+        let store_bound = StoreBound::coupled_v1(&ds_connection.scope);
+        let ds = match DsClient::connect(ds_connection).await {
+            Ok(ds) => ds,
+            Err(e) => refuse_boot("Durable Streams mTLS configuration", &e),
+        };
+        (ds, store_bound)
     };
     if let Some(target) = &config.statsd {
         statsd::init(target, &config.instance_id);
