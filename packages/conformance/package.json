@@ -13,6 +13,7 @@
     "@electric-circuits/api": "workspace:*",
     "@electric-circuits/client": "workspace:*",
     "@electric-circuits/ds-rust": "workspace:*",
+    "@electric-sql/client": "1.5.14",
     "@durable-streams/client": "^0.2.6",
     "@durable-streams/state": "^0.3.1",
     "@tanstack/db": "^0.6.12",
