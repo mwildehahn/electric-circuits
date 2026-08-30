@@ -17,12 +17,12 @@ COPY apps/engine/Cargo.toml apps/engine/Cargo.toml
 RUN mkdir -p apps/engine/src \
  && echo 'fn main() {}' > apps/engine/src/main.rs \
  && echo '' > apps/engine/src/lib.rs \
- && cargo build --release -p electric-circuits-engine \
+ && cargo build --release -p electric-circuits-engine --features test-support \
  && rm -rf apps/engine/src target/release/electric-circuits-engine target/release/deps/electric_circuits_engine-*
 COPY apps/engine apps/engine
 # touch so cargo re-fingerprints our crate (mtime) and rebuilds it from the real sources.
 RUN touch apps/engine/src/main.rs apps/engine/src/lib.rs \
- && cargo build --release -p electric-circuits-engine
+ && cargo build --release -p electric-circuits-engine --features test-support
 
 # --- stage 2: build the durable-streams-server binary (see docker/Dockerfile.ds) --------------
 FROM rust:1.83-slim AS ds-build

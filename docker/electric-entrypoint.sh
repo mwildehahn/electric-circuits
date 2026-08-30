@@ -59,6 +59,12 @@ export DS_HOST DS_PORT
 export BIND_HOST="$DS_HOST"
 : "${ELECTRIC_CIRCUITS_DS_URL:=http://${DS_HOST}:${DS_PORT}}"
 export ELECTRIC_CIRCUITS_DS_URL
+# This image owns both processes and keeps the stream server on loopback. The engine's production
+# image never enables this mode and still requires the HTTPS/mTLS storage boundary.
+: "${ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST:=1}"
+export ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST
+: "${ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE:=1}"
+export ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE
 
 # Engine fallbacks (only set what the caller didn't). A newer engine reads ELECTRIC_* directly;
 # these keep the current engine working with the same inputs.

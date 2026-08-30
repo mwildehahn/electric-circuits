@@ -11,8 +11,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Explicitly opt into in-process HTTP stores used by Rust test binaries. Production builds never
-# compile their constructor.
+# Explicitly opt into loopback HTTP stores used by Rust tests and the self-contained benchmarking
+# image. The production engine image never compiles their constructor.
 test-support = []
 
 [[bin]]

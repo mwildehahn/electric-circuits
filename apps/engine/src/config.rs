@@ -43,6 +43,8 @@ pub struct Config {
     pub ds_url: Option<String>,
     /// Fully validated HTTPS/mTLS storage connection and immutable path scope.
     pub ds_connection: Option<DsConnectionConfig>,
+    /// Loopback HTTP store selected explicitly by the self-contained conformance image.
+    pub ds_in_process_test_url: Option<String>,
     /// Explicit one-shot authority to write the first namespace binding into an empty catalog.
     pub initialize_namespace: bool,
     /// HTTP bind address for the control plane + `/v1/shape` + `/v1/health`.
@@ -204,7 +206,18 @@ impl Config {
                 .context("ELECTRIC_CIRCUITS_PG_URL / DATABASE_URL")?;
         }
         let ds_url = g("ELECTRIC_CIRCUITS_DS_URL");
-        let ds_connection = match ds_url.clone() {
+        let ds_in_process_test = match g("ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST").as_deref() {
+            None => false,
+            Some("1") => true,
+            Some(value) => {
+                bail!("ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST must be exactly '1' when set, got '{value}'")
+            }
+        };
+        let (ds_connection, ds_in_process_test_url) = match ds_url.clone() {
+            Some(base_url) if ds_in_process_test => {
+                crate::ds::validate_in_process_test_url(&base_url)?;
+                (None, Some(base_url))
+            }
             Some(base_url) => {
                 let required = |name: &str| {
                     g(name).ok_or_else(|| anyhow::anyhow!("{name} must be set when ELECTRIC_CIRCUITS_DS_URL is set"))
@@ -235,22 +248,28 @@ impl Config {
                     required("ELECTRIC_CIRCUITS_QUERY_GENERATION")?,
                 )
                 .context("Durable Streams namespace scope")?;
-                Some(DsConnectionConfig::new(
-                    base_url,
-                    std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CA_BUNDLE")?),
-                    std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_CERT")?),
-                    std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_KEY")?),
-                    scope,
-                )?)
+                (
+                    Some(DsConnectionConfig::new(
+                        base_url,
+                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CA_BUNDLE")?),
+                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_CERT")?),
+                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_KEY")?),
+                        scope,
+                    )?),
+                    None,
+                )
             }
-            None => None,
+            None if ds_in_process_test => {
+                bail!("ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST=1 requires ELECTRIC_CIRCUITS_DS_URL")
+            }
+            None => (None, None),
         };
         let initialize_namespace = match g("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE").as_deref() {
             None => false,
             Some("1") => true,
             Some(value) => bail!("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE must be exactly '1' when set, got '{value}'"),
         };
-        if initialize_namespace && ds_connection.is_none() {
+        if initialize_namespace && ds_connection.is_none() && ds_in_process_test_url.is_none() {
             bail!("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1 requires a complete Durable Streams configuration");
         }
 
@@ -452,6 +471,7 @@ impl Config {
             pg_url,
             ds_url,
             ds_connection,
+            ds_in_process_test_url,
             initialize_namespace,
             bind,
             log_filter,
@@ -634,6 +654,37 @@ mod tests {
         let mut http = pilot_ds_config();
         http[0].1 = "http://127.0.0.1:4437";
         assert!(try_cfg(&http).is_err());
+    }
+
+    #[test]
+    fn self_contained_image_can_explicitly_use_its_loopback_test_store() {
+        let resolved = try_cfg(&[
+            ("ELECTRIC_CIRCUITS_DS_URL", "http://127.0.0.1:8791"),
+            ("ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST", "1"),
+            ("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE", "1"),
+        ])
+        .expect("the self-contained image explicitly opts into its loopback-only test store");
+
+        assert_eq!(resolved.ds_url.as_deref(), Some("http://127.0.0.1:8791"));
+        assert!(resolved.ds_connection.is_none());
+        assert!(resolved.initialize_namespace);
+
+        assert!(
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_DS_URL", "http://durable-streams.internal:8791"),
+                ("ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST", "1"),
+            ])
+            .is_err(),
+            "the test-only escape hatch must not permit a remote plaintext store"
+        );
+        assert!(
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_DS_URL", "http://127.0.0.1:8791"),
+                ("ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST", "true"),
+            ])
+            .is_err(),
+            "the opt-in must be exact"
+        );
     }
 
     #[test]
