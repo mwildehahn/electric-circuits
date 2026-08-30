@@ -748,6 +748,11 @@ which the Electric client handles by re-syncing onto the retained shape. Conform
 `electric-conformance/` (see its README for scope and known gaps — e.g. row `tags` are not emitted;
 absolute membership emission makes them unnecessary for convergence).
 
+The adapter's `electric-schema` header preserves an introspected PostgreSQL `jsonb` column as
+`jsonb`. The engine still evaluates and emits its scalar text representation, while the official
+Electric client uses that native type metadata to materialize JSON objects. Schemas supplied in
+library mode do not carry native PostgreSQL type names, so a coarse `text` column remains text.
+
 ---
 
 ## 9. Consistency & durability model (summary)

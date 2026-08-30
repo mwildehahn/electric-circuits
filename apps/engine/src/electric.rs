@@ -249,9 +249,13 @@ fn col_csv(c: &Option<String>) -> Option<Vec<String>> {
     c.as_ref().map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
 }
 
-/// A Postgres type name for the `electric-schema` header. Only `int*`/`float*` trigger the client's
-/// value coercion; text/bool stay strings (which is what we want for the stringified oracle compare).
-fn pg_type(ty: ColumnType) -> &'static str {
+/// A Postgres type name for the `electric-schema` header. JSONB stays opaque Postgres text inside
+/// the engine, but an introspected `jsonb` column must retain its wire type so Electric clients parse
+/// the text into a JSON value. Other native types keep the existing coarse compatibility mapping.
+fn pg_type(ty: ColumnType, native: Option<&str>) -> &'static str {
+    if native == Some("jsonb") {
+        return "jsonb";
+    }
     match ty {
         ColumnType::Int => "int8",
         ColumnType::Float => "float8",
@@ -263,14 +267,15 @@ fn pg_type(ty: ColumnType) -> &'static str {
 /// Build the `electric-schema` JSON: `{col: {type, pk_index?}}`.
 fn schema_json(ts: &TableSchema, columns: &Option<Vec<String>>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
-    for (name, ty) in &ts.columns {
+    for (index, (name, ty)) in ts.columns.iter().enumerate() {
         if let Some(cols) = columns {
             if !cols.iter().any(|c| c == name) && name != &ts.pk_name {
                 continue;
             }
         }
         let mut entry = serde_json::Map::new();
-        entry.insert("type".into(), serde_json::Value::String(pg_type(*ty).into()));
+        let native = ts.pg_types.get(index).and_then(|value| value.as_deref());
+        entry.insert("type".into(), serde_json::Value::String(pg_type(*ty, native).into()));
         if name == &ts.pk_name {
             entry.insert("pk_index".into(), serde_json::Value::from(0));
         }
@@ -1057,7 +1062,24 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
 mod tests {
     use super::*;
     use crate::ds::EnvelopeHeaders;
+    use crate::schema::{ColumnDef, TableDef};
     use crate::shutdown::ShutdownToken;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn electric_schema_preserves_introspected_jsonb_type() {
+        let columns = BTreeMap::from([
+            ("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: Some("int8".into()), has_default: false }),
+            (
+                "metadata".to_string(),
+                ColumnDef { ty: ColumnType::Text, pg_type: Some("jsonb".into()), has_default: false },
+            ),
+        ]);
+        let def = TableDef { columns, primary_key: vec!["id".into()], fingerprint: None };
+        let schema = TableSchema::from_def(&"conversation".into(), &def).unwrap();
+
+        assert_eq!(schema_json(&schema, &None)["metadata"]["type"], "jsonb");
+    }
 
     fn env(op: &str, key: &str, offset: &str) -> Envelope {
         Envelope {

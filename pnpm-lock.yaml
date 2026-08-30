@@ -289,6 +289,9 @@ importers:
       '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@electric-sql/client':
+        specifier: 1.5.14
+        version: 1.5.14
       '@electric-sql/pglite':
         specifier: ^0.5.3
         version: 0.5.3
@@ -466,6 +469,10 @@ packages:
     peerDependenciesMeta:
       '@tanstack/db':
         optional: true
+
+  '@electric-sql/client@1.5.14':
+    resolution: {integrity: sha512-/bT33y++WsX1McYZ0oa6NtnTfxTB8JgFdrGkSWtQnBNusDRNBEpF+Wn4Meg0Hjxj99gfAbQprqBz4U0KGG/EBA==}
+    hasBin: true
 
   '@electric-sql/pglite@0.5.3':
     resolution: {integrity: sha512-iTTYbA5Uesrl+N7zss0J5LopT7KE4j9aymYo+EZZh+rZbARQCUQOs+n2pay64JRUpc3fCkpfrniTNJnvYzOE+g==}
@@ -1844,6 +1851,12 @@ snapshots:
       '@standard-schema/spec': 1.1.0
     optionalDependencies:
       '@tanstack/db': 0.6.12(typescript@7.0.2)
+
+  '@electric-sql/client@1.5.14':
+    dependencies:
+      '@microsoft/fetch-event-source': 2.0.1
+    optionalDependencies:
+      '@rollup/rollup-darwin-arm64': 4.62.2
 
   '@electric-sql/pglite@0.5.3': {}
 
