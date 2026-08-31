@@ -362,7 +362,7 @@ impl Config {
             );
         }
         let managed_initial_active = match g("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE").as_deref() {
-            None => false,
+            None | Some("0") => false,
             Some("1") => true,
             Some(value) => {
                 bail!("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE must be exactly '1' when set, got '{value}'")
@@ -737,6 +737,12 @@ mod tests {
             config.redacted().contains("managed_deployment=enabled"),
             "managed deployment must be an explicit, observable opt-in"
         );
+        let disabled_bootstrap = cfg(&[
+            ("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION", "018f5f4d-70c2-7d70-a4d5-5f7355078f85"),
+            ("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE", "0"),
+            ("ELECTRIC_CIRCUITS_CONTROL_SECRET", "controller-test-secret"),
+        ]);
+        assert!(!disabled_bootstrap.managed_deployment.unwrap().initial_active);
     }
 
     #[test]

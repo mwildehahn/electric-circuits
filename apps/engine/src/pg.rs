@@ -423,6 +423,11 @@ pub fn failure_of(e: &tokio_postgres::Error) -> PgFailure<'_> {
 /// could not read — is fatal: those are the strictness refusals the engine already refused to boot
 /// past, and none of them changes by waiting.
 pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
+    // A managed standby is a successful observation, not a bad configuration. It remains alive
+    // and polls the ownership row so that a later exact promotion can take effect.
+    if e.chain().any(|cause| cause.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()) {
+        return BootFailure::Retryable;
+    }
     if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
         return classify(failure_of(pg));
     }
@@ -1692,6 +1697,12 @@ mod tests {
         // No SQLSTATE at all: DNS, connection refused, timeout, TLS — the server is not there yet.
         assert_eq!(classify(PgFailure { sqlstate: None, io: true }), BootFailure::Retryable);
         assert_eq!(classify(PgFailure::default()), BootFailure::Retryable);
+    }
+
+    #[test]
+    fn managed_standby_is_a_retryable_boot_observation() {
+        let error = anyhow::Error::new(crate::engine::DeploymentNotReady);
+        assert_eq!(boot_disposition(&error), BootFailure::Retryable);
     }
 
     #[test]

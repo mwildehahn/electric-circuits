@@ -399,8 +399,10 @@ async fn require_managed_public_ready(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if matches!(path, "/" | "/health" | "/ready" | "/v1/health")
-        || path.starts_with("/_admin/")
+    if matches!(
+        path,
+        "/" | "/health" | "/ready" | "/v1/health" | "/metrics" | "/memory" | "/metrics/prometheus" | "/v1/openapi.json"
+    ) || path.starts_with("/_admin/")
         || !engine.managed_deployment_enabled()
     {
         return next.run(request).await;
@@ -543,7 +545,6 @@ async fn close_control_admission(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
-    engine.ensure_not_degraded()?;
     engine.close_control_admission();
     engine.wait_for_control_drain().await;
     Ok(Json(serde_json::json!({ "controlAdmission": "closed" })))
@@ -1414,6 +1415,7 @@ struct AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
+        let ownership_error = e.downcast_ref::<crate::deployment::OwnershipError>();
         // A degradation is the one engine failure that is not a 500: the request was fine, the
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
@@ -1425,12 +1427,14 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::CreateRaced>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
+            || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))
         {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
         // not a server fault and not something a retry changes (ADR-0008).
         } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
-            || e.downcast_ref::<crate::deployment::OwnershipError>().is_some()
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::Conflict))
         {
             StatusCode::CONFLICT
         } else {

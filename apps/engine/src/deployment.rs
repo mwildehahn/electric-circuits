@@ -46,13 +46,26 @@ pub enum OwnershipError {
     Disabled,
 }
 
+/// The coordinator is unavailable or returned malformed state. It is distinct from a compare and
+/// set conflict: callers may retry this response, but must not advance a handoff on it.
+#[derive(Debug, thiserror::Error)]
+#[error("managed deployment ownership storage is unavailable: {source}")]
+pub struct OwnershipBackend {
+    #[source]
+    source: anyhow::Error,
+}
+
+fn backend<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|source| anyhow::Error::new(OwnershipBackend { source }))
+}
+
 /// SHA-256 of the canonical StoreBound fields, a NUL separator, and the logical slot name.
 ///
 /// The serialization is intentionally explicit: serde JSON permits representation changes while this
 /// value is a database primary key shared by independently built revisions.
 pub fn coordination_key(bound: &StoreBound, slot: &str) -> String {
     let canonical = format!(
-        "store_id={}\\nstore_generation={}\\nprotocol_version={}\\nlayout_version={}\\ndurability_mode={}\\nwal_shard_count={}\\nstream_lane_count={}\\nfilesystem_uuid={}\\nstack_namespace={}\\ningest_epoch={}\\nquery_generation={}",
+        "store_id={}\nstore_generation={}\nprotocol_version={}\nlayout_version={}\ndurability_mode={}\nwal_shard_count={}\nstream_lane_count={}\nfilesystem_uuid={}\nstack_namespace={}\ningest_epoch={}\nquery_generation={}",
         bound.store.store_id,
         bound.store.store_generation,
         bound.store.protocol_version,
@@ -73,7 +86,7 @@ pub fn coordination_key(bound: &StoreBound, slot: &str) -> String {
 }
 
 fn row_to_ownership(key: &str, row: &tokio_postgres::Row) -> Result<Ownership> {
-    let phase: String = row.get("phase");
+    let phase: String = row.try_get("phase").context("read ownership phase")?;
     let phase = match phase.as_str() {
         "active" => OwnershipPhase::Active,
         "quiesced" => OwnershipPhase::Quiesced,
@@ -81,11 +94,11 @@ fn row_to_ownership(key: &str, row: &tokio_postgres::Row) -> Result<Ownership> {
     };
     Ok(Ownership {
         coordination_key: key.to_string(),
-        generation: row.get("generation"),
-        owner_revision: row.get("owner_revision"),
+        generation: row.try_get("generation").context("read ownership generation")?,
+        owner_revision: row.try_get("owner_revision").context("read ownership owner revision")?,
         phase,
-        handoff_id: row.get("handoff_id"),
-        source_commit_id: row.get("source_commit_id"),
+        handoff_id: row.try_get("handoff_id").context("read ownership handoff id")?,
+        source_commit_id: row.try_get("source_commit_id").context("read ownership source receipt")?,
     })
 }
 
@@ -97,8 +110,9 @@ async fn read(client: &Client, key: &str) -> Result<Option<Ownership>> {
             &[&key],
         )
         .await
-        .context("read writer ownership")?;
-    row.as_ref().map(|row| row_to_ownership(key, row)).transpose()
+        .context("read writer ownership");
+    let row = backend(row)?;
+    backend(row.as_ref().map(|row| row_to_ownership(key, row)).transpose())
 }
 
 /// Claim the initially absent row only when the operator explicitly enables bootstrap. A conflict
@@ -115,9 +129,10 @@ pub async fn claim_or_observe(client: &Client, config: &ManagedDeploymentConfig,
                 &[&key, &config.revision],
             )
             .await
-            .context("bootstrap writer ownership")?;
+            .context("bootstrap writer ownership");
+        let inserted = backend(inserted)?;
         if let Some(row) = inserted {
-            return Ok(Claim::Active(row_to_ownership(key, &row)?));
+            return Ok(Claim::Active(backend(row_to_ownership(key, &row))?));
         }
     }
     let ownership = read(client, key).await?;
@@ -138,7 +153,7 @@ pub async fn quiesce(
     generation: i64,
     handoff_id: uuid::Uuid,
     source_commit_id: uuid::Uuid,
-) -> Result<Ownership, OwnershipError> {
+) -> Result<Ownership> {
     let handoff = handoff_id.to_string();
     let source = source_commit_id.to_string();
     let row = client
@@ -149,12 +164,12 @@ pub async fn quiesce(
              RETURNING generation, owner_revision, phase, handoff_id::text AS handoff_id, source_commit_id::text AS source_commit_id",
             &[&key, &expected_owner, &generation, &handoff, &source],
         )
-        .await
-        .map_err(|_| OwnershipError::Conflict)?;
+        .await;
+    let row = backend(row.context("quiesce writer ownership"))?;
     if let Some(row) = row {
-        return row_to_ownership(key, &row).map_err(|_| OwnershipError::Conflict);
+        return backend(row_to_ownership(key, &row));
     }
-    let existing = read(client, key).await.map_err(|_| OwnershipError::Conflict)?;
+    let existing = read(client, key).await?;
     match existing {
         Some(row)
             if row.phase == OwnershipPhase::Quiesced
@@ -165,7 +180,7 @@ pub async fn quiesce(
         {
             Ok(row)
         }
-        _ => Err(OwnershipError::Conflict),
+        _ => bail!(OwnershipError::Conflict),
     }
 }
 
@@ -177,7 +192,7 @@ pub async fn promote(
     generation: i64,
     handoff_id: uuid::Uuid,
     source_commit_id: uuid::Uuid,
-) -> Result<Ownership, OwnershipError> {
+) -> Result<Ownership> {
     let handoff = handoff_id.to_string();
     let source = source_commit_id.to_string();
     let row = client
@@ -189,12 +204,12 @@ pub async fn promote(
              RETURNING generation, owner_revision, phase, handoff_id::text AS handoff_id, source_commit_id::text AS source_commit_id",
             &[&key, &successor_revision, &expected_owner, &generation, &handoff, &source],
         )
-        .await
-        .map_err(|_| OwnershipError::Conflict)?;
+        .await;
+    let row = backend(row.context("promote writer ownership"))?;
     if let Some(row) = row {
-        return row_to_ownership(key, &row).map_err(|_| OwnershipError::Conflict);
+        return backend(row_to_ownership(key, &row));
     }
-    let existing = read(client, key).await.map_err(|_| OwnershipError::Conflict)?;
+    let existing = read(client, key).await?;
     match existing {
         Some(row)
             if row.phase == OwnershipPhase::Active
@@ -205,7 +220,7 @@ pub async fn promote(
         {
             Ok(row)
         }
-        _ => Err(OwnershipError::Conflict),
+        _ => bail!(OwnershipError::Conflict),
     }
 }
 

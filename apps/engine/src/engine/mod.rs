@@ -1189,9 +1189,7 @@ impl Engine {
         let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
         let client = crate::pg::connect(&url).await?;
         let ownership =
-            crate::deployment::quiesce(&client, &key, expected_owner, generation, handoff_id, source_commit_id)
-                .await
-                .map_err(anyhow::Error::new)?;
+            crate::deployment::quiesce(&client, &key, expected_owner, generation, handoff_id, source_commit_id).await?;
         if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
             state.role = ManagedRole::Quiescing;
             state.ownership = Some(ownership.clone());
@@ -1217,11 +1215,15 @@ impl Engine {
         if key != expected_key {
             bail!(crate::deployment::OwnershipError::Conflict);
         }
-        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
-            state.role = ManagedRole::Promoting;
-        }
         let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
         let client = crate::pg::connect(&url).await?;
+        let previous_role = {
+            let mut guard = self.managed_deployment.lock().unwrap();
+            let state = guard.as_mut().expect("managed state stays installed");
+            let previous = state.role;
+            state.role = ManagedRole::Promoting;
+            previous
+        };
         let ownership = crate::deployment::promote(
             &client,
             &key,
@@ -1231,13 +1233,22 @@ impl Engine {
             handoff_id,
             source_commit_id,
         )
-        .await
-        .map_err(anyhow::Error::new)?;
-        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
-            state.role = ManagedRole::Active;
-            state.ownership = Some(ownership.clone());
+        .await;
+        match ownership {
+            Ok(ownership) => {
+                if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
+                    state.role = ManagedRole::Active;
+                    state.ownership = Some(ownership.clone());
+                }
+                Ok(ownership)
+            }
+            Err(error) => {
+                if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
+                    state.role = previous_role;
+                }
+                Err(error)
+            }
         }
-        Ok(ownership)
     }
 
     /// Refuse new control mutations while leaving health/readiness unchanged for existing readers.

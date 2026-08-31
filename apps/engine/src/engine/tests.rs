@@ -51,6 +51,34 @@ async fn quiesce_requires_a_receipt_after_admission_is_preclosed_and_drained() {
     assert!(engine.require_preclosed_control_drain().await.is_ok());
 }
 
+#[tokio::test]
+async fn failed_promote_restores_the_previous_managed_role() {
+    let engine = Engine::new_pg_for_in_process_test(
+        DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        "postgres://127.0.0.1:1/unreachable".into(),
+    );
+    *engine.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+        config: crate::deployment::ManagedDeploymentConfig {
+            revision: "018f0f46-93d0-7cf0-8b74-4bf0866ec285".into(),
+            initial_active: false,
+        },
+        coordination_key: "a".repeat(64),
+        role: ManagedRole::Standby,
+        ownership: None,
+    });
+    let error = engine
+        .deployment_promote(
+            &"a".repeat(64),
+            "018f0f46-93d0-7cf0-8b74-4bf0866ec284",
+            1,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+        )
+        .await;
+    assert!(error.is_err());
+    assert_eq!(engine.managed_status().unwrap().0, ManagedRole::Standby);
+}
+
 /// The candidate set must contain every standalone shape that could match any row of the
 /// delta (old or new side), and exclude shapes whose necessary conjunct fails on all rows.
 #[test]

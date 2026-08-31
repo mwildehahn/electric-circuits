@@ -201,6 +201,34 @@ Two caveats worth knowing rather than discovering:
 
 ## Operating notes
 
+### Opt-in managed writer ownership schema
+
+Managed blue/green ownership is a pilot-only, opt-in engine capability. The Indexed migration, not
+the engine, provisions this relation before any capable revision starts; normal engine boot must
+never create, alter, or grant it.
+
+```sql
+CREATE SCHEMA IF NOT EXISTS electric_circuits;
+CREATE TABLE electric_circuits.writer_ownership (
+  coordination_key char(64) PRIMARY KEY,
+  generation bigint NOT NULL CHECK (generation >= 1),
+  owner_revision text NOT NULL CHECK (length(owner_revision) BETWEEN 1 AND 255),
+  phase text NOT NULL CHECK (phase IN ('active', 'quiesced')),
+  handoff_id uuid,
+  source_commit_id uuid,
+  updated_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+  CHECK (phase = 'active' OR (handoff_id IS NOT NULL AND source_commit_id IS NOT NULL))
+);
+GRANT USAGE ON SCHEMA electric_circuits TO electric_circuits_engine;
+GRANT SELECT, INSERT, UPDATE ON electric_circuits.writer_ownership TO electric_circuits_engine;
+```
+
+The migration must exclude this table from the engine's logical publication. A managed engine
+starts with control admission closed, including a restart of the persisted active revision. The
+controller may explicitly reopen it only after `/ready` is `active`; this is deliberate
+fail-closed recovery. A running second process with the same revision is fenced before readiness by
+the logical slot claim, while all public traffic and data/control mutations require full readiness.
+
 ### Managed blue/green pilot
 
 The managed writer-ownership capability is opt-in. Its PostgreSQL schema and grants are provisioned
