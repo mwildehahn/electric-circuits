@@ -135,6 +135,7 @@ pub(crate) fn spawn_sequencer(
     catalog_tx: CatalogWriter,
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
+    source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
@@ -162,6 +163,7 @@ pub(crate) fn spawn_sequencer(
         catalog_tx,
         source_receipts,
         last_source_receipt,
+        source_receipt_progress,
         cmd_rx,
         processed.clone(),
         stats.clone(),
@@ -360,6 +362,7 @@ pub(crate) async fn sequencer_loop(
     catalog_tx: CatalogWriter,
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
+    source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<LogPosition>>,
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
@@ -850,6 +853,12 @@ pub(crate) async fn sequencer_loop(
                                 source_commit_id: source_commit_id.clone(),
                                 commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
                             };
+                            // This lock is the receipt/closure linearization point. Advance it
+                            // before awaiting catalog durability so a source fence already being
+                            // sequenced when admission closes is conservatively pre-closure. A
+                            // failed append never reaches `source_receipts`, so it still cannot
+                            // satisfy quiesce.
+                            source_receipt_progress.lock().unwrap().record(&source_commit_id);
                             if let Err(error) = catalog_tx
                                 .send_durable(CatalogEvent::SourceDrained(receipt.clone()))
                                 .await

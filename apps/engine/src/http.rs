@@ -3,7 +3,7 @@
 use axum::body::to_bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::{Next, from_fn};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -167,6 +167,19 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentPromoteRequest {
+    coordination_key: String,
+    owner_revision: String,
+    /// Immutable revision of the receiving process. The endpoint refuses a request that does not
+    /// name this process, preventing a quiescing incumbent from reclaiming ownership.
+    successor_revision: String,
+    generation: i64,
+    handoff_id: String,
+    source_commit_id: String,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SubsetFeedRequest {
@@ -269,6 +282,19 @@ fn openapi_subset_feed() {}
 #[allow(dead_code)]
 fn openapi_aggregate() {}
 
+#[utoipa::path(
+    post,
+    path = "/_admin/deployment/promote",
+    request_body = DeploymentPromoteRequest,
+    responses(
+        (status = 200, description = "Exact quiesced generation promoted"),
+        (status = 409, description = "Ownership or receiving-revision conflict", body = ErrorResponse),
+        (status = 503, description = "Ownership storage unavailable", body = ErrorResponse)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_deployment_promote() {}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -282,7 +308,8 @@ fn openapi_aggregate() {}
         openapi_release_shape,
         openapi_subset_query,
         openapi_subset_feed,
-        openapi_aggregate
+        openapi_aggregate,
+        openapi_deployment_promote
     ),
     components(schemas(
         LeafOp,
@@ -298,15 +325,18 @@ fn openapi_aggregate() {}
         AggregateFunction,
         AggregateRequest,
         SubsetFeedRequest,
+        DeploymentPromoteRequest,
         ErrorResponse
     ))
 )]
 struct NativeApiDoc;
 
 async fn openapi_json() -> Result<Response, AppError> {
-    let body = NativeApiDoc::openapi()
-        .to_json()
-        .map_err(|e| AppError { status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("serialize OpenAPI: {e}") })?;
+    let body = NativeApiDoc::openapi().to_json().map_err(|e| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        msg: format!("serialize OpenAPI: {e}"),
+        retry_after: false,
+    })?;
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok((headers, body).into_response())
@@ -342,6 +372,9 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/_admin/control-admission/close", post(close_control_admission))
         .route("/_admin/control-admission/open", post(open_control_admission))
         .route("/_admin/drained-through/{source_commit_id}", get(drained_through))
+        .route("/_admin/deployment/status", get(deployment_status))
+        .route("/_admin/deployment/quiesce", post(deployment_quiesce))
+        .route("/_admin/deployment/promote", post(deployment_promote))
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
         .route("/aggregate", post(create_aggregate))
@@ -382,7 +415,44 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
             // Heavy — diagnostic/attribution use only; never sampled in the background.
             .route("/debug/dbsp-profile", get(get_dbsp_profile));
     }
-    r.layer(from_fn(normalize_extractor_rejection)).with_state(engine)
+    r.layer(from_fn(normalize_extractor_rejection))
+        .layer(from_fn_with_state(engine.clone(), require_managed_public_ready))
+        .with_state(engine)
+}
+
+/// Liveness and private deployment control deliberately bypass this gate. Every other route is a
+/// data/control surface and must independently refuse a liveness-healthy standby if a listener is
+/// miswired around `/ready`.
+async fn require_managed_public_ready(
+    State(engine): State<Engine>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path == "/replication/lsn"
+        || (path == "/epoch/reset" && engine.managed_recovery_owner())
+        || matches!(
+            path,
+            "/" | "/health"
+                | "/ready"
+                | "/v1/health"
+                | "/metrics"
+                | "/memory"
+                | "/metrics/prometheus"
+                | "/v1/openapi.json"
+        )
+        || path.starts_with("/_admin/")
+        || !engine.managed_deployment_enabled()
+    {
+        return next.run(request).await;
+    }
+    match engine.ensure_not_degraded() {
+        Ok(()) => next.run(request).await,
+        // `ensure_not_degraded` deliberately orders epoch/degradation latches before managed
+        // readiness. Keep that taxonomy at the outer fence too: an active but broken engine must
+        // report its durable diagnosis, while only transient deployment states get Retry-After.
+        Err(error) => AppError::from(error).into_response(),
+    }
 }
 
 /// Axum's built-in JSON and query extractors intentionally return plain-text rejection bodies.
@@ -491,6 +561,7 @@ fn require_private_admin_with_secret(headers: &HeaderMap, secret: Option<&str>) 
         return Err(AppError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             msg: "private admin authentication is not configured".to_string(),
+            retry_after: false,
         });
     };
     let authorized = headers
@@ -501,7 +572,11 @@ fn require_private_admin_with_secret(headers: &HeaderMap, secret: Option<&str>) 
     if authorized {
         Ok(())
     } else {
-        Err(AppError { status: StatusCode::UNAUTHORIZED, msg: "private admin authentication failed".to_string() })
+        Err(AppError {
+            status: StatusCode::UNAUTHORIZED,
+            msg: "private admin authentication failed".to_string(),
+            retry_after: false,
+        })
     }
 }
 
@@ -510,8 +585,7 @@ async fn close_control_admission(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
-    engine.close_control_admission();
-    engine.wait_for_control_drain().await;
+    engine.close_control_admission_with_receipt_barrier().await;
     Ok(Json(serde_json::json!({ "controlAdmission": "closed" })))
 }
 
@@ -520,6 +594,9 @@ async fn open_control_admission(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
+    if !engine.managed_recovery_owner() {
+        return Err(anyhow::Error::new(crate::engine::DeploymentNotReady).into());
+    }
     engine.open_control_admission();
     engine.ensure_control_admitted()?;
     Ok(Json(serde_json::json!({ "controlAdmission": "open" })))
@@ -534,11 +611,13 @@ async fn drained_through(
     let parsed = uuid::Uuid::parse_str(&source_commit_id).map_err(|_| AppError {
         status: StatusCode::BAD_REQUEST,
         msg: "source_commit_id must be a UUID".to_string(),
+        retry_after: false,
     })?;
     if parsed.to_string() != source_commit_id {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
             msg: "source_commit_id must be a canonical lowercase UUID".to_string(),
+            retry_after: false,
         });
     }
     let receipt = engine.source_drain_receipt(&source_commit_id);
@@ -549,6 +628,96 @@ async fn drained_through(
         "receipt": receipt,
         "lastReceipt": last_receipt,
     })))
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentTransitionReq {
+    coordination_key: String,
+    owner_revision: String,
+    generation: i64,
+    handoff_id: String,
+    source_commit_id: String,
+}
+
+fn canonical_uuid(value: &str, name: &str) -> Result<uuid::Uuid, AppError> {
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| AppError {
+        status: StatusCode::BAD_REQUEST,
+        msg: format!("{name} must be a UUID"),
+        retry_after: false,
+    })?;
+    if parsed.to_string() != value {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!("{name} must be a canonical lowercase UUID"),
+            retry_after: false,
+        });
+    }
+    Ok(parsed)
+}
+
+fn deployment_role(role: crate::engine::ManagedRole) -> &'static str {
+    match role {
+        crate::engine::ManagedRole::Active => "active",
+        crate::engine::ManagedRole::Standby => "standby",
+        crate::engine::ManagedRole::Quiescing => "quiescing",
+        crate::engine::ManagedRole::Promoting => "promoting",
+    }
+}
+
+async fn deployment_status(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    let (key, revision, role, ownership) = engine.deployment_status().await?;
+    Ok(Json(serde_json::json!({
+        "coordinationKey": key,
+        "revision": revision,
+        "role": deployment_role(role),
+        "generation": ownership.as_ref().map(|row| row.generation),
+        "ownerRevision": ownership.as_ref().map(|row| &row.owner_revision),
+        "phase": ownership.as_ref().map(|row| match row.phase { crate::deployment::OwnershipPhase::Active => "active", crate::deployment::OwnershipPhase::Quiesced => "quiesced" }),
+        "handoffId": ownership.as_ref().and_then(|row| row.handoff_id.as_ref()),
+        "sourceCommitId": ownership.as_ref().and_then(|row| row.source_commit_id.as_ref()),
+        "controlAdmission": engine.ensure_control_admitted().is_ok(),
+        "readiness": engine.readiness_status(),
+    })))
+}
+
+async fn deployment_quiesce(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+    Json(req): Json<DeploymentTransitionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    let handoff_id = canonical_uuid(&req.handoff_id, "handoffId")?;
+    let source_commit_id = canonical_uuid(&req.source_commit_id, "sourceCommitId")?;
+    let ownership = engine
+        .deployment_quiesce(&req.coordination_key, &req.owner_revision, req.generation, handoff_id, source_commit_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "accepted": true, "phase": "quiesced", "generation": ownership.generation })))
+}
+
+async fn deployment_promote(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+    Json(req): Json<DeploymentPromoteRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    let handoff_id = canonical_uuid(&req.handoff_id, "handoffId")?;
+    let source_commit_id = canonical_uuid(&req.source_commit_id, "sourceCommitId")?;
+    let ownership = engine
+        .deployment_promote(
+            &req.coordination_key,
+            &req.owner_revision,
+            &req.successor_revision,
+            req.generation,
+            handoff_id,
+            source_commit_id,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "accepted": true, "phase": "active", "generation": ownership.generation })))
 }
 
 /// `OPTIONS /v1/shape` — CORS preflight: 204 advertising the methods the adapter serves.
@@ -653,7 +822,7 @@ struct CreateShapeReq {
 /// reserved namespace (see [`validate_new_subscription`]).
 fn validate_subscription(sub: Option<String>) -> Result<Option<String>, AppError> {
     let Some(sub) = sub else { return Ok(None) };
-    let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string() };
+    let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string(), retry_after: false };
     if sub.is_empty() {
         return Err(bad("subscription must not be empty (omit it to have one minted)"));
     }
@@ -789,7 +958,7 @@ impl CreateShapeRequestError {
             Self::UnknownTable(table) => format!("unknown table '{table}'"),
             Self::UnknownColumn { table, column } => format!("unknown column '{column}' on table '{table}'"),
         };
-        AppError { status: StatusCode::BAD_REQUEST, msg }
+        AppError { status: StatusCode::BAD_REQUEST, msg, retry_after: false }
     }
 }
 
@@ -842,7 +1011,9 @@ async fn get_shape(State(engine): State<Engine>, Path(id): Path<String>) -> Resu
             let subscriptions = Some(engine.subscription_count(&rec.id).await);
             Ok(Json(ShapeResp { state, subscriptions, ..ShapeResp::of(&engine, rec) }))
         }
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") }),
+        None => {
+            Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found"), retry_after: false })
+        }
     }
 }
 
@@ -906,7 +1077,11 @@ async fn get_shape_log(
 ) -> Result<Json<ShapeLogResp>, AppError> {
     engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
-        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("shape {id} not found"),
+            retry_after: false,
+        });
     };
     // A touch reactivates: if the shape is dormant, replay it live first so the log is current.
     engine.ensure_active(&id).await?;
@@ -965,7 +1140,11 @@ async fn get_shape_rows(
 ) -> Result<Json<ShapeRowsResp>, AppError> {
     engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
-        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("shape {id} not found"),
+            retry_after: false,
+        });
     };
     // A touch reactivates: if the shape is dormant, replay it live first so the fold is current.
     engine.ensure_active(&id).await?;
@@ -1060,8 +1239,11 @@ async fn release_shape(
 /// `public.<name>` sugar, `schema.name` is taken as given, anything else is a 400 (never a
 /// mis-resolved lookup).
 fn path_table(raw: &str) -> Result<TableRef, AppError> {
-    TableRef::parse(raw)
-        .map_err(|e| AppError { status: StatusCode::BAD_REQUEST, msg: format!("invalid table '{raw}': {e:#}") })
+    TableRef::parse(raw).map_err(|e| AppError {
+        status: StatusCode::BAD_REQUEST,
+        msg: format!("invalid table '{raw}': {e:#}"),
+        retry_after: false,
+    })
 }
 
 /// `GET /tables/{name}/offset` — the sequencer's position in the (segmented) change log.
@@ -1081,7 +1263,11 @@ async fn table_offset(
             "path": pos.path(),
             "offset": pos.offset,
         }))),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+        None => Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("no tailer for table {name}"),
+            retry_after: false,
+        }),
     }
 }
 
@@ -1089,7 +1275,11 @@ async fn table_families(State(engine): State<Engine>, Path(name): Path<String>) 
     let name = path_table(&name)?;
     match engine.table_stats(&name).await {
         Some(stats) => Ok(Json(stats)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+        None => Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("no tailer for table {name}"),
+            retry_after: false,
+        }),
     }
 }
 
@@ -1102,7 +1292,7 @@ async fn get_table_schema(
     let table = path_table(&table)?;
     match engine.table_schema_info(&table).await {
         Ok(info) => Ok(Json(info)),
-        Err(e) => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("{e:#}"), retry_after: false }),
     }
 }
 
@@ -1129,7 +1319,7 @@ async fn insert_table_row(
     let values = req.columns.or(req.values).unwrap_or_default();
     match engine.insert_row(&table, &values).await {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}"), retry_after: false }),
     }
 }
 
@@ -1153,7 +1343,7 @@ async fn delete_table_rows(
     let table = path_table(&table)?;
     match engine.delete_rows(&table, &req.keys).await {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}"), retry_after: false }),
     }
 }
 
@@ -1178,7 +1368,11 @@ async fn get_node_index(
 ) -> Result<Json<crate::engine::NodeIndex>, AppError> {
     match engine.node_index(&q.sig, q.cap.unwrap_or(500)).await {
         Some(idx) => Ok(Json(idx)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.sig) }),
+        None => Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("node {} not found", q.sig),
+            retry_after: false,
+        }),
     }
 }
 
@@ -1202,7 +1396,9 @@ async fn get_state_node(
 ) -> Result<Json<serde_json::Value>, AppError> {
     match engine.dump_node(&q.id).await {
         Some(v) => Ok(Json(v)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.id) }),
+        None => {
+            Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.id), retry_after: false })
+        }
     }
 }
 
@@ -1253,6 +1449,7 @@ async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Va
         return Err(AppError {
             status: StatusCode::CONFLICT,
             msg: "the epoch is not broken; nothing to reset".to_string(),
+            retry_after: false,
         });
     };
     engine.reset_epoch(reason).await?;
@@ -1296,36 +1493,48 @@ async fn get_prometheus() -> Response {
 struct AppError {
     status: StatusCode,
     msg: String,
+    retry_after: bool,
 }
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
+        let ownership_error = e.downcast_ref::<crate::deployment::OwnershipError>();
         // A degradation is the one engine failure that is not a 500: the request was fine, the
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
-        let status = if e.downcast_ref::<crate::engine::Degraded>().is_some()
+        let retry_after = e.downcast_ref::<crate::engine::CreateRaced>().is_some()
+            || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
+            || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
+            || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));
+        let status = if retry_after
+            || e.downcast_ref::<crate::engine::Degraded>().is_some()
             || e.downcast_ref::<crate::engine::EpochBroken>().is_some()
             || e.downcast_ref::<crate::engine::EpochResetting>().is_some()
-            // A create that kept losing the same race is not a server fault either: the request is
-            // valid, the engine is busy retiring things underneath it (`CreateRaced`).
-            || e.downcast_ref::<crate::engine::CreateRaced>().is_some()
-            || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))
         {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
         // not a server fault and not something a retry changes (ADR-0008).
-        } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some() {
+        } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::Conflict))
+        {
             StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
-        AppError { status, msg: format!("{e:#}") }
+        AppError { status, msg: format!("{e:#}"), retry_after }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response()
+        let mut response = (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response();
+        if self.retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -1336,8 +1545,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json, require_private_admin_with_secret,
-        router_with_introspection,
+        AppError, CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json,
+        require_private_admin_with_secret, router_with_introspection,
     };
     use crate::predicate::PredicateJson;
     use crate::{ds::DsClient, engine::Engine};
@@ -1401,6 +1610,194 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(control_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn deployment_promote_requires_the_receiving_successor_revision_in_its_json_contract() {
+        crate::config::set_globals(
+            "http-route-test",
+            "http-route-test",
+            Some("gateway-secret"),
+            Some("controller-secret"),
+        );
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let app = router_with_introspection(engine, false);
+        let body = serde_json::json!({
+            "coordinationKey": "a".repeat(64),
+            "ownerRevision": "revision-a",
+            "generation": 1,
+            "handoffId": "00000000-0000-0000-0000-000000000000",
+            "sourceCommitId": "00000000-0000-0000-0000-000000000000"
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/_admin/deployment/promote")
+                    .header(header::AUTHORIZATION, "Bearer controller-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn managed_ownership_routes_report_an_unreachable_coordinator_as_retryable() {
+        crate::config::set_globals(
+            "http-route-test",
+            "http-route-test",
+            Some("gateway-secret"),
+            Some("controller-secret"),
+        );
+        let pg_url = "postgres://127.0.0.1:1/unreachable".to_string();
+        let auth = "Bearer controller-secret";
+
+        let status_engine =
+            Engine::new_pg_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"), pg_url.clone());
+        status_engine.install_managed_role_for_test(false);
+        let status = router_with_introspection(status_engine, false)
+            .oneshot(
+                Request::get("/_admin/deployment/status")
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+
+        let promote_engine =
+            Engine::new_pg_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"), pg_url.clone());
+        promote_engine.install_managed_role_for_test(false);
+        let promote = router_with_introspection(promote_engine, false)
+            .oneshot(
+                Request::post("/_admin/deployment/promote")
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "coordinationKey": "a".repeat(64),
+                            "ownerRevision": "revision-a",
+                            "successorRevision": "test-revision",
+                            "generation": 1,
+                            "handoffId": "00000000-0000-0000-0000-000000000000",
+                            "sourceCommitId": "00000000-0000-0000-0000-000000000000"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promote.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(promote.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+
+        let quiesce_engine =
+            Engine::new_pg_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"), pg_url);
+        quiesce_engine.install_managed_role_for_test(false);
+        quiesce_engine.close_control_admission_with_receipt_barrier().await;
+        quiesce_engine.record_source_drain_receipt_for_test("00000000-0000-0000-0000-000000000000");
+        let quiesce = router_with_introspection(quiesce_engine, false)
+            .oneshot(
+                Request::post("/_admin/deployment/quiesce")
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "coordinationKey": "a".repeat(64),
+                            "ownerRevision": "test-revision",
+                            "generation": 1,
+                            "handoffId": "00000000-0000-0000-0000-000000000000",
+                            "sourceCommitId": "00000000-0000-0000-0000-000000000000"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quiesce.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(quiesce.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+    }
+
+    #[test]
+    fn retry_after_is_reserved_for_retryable_unavailability() {
+        let degraded: AppError = anyhow::Error::new(crate::engine::Degraded).into();
+        let preclose: AppError = anyhow::Error::new(crate::deployment::OwnershipError::PrecloseRequired).into();
+        let fresh: AppError = anyhow::Error::new(crate::deployment::OwnershipError::FreshReceiptRequired).into();
+        assert!(!degraded.retry_after);
+        assert!(preclose.retry_after);
+        assert!(fresh.retry_after);
+    }
+
+    #[tokio::test]
+    async fn managed_standby_cannot_reset_but_active_owner_keeps_diagnostics_and_recovery_reachable() {
+        let active = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        active.install_managed_role_for_test(true);
+        active.force_degraded();
+        let active_app = router_with_introspection(active, false);
+        assert_eq!(
+            active_app
+                .clone()
+                .oneshot(Request::get("/replication/lsn").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // No broken epoch is installed, so reaching the reset handler is its stable 409—not the
+        // standby middleware's retryable 503.
+        assert_eq!(
+            active_app.oneshot(Request::post("/epoch/reset").body(Body::empty()).unwrap()).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
+        let standby = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        standby.install_managed_role_for_test(false);
+        let standby_app = router_with_introspection(standby, false);
+        assert_eq!(
+            standby_app.oneshot(Request::post("/epoch/reset").body(Body::empty()).unwrap()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_data_routes_preserve_degradation_taxonomy_before_readiness_fencing() {
+        let degraded = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        degraded.install_managed_role_for_test(true);
+        degraded.force_degraded();
+        let response = router_with_introspection(degraded, false)
+            .oneshot(Request::get("/tables").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER), None);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("degraded: subquery membership effects were lost"));
+
+        let broken = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        broken.install_managed_role_for_test(true);
+        assert!(broken.latch_epoch_break(crate::engine::EpochBreakReason::SlotLost, "test_slot"));
+        let response = router_with_introspection(broken, false)
+            .oneshot(Request::get("/tables").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER), None);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("epoch broken"));
+
+        let standby = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        standby.install_managed_role_for_test(false);
+        let response = router_with_introspection(standby, false)
+            .oneshot(Request::get("/tables").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
     }
 
     #[test]

@@ -384,6 +384,15 @@ impl ApiError {
         }
     }
 
+    fn deployment_not_ready() -> Self {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "managed deployment is not ready; retry".to_string(),
+            retry_after: Some(1),
+            must_refetch: false,
+        }
+    }
+
     fn must_refetch() -> Self {
         ApiError {
             status: StatusCode::CONFLICT,
@@ -402,6 +411,7 @@ impl From<anyhow::Error> for ApiError {
         // shape as broken.
         if e.downcast_ref::<crate::engine::CreateRaced>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
+            || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
         {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -895,6 +905,12 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
     if live && engine.shutdown_token().is_shutting_down() {
         return Err(ApiError::draining());
     }
+    // Middleware usually rejects managed standby/quiesce before this adapter runs. Re-check here
+    // because an already-admitted shape operation can cross that boundary while validating or
+    // creating its shared shape; it must receive the Electric retry contract, never a 500.
+    if !engine.managed_public_ready() {
+        return Err(ApiError::deployment_not_ready());
+    }
     let columns = col_csv(&p.columns);
     let _ = &p.cursor; // accepted (cache-busting hint); we mint our own electric-cursor
     let _ = &p.replica; // accepted; we always send full rows (replica=full semantics)
@@ -1065,6 +1081,16 @@ mod tests {
     use crate::schema::{ColumnDef, TableDef};
     use crate::shutdown::ShutdownToken;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn managed_deployment_not_ready_is_an_electric_retryable_response() {
+        let error: ApiError = anyhow::Error::new(crate::engine::DeploymentNotReady).into();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(1));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(axum::http::header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+    }
 
     #[test]
     fn electric_schema_preserves_introspected_jsonb_type() {

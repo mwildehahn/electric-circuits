@@ -74,6 +74,8 @@ pub struct Config {
     /// Bearer token for deployment-controller endpoints. Deliberately distinct from
     /// `ELECTRIC_SECRET`, which is distributed to the client-facing gateway.
     pub control_secret: Option<String>,
+    /// Opt-in persisted writer ownership. Absent by default, preserving the legacy boot protocol.
+    pub managed_deployment: Option<crate::deployment::ManagedDeploymentConfig>,
     /// Root dir of durable-streams file storage, for `electric.storage.used.bytes` (`du`).
     pub storage_dir: Option<String>,
     /// Optional second listener serving Prometheus text (`ELECTRIC_PROMETHEUS_PORT`).
@@ -359,6 +361,31 @@ impl Config {
                 "ELECTRIC_CIRCUITS_CONTROL_SECRET must be distinct from ELECTRIC_SECRET: the gateway credential must not authorize deployment-controller endpoints"
             );
         }
+        let managed_initial_active = match g("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE").as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(value) => {
+                bail!("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE must be exactly '1' when set, got '{value}'")
+            }
+        };
+        let managed_deployment = match g("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION") {
+            None if managed_initial_active => bail!(
+                "ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE=1 requires ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION"
+            ),
+            None => None,
+            Some(revision) => {
+                let parsed = uuid::Uuid::parse_str(&revision).map_err(|_| {
+                    anyhow::anyhow!("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION must be a canonical lowercase UUID")
+                })?;
+                if parsed.to_string() != revision {
+                    bail!("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION must be a canonical lowercase UUID");
+                }
+                if control_secret.is_none() {
+                    bail!("managed deployment requires ELECTRIC_CIRCUITS_CONTROL_SECRET");
+                }
+                Some(crate::deployment::ManagedDeploymentConfig { revision, initial_active: managed_initial_active })
+            }
+        };
 
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
@@ -484,6 +511,7 @@ impl Config {
             metrics_period,
             secret,
             control_secret,
+            managed_deployment,
             storage_dir,
             prometheus_port,
             db_pool_size,
@@ -509,7 +537,7 @@ impl Config {
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} control_secret={} storage_dir={} prometheus_port={:?} trace={} initialize_namespace={} log={} \
+             secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} initialize_namespace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
@@ -522,6 +550,7 @@ impl Config {
             self.metrics_period,
             if self.secret.is_some() { "<redacted>" } else { "<none>" },
             if self.control_secret.is_some() { "<redacted>" } else { "<none>" },
+            if self.managed_deployment.is_some() { "enabled" } else { "disabled" },
             self.storage_dir.as_deref().unwrap_or("<none>"),
             self.prometheus_port,
             self.trace,
@@ -695,6 +724,25 @@ mod tests {
         config.pop();
         config.push(("ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE", "true"));
         assert!(try_cfg(&config).is_err());
+    }
+
+    #[test]
+    fn managed_deployment_requires_an_immutable_revision_and_explicit_bootstrap() {
+        let config = cfg(&[
+            ("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION", "018f5f4d-70c2-7d70-a4d5-5f7355078f85"),
+            ("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE", "1"),
+            ("ELECTRIC_CIRCUITS_CONTROL_SECRET", "controller-test-secret"),
+        ]);
+        assert!(
+            config.redacted().contains("managed_deployment=enabled"),
+            "managed deployment must be an explicit, observable opt-in"
+        );
+        let disabled_bootstrap = cfg(&[
+            ("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION", "018f5f4d-70c2-7d70-a4d5-5f7355078f85"),
+            ("ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE", "0"),
+            ("ELECTRIC_CIRCUITS_CONTROL_SECRET", "controller-test-secret"),
+        ]);
+        assert!(!disabled_bootstrap.managed_deployment.unwrap().initial_active);
     }
 
     #[test]

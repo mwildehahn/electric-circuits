@@ -66,6 +66,34 @@ const HEALTH_WAITING: u8 = 0;
 const HEALTH_STARTING: u8 = 1;
 const HEALTH_ACTIVE: u8 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedRole {
+    Active,
+    Standby,
+    Quiescing,
+    Promoting,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedDeploymentState {
+    config: crate::deployment::ManagedDeploymentConfig,
+    coordination_key: String,
+    role: ManagedRole,
+    ownership: Option<crate::deployment::Ownership>,
+}
+
+/// Public data is fenced while a managed process has not proved its exact active generation.
+#[derive(Debug)]
+pub struct DeploymentNotReady;
+
+impl std::fmt::Display for DeploymentNotReady {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("managed deployment is not the active ready writer; retry")
+    }
+}
+
+impl std::error::Error for DeploymentNotReady {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BootEpochAction {
     Restore,
@@ -197,6 +225,59 @@ pub struct SourceDrainReceipt {
     pub commit_lsn: String,
 }
 
+/// In-process ordering for durable source receipts. The catalog remains the durable authority for
+/// the receipt itself; this ledger only distinguishes receipts observed before a control-admission
+/// closure from those observed afterwards. It intentionally resets on process restart, where
+/// managed admission is fail-closed and the controller must create a new fence.
+#[derive(Default)]
+pub(crate) struct SourceReceiptProgress {
+    next_sequence: u64,
+    sequences: HashMap<String, u64>,
+    closure_watermark: Option<u64>,
+}
+
+impl SourceReceiptProgress {
+    pub(crate) fn record(&mut self, source_commit_id: &str) {
+        if !self.sequences.contains_key(source_commit_id) {
+            self.next_sequence += 1;
+            self.sequences.insert(source_commit_id.to_owned(), self.next_sequence);
+        }
+    }
+
+    /// Installs a receipt read from the durable catalog. If admission was already closed while
+    /// boot was still restoring that catalog, this receipt necessarily predates the close: keep
+    /// it on (not across) that closure's frontier. Live sequencer receipts always use [`record`]
+    /// and therefore advance past the frontier.
+    pub(crate) fn record_restored(&mut self, source_commit_id: &str) {
+        if self.sequences.contains_key(source_commit_id) {
+            return;
+        }
+        if let Some(watermark) = self.closure_watermark {
+            self.sequences.insert(source_commit_id.to_owned(), watermark);
+        } else {
+            self.record(source_commit_id);
+        }
+    }
+
+    fn snapshot_closure(&mut self) {
+        self.closure_watermark = Some(self.next_sequence);
+    }
+
+    fn clear_closure(&mut self) {
+        self.closure_watermark = None;
+    }
+
+    fn is_after_closure(&self, source_commit_id: &str) -> bool {
+        self.closure_watermark
+            .zip(self.sequences.get(source_commit_id))
+            .is_some_and(|(watermark, sequence)| *sequence > watermark)
+    }
+
+    fn has_closure(&self) -> bool {
+        self.closure_watermark.is_some()
+    }
+}
+
 /// Fail-closed degradation state, latched when a flip batch exhausts its retries.
 ///
 /// The inner-set node was already reconciled under the registry lock before the batch's query-backs
@@ -249,6 +330,10 @@ pub struct Engine {
     /// `starting` (connected; introspecting / creating slot / spawning ingest), 2 = `active` (ingest
     /// loop running). Library mode (no Postgres) is `active` from construction.
     health: Arc<std::sync::atomic::AtomicU8>,
+    /// Opt-in ownership gate. Kept separate from health so legacy mode remains byte compatible.
+    managed_deployment: Arc<std::sync::Mutex<Option<ManagedDeploymentState>>>,
+    /// Wakes a standby boot retry immediately after a successful local promotion.
+    managed_wakeup: Arc<tokio::sync::Notify>,
     /// Independent of read health: false refuses new control-plane mutations while restored stream
     /// reads continue. The deployment controller closes this before writing a source fence.
     control_admission: Arc<ControlAdmission>,
@@ -257,6 +342,7 @@ pub struct Engine {
     /// not populate it.
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
+    source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     /// Cross-table subquery registry: maintained inner-set nodes (shared by canonical signature) + the
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
@@ -1017,9 +1103,12 @@ impl Engine {
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Library mode: no Postgres to wait on, so report `active` immediately.
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
+            managed_deployment: Arc::new(std::sync::Mutex::new(None)),
+            managed_wakeup: Arc::new(tokio::sync::Notify::new()),
             control_admission: ControlAdmission::new(),
             source_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             last_source_receipt: Arc::new(std::sync::Mutex::new(None)),
+            source_receipt_progress: Arc::new(std::sync::Mutex::new(SourceReceiptProgress::default())),
             subqueries,
             trace_tx,
             flip_tx,
@@ -1062,6 +1151,210 @@ impl Engine {
         self.shutdown.clone()
     }
 
+    /// Install the managed ownership gate before the HTTP server is exposed or Postgres setup runs.
+    pub fn configure_managed_deployment(
+        &self,
+        config: crate::deployment::ManagedDeploymentConfig,
+        slot: &str,
+    ) -> Result<()> {
+        let binding = self.store_bound.get().context("managed deployment requires an admitted StoreBound")?;
+        let coordination_key = crate::deployment::coordination_key(binding, slot);
+        *self.managed_deployment.lock().unwrap() =
+            Some(ManagedDeploymentState { config, coordination_key, role: ManagedRole::Standby, ownership: None });
+        self.close_control_admission();
+        Ok(())
+    }
+
+    fn managed_status(&self) -> Option<(ManagedRole, Option<crate::deployment::Ownership>)> {
+        self.managed_deployment.lock().unwrap().as_ref().map(|state| (state.role, state.ownership.clone()))
+    }
+
+    pub fn managed_deployment_enabled(&self) -> bool {
+        self.managed_deployment.lock().unwrap().is_some()
+    }
+
+    /// Recovery controls may run on the persisted active owner even while its epoch is broken.
+    /// Standby/quiescing processes must never reopen admission or reset the active writer's slot.
+    pub fn managed_recovery_owner(&self) -> bool {
+        self.managed_deployment.lock().unwrap().as_ref().is_none_or(|state| state.role == ManagedRole::Active)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn install_managed_role_for_test(&self, active: bool) {
+        *self.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+            config: crate::deployment::ManagedDeploymentConfig {
+                revision: "test-revision".into(),
+                initial_active: false,
+            },
+            coordination_key: "a".repeat(64),
+            role: if active { ManagedRole::Active } else { ManagedRole::Standby },
+            ownership: None,
+        });
+    }
+
+    /// Managed traffic may flow only after the owner has completed the normal engine boot.
+    /// Claiming the database row is deliberately not enough: catalog restore, slot ownership, and
+    /// ingestor startup still happen after that claim.
+    pub fn managed_public_ready(&self) -> bool {
+        !self.managed_deployment_enabled() || self.readiness_status() == "active"
+    }
+
+    pub fn managed_wakeup(&self) -> Arc<tokio::sync::Notify> {
+        self.managed_wakeup.clone()
+    }
+
+    async fn claim_managed_ownership(&self, client: &tokio_postgres::Client) -> Result<()> {
+        let (config, key) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let Some(state) = guard.as_ref() else { return Ok(()) };
+            (state.config.clone(), state.coordination_key.clone())
+        };
+        match crate::deployment::claim_or_observe(client, &config, &key).await? {
+            crate::deployment::Claim::Active(ownership) => {
+                let mut guard = self.managed_deployment.lock().unwrap();
+                let state = guard.as_mut().expect("managed state stays installed");
+                state.role = ManagedRole::Active;
+                state.ownership = Some(ownership);
+                Ok(())
+            }
+            crate::deployment::Claim::Standby(ownership) => {
+                let mut guard = self.managed_deployment.lock().unwrap();
+                let state = guard.as_mut().expect("managed state stays installed");
+                state.role = ManagedRole::Standby;
+                state.ownership = ownership;
+                Err(anyhow::Error::new(DeploymentNotReady))
+            }
+        }
+    }
+
+    pub(crate) async fn deployment_status(
+        &self,
+    ) -> Result<(String, String, ManagedRole, Option<crate::deployment::Ownership>)> {
+        let (revision, key, role) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let state =
+                guard.as_ref().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
+            (state.config.revision.clone(), state.coordination_key.clone(), state.role)
+        };
+        let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
+        let client = crate::deployment::connect(&url).await?;
+        let ownership = crate::deployment::status(&client, &key).await?;
+        Ok((key, revision, role, ownership))
+    }
+
+    pub(crate) async fn deployment_quiesce(
+        &self,
+        expected_key: &str,
+        expected_owner: &str,
+        generation: i64,
+        handoff_id: uuid::Uuid,
+        source_commit_id: uuid::Uuid,
+    ) -> Result<crate::deployment::Ownership> {
+        let (revision, key) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let state =
+                guard.as_ref().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
+            (state.config.revision.clone(), state.coordination_key.clone())
+        };
+        if key != expected_key || revision != expected_owner {
+            bail!(crate::deployment::OwnershipError::Conflict);
+        }
+        // A receipt that predates admission closure cannot fence a mutation which was already
+        // admitted. Close and drain on a first attempt, then refuse it so the controller obtains
+        // a fresh receipt and retries. The ordinary close endpoint is idempotent, so this is a
+        // bounded controller round-trip rather than a new protocol surface.
+        self.require_preclosed_control_drain().await?;
+        if self.source_drain_receipt(&source_commit_id.to_string()).is_none() {
+            bail!(crate::deployment::OwnershipError::Conflict);
+        }
+        if !self.source_receipt_progress.lock().unwrap().is_after_closure(&source_commit_id.to_string()) {
+            bail!(crate::deployment::OwnershipError::FreshReceiptRequired);
+        }
+        let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
+        let client = crate::deployment::connect(&url).await?;
+        let ownership =
+            crate::deployment::quiesce(&client, &key, expected_owner, generation, handoff_id, source_commit_id).await?;
+        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
+            state.role = ManagedRole::Quiescing;
+            state.ownership = Some(ownership.clone());
+        }
+        self.shutdown.begin();
+        Ok(ownership)
+    }
+
+    pub(crate) async fn deployment_promote(
+        &self,
+        expected_key: &str,
+        expected_owner: &str,
+        successor_revision: &str,
+        generation: i64,
+        handoff_id: uuid::Uuid,
+        source_commit_id: uuid::Uuid,
+    ) -> Result<crate::deployment::Ownership> {
+        // A promotion request names both ends of the transfer. Without the successor identity an
+        // incumbent that is already quiescing could write its own revision back into ownership.
+        // Only a standby process changes local readiness while it validates the CAS. An active
+        // successor is already serving its persisted generation, so an idempotent retry must not
+        // withdraw it during a transient coordinator outage.
+        let restore_standby = {
+            let mut guard = self.managed_deployment.lock().unwrap();
+            let state =
+                guard.as_mut().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
+            if state.coordination_key != expected_key
+                || state.config.revision != successor_revision
+                || state.role == ManagedRole::Quiescing
+                || self.shutdown.is_shutting_down()
+            {
+                bail!(crate::deployment::OwnershipError::Conflict);
+            }
+            if state.role == ManagedRole::Standby {
+                state.role = ManagedRole::Promoting;
+                true
+            } else {
+                // Active idempotent retries stay active. A second overlap observes the first
+                // promotion and leaves cleanup to the request that actually entered it.
+                false
+            }
+        };
+        let (revision, key) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let state = guard.as_ref().expect("managed state stays installed");
+            (state.config.revision.clone(), state.coordination_key.clone())
+        };
+        let ownership = async {
+            let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
+            let client = crate::deployment::connect(&url).await?;
+            crate::deployment::promote(
+                &client,
+                &key,
+                &revision,
+                expected_owner,
+                generation,
+                handoff_id,
+                source_commit_id,
+            )
+            .await
+        }
+        .await;
+        match ownership {
+            Ok(ownership) => {
+                if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
+                    state.role = ManagedRole::Active;
+                    state.ownership = Some(ownership.clone());
+                }
+                self.managed_wakeup.notify_one();
+                Ok(ownership)
+            }
+            Err(error) => {
+                if restore_standby {
+                    self.restore_failed_promotion_role();
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Refuse new control mutations while leaving health/readiness unchanged for existing readers.
     pub fn ensure_control_admitted(&self) -> Result<()> {
         if self.control_admission.open.load(Ordering::Acquire) && !self.shutdown.is_shutting_down() {
@@ -1087,6 +1380,30 @@ impl Engine {
         self.control_admission.open.store(false, Ordering::Release);
     }
 
+    /// Close admission, wait for every previously admitted mutation, then snapshot the receipt
+    /// frontier. A source fence recorded after this method returns has a sequence strictly above
+    /// the watermark; an earlier receipt can never be replayed into a handoff.
+    pub async fn close_control_admission_with_receipt_barrier(&self) -> bool {
+        let transitioned = self.control_admission.open.swap(false, Ordering::AcqRel);
+        self.wait_for_control_drain().await;
+        let mut progress = self.source_receipt_progress.lock().unwrap();
+        if transitioned || !progress.has_closure() {
+            // Managed boot is already closed. Its first explicit close must still establish the
+            // frontier so a controller can close, write a fence, and quiesce without an extra
+            // round trip; later idempotent closes preserve that original frontier.
+            progress.snapshot_closure();
+        }
+        transitioned
+    }
+
+    async fn require_preclosed_control_drain(&self) -> Result<()> {
+        if self.close_control_admission_with_receipt_barrier().await {
+            bail!(crate::deployment::OwnershipError::PrecloseRequired);
+        }
+        self.wait_for_control_drain().await;
+        Ok(())
+    }
+
     pub async fn wait_for_control_drain(&self) {
         loop {
             let notified = self.control_admission.drained.notified();
@@ -1102,11 +1419,28 @@ impl Engine {
     pub fn open_control_admission(&self) {
         if !self.shutdown.is_shutting_down() {
             self.control_admission.open.store(true, Ordering::Release);
+            self.source_receipt_progress.lock().unwrap().clear_closure();
         }
     }
 
     pub fn source_drain_receipt(&self, source_commit_id: &str) -> Option<SourceDrainReceipt> {
         self.source_receipts.lock().unwrap().get(source_commit_id).cloned()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_source_drain_receipt_for_test(&self, source_commit_id: &str) {
+        let receipt = SourceDrainReceipt { source_commit_id: source_commit_id.to_owned(), commit_lsn: "0/0".into() };
+        self.source_receipts.lock().unwrap().insert(source_commit_id.to_owned(), receipt.clone());
+        *self.last_source_receipt.lock().unwrap() = Some(receipt);
+        self.source_receipt_progress.lock().unwrap().record(source_commit_id);
+    }
+
+    fn restore_failed_promotion_role(&self) {
+        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut()
+            && state.role == ManagedRole::Promoting
+        {
+            state.role = ManagedRole::Standby;
+        }
     }
 
     pub fn last_source_drain_receipt(&self) -> Option<SourceDrainReceipt> {
@@ -1236,6 +1570,9 @@ impl Engine {
         if self.degraded() {
             return Err(anyhow::Error::new(Degraded));
         }
+        if !self.managed_public_ready() {
+            return Err(anyhow::Error::new(DeploymentNotReady));
+        }
         Ok(())
     }
 
@@ -1319,6 +1656,7 @@ impl Engine {
                 self.catalog_tx.clone(),
                 self.source_receipts.clone(),
                 self.last_source_receipt.clone(),
+                self.source_receipt_progress.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
@@ -1351,6 +1689,14 @@ impl Engine {
     /// string-compares the body, and `GET /replication/lsn` is where the *reason* lives
     /// (`flipFailures` vs `epoch.reason`).
     pub fn health_status(&self) -> &'static str {
+        if let Some((role, _)) = self.managed_status() {
+            match role {
+                ManagedRole::Standby => return "standby",
+                ManagedRole::Quiescing => return "quiescing",
+                ManagedRole::Promoting => return "promoting",
+                ManagedRole::Active => {}
+            }
+        }
         if self.degraded() || self.epoch_broken().is_some() {
             return "degraded";
         }
@@ -1402,6 +1748,10 @@ impl Engine {
         // `wal_level` is checked explicitly, first, rather than left to surface as a slot-creation
         // failure: it needs a Postgres RESTART to change, so it deserves its own named refusal.
         crate::pg::check_wal_level(&client).await?;
+        // This is the sole managed-mode operation before normal boot. A standby only reads (or
+        // wins the explicit generation-1 bootstrap insert); it cannot restore catalog state, alter
+        // publication/identity, claim a slot, spawn ingest, or admit controls.
+        self.claim_managed_ownership(&client).await?;
         // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
         // ingest spawn still ahead). `/v1/health` reports 202 until the ingest loop is running.
         self.health.store(HEALTH_STARTING, std::sync::atomic::Ordering::Relaxed);

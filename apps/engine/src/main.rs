@@ -158,6 +158,14 @@ async fn main() -> Result<()> {
             engine
         }
     };
+    if let Some(managed) = config.managed_deployment.clone() {
+        if config.pg_url.is_none() {
+            refuse_boot("configuration", &anyhow::anyhow!("managed deployment requires Postgres mode"));
+        }
+        if let Err(error) = engine.configure_managed_deployment(managed, &config.slot) {
+            refuse_boot("configuration", &error);
+        }
+    }
 
     // Memory probes via OpenTelemetry: register the meter provider + Prometheus exporter, publish an
     // initial sample, and start the background sampler. `_otel` is held for the process lifetime so the
@@ -289,8 +297,12 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
              GET /ready reports `waiting` until it is. Cause: {err:#}",
             pg::boot_failure_name(&err),
         );
+        let managed_wakeup = engine.managed_wakeup();
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            _ = managed_wakeup.notified() => {
+                tracing::info!("boot: managed promotion woke the ownership retry loop");
+            }
             // A pod terminated while still waiting for its database stops dialling and takes the
             // ordinary shutdown path — a clean exit 0, not a kill.
             _ = shutdown.wait() => {
