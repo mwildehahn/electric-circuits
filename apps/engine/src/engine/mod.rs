@@ -1115,6 +1115,26 @@ impl Engine {
         self.managed_deployment.lock().unwrap().is_some()
     }
 
+    /// Recovery controls may run on the persisted active owner even while its epoch is broken.
+    /// Standby/quiescing processes must never reopen admission or reset the active writer's slot.
+    pub fn managed_recovery_owner(&self) -> bool {
+        self.managed_deployment.lock().unwrap().as_ref().is_none_or(|state| state.role == ManagedRole::Active)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn install_managed_role_for_test(&self, active: bool) {
+        *self.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+            config: crate::deployment::ManagedDeploymentConfig {
+                revision: "test-revision".into(),
+                initial_active: false,
+            },
+            coordination_key: "a".repeat(64),
+            role: if active { ManagedRole::Active } else { ManagedRole::Standby },
+            ownership: None,
+        });
+    }
+
     /// Managed traffic may flow only after the owner has completed the normal engine boot.
     /// Claiming the database row is deliberately not enough: catalog restore, slot ownership, and
     /// ingestor startup still happen after that claim.
@@ -1215,8 +1235,6 @@ impl Engine {
         if key != expected_key {
             bail!(crate::deployment::OwnershipError::Conflict);
         }
-        let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
-        let client = crate::pg::connect(&url).await?;
         let previous_role = {
             let mut guard = self.managed_deployment.lock().unwrap();
             let state = guard.as_mut().expect("managed state stays installed");
@@ -1224,15 +1242,20 @@ impl Engine {
             state.role = ManagedRole::Promoting;
             previous
         };
-        let ownership = crate::deployment::promote(
-            &client,
-            &key,
-            &revision,
-            expected_owner,
-            generation,
-            handoff_id,
-            source_commit_id,
-        )
+        let ownership = async {
+            let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
+            let client = crate::pg::connect(&url).await?;
+            crate::deployment::promote(
+                &client,
+                &key,
+                &revision,
+                expected_owner,
+                generation,
+                handoff_id,
+                source_commit_id,
+            )
+            .await
+        }
         .await;
         match ownership {
             Ok(ownership) => {
@@ -1420,9 +1443,6 @@ impl Engine {
     /// policy ([`EpochBroken`], cleared by `POST /epoch/reset`). The epoch is checked first — it is
     /// the more fundamental "this engine is not serving this database right now".
     pub fn ensure_not_degraded(&self) -> Result<()> {
-        if !self.managed_public_ready() {
-            return Err(anyhow::Error::new(DeploymentNotReady));
-        }
         // A reset in flight is checked FIRST: it is the transient, actionable one, and while it runs
         // the epoch is also (correctly) latched broken — "retry in a moment" is the useful answer.
         // Taken under the engine-state lock by every create, so a create either registered before
@@ -1436,6 +1456,9 @@ impl Engine {
         }
         if self.degraded() {
             return Err(anyhow::Error::new(Degraded));
+        }
+        if !self.managed_public_ready() {
+            return Err(anyhow::Error::new(DeploymentNotReady));
         }
         Ok(())
     }

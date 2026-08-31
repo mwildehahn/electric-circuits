@@ -79,6 +79,15 @@ async fn failed_promote_restores_the_previous_managed_role() {
     assert_eq!(engine.managed_status().unwrap().0, ManagedRole::Standby);
 }
 
+#[tokio::test]
+async fn degradation_outranks_managed_readiness_for_typed_callers() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    engine.install_managed_role_for_test(false);
+    engine.force_degraded();
+    let error = engine.ensure_not_degraded().unwrap_err();
+    assert!(error.downcast_ref::<Degraded>().is_some(), "degradation must not be masked by standby readiness");
+}
+
 /// The candidate set must contain every standalone shape that could match any row of the
 /// delta (old or new side), and exclude shapes whose necessary conjunct fails on all rows.
 #[test]

@@ -399,10 +399,19 @@ async fn require_managed_public_ready(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if matches!(
-        path,
-        "/" | "/health" | "/ready" | "/v1/health" | "/metrics" | "/memory" | "/metrics/prometheus" | "/v1/openapi.json"
-    ) || path.starts_with("/_admin/")
+    if path == "/replication/lsn"
+        || (path == "/epoch/reset" && engine.managed_recovery_owner())
+        || matches!(
+            path,
+            "/" | "/health"
+                | "/ready"
+                | "/v1/health"
+                | "/metrics"
+                | "/memory"
+                | "/metrics/prometheus"
+                | "/v1/openapi.json"
+        )
+        || path.starts_with("/_admin/")
         || !engine.managed_deployment_enabled()
     {
         return next.run(request).await;
@@ -555,7 +564,9 @@ async fn open_control_admission(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
-    engine.ensure_not_degraded()?;
+    if !engine.managed_recovery_owner() {
+        return Err(anyhow::Error::new(crate::engine::DeploymentNotReady).into());
+    }
     engine.open_control_admission();
     engine.ensure_control_admitted()?;
     Ok(Json(serde_json::json!({ "controlAdmission": "open" })))
@@ -1522,6 +1533,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(control_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn managed_standby_cannot_reset_but_active_owner_keeps_diagnostics_and_recovery_reachable() {
+        let active = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        active.install_managed_role_for_test(true);
+        active.force_degraded();
+        let active_app = router_with_introspection(active, false);
+        assert_eq!(
+            active_app
+                .clone()
+                .oneshot(Request::get("/replication/lsn").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // No broken epoch is installed, so reaching the reset handler is its stable 409—not the
+        // standby middleware's retryable 503.
+        assert_eq!(
+            active_app.oneshot(Request::post("/epoch/reset").body(Body::empty()).unwrap()).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
+        let standby = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        standby.install_managed_role_for_test(false);
+        let standby_app = router_with_introspection(standby, false);
+        assert_eq!(
+            standby_app.oneshot(Request::post("/epoch/reset").body(Body::empty()).unwrap()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
