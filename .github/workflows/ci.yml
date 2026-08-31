@@ -47,7 +47,7 @@ jobs:
           "$PGBIN/initdb" --version
           DATA="$RUNNER_TEMP/circuits-rust-pg"
           "$PGBIN/initdb" -D "$DATA" -U postgres --auth=trust --no-sync
-          "$PGBIN/pg_ctl" -D "$DATA" -o '-p 55432 -c wal_level=logical' -w start
+          "$PGBIN/pg_ctl" -D "$DATA" -o "-p 55432 -c wal_level=logical -c unix_socket_directories=$RUNNER_TEMP" -w start
           echo 'ELECTRIC_CIRCUITS_TEST_PG_URL=postgres://postgres@127.0.0.1:55432/postgres' >> "$GITHUB_ENV"
 
       - name: Rust engine tests
