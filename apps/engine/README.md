@@ -99,6 +99,9 @@ quiesce closes and drains it, then returns retryable 503 with `Retry-After: 1`; 
 receipt after that closure and retry. A preclosure receipt is also rejected with retryable 503, even
 when it is still durable in the catalog. A preclosed/drained retry with the new receipt performs the
 CAS and begins graceful shutdown.
+All three deployment routes return retryable `503` with `Retry-After: 1` while the configured
+ownership coordinator is temporarily unavailable; malformed Postgres/TLS configuration remains a
+fatal operator configuration error rather than a handoff retry.
 Promotion advances only the exact quiesced generation and leaves admission closed until the existing
 explicit open call. This is an upstream pilot capability: release and production use remain gated by
 the Indexed schema migration, lifecycle controller, ECS/ALB workflow, and qualification matrix.

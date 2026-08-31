@@ -63,6 +63,14 @@ fn backend<T>(result: Result<T>) -> Result<T> {
     result.map_err(|source| anyhow::Error::new(OwnershipBackend { source }))
 }
 
+/// Acquire a client for a managed ownership operation. URL/TLS policy validation is a fatal
+/// operator configuration error and deliberately keeps its ordinary error type; only a validated
+/// coordinator that cannot be reached is wrapped as retryable ownership storage unavailability.
+pub async fn connect(url: &str) -> Result<Client> {
+    crate::pg::PgConnectionConfig::from_process_env(url)?;
+    backend(crate::pg::connect(url).await)
+}
+
 /// SHA-256 of the canonical StoreBound fields, a NUL separator, and the logical slot name.
 ///
 /// The serialization is intentionally explicit: serde JSON permits representation changes while this
@@ -244,5 +252,14 @@ mod tests {
         let mut other = bound.clone();
         other.query_generation = "other-query".to_string();
         assert_ne!(first, coordination_key(&other, "circuits_slot"));
+    }
+
+    #[tokio::test]
+    async fn managed_connect_wraps_a_validated_but_unreachable_coordinator() {
+        let error = connect("postgres://127.0.0.1:1/unreachable").await.unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause.downcast_ref::<OwnershipBackend>().is_some()),
+            "connection availability must retain the retryable ownership backend type: {error:#}"
+        );
     }
 }

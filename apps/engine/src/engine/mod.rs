@@ -1223,7 +1223,7 @@ impl Engine {
             (state.config.revision.clone(), state.coordination_key.clone(), state.role)
         };
         let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
-        let client = crate::pg::connect(&url).await?;
+        let client = crate::deployment::connect(&url).await?;
         let ownership = crate::deployment::status(&client, &key).await?;
         Ok((key, revision, role, ownership))
     }
@@ -1250,11 +1250,14 @@ impl Engine {
         // a fresh receipt and retries. The ordinary close endpoint is idempotent, so this is a
         // bounded controller round-trip rather than a new protocol surface.
         self.require_preclosed_control_drain().await?;
+        if self.source_drain_receipt(&source_commit_id.to_string()).is_none() {
+            bail!(crate::deployment::OwnershipError::Conflict);
+        }
         if !self.source_receipt_progress.lock().unwrap().is_after_closure(&source_commit_id.to_string()) {
             bail!(crate::deployment::OwnershipError::FreshReceiptRequired);
         }
         let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
-        let client = crate::pg::connect(&url).await?;
+        let client = crate::deployment::connect(&url).await?;
         let ownership =
             crate::deployment::quiesce(&client, &key, expected_owner, generation, handoff_id, source_commit_id).await?;
         if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
@@ -1298,7 +1301,7 @@ impl Engine {
         };
         let ownership = async {
             let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
-            let client = crate::pg::connect(&url).await?;
+            let client = crate::deployment::connect(&url).await?;
             crate::deployment::promote(
                 &client,
                 &key,
@@ -1321,9 +1324,7 @@ impl Engine {
                 Ok(ownership)
             }
             Err(error) => {
-                if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
-                    state.role = previous_role;
-                }
+                self.restore_failed_promotion_role(previous_role);
                 Err(error)
             }
         }
@@ -1375,13 +1376,6 @@ impl Engine {
             bail!(crate::deployment::OwnershipError::PrecloseRequired);
         }
         self.wait_for_control_drain().await;
-        // Managed boot starts closed. Until the controller (or this first quiesce attempt) has
-        // captured a frontier, restored receipts have no safe relationship to that closure.
-        let mut progress = self.source_receipt_progress.lock().unwrap();
-        if !progress.has_closure() {
-            progress.snapshot_closure();
-            bail!(crate::deployment::OwnershipError::PrecloseRequired);
-        }
         Ok(())
     }
 
@@ -1408,12 +1402,20 @@ impl Engine {
         self.source_receipts.lock().unwrap().get(source_commit_id).cloned()
     }
 
-    #[cfg(test)]
-    fn record_source_drain_receipt_for_test(&self, source_commit_id: &str) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_source_drain_receipt_for_test(&self, source_commit_id: &str) {
         let receipt = SourceDrainReceipt { source_commit_id: source_commit_id.to_owned(), commit_lsn: "0/0".into() };
         self.source_receipts.lock().unwrap().insert(source_commit_id.to_owned(), receipt.clone());
         *self.last_source_receipt.lock().unwrap() = Some(receipt);
         self.source_receipt_progress.lock().unwrap().record(source_commit_id);
+    }
+
+    fn restore_failed_promotion_role(&self, previous_role: ManagedRole) {
+        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut()
+            && state.role == ManagedRole::Promoting
+        {
+            state.role = previous_role;
+        }
     }
 
     pub fn last_source_drain_receipt(&self) -> Option<SourceDrainReceipt> {

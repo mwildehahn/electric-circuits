@@ -853,6 +853,12 @@ pub(crate) async fn sequencer_loop(
                                 source_commit_id: source_commit_id.clone(),
                                 commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
                             };
+                            // This lock is the receipt/closure linearization point. Advance it
+                            // before awaiting catalog durability so a source fence already being
+                            // sequenced when admission closes is conservatively pre-closure. A
+                            // failed append never reaches `source_receipts`, so it still cannot
+                            // satisfy quiesce.
+                            source_receipt_progress.lock().unwrap().record(&source_commit_id);
                             if let Err(error) = catalog_tx
                                 .send_durable(CatalogEvent::SourceDrained(receipt.clone()))
                                 .await
@@ -866,11 +872,6 @@ pub(crate) async fn sequencer_loop(
                                 processing_failed = true;
                                 break;
                             }
-                            // This lock is the linearization point shared with admission closure.
-                            // Record before publishing the read-model entry, so a receipt whose
-                            // durable catalog append preceded closure can never be assigned a
-                            // post-closure sequence merely because this task was descheduled.
-                            source_receipt_progress.lock().unwrap().record(&source_commit_id);
                             source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");

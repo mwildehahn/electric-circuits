@@ -332,9 +332,11 @@ fn openapi_deployment_promote() {}
 struct NativeApiDoc;
 
 async fn openapi_json() -> Result<Response, AppError> {
-    let body = NativeApiDoc::openapi()
-        .to_json()
-        .map_err(|e| AppError { status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("serialize OpenAPI: {e}") })?;
+    let body = NativeApiDoc::openapi().to_json().map_err(|e| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        msg: format!("serialize OpenAPI: {e}"),
+        retry_after: false,
+    })?;
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok((headers, body).into_response())
@@ -563,6 +565,7 @@ fn require_private_admin_with_secret(headers: &HeaderMap, secret: Option<&str>) 
         return Err(AppError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             msg: "private admin authentication is not configured".to_string(),
+            retry_after: false,
         });
     };
     let authorized = headers
@@ -573,7 +576,11 @@ fn require_private_admin_with_secret(headers: &HeaderMap, secret: Option<&str>) 
     if authorized {
         Ok(())
     } else {
-        Err(AppError { status: StatusCode::UNAUTHORIZED, msg: "private admin authentication failed".to_string() })
+        Err(AppError {
+            status: StatusCode::UNAUTHORIZED,
+            msg: "private admin authentication failed".to_string(),
+            retry_after: false,
+        })
     }
 }
 
@@ -608,11 +615,13 @@ async fn drained_through(
     let parsed = uuid::Uuid::parse_str(&source_commit_id).map_err(|_| AppError {
         status: StatusCode::BAD_REQUEST,
         msg: "source_commit_id must be a UUID".to_string(),
+        retry_after: false,
     })?;
     if parsed.to_string() != source_commit_id {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
             msg: "source_commit_id must be a canonical lowercase UUID".to_string(),
+            retry_after: false,
         });
     }
     let receipt = engine.source_drain_receipt(&source_commit_id);
@@ -636,12 +645,16 @@ struct DeploymentTransitionReq {
 }
 
 fn canonical_uuid(value: &str, name: &str) -> Result<uuid::Uuid, AppError> {
-    let parsed = uuid::Uuid::parse_str(value)
-        .map_err(|_| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{name} must be a UUID") })?;
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| AppError {
+        status: StatusCode::BAD_REQUEST,
+        msg: format!("{name} must be a UUID"),
+        retry_after: false,
+    })?;
     if parsed.to_string() != value {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
             msg: format!("{name} must be a canonical lowercase UUID"),
+            retry_after: false,
         });
     }
     Ok(parsed)
@@ -813,7 +826,7 @@ struct CreateShapeReq {
 /// reserved namespace (see [`validate_new_subscription`]).
 fn validate_subscription(sub: Option<String>) -> Result<Option<String>, AppError> {
     let Some(sub) = sub else { return Ok(None) };
-    let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string() };
+    let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string(), retry_after: false };
     if sub.is_empty() {
         return Err(bad("subscription must not be empty (omit it to have one minted)"));
     }
@@ -949,7 +962,7 @@ impl CreateShapeRequestError {
             Self::UnknownTable(table) => format!("unknown table '{table}'"),
             Self::UnknownColumn { table, column } => format!("unknown column '{column}' on table '{table}'"),
         };
-        AppError { status: StatusCode::BAD_REQUEST, msg }
+        AppError { status: StatusCode::BAD_REQUEST, msg, retry_after: false }
     }
 }
 
@@ -1002,7 +1015,9 @@ async fn get_shape(State(engine): State<Engine>, Path(id): Path<String>) -> Resu
             let subscriptions = Some(engine.subscription_count(&rec.id).await);
             Ok(Json(ShapeResp { state, subscriptions, ..ShapeResp::of(&engine, rec) }))
         }
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") }),
+        None => {
+            Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found"), retry_after: false })
+        }
     }
 }
 
@@ -1066,7 +1081,11 @@ async fn get_shape_log(
 ) -> Result<Json<ShapeLogResp>, AppError> {
     engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
-        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("shape {id} not found"),
+            retry_after: false,
+        });
     };
     // A touch reactivates: if the shape is dormant, replay it live first so the log is current.
     engine.ensure_active(&id).await?;
@@ -1125,7 +1144,11 @@ async fn get_shape_rows(
 ) -> Result<Json<ShapeRowsResp>, AppError> {
     engine.ensure_not_degraded()?;
     let Some(rec) = engine.get_shape(&id).await else {
-        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("shape {id} not found"),
+            retry_after: false,
+        });
     };
     // A touch reactivates: if the shape is dormant, replay it live first so the fold is current.
     engine.ensure_active(&id).await?;
@@ -1220,8 +1243,11 @@ async fn release_shape(
 /// `public.<name>` sugar, `schema.name` is taken as given, anything else is a 400 (never a
 /// mis-resolved lookup).
 fn path_table(raw: &str) -> Result<TableRef, AppError> {
-    TableRef::parse(raw)
-        .map_err(|e| AppError { status: StatusCode::BAD_REQUEST, msg: format!("invalid table '{raw}': {e:#}") })
+    TableRef::parse(raw).map_err(|e| AppError {
+        status: StatusCode::BAD_REQUEST,
+        msg: format!("invalid table '{raw}': {e:#}"),
+        retry_after: false,
+    })
 }
 
 /// `GET /tables/{name}/offset` — the sequencer's position in the (segmented) change log.
@@ -1241,7 +1267,11 @@ async fn table_offset(
             "path": pos.path(),
             "offset": pos.offset,
         }))),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+        None => Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("no tailer for table {name}"),
+            retry_after: false,
+        }),
     }
 }
 
@@ -1249,7 +1279,11 @@ async fn table_families(State(engine): State<Engine>, Path(name): Path<String>) 
     let name = path_table(&name)?;
     match engine.table_stats(&name).await {
         Some(stats) => Ok(Json(stats)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+        None => Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("no tailer for table {name}"),
+            retry_after: false,
+        }),
     }
 }
 
@@ -1262,7 +1296,7 @@ async fn get_table_schema(
     let table = path_table(&table)?;
     match engine.table_schema_info(&table).await {
         Ok(info) => Ok(Json(info)),
-        Err(e) => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("{e:#}"), retry_after: false }),
     }
 }
 
@@ -1289,7 +1323,7 @@ async fn insert_table_row(
     let values = req.columns.or(req.values).unwrap_or_default();
     match engine.insert_row(&table, &values).await {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}"), retry_after: false }),
     }
 }
 
@@ -1313,7 +1347,7 @@ async fn delete_table_rows(
     let table = path_table(&table)?;
     match engine.delete_rows(&table, &req.keys).await {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
+        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}"), retry_after: false }),
     }
 }
 
@@ -1338,7 +1372,11 @@ async fn get_node_index(
 ) -> Result<Json<crate::engine::NodeIndex>, AppError> {
     match engine.node_index(&q.sig, q.cap.unwrap_or(500)).await {
         Some(idx) => Ok(Json(idx)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.sig) }),
+        None => Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: format!("node {} not found", q.sig),
+            retry_after: false,
+        }),
     }
 }
 
@@ -1362,7 +1400,9 @@ async fn get_state_node(
 ) -> Result<Json<serde_json::Value>, AppError> {
     match engine.dump_node(&q.id).await {
         Some(v) => Ok(Json(v)),
-        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.id) }),
+        None => {
+            Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.id), retry_after: false })
+        }
     }
 }
 
@@ -1413,6 +1453,7 @@ async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Va
         return Err(AppError {
             status: StatusCode::CONFLICT,
             msg: "the epoch is not broken; nothing to reset".to_string(),
+            retry_after: false,
         });
     };
     engine.reset_epoch(reason).await?;
@@ -1456,6 +1497,7 @@ async fn get_prometheus() -> Response {
 struct AppError {
     status: StatusCode,
     msg: String,
+    retry_after: bool,
 }
 
 impl From<anyhow::Error> for AppError {
@@ -1464,18 +1506,17 @@ impl From<anyhow::Error> for AppError {
         // A degradation is the one engine failure that is not a 500: the request was fine, the
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
-        let status = if e.downcast_ref::<crate::engine::Degraded>().is_some()
-            || e.downcast_ref::<crate::engine::EpochBroken>().is_some()
-            || e.downcast_ref::<crate::engine::EpochResetting>().is_some()
-            // A create that kept losing the same race is not a server fault either: the request is
-            // valid, the engine is busy retiring things underneath it (`CreateRaced`).
-            || e.downcast_ref::<crate::engine::CreateRaced>().is_some()
+        let retry_after = e.downcast_ref::<crate::engine::CreateRaced>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
-            || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
-            || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired))
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));
+        let status = if retry_after
+            || e.downcast_ref::<crate::engine::Degraded>().is_some()
+            || e.downcast_ref::<crate::engine::EpochBroken>().is_some()
+            || e.downcast_ref::<crate::engine::EpochResetting>().is_some()
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))
         {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
@@ -1487,14 +1528,14 @@ impl From<anyhow::Error> for AppError {
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
-        AppError { status, msg: format!("{e:#}") }
+        AppError { status, msg: format!("{e:#}"), retry_after }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let mut response = (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response();
-        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+        if self.retry_after {
             response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
@@ -1508,8 +1549,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json, require_private_admin_with_secret,
-        router_with_introspection,
+        AppError, CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json,
+        require_private_admin_with_secret, router_with_introspection,
     };
     use crate::predicate::PredicateJson;
     use crate::{ds::DsClient, engine::Engine};
@@ -1604,6 +1645,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn managed_ownership_routes_report_an_unreachable_coordinator_as_retryable() {
+        crate::config::set_globals(
+            "http-route-test",
+            "http-route-test",
+            Some("gateway-secret"),
+            Some("controller-secret"),
+        );
+        let pg_url = "postgres://127.0.0.1:1/unreachable".to_string();
+        let auth = "Bearer controller-secret";
+
+        let status_engine =
+            Engine::new_pg_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"), pg_url.clone());
+        status_engine.install_managed_role_for_test(false);
+        let status = router_with_introspection(status_engine, false)
+            .oneshot(
+                Request::get("/_admin/deployment/status")
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+
+        let promote_engine =
+            Engine::new_pg_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"), pg_url.clone());
+        promote_engine.install_managed_role_for_test(false);
+        let promote = router_with_introspection(promote_engine, false)
+            .oneshot(
+                Request::post("/_admin/deployment/promote")
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "coordinationKey": "a".repeat(64),
+                            "ownerRevision": "revision-a",
+                            "successorRevision": "test-revision",
+                            "generation": 1,
+                            "handoffId": "00000000-0000-0000-0000-000000000000",
+                            "sourceCommitId": "00000000-0000-0000-0000-000000000000"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(promote.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(promote.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+
+        let quiesce_engine =
+            Engine::new_pg_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"), pg_url);
+        quiesce_engine.install_managed_role_for_test(false);
+        quiesce_engine.close_control_admission_with_receipt_barrier().await;
+        quiesce_engine.record_source_drain_receipt_for_test("00000000-0000-0000-0000-000000000000");
+        let quiesce = router_with_introspection(quiesce_engine, false)
+            .oneshot(
+                Request::post("/_admin/deployment/quiesce")
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "coordinationKey": "a".repeat(64),
+                            "ownerRevision": "test-revision",
+                            "generation": 1,
+                            "handoffId": "00000000-0000-0000-0000-000000000000",
+                            "sourceCommitId": "00000000-0000-0000-0000-000000000000"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quiesce.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(quiesce.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
+    }
+
+    #[test]
+    fn retry_after_is_reserved_for_retryable_unavailability() {
+        let degraded: AppError = anyhow::Error::new(crate::engine::Degraded).into();
+        let preclose: AppError = anyhow::Error::new(crate::deployment::OwnershipError::PrecloseRequired).into();
+        let fresh: AppError = anyhow::Error::new(crate::deployment::OwnershipError::FreshReceiptRequired).into();
+        assert!(!degraded.retry_after);
+        assert!(preclose.retry_after);
+        assert!(fresh.retry_after);
     }
 
     #[tokio::test]

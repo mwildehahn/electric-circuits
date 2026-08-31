@@ -99,8 +99,37 @@ async fn failed_promote_restores_the_previous_managed_role() {
             uuid::Uuid::nil(),
         )
         .await;
-    assert!(error.is_err());
+    let error = error.unwrap_err();
+    assert!(
+        error.chain().any(|cause| cause.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()),
+        "an unavailable ownership coordinator must be typed retryable: {error:#}"
+    );
     assert_eq!(engine.managed_status().unwrap().0, ManagedRole::Standby);
+}
+
+#[tokio::test]
+async fn failed_promote_never_overwrites_a_concurrent_successful_owner() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    engine.install_managed_role_for_test(false);
+    {
+        let mut state = engine.managed_deployment.lock().unwrap();
+        let state = state.as_mut().unwrap();
+        state.role = ManagedRole::Active;
+        state.ownership = Some(crate::deployment::Ownership {
+            coordination_key: "a".repeat(64),
+            generation: 2,
+            owner_revision: "test-revision".into(),
+            phase: crate::deployment::OwnershipPhase::Active,
+            handoff_id: None,
+            source_commit_id: None,
+        });
+    }
+
+    // This models an older overlapping request failing after another request completed its CAS.
+    engine.restore_failed_promotion_role(ManagedRole::Standby);
+    let (role, ownership) = engine.managed_status().unwrap();
+    assert_eq!(role, ManagedRole::Active);
+    assert_eq!(ownership.unwrap().generation, 2);
 }
 
 #[tokio::test]
