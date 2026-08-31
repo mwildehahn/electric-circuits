@@ -162,7 +162,7 @@ pub async fn quiesce(
              SET phase = 'quiesced', handoff_id = $4::uuid, source_commit_id = $5::uuid, updated_at = statement_timestamp() \
              WHERE coordination_key = $1 AND owner_revision = $2 AND generation = $3 AND phase = 'active' \
              RETURNING generation, owner_revision, phase, handoff_id::text AS handoff_id, source_commit_id::text AS source_commit_id",
-            &[&key, &expected_owner, &generation, &handoff, &source],
+            &[&key, &expected_owner, &generation, &handoff_id, &source_commit_id],
         )
         .await;
     let row = backend(row.context("quiesce writer ownership"))?;
@@ -202,7 +202,7 @@ pub async fn promote(
              WHERE coordination_key = $1 AND owner_revision = $3 AND generation = $4 AND phase = 'quiesced' \
                AND handoff_id = $5::uuid AND source_commit_id = $6::uuid \
              RETURNING generation, owner_revision, phase, handoff_id::text AS handoff_id, source_commit_id::text AS source_commit_id",
-            &[&key, &successor_revision, &expected_owner, &generation, &handoff, &source],
+            &[&key, &successor_revision, &expected_owner, &generation, &handoff_id, &source_commit_id],
         )
         .await;
     let row = backend(row.context("promote writer ownership"))?;
