@@ -243,8 +243,18 @@ the lifecycle controller, ECS/ALB topology, and failure-matrix qualification rem
 
 The quiesce operation is deliberately two-step when admission is open: its first call closes and
 drains admission and returns retryable 503. The controller then obtains a fresh source receipt and
-repeats quiesce with the same expected identities. A 409 remains reserved for an ownership CAS
-conflict and makes no ownership-row mutation.
+repeats quiesce with the same expected identities. A durable receipt that predates the closure is
+also rejected with retryable 503: it cannot fence a mutation already admitted before the closure.
+The engine snapshots an in-process receipt sequence when close-and-drain completes, and accepts
+only a receipt recorded strictly after that snapshot. Repeating close is idempotent and preserves
+the snapshot; after restart, managed admission is fail-closed and the controller must close then
+record a fresh fence again. A 409 remains reserved for an ownership CAS conflict and makes no
+ownership-row mutation.
+
+Promotion requests additionally include `successorRevision`; it is required to exactly match the
+immutable revision configured on the receiving process. A quiescing or shutting-down incumbent
+therefore cannot replay a promote request and reclaim the row for itself. The successor alone may
+perform the idempotent exact-generation promotion.
 
 - **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
   replica identity on the new table and introspect it at startup.

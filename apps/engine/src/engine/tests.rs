@@ -41,14 +41,37 @@ async fn managed_public_traffic_waits_for_full_engine_readiness_after_claim() {
 async fn quiesce_requires_a_receipt_after_admission_is_preclosed_and_drained() {
     let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     assert!(engine.ensure_control_admitted().is_ok());
+    engine.record_source_drain_receipt_for_test("receipt-before-close");
 
     // This is the pre-CAS barrier used by managed quiesce. An open admission is closed and
     // drained, but cannot use a receipt that might predate an admitted mutation.
     assert!(engine.require_preclosed_control_drain().await.is_err());
     assert!(engine.ensure_control_admitted().is_err());
 
-    // A retry after the controller has observed closure can proceed to receipt verification.
+    // A retry sees the closure frontier, but the old receipt is rejected: the controller must
+    // write its named source fence only after the close endpoint has returned.
     assert!(engine.require_preclosed_control_drain().await.is_ok());
+    assert!(
+        !engine.source_receipt_progress.lock().unwrap().is_after_closure("receipt-before-close"),
+        "a durable receipt from before closure cannot fence an admitted mutation"
+    );
+    engine.record_source_drain_receipt_for_test("receipt-after-close");
+    assert!(engine.source_receipt_progress.lock().unwrap().is_after_closure("receipt-after-close"));
+}
+
+#[tokio::test]
+async fn repeated_admission_close_preserves_the_original_receipt_frontier() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    engine.record_source_drain_receipt_for_test("receipt-before-close");
+    assert!(engine.close_control_admission_with_receipt_barrier().await);
+    assert!(
+        !engine.close_control_admission_with_receipt_barrier().await,
+        "the authenticated close route is idempotent"
+    );
+    engine.record_source_drain_receipt_for_test("receipt-after-close");
+    let progress = engine.source_receipt_progress.lock().unwrap();
+    assert!(!progress.is_after_closure("receipt-before-close"));
+    assert!(progress.is_after_closure("receipt-after-close"));
 }
 
 #[tokio::test]
@@ -70,12 +93,66 @@ async fn failed_promote_restores_the_previous_managed_role() {
         .deployment_promote(
             &"a".repeat(64),
             "018f0f46-93d0-7cf0-8b74-4bf0866ec284",
+            "018f0f46-93d0-7cf0-8b74-4bf0866ec285",
             1,
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
         )
         .await;
     assert!(error.is_err());
+    assert_eq!(engine.managed_status().unwrap().0, ManagedRole::Standby);
+}
+
+#[tokio::test]
+async fn stale_promote_cannot_reclaim_ownership_from_a_quiescing_incumbent() {
+    let engine = Engine::new_pg_for_in_process_test(
+        DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        "postgres://127.0.0.1:1/unreachable".into(),
+    );
+    *engine.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+        config: crate::deployment::ManagedDeploymentConfig { revision: "revision-a".into(), initial_active: false },
+        coordination_key: "a".repeat(64),
+        role: ManagedRole::Quiescing,
+        ownership: None,
+    });
+    engine.shutdown.begin();
+
+    let error = engine
+        .deployment_promote(&"a".repeat(64), "revision-a", "revision-a", 1, uuid::Uuid::nil(), uuid::Uuid::nil())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::deployment::OwnershipError>()
+            .is_some_and(|error| matches!(error, crate::deployment::OwnershipError::Conflict)),
+        "the precondition must reject before attempting the ownership database mutation: {error:#}"
+    );
+    assert_eq!(engine.managed_status().unwrap().0, ManagedRole::Quiescing);
+}
+
+#[tokio::test]
+async fn promote_requires_the_receiving_process_immutable_revision() {
+    let engine = Engine::new_pg_for_in_process_test(
+        DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        "postgres://127.0.0.1:1/unreachable".into(),
+    );
+    *engine.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+        config: crate::deployment::ManagedDeploymentConfig { revision: "revision-b".into(), initial_active: false },
+        coordination_key: "a".repeat(64),
+        role: ManagedRole::Standby,
+        ownership: None,
+    });
+
+    let error = engine
+        .deployment_promote(&"a".repeat(64), "revision-a", "revision-a", 1, uuid::Uuid::nil(), uuid::Uuid::nil())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::deployment::OwnershipError>()
+            .is_some_and(|error| matches!(error, crate::deployment::OwnershipError::Conflict)),
+        "a request naming another successor must be rejected before database access: {error:#}"
+    );
     assert_eq!(engine.managed_status().unwrap().0, ManagedRole::Standby);
 }
 

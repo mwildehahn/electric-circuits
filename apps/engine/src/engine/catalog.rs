@@ -1125,6 +1125,12 @@ impl Engine {
         let live_last = self.last_source_receipt.lock().unwrap().clone();
         let preserve_live_last =
             live_last.as_ref().is_some_and(|receipt| !fold.source_receipts.contains_key(&receipt.source_commit_id));
+        {
+            let mut progress = self.source_receipt_progress.lock().unwrap();
+            for source_commit_id in fold.source_receipts.keys() {
+                progress.record(source_commit_id);
+            }
+        }
         self.source_receipts.lock().unwrap().extend(fold.source_receipts.clone());
         if !preserve_live_last {
             *self.last_source_receipt.lock().unwrap() = fold.last_source_receipt.clone().or(live_last);

@@ -225,6 +225,44 @@ pub struct SourceDrainReceipt {
     pub commit_lsn: String,
 }
 
+/// In-process ordering for durable source receipts. The catalog remains the durable authority for
+/// the receipt itself; this ledger only distinguishes receipts observed before a control-admission
+/// closure from those observed afterwards. It intentionally resets on process restart, where
+/// managed admission is fail-closed and the controller must create a new fence.
+#[derive(Default)]
+pub(crate) struct SourceReceiptProgress {
+    next_sequence: u64,
+    sequences: HashMap<String, u64>,
+    closure_watermark: Option<u64>,
+}
+
+impl SourceReceiptProgress {
+    pub(crate) fn record(&mut self, source_commit_id: &str) {
+        if !self.sequences.contains_key(source_commit_id) {
+            self.next_sequence += 1;
+            self.sequences.insert(source_commit_id.to_owned(), self.next_sequence);
+        }
+    }
+
+    fn snapshot_closure(&mut self) {
+        self.closure_watermark = Some(self.next_sequence);
+    }
+
+    fn clear_closure(&mut self) {
+        self.closure_watermark = None;
+    }
+
+    fn is_after_closure(&self, source_commit_id: &str) -> bool {
+        self.closure_watermark
+            .zip(self.sequences.get(source_commit_id))
+            .is_some_and(|(watermark, sequence)| *sequence > watermark)
+    }
+
+    fn has_closure(&self) -> bool {
+        self.closure_watermark.is_some()
+    }
+}
+
 /// Fail-closed degradation state, latched when a flip batch exhausts its retries.
 ///
 /// The inner-set node was already reconciled under the registry lock before the batch's query-backs
@@ -289,6 +327,7 @@ pub struct Engine {
     /// not populate it.
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
+    source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     /// Cross-table subquery registry: maintained inner-set nodes (shared by canonical signature) + the
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
@@ -1054,6 +1093,7 @@ impl Engine {
             control_admission: ControlAdmission::new(),
             source_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             last_source_receipt: Arc::new(std::sync::Mutex::new(None)),
+            source_receipt_progress: Arc::new(std::sync::Mutex::new(SourceReceiptProgress::default())),
             subqueries,
             trace_tx,
             flip_tx,
@@ -1210,8 +1250,8 @@ impl Engine {
         // a fresh receipt and retries. The ordinary close endpoint is idempotent, so this is a
         // bounded controller round-trip rather than a new protocol surface.
         self.require_preclosed_control_drain().await?;
-        if self.source_drain_receipt(&source_commit_id.to_string()).is_none() {
-            bail!(crate::deployment::OwnershipError::Conflict);
+        if !self.source_receipt_progress.lock().unwrap().is_after_closure(&source_commit_id.to_string()) {
+            bail!(crate::deployment::OwnershipError::FreshReceiptRequired);
         }
         let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
         let client = crate::pg::connect(&url).await?;
@@ -1229,17 +1269,24 @@ impl Engine {
         &self,
         expected_key: &str,
         expected_owner: &str,
+        successor_revision: &str,
         generation: i64,
         handoff_id: uuid::Uuid,
         source_commit_id: uuid::Uuid,
     ) -> Result<crate::deployment::Ownership> {
-        let (revision, key) = {
+        let (revision, key, role) = {
             let guard = self.managed_deployment.lock().unwrap();
             let state =
                 guard.as_ref().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
-            (state.config.revision.clone(), state.coordination_key.clone())
+            (state.config.revision.clone(), state.coordination_key.clone(), state.role)
         };
-        if key != expected_key {
+        // A promotion request names both ends of the transfer. Without the successor identity an
+        // incumbent that is already quiescing could write its own revision back into ownership.
+        if key != expected_key
+            || revision != successor_revision
+            || role == ManagedRole::Quiescing
+            || self.shutdown.is_shutting_down()
+        {
             bail!(crate::deployment::OwnershipError::Conflict);
         }
         let previous_role = {
@@ -1307,12 +1354,34 @@ impl Engine {
         self.control_admission.open.store(false, Ordering::Release);
     }
 
+    /// Close admission, wait for every previously admitted mutation, then snapshot the receipt
+    /// frontier. A source fence recorded after this method returns has a sequence strictly above
+    /// the watermark; an earlier receipt can never be replayed into a handoff.
+    pub async fn close_control_admission_with_receipt_barrier(&self) -> bool {
+        let transitioned = self.control_admission.open.swap(false, Ordering::AcqRel);
+        self.wait_for_control_drain().await;
+        let mut progress = self.source_receipt_progress.lock().unwrap();
+        if transitioned || !progress.has_closure() {
+            // Managed boot is already closed. Its first explicit close must still establish the
+            // frontier so a controller can close, write a fence, and quiesce without an extra
+            // round trip; later idempotent closes preserve that original frontier.
+            progress.snapshot_closure();
+        }
+        transitioned
+    }
+
     async fn require_preclosed_control_drain(&self) -> Result<()> {
-        if self.control_admission.open.swap(false, Ordering::AcqRel) {
-            self.wait_for_control_drain().await;
+        if self.close_control_admission_with_receipt_barrier().await {
             bail!(crate::deployment::OwnershipError::PrecloseRequired);
         }
         self.wait_for_control_drain().await;
+        // Managed boot starts closed. Until the controller (or this first quiesce attempt) has
+        // captured a frontier, restored receipts have no safe relationship to that closure.
+        let mut progress = self.source_receipt_progress.lock().unwrap();
+        if !progress.has_closure() {
+            progress.snapshot_closure();
+            bail!(crate::deployment::OwnershipError::PrecloseRequired);
+        }
         Ok(())
     }
 
@@ -1331,11 +1400,20 @@ impl Engine {
     pub fn open_control_admission(&self) {
         if !self.shutdown.is_shutting_down() {
             self.control_admission.open.store(true, Ordering::Release);
+            self.source_receipt_progress.lock().unwrap().clear_closure();
         }
     }
 
     pub fn source_drain_receipt(&self, source_commit_id: &str) -> Option<SourceDrainReceipt> {
         self.source_receipts.lock().unwrap().get(source_commit_id).cloned()
+    }
+
+    #[cfg(test)]
+    fn record_source_drain_receipt_for_test(&self, source_commit_id: &str) {
+        let receipt = SourceDrainReceipt { source_commit_id: source_commit_id.to_owned(), commit_lsn: "0/0".into() };
+        self.source_receipts.lock().unwrap().insert(source_commit_id.to_owned(), receipt.clone());
+        *self.last_source_receipt.lock().unwrap() = Some(receipt);
+        self.source_receipt_progress.lock().unwrap().record(source_commit_id);
     }
 
     pub fn last_source_drain_receipt(&self) -> Option<SourceDrainReceipt> {
@@ -1551,6 +1629,7 @@ impl Engine {
                 self.catalog_tx.clone(),
                 self.source_receipts.clone(),
                 self.last_source_receipt.clone(),
+                self.source_receipt_progress.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),

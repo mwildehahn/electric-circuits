@@ -46,6 +46,8 @@ pub enum OwnershipError {
     Disabled,
     #[error("control admission was open; acquire a fresh source receipt and retry quiesce")]
     PrecloseRequired,
+    #[error("source receipt predates control-admission closure; acquire a fresh source receipt and retry quiesce")]
+    FreshReceiptRequired,
 }
 
 /// The coordinator is unavailable or returned malformed state. It is distinct from a compare and

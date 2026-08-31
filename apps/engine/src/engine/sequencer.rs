@@ -135,6 +135,7 @@ pub(crate) fn spawn_sequencer(
     catalog_tx: CatalogWriter,
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
+    source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
@@ -162,6 +163,7 @@ pub(crate) fn spawn_sequencer(
         catalog_tx,
         source_receipts,
         last_source_receipt,
+        source_receipt_progress,
         cmd_rx,
         processed.clone(),
         stats.clone(),
@@ -360,6 +362,7 @@ pub(crate) async fn sequencer_loop(
     catalog_tx: CatalogWriter,
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
+    source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<LogPosition>>,
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
@@ -863,6 +866,11 @@ pub(crate) async fn sequencer_loop(
                                 processing_failed = true;
                                 break;
                             }
+                            // This lock is the linearization point shared with admission closure.
+                            // Record before publishing the read-model entry, so a receipt whose
+                            // durable catalog append preceded closure can never be assigned a
+                            // post-closure sequence merely because this task was descheduled.
+                            source_receipt_progress.lock().unwrap().record(&source_commit_id);
                             source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");

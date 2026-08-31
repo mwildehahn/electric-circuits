@@ -167,6 +167,19 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentPromoteRequest {
+    coordination_key: String,
+    owner_revision: String,
+    /// Immutable revision of the receiving process. The endpoint refuses a request that does not
+    /// name this process, preventing a quiescing incumbent from reclaiming ownership.
+    successor_revision: String,
+    generation: i64,
+    handoff_id: String,
+    source_commit_id: String,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SubsetFeedRequest {
@@ -269,6 +282,19 @@ fn openapi_subset_feed() {}
 #[allow(dead_code)]
 fn openapi_aggregate() {}
 
+#[utoipa::path(
+    post,
+    path = "/_admin/deployment/promote",
+    request_body = DeploymentPromoteRequest,
+    responses(
+        (status = 200, description = "Exact quiesced generation promoted"),
+        (status = 409, description = "Ownership or receiving-revision conflict", body = ErrorResponse),
+        (status = 503, description = "Ownership storage unavailable", body = ErrorResponse)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_deployment_promote() {}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -282,7 +308,8 @@ fn openapi_aggregate() {}
         openapi_release_shape,
         openapi_subset_query,
         openapi_subset_feed,
-        openapi_aggregate
+        openapi_aggregate,
+        openapi_deployment_promote
     ),
     components(schemas(
         LeafOp,
@@ -298,6 +325,7 @@ fn openapi_aggregate() {}
         AggregateFunction,
         AggregateRequest,
         SubsetFeedRequest,
+        DeploymentPromoteRequest,
         ErrorResponse
     ))
 )]
@@ -554,8 +582,7 @@ async fn close_control_admission(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
-    engine.close_control_admission();
-    engine.wait_for_control_drain().await;
+    engine.close_control_admission_with_receipt_barrier().await;
     Ok(Json(serde_json::json!({ "controlAdmission": "closed" })))
 }
 
@@ -598,7 +625,7 @@ async fn drained_through(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct DeploymentTransitionReq {
     coordination_key: String,
@@ -666,13 +693,20 @@ async fn deployment_quiesce(
 async fn deployment_promote(
     State(engine): State<Engine>,
     headers: HeaderMap,
-    Json(req): Json<DeploymentTransitionReq>,
+    Json(req): Json<DeploymentPromoteRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
     let handoff_id = canonical_uuid(&req.handoff_id, "handoffId")?;
     let source_commit_id = canonical_uuid(&req.source_commit_id, "sourceCommitId")?;
     let ownership = engine
-        .deployment_promote(&req.coordination_key, &req.owner_revision, req.generation, handoff_id, source_commit_id)
+        .deployment_promote(
+            &req.coordination_key,
+            &req.owner_revision,
+            &req.successor_revision,
+            req.generation,
+            handoff_id,
+            source_commit_id,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "accepted": true, "phase": "active", "generation": ownership.generation })))
 }
@@ -1441,6 +1475,7 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired))
         {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
@@ -1538,6 +1573,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(control_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn deployment_promote_requires_the_receiving_successor_revision_in_its_json_contract() {
+        crate::config::set_globals(
+            "http-route-test",
+            "http-route-test",
+            Some("gateway-secret"),
+            Some("controller-secret"),
+        );
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let app = router_with_introspection(engine, false);
+        let body = serde_json::json!({
+            "coordinationKey": "a".repeat(64),
+            "ownerRevision": "revision-a",
+            "generation": 1,
+            "handoffId": "00000000-0000-0000-0000-000000000000",
+            "sourceCommitId": "00000000-0000-0000-0000-000000000000"
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/_admin/deployment/promote")
+                    .header(header::AUTHORIZATION, "Bearer controller-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
