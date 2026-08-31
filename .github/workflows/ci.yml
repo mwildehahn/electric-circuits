@@ -28,16 +28,7 @@ jobs:
       - name: Rust formatting (rustfmt.toml at the root)
         run: cargo fmt --check
 
-      - name: Rust engine tests
-        run: cargo test -p electric-circuits-engine --features test-support
-
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Put PostgreSQL server binaries on PATH
+      - name: Start isolated PostgreSQL 18 for Rust ownership tests
         run: |
           # Pin the ephemeral logical-replication harness to PostgreSQL 18; do not let the
           # runner's preinstalled major select the test boundary implicitly.
@@ -54,6 +45,21 @@ jobs:
           PGBIN="/usr/lib/postgresql/18/bin"
           echo "$PGBIN" >> "$GITHUB_PATH"
           "$PGBIN/initdb" --version
+          DATA="$RUNNER_TEMP/circuits-rust-pg"
+          "$PGBIN/initdb" -D "$DATA" -U postgres --auth=trust --no-sync
+          "$PGBIN/pg_ctl" -D "$DATA" -o '-p 55432 -c wal_level=logical' -w start
+          echo 'ELECTRIC_CIRCUITS_TEST_PG_URL=postgres://postgres@127.0.0.1:55432/postgres' >> "$GITHUB_ENV"
+
+      - name: Rust engine tests
+        run: |
+          cargo test -p electric-circuits-engine --features test-support
+          cargo test -p electric-circuits-engine --test deployment_ownership -- --ignored
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
 
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
