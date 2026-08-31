@@ -446,16 +446,12 @@ async fn require_managed_public_ready(
     {
         return next.run(request).await;
     }
-    match engine.managed_public_ready() {
-        true => next.run(request).await,
-        false => {
-            let mut response =
-                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "deployment not ready; retry" })))
-                    .into_response();
-            response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response
-        }
+    match engine.ensure_not_degraded() {
+        Ok(()) => next.run(request).await,
+        // `ensure_not_degraded` deliberately orders epoch/degradation latches before managed
+        // readiness. Keep that taxonomy at the outer fence too: an active but broken engine must
+        // report its durable diagnosis, while only transient deployment states get Retry-After.
+        Err(error) => AppError::from(error).into_response(),
     }
 }
 
@@ -1766,6 +1762,42 @@ mod tests {
             standby_app.oneshot(Request::post("/epoch/reset").body(Body::empty()).unwrap()).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn managed_data_routes_preserve_degradation_taxonomy_before_readiness_fencing() {
+        let degraded = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        degraded.install_managed_role_for_test(true);
+        degraded.force_degraded();
+        let response = router_with_introspection(degraded, false)
+            .oneshot(Request::get("/tables").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER), None);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("degraded: subquery membership effects were lost"));
+
+        let broken = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        broken.install_managed_role_for_test(true);
+        assert!(broken.latch_epoch_break(crate::engine::EpochBreakReason::SlotLost, "test_slot"));
+        let response = router_with_introspection(broken, false)
+            .oneshot(Request::get("/tables").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER), None);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("epoch broken"));
+
+        let standby = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        standby.install_managed_role_for_test(false);
+        let response = router_with_introspection(standby, false)
+            .oneshot(Request::get("/tables").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER), Some(&HeaderValue::from_static("1")));
     }
 
     #[test]

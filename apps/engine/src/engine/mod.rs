@@ -244,6 +244,21 @@ impl SourceReceiptProgress {
         }
     }
 
+    /// Installs a receipt read from the durable catalog. If admission was already closed while
+    /// boot was still restoring that catalog, this receipt necessarily predates the close: keep
+    /// it on (not across) that closure's frontier. Live sequencer receipts always use [`record`]
+    /// and therefore advance past the frontier.
+    pub(crate) fn record_restored(&mut self, source_commit_id: &str) {
+        if self.sequences.contains_key(source_commit_id) {
+            return;
+        }
+        if let Some(watermark) = self.closure_watermark {
+            self.sequences.insert(source_commit_id.to_owned(), watermark);
+        } else {
+            self.record(source_commit_id);
+        }
+    }
+
     fn snapshot_closure(&mut self) {
         self.closure_watermark = Some(self.next_sequence);
     }

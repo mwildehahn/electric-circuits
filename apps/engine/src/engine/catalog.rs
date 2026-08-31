@@ -1128,7 +1128,7 @@ impl Engine {
         {
             let mut progress = self.source_receipt_progress.lock().unwrap();
             for source_commit_id in fold.source_receipts.keys() {
-                progress.record(source_commit_id);
+                progress.record_restored(source_commit_id);
             }
         }
         self.source_receipts.lock().unwrap().extend(fold.source_receipts.clone());
@@ -1904,6 +1904,30 @@ mod tests {
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
         assert_eq!(engine.source_drain_receipt(&receipt.source_commit_id), Some(receipt.clone()));
         assert_eq!(engine.last_source_drain_receipt(), Some(receipt));
+    }
+
+    #[test]
+    fn restored_receipts_cannot_cross_a_closure_that_happened_during_boot() {
+        let old = SourceDrainReceipt {
+            source_commit_id: "018f5f4d-70c2-7d70-a4d5-5f7355078f85".to_string(),
+            commit_lsn: "0/16B6C50".to_string(),
+        };
+        let mut progress = super::super::SourceReceiptProgress::default();
+
+        // HTTP can close admission before `apply_catalog` restores this old durable receipt.
+        // The restore path calls `record_restored`, which must not advance across that frontier.
+        progress.snapshot_closure();
+        progress.record_restored(&old.source_commit_id);
+        assert!(progress.has_closure());
+        assert!(
+            !progress.is_after_closure(&old.source_commit_id),
+            "a receipt restored after close is historical, not a fresh source fence"
+        );
+        progress.record("018f5f4d-70c2-7d70-a4d5-5f7355078f86");
+        assert!(
+            progress.is_after_closure("018f5f4d-70c2-7d70-a4d5-5f7355078f86"),
+            "the first live receipt after restore must advance beyond the closure"
+        );
     }
 
     #[tokio::test]
