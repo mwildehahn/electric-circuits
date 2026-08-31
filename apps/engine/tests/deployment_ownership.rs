@@ -69,8 +69,10 @@ async fn ownership_cas_fences_bootstrap_handoff_restart_and_reverse_transfer() -
     );
 
     // A former revision is fenced after restart; the promoted revision alone can reclaim gen 2.
-    assert!(matches!(deployment::claim_or_observe(&first, &active_a, &key).await?, Claim::Standby(_)));
-    assert!(matches!(deployment::claim_or_observe(&first, &active_b, &key).await?, Claim::Active(_)));
+    let restart_a = deployment::claim_or_observe(&first, &active_a, &key).await?;
+    let restart_b = deployment::claim_or_observe(&first, &active_b, &key).await?;
+    assert_eq!(matches!(restart_a, Claim::Active(_)), successor == "revision-a");
+    assert_eq!(matches!(restart_b, Claim::Active(_)), successor == "revision-b");
 
     let reverse_handoff = Uuid::new_v4();
     let reverse_receipt = Uuid::new_v4();

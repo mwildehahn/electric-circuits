@@ -93,8 +93,11 @@ normal bounded boot backoff. Every non-admin data route independently returns st
 Authenticated controller routes are `GET /_admin/deployment/status`, `POST
 /_admin/deployment/quiesce`, and `POST /_admin/deployment/promote`. Transition requests require
 exact `coordinationKey`, `ownerRevision`, `generation`, canonical `handoffId`, and canonical
-`sourceCommitId`; duplicates are idempotent and conflicts are 409 without mutation. Quiesce also
-requires the matching durable source-fence receipt, closes admission, and begins graceful shutdown.
+`sourceCommitId`; duplicates are idempotent and ownership conflicts are 409 without mutation.
+Quiesce also requires the matching durable source-fence receipt. If admission was open, the first
+quiesce closes and drains it, then returns retryable 503 with `Retry-After: 1`; obtain a fresh
+receipt after that closure and retry. A preclosed/drained retry performs the CAS and begins graceful
+shutdown.
 Promotion advances only the exact quiesced generation and leaves admission closed until the existing
 explicit open call. This is an upstream pilot capability: release and production use remain gated by
 the Indexed schema migration, lifecycle controller, ECS/ALB workflow, and qualification matrix.

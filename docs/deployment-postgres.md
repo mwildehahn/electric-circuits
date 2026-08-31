@@ -241,6 +241,11 @@ reach its scale-up lifecycle hook; `/ready` and public data admission stay close
 active revision has restored and started ingest. This document does not authorize production use:
 the lifecycle controller, ECS/ALB topology, and failure-matrix qualification remain separate gates.
 
+The quiesce operation is deliberately two-step when admission is open: its first call closes and
+drains admission and returns retryable 503. The controller then obtains a fresh source receipt and
+repeats quiesce with the same expected identities. A 409 remains reserved for an ownership CAS
+conflict and makes no ownership-row mutation.
+
 - **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
   replica identity on the new table and introspect it at startup.
 - **Change-log disk is bounded by segment size/age and the retain window.** Every committed change

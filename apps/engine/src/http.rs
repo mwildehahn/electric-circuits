@@ -1440,6 +1440,7 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))
+            || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
         {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
@@ -1457,7 +1458,11 @@ impl From<anyhow::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response()
+        let mut response = (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response();
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 

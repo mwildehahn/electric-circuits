@@ -297,8 +297,12 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
              GET /ready reports `waiting` until it is. Cause: {err:#}",
             pg::boot_failure_name(&err),
         );
+        let managed_wakeup = engine.managed_wakeup();
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            _ = managed_wakeup.notified() => {
+                tracing::info!("boot: managed promotion woke the ownership retry loop");
+            }
             // A pod terminated while still waiting for its database stops dialling and takes the
             // ordinary shutdown path — a clean exit 0, not a kill.
             _ = shutdown.wait() => {

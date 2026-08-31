@@ -44,6 +44,8 @@ pub enum OwnershipError {
     Conflict,
     #[error("managed deployment is not configured")]
     Disabled,
+    #[error("control admission was open; acquire a fresh source receipt and retry quiesce")]
+    PrecloseRequired,
 }
 
 /// The coordinator is unavailable or returned malformed state. It is distinct from a compare and

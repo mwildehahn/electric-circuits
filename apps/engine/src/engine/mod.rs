@@ -279,6 +279,8 @@ pub struct Engine {
     health: Arc<std::sync::atomic::AtomicU8>,
     /// Opt-in ownership gate. Kept separate from health so legacy mode remains byte compatible.
     managed_deployment: Arc<std::sync::Mutex<Option<ManagedDeploymentState>>>,
+    /// Wakes a standby boot retry immediately after a successful local promotion.
+    managed_wakeup: Arc<tokio::sync::Notify>,
     /// Independent of read health: false refuses new control-plane mutations while restored stream
     /// reads continue. The deployment controller closes this before writing a source fence.
     control_admission: Arc<ControlAdmission>,
@@ -1048,6 +1050,7 @@ impl Engine {
             // Library mode: no Postgres to wait on, so report `active` immediately.
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
             managed_deployment: Arc::new(std::sync::Mutex::new(None)),
+            managed_wakeup: Arc::new(tokio::sync::Notify::new()),
             control_admission: ControlAdmission::new(),
             source_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             last_source_receipt: Arc::new(std::sync::Mutex::new(None)),
@@ -1140,6 +1143,10 @@ impl Engine {
     /// ingestor startup still happen after that claim.
     pub fn managed_public_ready(&self) -> bool {
         !self.managed_deployment_enabled() || self.readiness_status() == "active"
+    }
+
+    pub fn managed_wakeup(&self) -> Arc<tokio::sync::Notify> {
+        self.managed_wakeup.clone()
     }
 
     async fn claim_managed_ownership(&self, client: &tokio_postgres::Client) -> Result<()> {
@@ -1263,6 +1270,7 @@ impl Engine {
                     state.role = ManagedRole::Active;
                     state.ownership = Some(ownership.clone());
                 }
+                self.managed_wakeup.notify_one();
                 Ok(ownership)
             }
             Err(error) => {
@@ -1302,7 +1310,7 @@ impl Engine {
     async fn require_preclosed_control_drain(&self) -> Result<()> {
         if self.control_admission.open.swap(false, Ordering::AcqRel) {
             self.wait_for_control_drain().await;
-            bail!(crate::deployment::OwnershipError::Conflict);
+            bail!(crate::deployment::OwnershipError::PrecloseRequired);
         }
         self.wait_for_control_drain().await;
         Ok(())
