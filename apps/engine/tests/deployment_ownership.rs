@@ -46,7 +46,10 @@ async fn ownership_cas_fences_bootstrap_handoff_restart_and_reverse_transfer() -
     let handoff = Uuid::new_v4();
     let receipt = Uuid::new_v4();
     let wrong = deployment::quiesce(&first, &key, &owner.owner_revision, 2, handoff, receipt).await.unwrap_err();
-    assert!(wrong.downcast_ref::<OwnershipError>().is_some());
+    assert!(
+        wrong.chain().any(|cause| cause.downcast_ref::<OwnershipError>().is_some()),
+        "wrong generation must be a typed CAS conflict, got: {wrong:#}"
+    );
     let quiesced = deployment::quiesce(&first, &key, &owner.owner_revision, 1, handoff, receipt).await?;
     assert_eq!(quiesced.generation, 1);
     assert_eq!(deployment::quiesce(&first, &key, &owner.owner_revision, 1, handoff, receipt).await?, quiesced);
@@ -54,7 +57,10 @@ async fn ownership_cas_fences_bootstrap_handoff_restart_and_reverse_transfer() -
     let successor = if owner.owner_revision == "revision-a" { "revision-b" } else { "revision-a" };
     let wrong_promote =
         deployment::promote(&first, &key, successor, &owner.owner_revision, 2, handoff, receipt).await.unwrap_err();
-    assert!(wrong_promote.downcast_ref::<OwnershipError>().is_some());
+    assert!(
+        wrong_promote.chain().any(|cause| cause.downcast_ref::<OwnershipError>().is_some()),
+        "wrong generation must be a typed CAS conflict, got: {wrong_promote:#}"
+    );
     let promoted = deployment::promote(&first, &key, successor, &owner.owner_revision, 1, handoff, receipt).await?;
     assert_eq!(promoted.generation, 2);
     assert_eq!(
