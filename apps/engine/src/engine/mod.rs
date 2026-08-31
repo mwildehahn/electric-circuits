@@ -1277,27 +1277,35 @@ impl Engine {
         handoff_id: uuid::Uuid,
         source_commit_id: uuid::Uuid,
     ) -> Result<crate::deployment::Ownership> {
-        let (revision, key, role) = {
-            let guard = self.managed_deployment.lock().unwrap();
-            let state =
-                guard.as_ref().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
-            (state.config.revision.clone(), state.coordination_key.clone(), state.role)
-        };
         // A promotion request names both ends of the transfer. Without the successor identity an
         // incumbent that is already quiescing could write its own revision back into ownership.
-        if key != expected_key
-            || revision != successor_revision
-            || role == ManagedRole::Quiescing
-            || self.shutdown.is_shutting_down()
-        {
-            bail!(crate::deployment::OwnershipError::Conflict);
-        }
-        let previous_role = {
+        // Only a standby process changes local readiness while it validates the CAS. An active
+        // successor is already serving its persisted generation, so an idempotent retry must not
+        // withdraw it during a transient coordinator outage.
+        let restore_standby = {
             let mut guard = self.managed_deployment.lock().unwrap();
-            let state = guard.as_mut().expect("managed state stays installed");
-            let previous = state.role;
-            state.role = ManagedRole::Promoting;
-            previous
+            let state =
+                guard.as_mut().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
+            if state.coordination_key != expected_key
+                || state.config.revision != successor_revision
+                || state.role == ManagedRole::Quiescing
+                || self.shutdown.is_shutting_down()
+            {
+                bail!(crate::deployment::OwnershipError::Conflict);
+            }
+            if state.role == ManagedRole::Standby {
+                state.role = ManagedRole::Promoting;
+                true
+            } else {
+                // Active idempotent retries stay active. A second overlap observes the first
+                // promotion and leaves cleanup to the request that actually entered it.
+                false
+            }
+        };
+        let (revision, key) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let state = guard.as_ref().expect("managed state stays installed");
+            (state.config.revision.clone(), state.coordination_key.clone())
         };
         let ownership = async {
             let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
@@ -1324,7 +1332,9 @@ impl Engine {
                 Ok(ownership)
             }
             Err(error) => {
-                self.restore_failed_promotion_role(previous_role);
+                if restore_standby {
+                    self.restore_failed_promotion_role();
+                }
                 Err(error)
             }
         }
@@ -1410,11 +1420,11 @@ impl Engine {
         self.source_receipt_progress.lock().unwrap().record(source_commit_id);
     }
 
-    fn restore_failed_promotion_role(&self, previous_role: ManagedRole) {
+    fn restore_failed_promotion_role(&self) {
         if let Some(state) = self.managed_deployment.lock().unwrap().as_mut()
             && state.role == ManagedRole::Promoting
         {
-            state.role = previous_role;
+            state.role = ManagedRole::Standby;
         }
     }
 

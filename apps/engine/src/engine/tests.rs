@@ -126,10 +126,57 @@ async fn failed_promote_never_overwrites_a_concurrent_successful_owner() {
     }
 
     // This models an older overlapping request failing after another request completed its CAS.
-    engine.restore_failed_promotion_role(ManagedRole::Standby);
+    engine.restore_failed_promotion_role();
     let (role, ownership) = engine.managed_status().unwrap();
     assert_eq!(role, ManagedRole::Active);
     assert_eq!(ownership.unwrap().generation, 2);
+}
+
+#[tokio::test]
+async fn active_idempotent_promote_retry_stays_ready_when_the_coordinator_is_unreachable() {
+    let engine = Engine::new_pg_for_in_process_test(
+        DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        "postgres://127.0.0.1:1/unreachable".into(),
+    );
+    *engine.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+        config: crate::deployment::ManagedDeploymentConfig { revision: "revision-b".into(), initial_active: false },
+        coordination_key: "a".repeat(64),
+        role: ManagedRole::Active,
+        ownership: Some(crate::deployment::Ownership {
+            coordination_key: "a".repeat(64),
+            generation: 2,
+            owner_revision: "revision-b".into(),
+            phase: crate::deployment::OwnershipPhase::Active,
+            handoff_id: Some(uuid::Uuid::nil().to_string()),
+            source_commit_id: Some(uuid::Uuid::nil().to_string()),
+        }),
+    });
+    engine.health.store(HEALTH_ACTIVE, Ordering::Release);
+
+    let error = engine
+        .deployment_promote(&"a".repeat(64), "revision-a", "revision-b", 1, uuid::Uuid::nil(), uuid::Uuid::nil())
+        .await
+        .unwrap_err();
+    assert!(error.chain().any(|cause| cause.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()));
+    assert_eq!(engine.managed_status().unwrap().0, ManagedRole::Active);
+    assert!(engine.managed_public_ready(), "idempotent retry must not withdraw the active successor");
+}
+
+#[tokio::test]
+async fn unmanaged_promote_is_typed_disabled_instead_of_panicking() {
+    let engine = Engine::new_pg_for_in_process_test(
+        DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        "postgres://127.0.0.1:1/unreachable".into(),
+    );
+    let error = engine
+        .deployment_promote(&"a".repeat(64), "revision-a", "revision-b", 1, uuid::Uuid::nil(), uuid::Uuid::nil())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::deployment::OwnershipError>()
+            .is_some_and(|error| matches!(error, crate::deployment::OwnershipError::Disabled))
+    );
 }
 
 #[tokio::test]
