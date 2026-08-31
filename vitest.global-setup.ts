@@ -5,11 +5,23 @@
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { postgres18Tools } from './scripts/postgres18.js'
 
 export default function setup() {
+  // The conformance Durable Streams facade uses the checked-in test CA. Forked
+  // Vitest workers are new Node processes, so publish the CA before the pool is
+  // started; ordinary fetch() calls can then verify stream URLs without turning
+  // off TLS validation globally.
+  process.env.NODE_EXTRA_CA_CERTS = join(
+    dirname(fileURLToPath(import.meta.url)),
+    'packages',
+    'conformance',
+    'test-pki',
+    'ca.pem',
+  )
   execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { stdio: 'inherit' })
   process.env.ELECTRIC_CIRCUITS_ENGINE_PREBUILT = '1'
 

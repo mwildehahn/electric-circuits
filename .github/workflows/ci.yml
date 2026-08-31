@@ -12,7 +12,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -69,3 +69,5 @@ jobs:
 
       - name: Full Vitest suite (including conformance)
         run: pnpm exec vitest run
+        env:
+          NODE_EXTRA_CA_CERTS: packages/conformance/test-pki/ca.pem

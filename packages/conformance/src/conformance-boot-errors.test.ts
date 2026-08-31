@@ -31,7 +31,7 @@ const DEAD_PG_PORT = 5
  * schedule, for minutes. This is the shape a firewalled database or a stale Service IP has, and it
  * is the one that used to leave the process alive long past its grace period.
  */
-const BLACKHOLE_PG = 'postgres://u:p@10.255.255.1:5432/db'
+const BLACKHOLE_PG = 'postgres://u:p@10.255.255.1:5432/db?sslmode=verify-full'
 
 function adminUrl(): string {
   const url = process.env.ELECTRIC_CIRCUITS_TEST_PG_URL
@@ -126,12 +126,19 @@ async function spawnAgainst(pgUrl: string, opts: SpawnOpts = {}): Promise<RawEng
     dsUrl = await ds.start()
   }
   access = await mtlsAccess(dsUrl)
+  const postgresTls: Record<string, string> = {}
+  if (pgUrl === BLACKHOLE_PG) {
+    const caBundle = access.env.ELECTRIC_CIRCUITS_DS_CA_BUNDLE
+    if (!caBundle) throw new Error('durable-streams test CA bundle is unavailable')
+    postgresTls.ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE = caBundle
+  }
   engine = spawnRawEngine({
     ELECTRIC_CIRCUITS_DS_URL: access.url,
     ...access.env,
     ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
     ELECTRIC_CIRCUITS_LOG: process.env.ELECTRIC_CIRCUITS_LOG ?? 'info',
     ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+    ...postgresTls,
     ELECTRIC_CIRCUITS_PG_TABLES: '*',
     ELECTRIC_CIRCUITS_PG_SLOT: `boot_errors_${process.pid}_${Date.now().toString(36)}`,
   })

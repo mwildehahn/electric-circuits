@@ -21,6 +21,8 @@ export default defineConfig({
     // at once starves their drain/readiness deadlines; one fork makes that process topology
     // explicit while still running every collected file exactly once.
     pool: 'forks',
+    fileParallelism: false,
+    maxWorkers: 1,
     poolOptions: { forks: { minForks: 1, maxForks: 1 } },
     testTimeout: 60000,
     hookTimeout: 60000,
