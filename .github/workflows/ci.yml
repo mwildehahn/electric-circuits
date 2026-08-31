@@ -69,3 +69,5 @@ jobs:
 
       - name: Full Vitest suite (including conformance)
         run: pnpm exec vitest run
+        env:
+          NODE_EXTRA_CA_CERTS: packages/conformance/test-pki/ca.pem
