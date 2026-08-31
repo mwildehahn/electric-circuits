@@ -201,6 +201,18 @@ Two caveats worth knowing rather than discovering:
 
 ## Operating notes
 
+### Managed blue/green pilot
+
+The managed writer-ownership capability is opt-in. Its PostgreSQL schema and grants are provisioned
+by the deployment migration, never by engine boot. Install the first managed-capable revision through
+the existing stop-confirm-start procedure with an explicit immutable revision and
+`ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE=1`; every subsequent revision starts standby
+until the authenticated controller proves the source receipt, quiesces the current owner, confirms
+slot release, and promotes the successor generation. `/health` remains liveness-only so ECS can
+reach its scale-up lifecycle hook; `/ready` and public data admission stay closed until the exact
+active revision has restored and started ingest. This document does not authorize production use:
+the lifecycle controller, ECS/ALB topology, and failure-matrix qualification remain separate gates.
+
 - **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
   replica identity on the new table and introspect it at startup.
 - **Change-log disk is bounded by segment size/age and the retain window.** Every committed change

@@ -66,6 +66,34 @@ const HEALTH_WAITING: u8 = 0;
 const HEALTH_STARTING: u8 = 1;
 const HEALTH_ACTIVE: u8 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedRole {
+    Active,
+    Standby,
+    Quiescing,
+    Promoting,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedDeploymentState {
+    config: crate::deployment::ManagedDeploymentConfig,
+    coordination_key: String,
+    role: ManagedRole,
+    ownership: Option<crate::deployment::Ownership>,
+}
+
+/// Public data is fenced while a managed process has not proved its exact active generation.
+#[derive(Debug)]
+pub struct DeploymentNotReady;
+
+impl std::fmt::Display for DeploymentNotReady {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("managed deployment is not the active ready writer; retry")
+    }
+}
+
+impl std::error::Error for DeploymentNotReady {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BootEpochAction {
     Restore,
@@ -249,6 +277,8 @@ pub struct Engine {
     /// `starting` (connected; introspecting / creating slot / spawning ingest), 2 = `active` (ingest
     /// loop running). Library mode (no Postgres) is `active` from construction.
     health: Arc<std::sync::atomic::AtomicU8>,
+    /// Opt-in ownership gate. Kept separate from health so legacy mode remains byte compatible.
+    managed_deployment: Arc<std::sync::Mutex<Option<ManagedDeploymentState>>>,
     /// Independent of read health: false refuses new control-plane mutations while restored stream
     /// reads continue. The deployment controller closes this before writing a source fence.
     control_admission: Arc<ControlAdmission>,
@@ -1017,6 +1047,7 @@ impl Engine {
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Library mode: no Postgres to wait on, so report `active` immediately.
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
+            managed_deployment: Arc::new(std::sync::Mutex::new(None)),
             control_admission: ControlAdmission::new(),
             source_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             last_source_receipt: Arc::new(std::sync::Mutex::new(None)),
@@ -1062,6 +1093,153 @@ impl Engine {
         self.shutdown.clone()
     }
 
+    /// Install the managed ownership gate before the HTTP server is exposed or Postgres setup runs.
+    pub fn configure_managed_deployment(
+        &self,
+        config: crate::deployment::ManagedDeploymentConfig,
+        slot: &str,
+    ) -> Result<()> {
+        let binding = self.store_bound.get().context("managed deployment requires an admitted StoreBound")?;
+        let coordination_key = crate::deployment::coordination_key(binding, slot);
+        *self.managed_deployment.lock().unwrap() =
+            Some(ManagedDeploymentState { config, coordination_key, role: ManagedRole::Standby, ownership: None });
+        self.close_control_admission();
+        Ok(())
+    }
+
+    fn managed_status(&self) -> Option<(ManagedRole, Option<crate::deployment::Ownership>)> {
+        self.managed_deployment.lock().unwrap().as_ref().map(|state| (state.role, state.ownership.clone()))
+    }
+
+    pub fn managed_deployment_enabled(&self) -> bool {
+        self.managed_deployment.lock().unwrap().is_some()
+    }
+
+    /// Managed traffic may flow only after the owner has completed the normal engine boot.
+    /// Claiming the database row is deliberately not enough: catalog restore, slot ownership, and
+    /// ingestor startup still happen after that claim.
+    pub fn managed_public_ready(&self) -> bool {
+        !self.managed_deployment_enabled() || self.readiness_status() == "active"
+    }
+
+    async fn claim_managed_ownership(&self, client: &tokio_postgres::Client) -> Result<()> {
+        let (config, key) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let Some(state) = guard.as_ref() else { return Ok(()) };
+            (state.config.clone(), state.coordination_key.clone())
+        };
+        match crate::deployment::claim_or_observe(client, &config, &key).await? {
+            crate::deployment::Claim::Active(ownership) => {
+                let mut guard = self.managed_deployment.lock().unwrap();
+                let state = guard.as_mut().expect("managed state stays installed");
+                state.role = ManagedRole::Active;
+                state.ownership = Some(ownership);
+                Ok(())
+            }
+            crate::deployment::Claim::Standby(ownership) => {
+                let mut guard = self.managed_deployment.lock().unwrap();
+                let state = guard.as_mut().expect("managed state stays installed");
+                state.role = ManagedRole::Standby;
+                state.ownership = ownership;
+                Err(anyhow::Error::new(DeploymentNotReady))
+            }
+        }
+    }
+
+    pub(crate) async fn deployment_status(
+        &self,
+    ) -> Result<(String, String, ManagedRole, Option<crate::deployment::Ownership>)> {
+        let (revision, key, role) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let state =
+                guard.as_ref().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
+            (state.config.revision.clone(), state.coordination_key.clone(), state.role)
+        };
+        let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
+        let client = crate::pg::connect(&url).await?;
+        let ownership = crate::deployment::status(&client, &key).await?;
+        Ok((key, revision, role, ownership))
+    }
+
+    pub(crate) async fn deployment_quiesce(
+        &self,
+        expected_key: &str,
+        expected_owner: &str,
+        generation: i64,
+        handoff_id: uuid::Uuid,
+        source_commit_id: uuid::Uuid,
+    ) -> Result<crate::deployment::Ownership> {
+        let (revision, key) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let state =
+                guard.as_ref().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
+            (state.config.revision.clone(), state.coordination_key.clone())
+        };
+        if key != expected_key || revision != expected_owner {
+            bail!(crate::deployment::OwnershipError::Conflict);
+        }
+        // A receipt that predates admission closure cannot fence a mutation which was already
+        // admitted. Close and drain on a first attempt, then refuse it so the controller obtains
+        // a fresh receipt and retries. The ordinary close endpoint is idempotent, so this is a
+        // bounded controller round-trip rather than a new protocol surface.
+        self.require_preclosed_control_drain().await?;
+        if self.source_drain_receipt(&source_commit_id.to_string()).is_none() {
+            bail!(crate::deployment::OwnershipError::Conflict);
+        }
+        let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
+        let client = crate::pg::connect(&url).await?;
+        let ownership =
+            crate::deployment::quiesce(&client, &key, expected_owner, generation, handoff_id, source_commit_id)
+                .await
+                .map_err(anyhow::Error::new)?;
+        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
+            state.role = ManagedRole::Quiescing;
+            state.ownership = Some(ownership.clone());
+        }
+        self.shutdown.begin();
+        Ok(ownership)
+    }
+
+    pub(crate) async fn deployment_promote(
+        &self,
+        expected_key: &str,
+        expected_owner: &str,
+        generation: i64,
+        handoff_id: uuid::Uuid,
+        source_commit_id: uuid::Uuid,
+    ) -> Result<crate::deployment::Ownership> {
+        let (revision, key) = {
+            let guard = self.managed_deployment.lock().unwrap();
+            let state =
+                guard.as_ref().ok_or_else(|| anyhow::Error::new(crate::deployment::OwnershipError::Disabled))?;
+            (state.config.revision.clone(), state.coordination_key.clone())
+        };
+        if key != expected_key {
+            bail!(crate::deployment::OwnershipError::Conflict);
+        }
+        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
+            state.role = ManagedRole::Promoting;
+        }
+        let url = self.pg_url.clone().context("managed deployment requires Postgres mode")?;
+        let client = crate::pg::connect(&url).await?;
+        let ownership = crate::deployment::promote(
+            &client,
+            &key,
+            &revision,
+            expected_owner,
+            generation,
+            handoff_id,
+            source_commit_id,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
+        if let Some(state) = self.managed_deployment.lock().unwrap().as_mut() {
+            state.role = ManagedRole::Active;
+            state.ownership = Some(ownership.clone());
+        }
+        Ok(ownership)
+    }
+
     /// Refuse new control mutations while leaving health/readiness unchanged for existing readers.
     pub fn ensure_control_admitted(&self) -> Result<()> {
         if self.control_admission.open.load(Ordering::Acquire) && !self.shutdown.is_shutting_down() {
@@ -1085,6 +1263,15 @@ impl Engine {
 
     pub fn close_control_admission(&self) {
         self.control_admission.open.store(false, Ordering::Release);
+    }
+
+    async fn require_preclosed_control_drain(&self) -> Result<()> {
+        if self.control_admission.open.swap(false, Ordering::AcqRel) {
+            self.wait_for_control_drain().await;
+            bail!(crate::deployment::OwnershipError::Conflict);
+        }
+        self.wait_for_control_drain().await;
+        Ok(())
     }
 
     pub async fn wait_for_control_drain(&self) {
@@ -1222,6 +1409,9 @@ impl Engine {
     /// policy ([`EpochBroken`], cleared by `POST /epoch/reset`). The epoch is checked first — it is
     /// the more fundamental "this engine is not serving this database right now".
     pub fn ensure_not_degraded(&self) -> Result<()> {
+        if !self.managed_public_ready() {
+            return Err(anyhow::Error::new(DeploymentNotReady));
+        }
         // A reset in flight is checked FIRST: it is the transient, actionable one, and while it runs
         // the epoch is also (correctly) latched broken — "retry in a moment" is the useful answer.
         // Taken under the engine-state lock by every create, so a create either registered before
@@ -1351,6 +1541,14 @@ impl Engine {
     /// string-compares the body, and `GET /replication/lsn` is where the *reason* lives
     /// (`flipFailures` vs `epoch.reason`).
     pub fn health_status(&self) -> &'static str {
+        if let Some((role, _)) = self.managed_status() {
+            match role {
+                ManagedRole::Standby => return "standby",
+                ManagedRole::Quiescing => return "quiescing",
+                ManagedRole::Promoting => return "promoting",
+                ManagedRole::Active => {}
+            }
+        }
         if self.degraded() || self.epoch_broken().is_some() {
             return "degraded";
         }
@@ -1402,6 +1600,10 @@ impl Engine {
         // `wal_level` is checked explicitly, first, rather than left to surface as a slot-creation
         // failure: it needs a Postgres RESTART to change, so it deserves its own named refusal.
         crate::pg::check_wal_level(&client).await?;
+        // This is the sole managed-mode operation before normal boot. A standby only reads (or
+        // wins the explicit generation-1 bootstrap insert); it cannot restore catalog state, alter
+        // publication/identity, claim a slot, spawn ingest, or admit controls.
+        self.claim_managed_ownership(&client).await?;
         // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
         // ingest spawn still ahead). `/v1/health` reports 202 until the ingest loop is running.
         self.health.store(HEALTH_STARTING, std::sync::atomic::Ordering::Relaxed);

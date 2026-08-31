@@ -56,6 +56,8 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |
 | `ELECTRIC_CIRCUITS_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `electric_circuits_engine=debug`) |
 | `ELECTRIC_CIRCUITS_CONTROL_SECRET` | *(unset; private admin disabled)* | Dedicated bearer token for `/_admin/control-admission/{close,open}` and `/_admin/drained-through/{source_commit_id}`. This must be a controller-only secret distinct from client-facing `ELECTRIC_SECRET`; when unset the routes fail closed with 503 |
+| `ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION` | *(unset; disabled)* | Canonical immutable UUID for opt-in managed writer ownership. Requires `ELECTRIC_CIRCUITS_CONTROL_SECRET`; only the persisted active revision can restore, claim the slot, or serve data. |
+| `ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE` | *(unset)* | Exact `1` permits the one managed-capable incumbent to bootstrap an absent ownership row at generation 1. It never overwrites an existing owner. |
 | `ELECTRIC_CIRCUITS_TRACE` | `1` (on) | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc) |
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). It is also the **subscription lease window** — a claim not renewed within it is released (see "Subscriptions"). `0` disables both |
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
@@ -78,6 +80,24 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_LIVE_TIMEOUT_MS` | `20000` | Overall deadline for a `live=true` `/v1/shape` long-poll, then `204` |
 
 ### Deployment handoff source fence
+
+### Opt-in managed writer ownership
+
+Managed mode is disabled by default, preserving legacy wire and boot behavior. Its migration-owned
+`electric_circuits.writer_ownership` table must already exist; the engine never creates it. A
+non-owner stays `/health` 200 but reports `/ready` 503 `standby`, performs no catalog restore/append,
+Postgres setup write, slot claim, ingestor spawn, or control mutation, and retries ownership with the
+normal bounded boot backoff. Every non-admin data route independently returns stable retryable
+`503 {"error":"deployment not ready; retry"}` with `Retry-After: 1`.
+
+Authenticated controller routes are `GET /_admin/deployment/status`, `POST
+/_admin/deployment/quiesce`, and `POST /_admin/deployment/promote`. Transition requests require
+exact `coordinationKey`, `ownerRevision`, `generation`, canonical `handoffId`, and canonical
+`sourceCommitId`; duplicates are idempotent and conflicts are 409 without mutation. Quiesce also
+requires the matching durable source-fence receipt, closes admission, and begins graceful shutdown.
+Promotion advances only the exact quiesced generation and leaves admission closed until the existing
+explicit open call. This is an upstream pilot capability: release and production use remain gated by
+the Indexed schema migration, lifecycle controller, ECS/ALB workflow, and qualification matrix.
 
 The stop-confirm-start deployment controller requires this bookkeeping table in the same database
 and publication as the application tables:

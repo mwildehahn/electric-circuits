@@ -3,7 +3,7 @@
 use axum::body::to_bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::{Next, from_fn};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -342,6 +342,9 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/_admin/control-admission/close", post(close_control_admission))
         .route("/_admin/control-admission/open", post(open_control_admission))
         .route("/_admin/drained-through/{source_commit_id}", get(drained_through))
+        .route("/_admin/deployment/status", get(deployment_status))
+        .route("/_admin/deployment/quiesce", post(deployment_quiesce))
+        .route("/_admin/deployment/promote", post(deployment_promote))
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
         .route("/aggregate", post(create_aggregate))
@@ -382,7 +385,37 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
             // Heavy — diagnostic/attribution use only; never sampled in the background.
             .route("/debug/dbsp-profile", get(get_dbsp_profile));
     }
-    r.layer(from_fn(normalize_extractor_rejection)).with_state(engine)
+    r.layer(from_fn(normalize_extractor_rejection))
+        .layer(from_fn_with_state(engine.clone(), require_managed_public_ready))
+        .with_state(engine)
+}
+
+/// Liveness and private deployment control deliberately bypass this gate. Every other route is a
+/// data/control surface and must independently refuse a liveness-healthy standby if a listener is
+/// miswired around `/ready`.
+async fn require_managed_public_ready(
+    State(engine): State<Engine>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if matches!(path, "/" | "/health" | "/ready" | "/v1/health")
+        || path.starts_with("/_admin/")
+        || !engine.managed_deployment_enabled()
+    {
+        return next.run(request).await;
+    }
+    match engine.managed_public_ready() {
+        true => next.run(request).await,
+        false => {
+            let mut response =
+                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "deployment not ready; retry" })))
+                    .into_response();
+            response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+    }
 }
 
 /// Axum's built-in JSON and query extractors intentionally return plain-text rejection bodies.
@@ -510,6 +543,7 @@ async fn close_control_admission(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
+    engine.ensure_not_degraded()?;
     engine.close_control_admission();
     engine.wait_for_control_drain().await;
     Ok(Json(serde_json::json!({ "controlAdmission": "closed" })))
@@ -520,6 +554,7 @@ async fn open_control_admission(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
+    engine.ensure_not_degraded()?;
     engine.open_control_admission();
     engine.ensure_control_admitted()?;
     Ok(Json(serde_json::json!({ "controlAdmission": "open" })))
@@ -549,6 +584,85 @@ async fn drained_through(
         "receipt": receipt,
         "lastReceipt": last_receipt,
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentTransitionReq {
+    coordination_key: String,
+    owner_revision: String,
+    generation: i64,
+    handoff_id: String,
+    source_commit_id: String,
+}
+
+fn canonical_uuid(value: &str, name: &str) -> Result<uuid::Uuid, AppError> {
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{name} must be a UUID") })?;
+    if parsed.to_string() != value {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!("{name} must be a canonical lowercase UUID"),
+        });
+    }
+    Ok(parsed)
+}
+
+fn deployment_role(role: crate::engine::ManagedRole) -> &'static str {
+    match role {
+        crate::engine::ManagedRole::Active => "active",
+        crate::engine::ManagedRole::Standby => "standby",
+        crate::engine::ManagedRole::Quiescing => "quiescing",
+        crate::engine::ManagedRole::Promoting => "promoting",
+    }
+}
+
+async fn deployment_status(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    let (key, revision, role, ownership) = engine.deployment_status().await?;
+    Ok(Json(serde_json::json!({
+        "coordinationKey": key,
+        "revision": revision,
+        "role": deployment_role(role),
+        "generation": ownership.as_ref().map(|row| row.generation),
+        "ownerRevision": ownership.as_ref().map(|row| &row.owner_revision),
+        "phase": ownership.as_ref().map(|row| match row.phase { crate::deployment::OwnershipPhase::Active => "active", crate::deployment::OwnershipPhase::Quiesced => "quiesced" }),
+        "handoffId": ownership.as_ref().and_then(|row| row.handoff_id.as_ref()),
+        "sourceCommitId": ownership.as_ref().and_then(|row| row.source_commit_id.as_ref()),
+        "controlAdmission": engine.ensure_control_admitted().is_ok(),
+        "readiness": engine.readiness_status(),
+    })))
+}
+
+async fn deployment_quiesce(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+    Json(req): Json<DeploymentTransitionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    let handoff_id = canonical_uuid(&req.handoff_id, "handoffId")?;
+    let source_commit_id = canonical_uuid(&req.source_commit_id, "sourceCommitId")?;
+    let ownership = engine
+        .deployment_quiesce(&req.coordination_key, &req.owner_revision, req.generation, handoff_id, source_commit_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "accepted": true, "phase": "quiesced", "generation": ownership.generation })))
+}
+
+async fn deployment_promote(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+    Json(req): Json<DeploymentTransitionReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_private_admin(&headers)?;
+    let handoff_id = canonical_uuid(&req.handoff_id, "handoffId")?;
+    let source_commit_id = canonical_uuid(&req.source_commit_id, "sourceCommitId")?;
+    let ownership = engine
+        .deployment_promote(&req.coordination_key, &req.owner_revision, req.generation, handoff_id, source_commit_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "accepted": true, "phase": "active", "generation": ownership.generation })))
 }
 
 /// `OPTIONS /v1/shape` — CORS preflight: 204 advertising the methods the adapter serves.
@@ -1310,11 +1424,14 @@ impl From<anyhow::Error> for AppError {
             // valid, the engine is busy retiring things underneath it (`CreateRaced`).
             || e.downcast_ref::<crate::engine::CreateRaced>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
+            || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
         {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
         // not a server fault and not something a retry changes (ADR-0008).
-        } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some() {
+        } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
+            || e.downcast_ref::<crate::deployment::OwnershipError>().is_some()
+        {
             StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR

@@ -19,6 +19,7 @@
 pub mod arrangements;
 pub mod changelog;
 pub mod config;
+pub mod deployment;
 pub mod ds;
 pub mod electric;
 pub mod engine;

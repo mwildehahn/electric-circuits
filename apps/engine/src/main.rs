@@ -158,6 +158,14 @@ async fn main() -> Result<()> {
             engine
         }
     };
+    if let Some(managed) = config.managed_deployment.clone() {
+        if config.pg_url.is_none() {
+            refuse_boot("configuration", &anyhow::anyhow!("managed deployment requires Postgres mode"));
+        }
+        if let Err(error) = engine.configure_managed_deployment(managed, &config.slot) {
+            refuse_boot("configuration", &error);
+        }
+    }
 
     // Memory probes via OpenTelemetry: register the meter provider + Prometheus exporter, publish an
     // initial sample, and start the background sampler. `_otel` is held for the process lifetime so the

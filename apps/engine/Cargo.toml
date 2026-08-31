@@ -78,6 +78,7 @@ libc = "0.2.186"
 # tree transitively (dbsp -> roaring 0.11.3). See docs/notes/2026-07-16-feed-set-representation-spike.md.
 roaring = "0.11"
 time = { version = "0.3", features = ["parsing"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the /v1/health + endpoint tests.

@@ -15,6 +15,42 @@ fn boot_does_not_restore_or_activate_when_slot_is_busy_or_epoch_is_broken() {
     }
 }
 
+#[tokio::test]
+async fn managed_public_traffic_waits_for_full_engine_readiness_after_claim() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    *engine.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+        config: crate::deployment::ManagedDeploymentConfig {
+            revision: "018f0f46-93d0-7cf0-8b74-4bf0866ec285".into(),
+            initial_active: false,
+        },
+        coordination_key: "a".repeat(64),
+        role: ManagedRole::Active,
+        ownership: None,
+    });
+    engine.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
+    assert!(!engine.managed_public_ready(), "a claimed owner still has no catalog, slot, or ingestor");
+
+    engine.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
+    assert!(engine.managed_public_ready());
+
+    engine.managed_deployment.lock().unwrap().as_mut().unwrap().role = ManagedRole::Standby;
+    assert!(!engine.managed_public_ready());
+}
+
+#[tokio::test]
+async fn quiesce_requires_a_receipt_after_admission_is_preclosed_and_drained() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    assert!(engine.ensure_control_admitted().is_ok());
+
+    // This is the pre-CAS barrier used by managed quiesce. An open admission is closed and
+    // drained, but cannot use a receipt that might predate an admitted mutation.
+    assert!(engine.require_preclosed_control_drain().await.is_err());
+    assert!(engine.ensure_control_admitted().is_err());
+
+    // A retry after the controller has observed closure can proceed to receipt verification.
+    assert!(engine.require_preclosed_control_drain().await.is_ok());
+}
+
 /// The candidate set must contain every standalone shape that could match any row of the
 /// delta (old or new side), and exclude shapes whose necessary conjunct fails on all rows.
 #[test]
