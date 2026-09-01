@@ -150,10 +150,12 @@ acknowledged to Postgres (`confirmed_flush_lsn`) — a failed append tears the c
 unacknowledged, and the server resends from the confirmed position.
 
 When there is no open transaction, the ingestor also acknowledges the WAL end carried by a server
-keepalive. That position is a transaction boundary, so it cannot cover changes waiting to reach the
-change log; acknowledging it lets Postgres recycle forced/archived WAL even when no tracked table is
-changing. A keepalive received between `Begin` and `Commit` is not acknowledged — the commit's last
-durable chunk remains the only path that may advance the slot past that transaction.
+keepalive. Postgres decides whether a transaction must be replayed from its commit record, so this
+position may pass WAL written by a still-uncommitted transaction without skipping that transaction
+if it commits later. A keepalive received after the decoder emits `Begin` and before it emits
+`Commit` is not acknowledged — the commit's last durable chunk remains the only path that may
+advance the slot past that decoded transaction. This lets Postgres recycle forced/archived WAL even
+when no tracked table is changing without weakening append-before-ack durability.
 
 **The buffer is bounded; large transactions spill and are appended in chunks** (ADR-0003). A
 transaction cannot be appended before its commit frame (the commit LSN is unknown and it may still

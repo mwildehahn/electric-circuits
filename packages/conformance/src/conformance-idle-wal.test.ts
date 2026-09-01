@@ -3,8 +3,9 @@
 // position because there is no buffered transaction whose durable-stream append is still pending.
 
 import type { Schema } from '@electric-circuits/protocol'
+import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { pgQuery, waitFor } from './engine-native.js'
+import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {
@@ -41,17 +42,39 @@ describe('conformance: idle logical-replication progress', () => {
     await harness?.shutdown()
   })
 
-  it('acknowledges a forced WAL switch without requiring a table write', async () => {
+  it('releases idle WAL without skipping a transaction that commits afterward', async () => {
     await drainEngine(harness)
+    const shape = await createShape(harness, {
+      table: 'users',
+      where: { col: 'id', op: 'gte', value: 0 },
+    })
 
-    const [switched] = await pgQuery(harness, 'SELECT pg_switch_wal()::text AS lsn')
-    const switchLsn = String(switched?.lsn)
-    expect(switchLsn).toMatch(/^[0-9A-F]+\/[0-9A-F]+$/)
+    const transaction = new pgpkg.Client({ connectionString: harness.pgUrl })
+    await transaction.connect()
+    await transaction.query('BEGIN')
+    await transaction.query('INSERT INTO users (id) VALUES (1)')
 
-    await waitFor(
-      () => confirmedFlushReached(harness, switchLsn),
-      `slot ${harness.slot} to acknowledge idle WAL through ${switchLsn}`,
-      30000,
-    )
-  }, 60000)
+    try {
+      const [switched] = await pgQuery(harness, 'SELECT pg_switch_wal()::text AS lsn')
+      const switchLsn = String(switched?.lsn)
+      expect(switchLsn).toMatch(/^[0-9A-F]+\/[0-9A-F]+$/)
+
+      await waitFor(
+        () => confirmedFlushReached(harness, switchLsn),
+        `slot ${harness.slot} to acknowledge idle WAL through ${switchLsn}`,
+        30000,
+      )
+
+      await transaction.query('COMMIT')
+    } finally {
+      await transaction.query('ROLLBACK').catch(() => {})
+      await transaction.end().catch(() => {})
+    }
+
+    // Crash before using a drain barrier: the replacement must resume from the idle acknowledgement
+    // and still receive the transaction whose commit record came after that position.
+    await harness.restartEngine()
+    await drainEngine(harness)
+    expect((await foldStream(shape.streamUrl)).has('1')).toBe(true)
+  }, 90000)
 })
