@@ -2068,6 +2068,35 @@ mod tests {
         assert_eq!(json["segment"], 7);
     }
 
+    #[test]
+    fn consumer_pins_fold_last_write_wins_and_evictions_remove_them() {
+        let fold = fold_of(vec![
+            CatalogEvent::ConsumerPinned { id: "kernel".into(), position: pos(0, "10") },
+            CatalogEvent::ConsumerPinned { id: "kernel".into(), position: pos(1, "20") },
+            CatalogEvent::ConsumerPinned { id: "audit".into(), position: pos(1, "30") },
+            CatalogEvent::ConsumerEvicted { id: "kernel".into() },
+        ]);
+        assert_eq!(fold.consumers.get("audit"), Some(&pos(1, "30")));
+        assert!(!fold.consumers.contains_key("kernel"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_refuses_a_consumer_pin_for_an_unknown_change_log_segment() {
+        let fold = fold_of(vec![CatalogEvent::ConsumerPinned { id: "kernel".into(), position: pos(9, "10") }]);
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        engine.changes.state().adopt(1, [(0, 100), (1, 200)].into_iter().collect(), None);
+
+        let err = engine
+            .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
+            .await
+            .expect_err("a restored consumer cannot resume in a segment the catalog no longer retains");
+        assert!(
+            format!("{err:#}").contains("consumer kernel") && format!("{err:#}").contains("changes/9"),
+            "the restore error must name both the consumer and its missing segment: {err:#}"
+        );
+        assert!(engine.consumers().is_empty(), "a rejected restore must not publish any pins");
+    }
+
     /// The sequencer's checkpoint and a dormant shape's resume state carry the SEGMENT, so a
     /// restart after a rotation resumes in the right stream rather than at a byte position in a
     /// stream that no longer holds those bytes.
