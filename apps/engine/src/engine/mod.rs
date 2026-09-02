@@ -1064,7 +1064,14 @@ impl Engine {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_pg_for_in_process_test(ds: DsClient, pg_url: String) -> Self {
-        let e = Self::new_inner(ds, Some(pg_url), None, PostgresSetup::EngineManaged);
+        Self::new_pg_for_in_process_test_with_setup(ds, pg_url, PostgresSetup::EngineManaged)
+    }
+
+    /// Test-only Postgres constructor with an explicit DDL authority boundary.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new_pg_for_in_process_test_with_setup(ds: DsClient, pg_url: String, setup: PostgresSetup) -> Self {
+        let e = Self::new_inner(ds, Some(pg_url), None, setup);
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
     }

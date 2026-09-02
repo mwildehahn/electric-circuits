@@ -144,7 +144,11 @@ async fn externally_managed_setup_validates_without_mutating_replica_identity() 
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let engine = Engine::new_pg_with_setup(DsClient::new(&ds_url), url.clone(), PostgresSetup::ExternallyManaged);
+    let engine = Engine::new_pg_for_in_process_test_with_setup(
+        DsClient::new_for_in_process_test(&ds_url),
+        url.clone(),
+        PostgresSetup::ExternallyManaged,
+    );
     let table = TableRef::new("public", &table_name)?;
     let error = engine
         .setup_postgres(&[TableSelector::One(table)], &slot)
