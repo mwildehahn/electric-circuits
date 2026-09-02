@@ -70,7 +70,9 @@ async function read(segment: number, offset: string, generation: string): Promis
 function successor(page: Page): number | undefined {
   const pointer = [...page.envelopes]
     .reverse()
-    .find((envelope) => envelope.type === '__circuits.control' && envelope.headers.operation === 'rotated')
+    // Control envelopes are not table operations. The control type is the discriminator; the
+    // rotation action is carried by the control key (ADR-0006), not `headers.operation`.
+    .find((envelope) => envelope.type === '__circuits.control' && envelope.key === 'rotated')
   const segment = pointer?.value?.segment
   return typeof segment === 'number' ? segment : undefined
 }
