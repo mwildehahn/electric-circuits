@@ -647,6 +647,27 @@ impl std::fmt::Display for CatalogPredatesSegmentation {
 
 impl std::error::Error for CatalogPredatesSegmentation {}
 
+/// A consumer pin names a physical change-log segment. Restoring a pin for a segment that the
+/// folded retention history no longer retains would publish a reader that can only receive 410,
+/// and—worse—would make the deletion floor appear protected by a non-existent stream.
+#[derive(Debug)]
+pub struct CatalogConsumerSegmentMissing {
+    id: String,
+    position: LogPosition,
+}
+
+impl std::fmt::Display for CatalogConsumerSegmentMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "durable catalog restores consumer {} at {}, but that change-log segment is not retained",
+            self.id, self.position
+        )
+    }
+}
+
+impl std::error::Error for CatalogConsumerSegmentMissing {}
+
 /// The durable catalog holds an event written **before** ADR-0008: no `eid`, or a shape-lifecycle
 /// event with no `subscription`.
 ///
@@ -1142,10 +1163,19 @@ impl Engine {
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
-        // Pins are independent of shapes: install them before the empty-catalog fast path and
-        // before the retention sweep can run after restore. The fold has already rejected malformed
-        // `LogPosition` values through serde, and a missing segment is refused by `init_change_log`
-        // before serving starts.
+        // Pins are independent of shapes: validate and install them before the empty-catalog fast
+        // path and before the retention sweep can run after restore. `init_change_log` has already
+        // rebuilt the retained segment set, but it validates only the sequencer checkpoint; every
+        // external reader's independently durable position needs the same fail-closed check.
+        let retained_segments = self.changes.state().segments();
+        for (id, position) in &fold.consumers {
+            if !retained_segments.contains_key(&position.segment) {
+                return Err(anyhow::Error::new(CatalogConsumerSegmentMissing {
+                    id: id.clone(),
+                    position: position.clone(),
+                }));
+            }
+        }
         *self.consumers.lock().unwrap() = fold.consumers.clone();
         // A re-fold can race a receipt appended after its read snapshot. Merge the durable snapshot
         // instead of replacing live receipts, and preserve the live `last` when the fold did not
