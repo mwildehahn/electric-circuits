@@ -40,12 +40,7 @@ async fn engine() -> Engine {
 #[tokio::test]
 async fn returns_the_unmodified_change_log_page_and_stream_headers() {
     let response = router(engine().await)
-        .oneshot(
-            axum::http::Request::builder()
-                .uri("/changes/0?offset=-1")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(axum::http::Request::builder().uri("/changes/0?offset=-1").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

@@ -2489,12 +2489,7 @@ impl Engine {
 
     /// Read one positioned page of the external change-log contract. The ingestor remains its only
     /// writer; this is deliberately a byte-level view over the same segment the sequencer reads.
-    pub async fn read_changes(
-        &self,
-        segment: u32,
-        offset: &str,
-        live: bool,
-    ) -> anyhow::Result<crate::ds::ReadResult> {
+    pub async fn read_changes(&self, segment: u32, offset: &str, live: bool) -> anyhow::Result<crate::ds::ReadResult> {
         self.changes.ds().read(&crate::changelog::segment_path(segment), offset, live).await
     }
 

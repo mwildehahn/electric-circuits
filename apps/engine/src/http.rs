@@ -439,21 +439,25 @@ async fn read_changes(
     Query(query): Query<ChangesReadQuery>,
 ) -> Result<Response, AppError> {
     engine.ensure_not_degraded()?;
-    let page = match engine
-        .read_changes(segment, &query.offset, query.live.as_deref() == Some("long-poll"))
-        .await
-    {
+    let page = match engine.read_changes(segment, &query.offset, query.live.as_deref() == Some("long-poll")).await {
         Ok(page) => page,
         Err(error) => {
             if let Some(gone) = error.chain().find_map(|cause| cause.downcast_ref::<crate::ds::StreamGone>()) {
-                return Err(AppError { status: StatusCode::from_u16(gone.status).unwrap_or(StatusCode::GONE), msg: gone.to_string(), retry_after: false });
+                return Err(AppError {
+                    status: StatusCode::from_u16(gone.status).unwrap_or(StatusCode::GONE),
+                    msg: gone.to_string(),
+                    retry_after: false,
+                });
             }
             return Err(AppError::from(error));
         }
     };
     let mut response = Json(page.envelopes).into_response();
     if let Some(offset) = page.next_offset {
-        response.headers_mut().insert("stream-next-offset", HeaderValue::from_str(&offset).unwrap_or_else(|_| HeaderValue::from_static("")));
+        response.headers_mut().insert(
+            "stream-next-offset",
+            HeaderValue::from_str(&offset).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
     }
     if page.up_to_date {
         response.headers_mut().insert("stream-up-to-date", HeaderValue::from_static("true"));
