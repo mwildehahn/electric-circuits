@@ -58,19 +58,15 @@ impl FakeDs {
 }
 
 async fn durable_streams(State(ds): State<FakeDs>, request: Request) -> Response {
-    let path = request
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .rsplit_once("/queries/test-query/")
-        .map_or_else(|| request.uri().path().trim_start_matches('/').to_string(), |(_, logical)| logical.to_string());
+    let path =
+        request.uri().path().trim_start_matches('/').rsplit_once("/queries/test-query/").map_or_else(
+            || request.uri().path().trim_start_matches('/').to_string(),
+            |(_, logical)| logical.to_string(),
+        );
     match *request.method() {
         Method::GET => {
             let query = request.uri().query().unwrap_or("");
-            let offset = query
-                .split('&')
-                .find_map(|part| part.strip_prefix("offset="))
-                .unwrap_or("-1");
+            let offset = query.split('&').find_map(|part| part.strip_prefix("offset=")).unwrap_or("-1");
             let live = query.split('&').any(|part| part == "live=long-poll");
             let page = ds
                 .pages
@@ -139,10 +135,7 @@ async fn returns_the_unmodified_change_log_page_and_stream_headers() {
         "-1",
         false,
         FakePage {
-            headers: vec![
-                ("stream-next-offset", "0000000000000000_0000000000000100"),
-                ("stream-up-to-date", "true"),
-            ],
+            headers: vec![("stream-next-offset", "0000000000000000_0000000000000100"), ("stream-up-to-date", "true")],
             ..FakePage::ok(page(&[first, second]))
         },
     );
@@ -212,6 +205,18 @@ async fn missing_deleted_and_stale_generation_positions_have_distinct_terminal_r
 }
 
 #[tokio::test]
+async fn position_names_the_current_generation_tail_and_known_segments() {
+    let (engine, _ds) = engine().await;
+    let response = get(router(engine), "/changes/position").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let position: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(position["generation"], "test-query");
+    assert_eq!(position["position"], serde_json::json!({ "segment": 0, "offset": "-1" }));
+    assert_eq!(position["segments"], serde_json::json!({}));
+}
+
+#[tokio::test]
 async fn live_long_poll_uses_the_shared_deadline_and_returns_up_to_date() {
     // This binary is the first route test to ask for a live deadline. Set it before the request;
     // the config caches it exactly as shape reads do.
@@ -263,7 +268,10 @@ async fn reference_consumer_holds_a_chunked_transaction_until_last_and_crosses_o
     let second_page = ChangePage::from_response(second_page).await.unwrap();
     assert_eq!(consumer.consume(second_page), Some(1), "a reader crosses only after draining a closed segment");
     assert_eq!(consumer.transactions().len(), 1);
-    assert_eq!(consumer.transactions()[0].iter().map(|env| env.key.as_str()).collect::<Vec<_>>(), vec!["first", "last"]);
+    assert_eq!(
+        consumer.transactions()[0].iter().map(|env| env.key.as_str()).collect::<Vec<_>>(),
+        vec!["first", "last"]
+    );
 
     // At-least-once delivery may replay both pages. `(lsn, seq)` highwater prevents a second
     // completed transaction while retaining the original held-run rule.

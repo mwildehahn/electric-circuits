@@ -62,7 +62,10 @@ Three ideas carry the whole design:
   result feed). The decoupling boundary between write and read paths. External consumers read an
   unmodified positioned page through `GET /changes/{segment}?offset=<offset>&live=long-poll`; the
   response preserves the stream body and `stream-next-offset`, `stream-up-to-date`, and
-  `stream-closed` headers.
+  `stream-closed` headers. `GET /changes/position` supplies the current query generation, tail and
+  known segments. A consumer persists that generation with its position and supplies it as
+  `generation=` on subsequent reads: a mismatch returns named `410 Gone` (`stale-generation`) so a
+  prior store/query generation is re-synced rather than confused with a missing stream.
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
   shapes/subqueries/aggregations, the native versioned REST/OpenAPI surface (`/v1/*`), and the
   Electric-compatible `GET /v1/shape` endpoint.

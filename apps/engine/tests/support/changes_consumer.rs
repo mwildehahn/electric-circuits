@@ -44,7 +44,11 @@ impl ReferenceConsumer {
             }
             // A replay can overlap the held, unmarked prefix before the crash/retry. It has not
             // advanced the durable highwater yet, so suppress the exact prefix locally too.
-            if self.held.iter().any(|held| held.headers.lsn.as_deref() == Some(lsn.as_str()) && held.headers.seq == Some(seq)) {
+            if self
+                .held
+                .iter()
+                .any(|held| held.headers.lsn.as_deref() == Some(lsn.as_str()) && held.headers.seq == Some(seq))
+            {
                 continue;
             }
             let last = envelope.headers.last == Some(true);

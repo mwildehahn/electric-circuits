@@ -175,7 +175,7 @@ pub(crate) async fn ttl_registry_heap_bytes() -> usize {
 /// the adapter keeps re-polling the ds stream until data arrives or this elapses, then returns an
 /// Electric-compatible `up-to-date` control message.
 /// `ELECTRIC_LIVE_TIMEOUT_MS` env var; default 20000 (Electric's ~20s live long-poll).
-fn live_timeout() -> Duration {
+pub(crate) fn live_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
         let ms =
@@ -714,7 +714,7 @@ where
 /// unchanged. A `closed` page ends the loop immediately: the engine retired the shape, so the stream
 /// can never grow — re-polling would hammer the storage server (a closed stream answers a long-poll
 /// at once) for the whole live window.
-async fn poll_live_until<F, Fut, E>(
+pub(crate) async fn poll_live_until<F, Fut, E>(
     mut from: String,
     deadline: Instant,
     shutdown: &crate::shutdown::ShutdownToken,

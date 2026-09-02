@@ -7,6 +7,8 @@ use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
@@ -366,6 +368,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/subsets/query", post(query_subset))
         .route("/v1/subset-feeds", post(create_subset_feed))
         .route("/v1/aggregates", post(create_aggregate))
+        .route("/changes/position", get(changes_position))
         .route("/changes/{segment}", get(read_changes))
         // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
         .route("/health", get(|| async { "ok" }))
@@ -426,6 +429,9 @@ struct ChangesReadQuery {
     #[serde(default = "changes_start_offset")]
     offset: String,
     live: Option<String>,
+    /// A cursor is bound to its immutable query generation.  Older cursors are terminal even if
+    /// an identically numbered path exists in the current namespace.
+    generation: Option<String>,
 }
 
 fn changes_start_offset() -> String {
@@ -439,7 +445,27 @@ async fn read_changes(
     Query(query): Query<ChangesReadQuery>,
 ) -> Result<Response, AppError> {
     engine.ensure_not_degraded()?;
-    let page = match engine.read_changes(segment, &query.offset, query.live.as_deref() == Some("long-poll")).await {
+    if query.generation.as_deref().is_some_and(|generation| generation != engine.changes_generation()) {
+        return Err(AppError {
+            status: StatusCode::GONE,
+            msg: "stale-generation: change-log position belongs to a previous query generation; re-sync".to_string(),
+            retry_after: false,
+        });
+    }
+    let live = query.live.as_deref() == Some("long-poll");
+    let mut page = match if live {
+        let deadline = Instant::now() + crate::electric::live_timeout();
+        let read_engine = engine.clone();
+        let offset = query.offset.clone();
+        let shutdown = engine.shutdown_token();
+        crate::electric::poll_live_until(offset, deadline, &shutdown, move |offset| {
+            let engine = read_engine.clone();
+            async move { engine.read_changes(segment, &offset, true).await }
+        })
+        .await
+    } else {
+        engine.read_changes(segment, &query.offset, false).await
+    } {
         Ok(page) => page,
         Err(error) => {
             if let Some(gone) = error.chain().find_map(|cause| cause.downcast_ref::<crate::ds::StreamGone>()) {
@@ -452,6 +478,11 @@ async fn read_changes(
             return Err(AppError::from(error));
         }
     };
+    // The common reader contract reports an idle, deadline-bounded long-poll as caught up. The
+    // storage poll may have been cancelled at our deadline before it could send its own 204.
+    if live && page.envelopes.is_empty() && !page.closed {
+        page.up_to_date = true;
+    }
     let mut response = Json(page.envelopes).into_response();
     if let Some(offset) = page.next_offset {
         response.headers_mut().insert(
@@ -466,6 +497,18 @@ async fn read_changes(
         response.headers_mut().insert("stream-closed", HeaderValue::from_static("true"));
     }
     Ok(response)
+}
+
+/// Public current position and namespace of the segmented change log. The segment list is useful
+/// to an external consumer only for diagnostics; positioned reads still follow each closed
+/// segment's control pointer one hop at a time.
+async fn changes_position(State(engine): State<Engine>) -> Result<Json<serde_json::Value>, AppError> {
+    engine.ensure_not_degraded()?;
+    Ok(Json(serde_json::json!({
+        "generation": engine.changes_generation(),
+        "position": engine.changes_position(),
+        "segments": engine.changes_segments(),
+    })))
 }
 
 /// Liveness and private deployment control deliberately bypass this gate. Every other route is a

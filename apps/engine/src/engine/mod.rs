@@ -2487,6 +2487,18 @@ impl Engine {
         self.changes.state().position()
     }
 
+    /// Immutable query generation that names the current change-log namespace.  Consumers bind
+    /// a stored position to this value; a mismatch is a terminal re-sync signal, never a guess at
+    /// whether an identically numbered segment exists in a different generation.
+    pub fn changes_generation(&self) -> &str {
+        self.changes.ds().query_generation()
+    }
+
+    /// Every retained change-log segment and the unix second it became current.
+    pub fn changes_segments(&self) -> std::collections::BTreeMap<u32, u64> {
+        self.changes.state().segments()
+    }
+
     /// Read one positioned page of the external change-log contract. The ingestor remains its only
     /// writer; this is deliberately a byte-level view over the same segment the sequencer reads.
     pub async fn read_changes(&self, segment: u32, offset: &str, live: bool) -> anyhow::Result<crate::ds::ReadResult> {
