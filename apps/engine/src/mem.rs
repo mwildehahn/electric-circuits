@@ -176,16 +176,22 @@ pub fn process_memory() -> (u64, u64) {
     }
 }
 
-/// cgroup-v2 memory counters for the container. ECS exposes task-level memory in Container
+/// cgroup memory counters for the container. ECS exposes task-level memory in Container
 /// Insights, but these files give us the engine's own 5-second view and preserve the `oom_kill`
-/// edge that a one-minute CloudWatch sample can miss.
+/// edge that a one-minute CloudWatch sample can miss. ECS EC2 hosts may still mount cgroup v1,
+/// so the probe supports both layouts and reports which one was found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CgroupMemory {
+    pub version: Option<&'static str>,
     pub current_bytes: Option<u64>,
     pub max_bytes: Option<u64>,
     pub high_events: Option<u64>,
     pub oom_events: Option<u64>,
     pub oom_kill_events: Option<u64>,
+    /// cgroup-v1 allocation-failure counter (`memory.failcnt`).
+    pub failcnt: Option<u64>,
+    /// cgroup-v1's current OOM pressure bit (`memory.oom_control: under_oom`).
+    pub under_oom: Option<u64>,
 }
 
 fn read_cgroup_bytes(path: &str) -> Option<u64> {
@@ -205,16 +211,46 @@ fn read_cgroup_event(path: &str, key: &str) -> Option<u64> {
     parse_cgroup_event(&std::fs::read_to_string(path).ok()?, key)
 }
 
-/// Read the Linux cgroup-v2 memory files. On non-Linux hosts or cgroup-v1 containers all fields are
-/// `None`; the sampler still reports process RSS and engine cardinalities.
-pub fn cgroup_memory() -> CgroupMemory {
-    CgroupMemory {
+fn read_cgroup_v2() -> Option<CgroupMemory> {
+    if !std::path::Path::new("/sys/fs/cgroup/memory.current").exists() {
+        return None;
+    }
+    Some(CgroupMemory {
+        version: Some("v2"),
         current_bytes: read_cgroup_bytes("/sys/fs/cgroup/memory.current"),
         max_bytes: read_cgroup_bytes("/sys/fs/cgroup/memory.max"),
         high_events: read_cgroup_event("/sys/fs/cgroup/memory.events", "high"),
         oom_events: read_cgroup_event("/sys/fs/cgroup/memory.events", "oom"),
         oom_kill_events: read_cgroup_event("/sys/fs/cgroup/memory.events", "oom_kill"),
+        failcnt: None,
+        under_oom: None,
+    })
+}
+
+fn read_cgroup_v1() -> Option<CgroupMemory> {
+    let current_bytes = read_cgroup_bytes("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+    let max_bytes = read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    if current_bytes.is_none() && max_bytes.is_none() {
+        return None;
     }
+
+    let oom_control = "/sys/fs/cgroup/memory/memory.oom_control";
+    Some(CgroupMemory {
+        version: Some("v1"),
+        current_bytes,
+        max_bytes,
+        high_events: None,
+        oom_events: read_cgroup_event(oom_control, "oom"),
+        oom_kill_events: read_cgroup_event(oom_control, "oom_kill"),
+        failcnt: read_cgroup_bytes("/sys/fs/cgroup/memory/memory.failcnt"),
+        under_oom: read_cgroup_event(oom_control, "under_oom"),
+    })
+}
+
+/// Read the Linux cgroup memory files. On non-Linux hosts without a mounted memory controller all
+/// fields are `None`; the sampler still reports process RSS and engine cardinalities.
+pub fn cgroup_memory() -> CgroupMemory {
+    read_cgroup_v2().or_else(read_cgroup_v1).unwrap_or_default()
 }
 
 fn log_memory_snapshot(card: &Cardinalities, bytes: Option<&HeapBytes>) {
@@ -256,6 +292,9 @@ fn log_memory_snapshot(card: &Cardinalities, bytes: Option<&HeapBytes>) {
         cgroup_memory_high_events = cgroup.high_events.unwrap_or(0),
         cgroup_memory_oom_events = cgroup.oom_events.unwrap_or(0),
         cgroup_memory_oom_kill_events = cgroup.oom_kill_events.unwrap_or(0),
+        cgroup_memory_failcnt = cgroup.failcnt.unwrap_or(0),
+        cgroup_memory_under_oom = cgroup.under_oom.unwrap_or(0),
+        cgroup_memory_version = cgroup.version.unwrap_or("unavailable"),
         cgroup_memory_available = cgroup.current_bytes.is_some(),
         shapes = card.shapes,
         shapes_dormant = card.shapes_dormant,
