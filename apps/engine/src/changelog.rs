@@ -333,6 +333,11 @@ impl ChangeLogWriter {
         &self.state
     }
 
+    /// The scoped durable-stream client shared by the ingestor and read-only change-log readers.
+    pub fn ds(&self) -> &DsClient {
+        &self.ds
+    }
+
     pub fn config(&self) -> &ChangeLogConfig {
         &self.cfg
     }

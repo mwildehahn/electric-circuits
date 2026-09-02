@@ -366,6 +366,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/subsets/query", post(query_subset))
         .route("/v1/subset-feeds", post(create_subset_feed))
         .route("/v1/aggregates", post(create_aggregate))
+        .route("/changes/{segment}", get(read_changes))
         // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
@@ -418,6 +419,49 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
     r.layer(from_fn(normalize_extractor_rejection))
         .layer(from_fn_with_state(engine.clone(), require_managed_public_ready))
         .with_state(engine)
+}
+
+#[derive(Deserialize)]
+struct ChangesReadQuery {
+    #[serde(default = "changes_start_offset")]
+    offset: String,
+    live: Option<String>,
+}
+
+fn changes_start_offset() -> String {
+    "-1".to_string()
+}
+
+/// A positioned, unmodified page of the segmented durable change log for external consumers.
+async fn read_changes(
+    State(engine): State<Engine>,
+    Path(segment): Path<u32>,
+    Query(query): Query<ChangesReadQuery>,
+) -> Result<Response, AppError> {
+    engine.ensure_not_degraded()?;
+    let page = match engine
+        .read_changes(segment, &query.offset, query.live.as_deref() == Some("long-poll"))
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            if let Some(gone) = error.chain().find_map(|cause| cause.downcast_ref::<crate::ds::StreamGone>()) {
+                return Err(AppError { status: StatusCode::from_u16(gone.status).unwrap_or(StatusCode::GONE), msg: gone.to_string(), retry_after: false });
+            }
+            return Err(AppError::from(error));
+        }
+    };
+    let mut response = Json(page.envelopes).into_response();
+    if let Some(offset) = page.next_offset {
+        response.headers_mut().insert("stream-next-offset", HeaderValue::from_str(&offset).unwrap_or_else(|_| HeaderValue::from_static("")));
+    }
+    if page.up_to_date {
+        response.headers_mut().insert("stream-up-to-date", HeaderValue::from_static("true"));
+    }
+    if page.closed {
+        response.headers_mut().insert("stream-closed", HeaderValue::from_static("true"));
+    }
+    Ok(response)
 }
 
 /// Liveness and private deployment control deliberately bypass this gate. Every other route is a

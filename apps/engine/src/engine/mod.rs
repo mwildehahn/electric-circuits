@@ -2487,6 +2487,17 @@ impl Engine {
         self.changes.state().position()
     }
 
+    /// Read one positioned page of the external change-log contract. The ingestor remains its only
+    /// writer; this is deliberately a byte-level view over the same segment the sequencer reads.
+    pub async fn read_changes(
+        &self,
+        segment: u32,
+        offset: &str,
+        live: bool,
+    ) -> anyhow::Result<crate::ds::ReadResult> {
+        self.changes.ds().read(&crate::changelog::segment_path(segment), offset, live).await
+    }
+
     /// The table's current circuit topology (shared families + standalone count), or `None` if no
     /// tailer exists.
     pub async fn table_stats(&self, table: &TableRef) -> Option<TableStats> {
