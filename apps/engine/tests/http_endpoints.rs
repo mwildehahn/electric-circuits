@@ -303,6 +303,50 @@ async fn ready_is_200_active_in_library_mode() {
     assert_eq!(body_string(res).await, r#"{"status":"active"}"#);
 }
 
+/// External change-log consumers are observability-only: their position and lag are available to a
+/// source-status wrapper, but neither a live pin nor an abandoned one changes the engine's health.
+#[tokio::test]
+async fn change_log_position_and_consumer_listing_do_not_affect_readiness() {
+    let (engine, stop) = feed_engine().await;
+    let expected_position = engine.changes_position();
+    let app = router(engine);
+
+    let position =
+        app.clone().oneshot(Request::builder().uri("/changes/position").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(position.status(), StatusCode::OK);
+    let position: serde_json::Value = serde_json::from_str(&body_string(position).await).unwrap();
+    assert_eq!(position["position"], serde_json::to_value(expected_position).unwrap());
+    assert!(position["segments"].is_object(), "the wrapper receives the known retained segments");
+
+    let pin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/consumers/kernel")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"segment":0,"offset":"tip"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pin.status(), StatusCode::OK);
+    let consumers =
+        app.clone().oneshot(Request::builder().uri("/consumers").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(consumers.status(), StatusCode::OK);
+    let consumers: serde_json::Value = serde_json::from_str(&body_string(consumers).await).unwrap();
+    assert_eq!(
+        consumers,
+        serde_json::json!([{
+            "id": "kernel", "position": { "segment": 0, "offset": "tip" }, "pinned_segments": [0], "lag_segments": 0
+        }])
+    );
+
+    let ready = app.oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(ready.status(), StatusCode::OK, "consumer state is not readiness state");
+    let _ = stop.send(());
+}
+
 /// Postgres mode before `setup_postgres`: NOT ready (503 `waiting`), while `/v1/health` answers its
 /// fleet-parity 202 for the same phase. The two probes are deliberately different contracts.
 #[tokio::test]
