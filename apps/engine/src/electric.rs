@@ -1343,6 +1343,18 @@ mod tests {
     }
 
     #[test]
+    fn apply_changes_preserves_the_source_transaction_id() {
+        let mut change = env("upsert", "k1", "01");
+        change.headers.txid = Some("3259".into());
+        let mut keys = HashSet::new();
+
+        let messages = apply_changes(&mut keys, "id", vec![change]);
+
+        assert_eq!(messages[0]["headers"]["txid"], "3259");
+        assert_eq!(messages[0]["headers"]["txids"], serde_json::json!([3259]));
+    }
+
+    #[test]
     fn offset_ordering() {
         assert!(offset_after("02", "01"));
         assert!(!offset_after("01", "02"));
