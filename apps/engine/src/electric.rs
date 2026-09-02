@@ -304,10 +304,16 @@ fn pg_text(v: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>) -> serde_json::Value {
+fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>, txid: Option<&str>) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     let mut headers = serde_json::Map::new();
     headers.insert("operation".into(), serde_json::Value::String(op.into()));
+    if let Some(txid) = txid {
+        headers.insert("txid".into(), serde_json::Value::String(txid.into()));
+        if let Ok(txid) = txid.parse::<u64>() {
+            headers.insert("txids".into(), serde_json::json!([txid]));
+        }
+    }
     m.insert("headers".into(), serde_json::Value::Object(headers));
     m.insert("key".into(), serde_json::Value::String(key.into()));
     if let Some(v) = value {
@@ -594,16 +600,16 @@ fn apply_changes(keys: &mut HashSet<String>, pk_name: &str, envelopes: Vec<Envel
                     // on `"value"`). For a delete we carry the row's old value if present, else the key.
                     let value =
                         env.value.as_ref().map(encode_value).unwrap_or_else(|| serde_json::json!({ pk_name: env.key }));
-                    messages.push(change_msg("delete", &env.key, Some(value)));
+                    messages.push(change_msg("delete", &env.key, Some(value), env.headers.txid.as_deref()));
                 }
             }
             _ => {
                 let value = env.value.as_ref().map(encode_value);
                 if keys.contains(&env.key) {
-                    messages.push(change_msg("update", &env.key, value));
+                    messages.push(change_msg("update", &env.key, value, env.headers.txid.as_deref()));
                 } else {
                     keys.insert(env.key.clone());
-                    messages.push(change_msg("insert", &env.key, value));
+                    messages.push(change_msg("insert", &env.key, value, env.headers.txid.as_deref()));
                 }
             }
         }
@@ -972,7 +978,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         let mut messages = Vec::with_capacity(rows.len() + 1);
         let mut keys = HashSet::with_capacity(rows.len());
         for (key, value) in &rows {
-            messages.push(change_msg("insert", key, Some(encode_value(value))));
+            messages.push(change_msg("insert", key, Some(encode_value(value)), None));
             keys.insert(key.clone());
         }
         messages.push(control_msg("up-to-date"));
@@ -1340,6 +1346,38 @@ mod tests {
         assert_eq!(op_and_key(&msgs[1]), ("insert".into(), "k2".into()));
         // delete of a key the client never had is suppressed
         assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn apply_changes_preserves_source_transaction_ids_for_each_live_operation() {
+        let mut update = env("upsert", "k1", "01");
+        update.headers.txid = Some("3259".into());
+        let mut insert = env("upsert", "k2", "02");
+        insert.headers.txid = Some("3260".into());
+        let mut delete = env("delete", "k3", "03");
+        delete.headers.txid = Some("3261".into());
+        let mut keys: HashSet<String> = ["k1".into(), "k3".into()].into_iter().collect();
+
+        let messages = apply_changes(&mut keys, "id", vec![update, insert, delete]);
+
+        assert_eq!(messages[0]["headers"]["txid"], "3259");
+        assert_eq!(messages[0]["headers"]["txids"], serde_json::json!([3259]));
+        assert_eq!(messages[1]["headers"]["txid"], "3260");
+        assert_eq!(messages[1]["headers"]["txids"], serde_json::json!([3260]));
+        assert_eq!(messages[2]["headers"]["txid"], "3261");
+        assert_eq!(messages[2]["headers"]["txids"], serde_json::json!([3261]));
+    }
+
+    #[test]
+    fn apply_changes_keeps_opaque_transaction_ids_without_a_numeric_alias() {
+        let mut change = env("upsert", "k1", "01");
+        change.headers.txid = Some("library-write".into());
+        let mut keys = HashSet::new();
+
+        let messages = apply_changes(&mut keys, "id", vec![change]);
+
+        assert_eq!(messages[0]["headers"]["txid"], "library-write");
+        assert!(messages[0]["headers"].get("txids").is_none());
     }
 
     #[test]
