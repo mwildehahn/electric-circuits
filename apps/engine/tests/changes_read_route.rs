@@ -217,6 +217,40 @@ async fn position_names_the_current_generation_tail_and_known_segments() {
 }
 
 #[tokio::test]
+async fn an_external_consumer_pin_is_explicit_monotone_and_listed() {
+    let (engine, _ds) = engine().await;
+    let app = router(engine);
+    let pin = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::PUT)
+                .uri("/consumers/kernel")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"segment":0,"offset":"tail"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pin.status(), StatusCode::OK);
+    let listed = get(app.clone(), "/consumers").await;
+    let bytes = axum::body::to_bytes(listed.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()[0]["position"]["offset"], "tail");
+    let backwards = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::PUT)
+                .uri("/consumers/kernel")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"segment":0,"offset":"-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(backwards.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn live_long_poll_uses_the_shared_deadline_and_returns_up_to_date() {
     // This binary is the first route test to ask for a live deadline. Set it before the request;
     // the config caches it exactly as shape reads do.

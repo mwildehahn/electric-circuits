@@ -115,6 +115,18 @@ pub(crate) enum CatalogEvent {
     ChangesSegmentDeleted {
         segment: u32,
     },
+    /// An external reader's durable resume point. Unlike a shape read, this is an explicit
+    /// retention claim and is therefore replayed before the retention sweeper is allowed to run.
+    ConsumerPinned {
+        id: String,
+        position: LogPosition,
+    },
+    /// Release a consumer pin (explicitly, or because the retain window won). Keeping this as a
+    /// separate event makes eviction crash-safe: deletion can only observe the pin gone after the
+    /// catalog has recorded why it is gone.
+    ConsumerEvicted {
+        id: String,
+    },
     /// **Audit only**: a table's schema drifted and was re-introspected (ADR-0005). The restore
     /// ignores it — every dependent shape of the table was retired by the same handler, so it is
     /// already `Dropped` in the log. It is written so the durable record explains *why* a swathe of
@@ -505,6 +517,8 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
         CatalogEvent::Offset { .. } => "offset",
         CatalogEvent::ChangesRotated { .. } => "changesRotated",
         CatalogEvent::ChangesSegmentDeleted { .. } => "changesSegmentDeleted",
+        CatalogEvent::ConsumerPinned { .. } => "consumerPinned",
+        CatalogEvent::ConsumerEvicted { .. } => "consumerEvicted",
         CatalogEvent::SchemaChanged { .. } => "schemaChanged",
         CatalogEvent::SourceDrained(_) => "sourceDrained",
         CatalogEvent::SlotBound(_) => "slotBound",
@@ -805,6 +819,8 @@ pub(crate) struct CatalogFold {
     pub(crate) current_segment: u32,
     /// Every segment's start time (unix seconds), for the retain window that governs deletion.
     pub(crate) segment_starts: std::collections::BTreeMap<u32, u64>,
+    /// Durable external consumer positions, folded last-write-wins by caller chosen id.
+    pub(crate) consumers: std::collections::BTreeMap<String, LogPosition>,
     /// The last `SlotBound`: the epoch these shapes belong to. `None` = nothing ever claimed one,
     /// which is a genuine first boot.
     pub(crate) binding: Option<crate::engine::epoch::SlotBinding>,
@@ -834,6 +850,7 @@ impl Default for CatalogFold {
             last_source_receipt: None,
             current_segment: 0,
             segment_starts: std::collections::BTreeMap::new(),
+            consumers: std::collections::BTreeMap::new(),
             seen: HashSet::new(),
         }
     }
@@ -919,6 +936,12 @@ impl CatalogFold {
             // is never deleted, so the last rotation still names it.
             CatalogEvent::ChangesSegmentDeleted { segment } => {
                 self.segment_starts.remove(&segment);
+            }
+            CatalogEvent::ConsumerPinned { id, position } => {
+                self.consumers.insert(id, position);
+            }
+            CatalogEvent::ConsumerEvicted { id } => {
+                self.consumers.remove(&id);
             }
             // Audit only (see the variant): the shapes it explains are already `Dropped`,
             // and the boot's own introspection is the authority on the schema.
@@ -1119,6 +1142,11 @@ impl Engine {
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
+        // Pins are independent of shapes: install them before the empty-catalog fast path and
+        // before the retention sweep can run after restore. The fold has already rejected malformed
+        // `LogPosition` values through serde, and a missing segment is refused by `init_change_log`
+        // before serving starts.
+        *self.consumers.lock().unwrap() = fold.consumers.clone();
         // A re-fold can race a receipt appended after its read snapshot. Merge the durable snapshot
         // instead of replacing live receipts, and preserve the live `last` when the fold did not
         // contain it; otherwise the fold's last event is the newer durable order authority.

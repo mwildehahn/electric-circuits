@@ -1660,6 +1660,14 @@ impl Engine {
         );
         let mut evicted_all = true;
         for id in &plan.evict {
+            if let Some(consumer_id) = id.strip_prefix("consumer:") {
+                tracing::info!("change log: evicting external consumer {consumer_id} beyond the retain window");
+                if let Err(e) = self.remove_consumer(consumer_id).await {
+                    tracing::warn!("change log: evicting consumer {consumer_id} failed: {e:#}");
+                    evicted_all = false;
+                }
+                continue;
+            }
             tracing::info!(
                 "change log: evicting dormant shape {id} — its resume segment was rotated out more than {:?} ago",
                 self.changes.config().retain
@@ -1725,7 +1733,8 @@ impl Engine {
     /// active nor a deactivating shape can pin anything below the floor — their resume position is
     /// captured from the sequencer, which is at or past it.
     fn segment_pins(&self) -> Vec<crate::changelog::SegmentPin> {
-        self.lives
+        let mut pins: Vec<_> = self
+            .lives
             .lock()
             .unwrap()
             .iter()
@@ -1742,7 +1751,16 @@ impl Engine {
                 }),
                 LifeState::Active | LifeState::Deactivating { .. } => None,
             })
-            .collect()
+            .collect();
+        // External consumers have no active replay task, so their sole lifecycle is the bounded
+        // retain window. Prefixing is internal to the common planner; caller ids are validated to
+        // exclude ':' and shape ids are engine-minted `s<N>`, so the two namespaces cannot collide.
+        pins.extend(self.consumers.lock().unwrap().iter().map(|(id, position)| crate::changelog::SegmentPin {
+            shape_id: format!("consumer:{id}"),
+            segment: position.segment,
+            evictable: true,
+        }));
+        pins
     }
 
     /// Spawn (once) the background retention sweeper. Started lazily from the shape-create paths
