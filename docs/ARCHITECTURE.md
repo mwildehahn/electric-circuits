@@ -744,8 +744,11 @@ Paging is **keyset**, and the cursor has to agree with the page query's `ORDER B
 `table` + SQL `where` (+ `columns`) are parsed (`where_sql.rs`) into the same predicate AST used
 everywhere else, identical `/v1/shape` definitions share ONE engine shape (`share=true`, so the
 handle is the shared shape id), the shape stream is folded into the Electric message shape
-(insert/update/delete + `up-to-date` control messages), and live requests long-poll. Handle state
-is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
+(insert/update/delete + `up-to-date` control messages), and live requests long-poll. Replicated
+change messages preserve the source xid as `headers.txid` and, when numeric, the singleton
+`headers.txids`; synthetic snapshot inserts represent folded state rather than one source transaction
+boundary, so they omit both.
+Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
 drop their engine state but keep the stream, and any touch reactivates them by change-log replay
 from the captured resume offset (through the sequencer's two-phase pending-buffer handshake);
