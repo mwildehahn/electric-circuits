@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         Ok(c) => c,
         Err(e) => refuse_boot("configuration", &e),
     };
-    init_tracing(&config.log_filter);
+    init_tracing(&config.log_filter, config.json_logs);
 
     // Unknown ELECTRIC_* vars are accepted, never fatal — surface them once so operators can see the
     // image tolerated (and ignored) them.
@@ -167,18 +167,25 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Memory probes via OpenTelemetry: register the meter provider + Prometheus exporter, publish an
-    // initial sample, and start the background sampler. `_otel` is held for the process lifetime so the
-    // provider (and its exporter) stays alive. Exposed at GET /metrics/prometheus and GET /memory.
+    // Memory probes via OpenTelemetry: register the meter provider + Prometheus/optional OTLP
+    // exporters, publish an initial sample, and start the background samplers. `_otel` is held for
+    // the process lifetime so the provider (and its exporters) stay alive. Exposed at
+    // GET /metrics/prometheus and GET /memory; structured snapshots go to stderr/CloudWatch.
     let _otel = electric_circuits_engine::mem::init_otel();
     electric_circuits_engine::mem::publish(&engine.mem_cardinalities().await);
     electric_circuits_engine::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
+    let shutdown = engine.shutdown_token();
+    electric_circuits_engine::mem::spawn_memory_logger(
+        engine.clone(),
+        config.memory_log_period,
+        config.memory_bytes_log_period,
+        shutdown.clone(),
+    );
 
     // StatsD periodic samplers (no-ops when StatsD is off): system metrics + storage size.
     statsd::spawn_system_sampler(config.metrics_period);
     statsd::spawn_storage_sampler(config.storage_dir.clone());
 
-    let shutdown = engine.shutdown_token();
     // Kept past the router so the Postgres setup and the shutdown path still have a handle.
     let engine_at_exit = engine.clone();
     let boot_engine = engine.clone();
@@ -435,11 +442,15 @@ fn refuse_boot(kind: &str, e: &anyhow::Error) -> ! {
     std::process::exit(pg::EXIT_CONFIG)
 }
 
-fn init_tracing(filter: &str) {
+fn init_tracing(filter: &str, json_logs: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
     // `filter` already reflects ELECTRIC_CIRCUITS_LOG / ELECTRIC_LOG_LEVEL precedence (see config.rs).
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
+    if json_logs {
+        fmt().json().with_env_filter(env_filter).with_writer(std::io::stderr).init();
+    } else {
+        fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
+    }
 }
 
 #[cfg(test)]

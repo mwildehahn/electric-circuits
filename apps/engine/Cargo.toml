@@ -61,13 +61,17 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 memory-stats = "1"
 # System-metrics sampler for the StatsD periodic-metrics table (CPU/mem/load/process, conformance §4a).
 sysinfo = "0.33"
 opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
 opentelemetry-prometheus = "0.27"
+# Optional at runtime: when OTEL_EXPORTER_OTLP_ENDPOINT (or the signal-specific metrics endpoint)
+# is present, the engine adds a bounded periodic HTTP/protobuf reader alongside its local
+# Prometheus reader. The standard OTEL_EXPORTER_OTLP_HEADERS secret is consumed by the exporter.
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["metrics", "http-proto", "reqwest-client", "reqwest-rustls"] }
 prometheus = "0.13"
 pgwire-replication = { version = "0.3.2", default-features = false, features = ["scram", "tls-rustls"] }
 url = "2"

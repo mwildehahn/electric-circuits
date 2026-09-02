@@ -678,8 +678,8 @@ pub(crate) fn stats_of(exec: &TableExec) -> TableStats {
 /// runs inside `publish_all`, which fires after every processed sequencer batch, so anything
 /// computed there is paid on every write. It must also never run on the 500ms background sampler
 /// (`mem::spawn_sampler`), which calls the cheap `Engine::mem_cardinalities` only. This function is
-/// instead invoked exclusively via `SequencerCmd::MemBytes`, sent only from `Engine::mem_bytes`
-/// (called only by `GET /memory`) — see `sequencer.rs`'s handling of that command.
+/// instead invoked exclusively via `SequencerCmd::MemBytes`, sent from `Engine::mem_bytes` (the
+/// `/memory` endpoint or slower diagnostic logger) — see `sequencer.rs`'s handling of that command.
 pub(crate) fn exec_heap_bytes(exec: &TableExec) -> usize {
     exec.shapes.heap_bytes()
         + exec.shape_index.heap_bytes()

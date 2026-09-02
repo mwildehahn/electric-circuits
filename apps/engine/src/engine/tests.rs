@@ -1647,7 +1647,7 @@ async fn emission_lanes_order_and_barrier() {
 /// `bytes_*` field. If a future change re-wires the byte-level `HeapSize` walk (or the
 /// `SequencerCmd::MemBytes` round-trip) into this function, this test catches it: every `bytes_*`
 /// field would stop being its `Default` zero. The expensive walk lives only in `Engine::mem_bytes`,
-/// called exclusively from the `GET /memory` HTTP handler (see `http::get_memory`).
+/// called from the `GET /memory` HTTP handler or slower diagnostic logger.
 #[tokio::test(flavor = "multi_thread")]
 async fn sampler_cardinalities_never_populates_bytes_fields() {
     let ts = users();
@@ -1677,7 +1677,7 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
 
     // Every bytes_* field must be exactly zero — `mem_cardinalities` must never call
     // `HeapSize::heap_bytes` or send `SequencerCmd::MemBytes`. Only `Engine::mem_bytes` (called
-    // only by `GET /memory`) is allowed to populate these.
+    // by `GET /memory` or the slower diagnostic logger) is allowed to populate these.
     assert_eq!(card.bytes_shape_records, 0, "sampler path must not walk ShapeRecord heap bytes");
     assert_eq!(card.bytes_executors, 0, "sampler path must not round-trip SequencerCmd::MemBytes");
     assert_eq!(card.bytes_retention, 0, "sampler path must not walk retention lifecycle heap bytes");
@@ -1692,7 +1692,7 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
         "sampler path must not walk the electric adapter TTL registry heap bytes"
     );
 
-    // `Engine::mem_bytes` — the on-demand-only counterpart — does populate them (proves the split
+    // `Engine::mem_bytes` — the on-demand diagnostic counterpart — does populate them (proves the split
     // isn't just "the fields are dead code"; the walk still exists and works, just gated off the
     // sampler path).
     let bytes = engine.mem_bytes().await;

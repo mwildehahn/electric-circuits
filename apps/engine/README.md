@@ -55,6 +55,13 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_PG_POLL_MS` | `50` | Replication-slot poll interval |
 | `ELECTRIC_CIRCUITS_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |
 | `ELECTRIC_CIRCUITS_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `electric_circuits_engine=debug`) |
+| `ELECTRIC_CIRCUITS_LOG_JSON` | `1` | Emit structured JSON logs (recommended for CloudWatch/Logfire); set `0` for human-readable text |
+| `ELECTRIC_CIRCUITS_MEMORY_LOG_PERIOD_SECS` | `5` | Emit a cheap structured process/cgroup/cardinality memory snapshot at this interval; `0` disables it |
+| `ELECTRIC_CIRCUITS_MEMORY_BYTES_LOG_PERIOD_SECS` | `30` | Include the expensive owned-heap breakdown in a memory snapshot at this interval; `0` disables byte walks |
+| `OTEL_SERVICE_NAME` | *(unset)* | OTel resource service name; used by the OTLP metrics exporter when set |
+| `OTEL_RESOURCE_ATTRIBUTES` | *(unset)* | Comma-separated OTel resource attributes (for example, `deployment.environment=prod`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | When set, export the engine's OTel metrics over HTTP/protobuf in addition to `/metrics/prometheus` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | *(unset)* | Comma-separated OTLP HTTP headers (for example, `Authorization=Bearer ...`); keep this in a secret |
 | `ELECTRIC_CIRCUITS_CONTROL_SECRET` | *(unset; private admin disabled)* | Dedicated bearer token for `/_admin/control-admission/{close,open}` and `/_admin/drained-through/{source_commit_id}`. This must be a controller-only secret distinct from client-facing `ELECTRIC_SECRET`; when unset the routes fail closed with 503 |
 | `ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION` | *(unset; disabled)* | Canonical immutable UUID for opt-in managed writer ownership. Requires `ELECTRIC_CIRCUITS_CONTROL_SECRET`; only the persisted active revision can restore, claim the slot, or serve data. |
 | `ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE` | *(unset)* | Exact `1` permits the one managed-capable incumbent to bootstrap an absent ownership row at generation 1. It never overwrites an existing owner. |

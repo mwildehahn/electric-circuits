@@ -741,7 +741,8 @@ impl SubqueryRegistry {
     /// state or an O(containers) bitmap-length sum, the same class of walk this method always did.
     ///
     /// Does NOT include the byte-level measurements (`bytes_membership_circuit`, `bytes_feed_sets`)
-    /// — those are on-demand-only (`GET /memory`); see [`Self::circuit_bytes`].
+    /// — those are on-demand diagnostic measurements (`GET /memory` or the slower logger); see
+    /// [`Self::circuit_bytes`].
     pub fn mem_totals(&self) -> MemTotals {
         let mut contributors = 0;
         let mut distinct = 0;
@@ -762,7 +763,8 @@ impl SubqueryRegistry {
 
     /// Measured owned/on-disk bytes of the membership circuit's published snapshots
     /// (`bytes_membership_circuit` and its `bytes_circuit_integral` / `bytes_circuit_snapshots`
-    /// split) — the on-demand-only (`GET /memory`) counterpart to [`Self::mem_totals`]. Never
+    /// split) — the on-demand diagnostic (`GET /memory` or slower logger) counterpart to
+    /// [`Self::mem_totals`]. Never
     /// called from the 500ms background sampler.
     ///
     /// Replaces the former `key_count × 88 B` estimate with dbsp's exact per-batch

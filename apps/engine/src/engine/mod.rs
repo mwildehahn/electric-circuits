@@ -2322,8 +2322,9 @@ impl Engine {
     /// allowed to call. It deliberately never touches `HeapSize::heap_bytes` or sends
     /// `SequencerCmd::MemBytes` — every `bytes_*` field on the returned [`crate::mem::Cardinalities`]
     /// is left at its `Default` zero. Byte-level self-accounting (Phase 0 of the memory-reduction
-    /// effort) lives in the sibling [`Self::mem_bytes`], called only by `GET /memory`; see its doc
-    /// comment for why that split exists (a prior regression: this method used to do the walk
+    /// effort) lives in the sibling [`Self::mem_bytes`], called by `GET /memory` and the slower
+    /// diagnostic memory logger; see its doc comment for why that split exists (a prior regression:
+    /// this method used to do the walk
     /// inline, which meant a ~100MB recursive walk + a `MemBytes` sequencer round-trip ran twice a
     /// second at 50k+ shapes).
     pub async fn mem_cardinalities(&self) -> crate::mem::Cardinalities {
@@ -2408,8 +2409,9 @@ impl Engine {
     ///
     /// Expensive: locks engine state, round-trips a one-off `SequencerCmd::MemBytes` to the
     /// sequencer task (mirroring the `DumpNode` command's pattern — see `dump_node` below), locks
-    /// the subquery registry, and walks roughly the engine's entire owned heap. Call this ONLY
-    /// from the `GET /memory` HTTP handler — never from the 500ms background sampler
+    /// the subquery registry, and walks roughly the engine's entire owned heap. Call this only
+    /// from the `GET /memory` HTTP handler or the slower diagnostic memory logger — never from the
+    /// 500ms background sampler
     /// (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing this into the
     /// sampler's path was exactly the prior regression (a large peak/steady RSS increase from
     /// twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
@@ -2421,7 +2423,7 @@ impl Engine {
     /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
     /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
     /// so instead this method round-trips the one-off `SequencerCmd::MemBytes` so the byte-walk
-    /// itself only ever runs on this on-demand path, never per batch.
+    /// itself only ever runs on an explicit diagnostic path, never per batch.
     pub async fn mem_bytes(&self) -> crate::mem::HeapBytes {
         let (bytes_shape_records, cmd_tx) = {
             let st = self.state.lock().await;

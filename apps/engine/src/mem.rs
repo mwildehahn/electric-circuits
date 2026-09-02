@@ -8,8 +8,9 @@
 //!      subquery registry's nodes + contributor-pk sets.
 //!
 //! Both are published as OpenTelemetry observable gauges through a Prometheus exporter
-//! (`GET /metrics/prometheus`, the format an OTel collector scrapes) and as JSON (`GET /memory`) for the
-//! benchmark harness. OTel observable-gauge callbacks are synchronous, so a background sampler refreshes
+//! (`GET /metrics/prometheus`, the format an OTel collector scrapes) and, when configured, an OTLP
+//! HTTP/protobuf exporter. They are also exposed as JSON (`GET /memory`) for the benchmark harness.
+//! OTel observable-gauge callbacks are synchronous, so a background sampler refreshes
 //! a lock-free [`Gauges`] snapshot that the callbacks (and the JSON endpoint) read.
 //!
 //! A third layer, JSON-only (Phase 0 of the memory-reduction effort, no OTel gauges to avoid metric
@@ -19,23 +20,22 @@
 //!
 //! The byte-level walk (`Engine::mem_bytes`) is expensive — it locks engine state, round-trips a
 //! `SequencerCmd::MemBytes` command to the sequencer task, locks the subquery registry, and walks
-//! roughly the engine's entire owned heap. It must run ONLY when `GET /memory` is actually served,
-//! never on the 500ms background sampler (`spawn_sampler` below): that sampler calls
-//! `Engine::mem_cardinalities` exclusively, which computes cheap in-memory counts and never touches
-//! `HeapSize::heap_bytes` or `SequencerCmd::MemBytes`. See `engine::Engine::mem_cardinalities` /
-//! `mem_bytes` for the split and `http::get_memory` for the one place both are combined.
+//! roughly the engine's entire owned heap. It runs on the explicit `GET /memory` endpoint and, when
+//! enabled, on the slower structured memory logger; it must never run on the 500ms background OTel
+//! sampler (`spawn_sampler` below), which calls `Engine::mem_cardinalities` exclusively. See
+//! `engine::Engine::mem_cardinalities` / `mem_bytes` for the split and `http::get_memory` for the
+//! endpoint that combines both layers.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider as _;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 use prometheus::{Registry, TextEncoder};
 
 /// The six byte-level self-accounting terms (Phase 0 of the memory-reduction effort), computed by
-/// [`crate::engine::Engine::mem_bytes`] — the on-demand, `GET /memory`-only counterpart to
+/// [`crate::engine::Engine::mem_bytes`] — the on-demand diagnostic counterpart to
 /// [`Cardinalities`]/[`crate::engine::Engine::mem_cardinalities`]. Deliberately its own type (not
 /// folded into `Cardinalities` at the source) so the cheap-count path has no fields to leave zeroed
 /// by convention — `mem_cardinalities` simply never constructs one of these.
@@ -176,6 +176,147 @@ pub fn process_memory() -> (u64, u64) {
     }
 }
 
+/// cgroup-v2 memory counters for the container. ECS exposes task-level memory in Container
+/// Insights, but these files give us the engine's own 5-second view and preserve the `oom_kill`
+/// edge that a one-minute CloudWatch sample can miss.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CgroupMemory {
+    pub current_bytes: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub high_events: Option<u64>,
+    pub oom_events: Option<u64>,
+    pub oom_kill_events: Option<u64>,
+}
+
+fn read_cgroup_bytes(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn parse_cgroup_event(contents: &str, key: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let name = fields.next()?;
+        let value = fields.next()?;
+        (name == key).then(|| value.trim().parse().ok()).flatten()
+    })
+}
+
+fn read_cgroup_event(path: &str, key: &str) -> Option<u64> {
+    parse_cgroup_event(&std::fs::read_to_string(path).ok()?, key)
+}
+
+/// Read the Linux cgroup-v2 memory files. On non-Linux hosts or cgroup-v1 containers all fields are
+/// `None`; the sampler still reports process RSS and engine cardinalities.
+pub fn cgroup_memory() -> CgroupMemory {
+    CgroupMemory {
+        current_bytes: read_cgroup_bytes("/sys/fs/cgroup/memory.current"),
+        max_bytes: read_cgroup_bytes("/sys/fs/cgroup/memory.max"),
+        high_events: read_cgroup_event("/sys/fs/cgroup/memory.events", "high"),
+        oom_events: read_cgroup_event("/sys/fs/cgroup/memory.events", "oom"),
+        oom_kill_events: read_cgroup_event("/sys/fs/cgroup/memory.events", "oom_kill"),
+    }
+}
+
+fn log_memory_snapshot(card: &Cardinalities, bytes: Option<&HeapBytes>) {
+    let (rss_bytes, virtual_bytes) = process_memory();
+    let cgroup = cgroup_memory();
+    let (
+        bytes_shape_records,
+        bytes_executors,
+        bytes_retention,
+        bytes_subquery_registry,
+        bytes_membership_circuit,
+        bytes_circuit_integral,
+        bytes_circuit_snapshots,
+        bytes_feed_sets,
+        bytes_pk_dict,
+        bytes_electric_adapter,
+    ) = bytes.map_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0), |b| {
+        (
+            b.bytes_shape_records,
+            b.bytes_executors,
+            b.bytes_retention,
+            b.bytes_subquery_registry,
+            b.bytes_membership_circuit,
+            b.bytes_circuit_integral,
+            b.bytes_circuit_snapshots,
+            b.bytes_feed_sets,
+            b.bytes_pk_dict,
+            b.bytes_electric_adapter,
+        )
+    });
+
+    tracing::info!(
+        target: "electric_circuits_engine::memory",
+        event = "memory_snapshot",
+        rss_bytes,
+        virtual_bytes,
+        cgroup_memory_current_bytes = cgroup.current_bytes.unwrap_or(0),
+        cgroup_memory_max_bytes = cgroup.max_bytes.unwrap_or(0),
+        cgroup_memory_high_events = cgroup.high_events.unwrap_or(0),
+        cgroup_memory_oom_events = cgroup.oom_events.unwrap_or(0),
+        cgroup_memory_oom_kill_events = cgroup.oom_kill_events.unwrap_or(0),
+        cgroup_memory_available = cgroup.current_bytes.is_some(),
+        shapes = card.shapes,
+        shapes_dormant = card.shapes_dormant,
+        tailers = card.tailers,
+        tables = card.tables,
+        families = card.families,
+        family_shapes = card.family_shapes,
+        standalone = card.standalone,
+        subquery_nodes = card.subquery_nodes,
+        subquery_contributors = card.subquery_contributors,
+        subquery_distinct_values = card.subquery_distinct_values,
+        subquery_shapes = card.subquery_shapes,
+        subquery_edges = card.subquery_edges,
+        subquery_feed_entries = card.subquery_feed_entries,
+        bytes_sampled = bytes.is_some(),
+        bytes_shape_records,
+        bytes_executors,
+        bytes_retention,
+        bytes_subquery_registry,
+        bytes_membership_circuit,
+        bytes_circuit_integral,
+        bytes_circuit_snapshots,
+        bytes_feed_sets,
+        bytes_pk_dict,
+        bytes_electric_adapter,
+        "engine memory snapshot",
+    );
+}
+
+/// Emit cheap process/cardinality snapshots at `interval`, with an optional slower owned-heap walk.
+/// The byte walk is deliberately not part of the 500 ms OTel sampler; it runs only at the explicitly
+/// configured diagnostic period and is marked with `bytes_sampled=true` in the structured log.
+pub fn spawn_memory_logger(
+    engine: crate::engine::Engine,
+    interval: Duration,
+    bytes_interval: Duration,
+    shutdown: crate::shutdown::ShutdownToken,
+) {
+    if interval.is_zero() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut next_bytes_sample = std::time::Instant::now();
+        loop {
+            let card = engine.mem_cardinalities().await;
+            let bytes = if !bytes_interval.is_zero() && std::time::Instant::now() >= next_bytes_sample {
+                next_bytes_sample = std::time::Instant::now() + bytes_interval;
+                Some(engine.mem_bytes().await)
+            } else {
+                None
+            };
+            log_memory_snapshot(&card, bytes.as_ref());
+
+            tokio::select! {
+                _ = shutdown.wait() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    });
+}
+
 /// Refresh the published gauges from a freshly-measured process memory + engine cardinalities. Called by
 /// the background sampler and by `/memory` so the JSON read and the OTel scrape agree.
 pub fn publish(card: &Cardinalities) {
@@ -260,8 +401,9 @@ pub fn prometheus_text() -> String {
     buf
 }
 
-/// Initialize the OpenTelemetry meter provider with a Prometheus exporter and register the memory +
-/// cardinality observable gauges. Idempotent; returns the provider so the caller keeps it alive.
+/// Initialize the OpenTelemetry meter provider with a Prometheus exporter, an optional OTLP
+/// exporter, and register the memory + cardinality observable gauges. Idempotent; returns the
+/// provider so the caller keeps it alive.
 pub fn init_otel() -> SdkMeterProvider {
     let registry = Registry::new();
     let exporter = opentelemetry_prometheus::exporter()
@@ -270,7 +412,37 @@ pub fn init_otel() -> SdkMeterProvider {
         .expect("build prometheus exporter");
     let _ = PROM_REGISTRY.set(registry);
 
-    let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+    let mut provider_builder = SdkMeterProvider::builder().with_reader(exporter);
+    if std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
+        .ok()
+        .is_some_and(|endpoint| !endpoint.trim().is_empty())
+    {
+        match opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_temporality(Temporality::Cumulative)
+            .build()
+        {
+            Ok(otlp_exporter) => {
+                let reader = PeriodicReader::builder(otlp_exporter, opentelemetry_sdk::runtime::Tokio)
+                    .with_interval(Duration::from_secs(10))
+                    .with_timeout(Duration::from_secs(5))
+                    .build();
+                provider_builder = provider_builder.with_reader(reader);
+                tracing::info!(
+                    target: "electric_circuits_engine::telemetry",
+                    "OTLP metrics export enabled from OTEL_EXPORTER_OTLP_* configuration"
+                );
+            }
+            Err(error) => tracing::error!(
+                target: "electric_circuits_engine::telemetry",
+                error = %error,
+                "OTLP metrics exporter initialization failed; Prometheus metrics remain enabled"
+            ),
+        }
+    }
+
+    let provider = provider_builder.build();
     let meter = provider.meter("electric_circuits_engine");
 
     // One observable gauge per metric; each callback reads the lock-free published snapshot.
@@ -408,8 +580,6 @@ pub fn init_otel() -> SdkMeterProvider {
     );
     engine_gauge!("engine_replication_slot_active", "1 while a walsender holds the slot", replication_slot_active, "");
 
-    // Touch a KeyValue so the import is used even if labels are added later.
-    let _ = KeyValue::new("service.name", "electric-circuits-engine");
     provider
 }
 
@@ -418,8 +588,8 @@ pub fn init_otel() -> SdkMeterProvider {
 ///
 /// Deliberately calls `mem_cardinalities` only — cheap counts, no `heap_bytes` walk, no
 /// `SequencerCmd::MemBytes` round-trip. Do not change this to call `mem_bytes` (or any function
-/// that does): that byte-level walk is on-demand-only, reserved for `GET /memory` (see the module
-/// doc comment above and `Engine::mem_bytes`'s doc comment for why).
+/// that does): that byte-level walk is reserved for `GET /memory` and the slower diagnostic logger
+/// (see the module doc comment above and `Engine::mem_bytes`'s doc comment for why).
 pub fn spawn_sampler(engine: crate::engine::Engine, interval: Duration) {
     tokio::spawn(async move {
         loop {
@@ -428,4 +598,21 @@ pub fn spawn_sampler(engine: crate::engine::Engine, interval: Duration) {
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cgroup_event;
+
+    #[test]
+    fn cgroup_event_parser_accepts_only_the_named_counter() {
+        let contents = "high 3\noom 1\noom_kill 2\n";
+        assert_eq!(parse_cgroup_event(contents, "oom_kill"), Some(2));
+    }
+
+    #[test]
+    fn cgroup_event_parser_ignores_malformed_values() {
+        let contents = "oom_kill nope\n";
+        assert_eq!(parse_cgroup_event(contents, "oom_kill"), None);
+    }
 }

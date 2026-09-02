@@ -385,7 +385,7 @@ impl MembershipCircuit {
     /// Measured byte sizes of the published snapshots (see [`CircuitBytes`]). Cheap: reads the
     /// two slot snapshots this circuit holds and sums dbsp's per-batch
     /// `approximate_byte_size`/`len` — no circuit round-trip, no profiler. Safe on the on-demand
-    /// `GET /memory` path; never call it from the 500 ms sampler.
+    /// `GET /memory` or slower diagnostic logger; never call it from the 500 ms sampler.
     pub fn snapshot_bytes(&self) -> CircuitBytes {
         let (members_bytes, members_len) = snap_size(&self.members);
         let (contributors_bytes, contributors_len) = snap_size(&self.contributors);

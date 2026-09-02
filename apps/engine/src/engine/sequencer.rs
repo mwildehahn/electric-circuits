@@ -111,8 +111,8 @@ pub(crate) enum SequencerCmd {
     },
     /// On-demand owned-heap byte-walk of every table's live executor state (see
     /// `introspection::exec_heap_bytes`) — the memory probe's `bytes_executors` term. Sent only
-    /// from `Engine::mem_bytes` (called only by `GET /memory` — never the 500ms background
-    /// sampler, which calls the cheap `Engine::mem_cardinalities` instead), never from the
+    /// from `Engine::mem_bytes` (called by `GET /memory` or the slower diagnostic logger — never
+    /// the 500ms background sampler, which calls the cheap `Engine::mem_cardinalities` instead), never from the
     /// per-batch write path, so the walk's cost never lands on ingestion or on the sampler.
     MemBytes {
         resp: tokio::sync::oneshot::Sender<usize>,

@@ -51,6 +51,8 @@ pub struct Config {
     pub bind: String,
     /// `tracing` EnvFilter string.
     pub log_filter: String,
+    /// Emit tracing records as JSON so CloudWatch subscriptions preserve structured fields.
+    pub json_logs: bool,
     /// Logical-replication slot name.
     pub slot: String,
     /// Tables to replicate (`ELECTRIC_CIRCUITS_PG_TABLES`): `schema.name`, a bare name (=
@@ -87,6 +89,11 @@ pub struct Config {
     /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
     /// zero-subscriber fast path. Default on. Note: the surface is unauthenticated either way.
     pub trace: bool,
+    /// Period for the structured memory snapshot log. `0` disables the log sampler.
+    pub memory_log_period: Duration,
+    /// Period for the expensive owned-heap memory breakdown included in the snapshot log. `0`
+    /// disables byte-level walks; the cheap process/cardinality snapshot remains enabled.
+    pub memory_bytes_log_period: Duration,
     /// dbsp-backed table arrangements (always built; see `arrangements.rs`). The circuit is
     /// mandatory infrastructure — the sub-knobs below tune it, but it can no longer be turned off.
     pub dbsp: DbspConfig,
@@ -186,6 +193,28 @@ pub fn parse_human_duration(s: &str) -> Option<Duration> {
         _ => return None,
     };
     Some(Duration::from_millis(ms as u64))
+}
+
+fn seconds_setting(get: &impl Fn(&str) -> Option<String>, name: &str, default_seconds: u64) -> Result<Duration> {
+    let Some(raw) = get(name) else {
+        return Ok(Duration::from_secs(default_seconds));
+    };
+    let seconds = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("{name} must be a whole number of seconds, got '{raw}'"))?;
+    Ok(Duration::from_secs(seconds))
+}
+
+fn boolean_setting(get: &impl Fn(&str) -> Option<String>, name: &str, default: bool) -> Result<bool> {
+    let Some(raw) = get(name) else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{name} must be a boolean (1/0, true/false, yes/no, on/off), got '{raw}'"),
+    }
 }
 
 impl Config {
@@ -295,6 +324,7 @@ impl Config {
             Some("info") => "info".into(),
             _ => "info".into(),
         });
+        let json_logs = boolean_setting(&g, "ELECTRIC_CIRCUITS_LOG_JSON", true)?;
 
         // Slot name: ELECTRIC_CIRCUITS_PG_SLOT wins; else electric_slot_<stream id>; else the legacy default.
         let stream_id = g("ELECTRIC_REPLICATION_STREAM_ID");
@@ -395,6 +425,8 @@ impl Config {
         let trace = g("ELECTRIC_CIRCUITS_TRACE")
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
+        let memory_log_period = seconds_setting(&g, "ELECTRIC_CIRCUITS_MEMORY_LOG_PERIOD_SECS", 5)?;
+        let memory_bytes_log_period = seconds_setting(&g, "ELECTRIC_CIRCUITS_MEMORY_BYTES_LOG_PERIOD_SECS", 30)?;
 
         // The dbsp counts circuit is always built — it is mandatory infrastructure, no longer
         // gated by an on/off flag. It maintains only the configured COUNT groupings (`_COUNTS`);
@@ -502,6 +534,7 @@ impl Config {
             initialize_namespace,
             bind,
             log_filter,
+            json_logs,
             slot,
             tables,
             poll_ms,
@@ -516,6 +549,8 @@ impl Config {
             prometheus_port,
             db_pool_size,
             trace,
+            memory_log_period,
+            memory_bytes_log_period,
             dbsp,
             txn,
             backfill,
@@ -537,7 +572,7 @@ impl Config {
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} initialize_namespace={} log={} \
+             secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} json_logs={} memory_log_period={:?} memory_bytes_log_period={:?} initialize_namespace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
@@ -554,6 +589,9 @@ impl Config {
             self.storage_dir.as_deref().unwrap_or("<none>"),
             self.prometheus_port,
             self.trace,
+            self.json_logs,
+            self.memory_log_period,
+            self.memory_bytes_log_period,
             self.initialize_namespace,
             self.log_filter,
             self.txn.memory_bytes,
@@ -835,6 +873,26 @@ mod tests {
                 .log_filter,
             "electric_circuits_engine=debug"
         );
+    }
+
+    #[test]
+    fn memory_log_periods_default_and_validate() {
+        let defaults = cfg(&[]);
+        assert!(defaults.json_logs);
+        assert_eq!(defaults.memory_log_period, Duration::from_secs(5));
+        assert_eq!(defaults.memory_bytes_log_period, Duration::from_secs(30));
+
+        let disabled = cfg(&[
+            ("ELECTRIC_CIRCUITS_MEMORY_LOG_PERIOD_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_MEMORY_BYTES_LOG_PERIOD_SECS", "0"),
+        ]);
+        assert_eq!(disabled.memory_log_period, Duration::ZERO);
+        assert_eq!(disabled.memory_bytes_log_period, Duration::ZERO);
+
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_MEMORY_LOG_PERIOD_SECS", "fast")]).is_err());
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_MEMORY_BYTES_LOG_PERIOD_SECS", "fast")]).is_err());
+        assert!(!cfg(&[("ELECTRIC_CIRCUITS_LOG_JSON", "0")]).json_logs);
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_LOG_JSON", "maybe")]).is_err());
     }
 
     #[test]

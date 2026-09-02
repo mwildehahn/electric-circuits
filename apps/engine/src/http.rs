@@ -1636,9 +1636,10 @@ async fn reset_metrics() -> Json<serde_json::Value> {
 /// the harness reads the exact state right after creating a batch of shapes (and republishes the OTel
 /// gauges in the same pass).
 ///
-/// This is the ONLY call site for `Engine::mem_bytes` — the expensive `heap_bytes`/`MemBytes` byte
-/// walk (Phase 0 self-accounting) runs here, on demand, never on the 500ms background sampler (see
-/// `mem::spawn_sampler` / `Engine::mem_cardinalities`'s doc comments).
+/// The HTTP handler is one call site for `Engine::mem_bytes` — the expensive `heap_bytes`/`MemBytes`
+/// byte walk (Phase 0 self-accounting) runs here and in the slower diagnostic memory logger, never
+/// on the 500ms background sampler (see `mem::spawn_sampler` / `Engine::mem_cardinalities`'s doc
+/// comments).
 async fn get_memory(State(engine): State<Engine>) -> Json<serde_json::Value> {
     let card = engine.mem_cardinalities().await.with_bytes(engine.mem_bytes().await);
     crate::mem::publish(&card);

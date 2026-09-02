@@ -106,8 +106,8 @@ impl PkDict {
 
     /// Estimated owned heap bytes (estimate — hashbrown bucket approximation) — the amortized
     /// string storage plus the forward/reverse index buffers. Reported as `bytes_pk_dict` in
-    /// `GET /memory` so the append-only trade is visible. On-demand only (walks every interned
-    /// string); never call it from the 500 ms sampler.
+    /// `GET /memory` and the slower diagnostic logger so the append-only trade is visible.
+    /// On-demand only (walks every interned string); never call it from the 500 ms sampler.
     ///
     /// Locks `forward` then `reverse` — same order as `get_or_insert` (see the struct doc's lock
     /// order note) — to avoid a lock-order inversion against a concurrent mint.

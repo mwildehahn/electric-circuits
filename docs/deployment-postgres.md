@@ -81,6 +81,13 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_PG_POLL_MS`| no       | —                | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery). |
 | `ELECTRIC_CIRCUITS_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
 | `ELECTRIC_CIRCUITS_LOG`       | no       | `info`           | Log filter (`error`, `warn`, `info`, `debug`). |
+| `ELECTRIC_CIRCUITS_LOG_JSON`  | no       | `1`              | Emit structured JSON logs so CloudWatch subscription consumers preserve memory fields. Set `0` for text. |
+| `ELECTRIC_CIRCUITS_MEMORY_LOG_PERIOD_SECS` | no | `5` | Cheap process/cgroup/cardinality memory snapshot interval; `0` disables. |
+| `ELECTRIC_CIRCUITS_MEMORY_BYTES_LOG_PERIOD_SECS` | no | `30` | Expensive owned-heap breakdown interval; `0` disables byte walks. |
+| `OTEL_SERVICE_NAME` | no | unset | OTel resource service name used by the OTLP metrics exporter. |
+| `OTEL_RESOURCE_ATTRIBUTES` | no | unset | Comma-separated OTel resource attributes, such as `deployment.environment=prod`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no       | unset            | Enables the engine's optional OTLP HTTP/protobuf metrics reader alongside its local Prometheus reader. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | no       | unset            | Comma-separated OTLP HTTP headers; provide via a secret, never in a checked-in manifest. |
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | no | `true`      | Policy when the replication slot can no longer be trusted: `true` retires every shape and starts a new epoch; `false` refuses (fail-closed) until `POST /epoch/reset`. See "Losing the replication slot" below. |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | no | `1073741824` | Change-log segment size before rotation (`0` disables the size criterion). See "Change-log disk" below. |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | no | `86400` | Change-log segment age before rotation (`0` disables the age criterion). |
