@@ -5,8 +5,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
@@ -366,6 +368,10 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/subsets/query", post(query_subset))
         .route("/v1/subset-feeds", post(create_subset_feed))
         .route("/v1/aggregates", post(create_aggregate))
+        .route("/changes/position", get(changes_position))
+        .route("/changes/{segment}", get(read_changes))
+        .route("/consumers", get(list_consumers))
+        .route("/consumers/{id}", put(pin_consumer).delete(delete_consumer))
         // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
@@ -418,6 +424,167 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
     r.layer(from_fn(normalize_extractor_rejection))
         .layer(from_fn_with_state(engine.clone(), require_managed_public_ready))
         .with_state(engine)
+}
+
+#[derive(Deserialize)]
+struct ChangesReadQuery {
+    #[serde(default = "changes_start_offset")]
+    offset: String,
+    live: Option<String>,
+    /// A cursor is bound to its immutable query generation.  Older cursors are terminal even if
+    /// an identically numbered path exists in the current namespace.
+    generation: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConsumerPinRequest {
+    segment: u32,
+    offset: String,
+}
+
+#[derive(Serialize)]
+struct ConsumerResponse {
+    id: String,
+    position: crate::changelog::LogPosition,
+    pinned_segments: Vec<u32>,
+    lag_segments: u32,
+}
+
+fn changes_start_offset() -> String {
+    "-1".to_string()
+}
+
+/// A positioned, unmodified page of the segmented durable change log for external consumers.
+async fn read_changes(
+    State(engine): State<Engine>,
+    Path(segment): Path<u32>,
+    Query(query): Query<ChangesReadQuery>,
+) -> Result<Response, AppError> {
+    engine.ensure_not_degraded()?;
+    if query.generation.as_deref().is_some_and(|generation| generation != engine.changes_generation()) {
+        return Err(AppError {
+            status: StatusCode::GONE,
+            msg: "stale-generation: change-log position belongs to a previous query generation; re-sync".to_string(),
+            retry_after: false,
+        });
+    }
+    let live = query.live.as_deref() == Some("long-poll");
+    let mut page = match if live {
+        let deadline = Instant::now() + crate::electric::live_timeout();
+        let read_engine = engine.clone();
+        let offset = query.offset.clone();
+        let shutdown = engine.shutdown_token();
+        crate::electric::poll_live_until(offset, deadline, &shutdown, move |offset| {
+            let engine = read_engine.clone();
+            async move { engine.read_changes(segment, &offset, true).await }
+        })
+        .await
+    } else {
+        engine.read_changes(segment, &query.offset, false).await
+    } {
+        Ok(page) => page,
+        Err(error) => {
+            if let Some(gone) = error.chain().find_map(|cause| cause.downcast_ref::<crate::ds::StreamGone>()) {
+                return Err(AppError {
+                    status: StatusCode::from_u16(gone.status).unwrap_or(StatusCode::GONE),
+                    msg: gone.to_string(),
+                    retry_after: false,
+                });
+            }
+            return Err(AppError::from(error));
+        }
+    };
+    // The common reader contract reports an idle, deadline-bounded long-poll as caught up. The
+    // storage poll may have been cancelled at our deadline before it could send its own 204.
+    if live && page.envelopes.is_empty() && !page.closed {
+        page.up_to_date = true;
+    }
+    let mut response = Json(page.envelopes).into_response();
+    if let Some(offset) = page.next_offset {
+        response.headers_mut().insert(
+            "stream-next-offset",
+            HeaderValue::from_str(&offset).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+    }
+    if page.up_to_date {
+        response.headers_mut().insert("stream-up-to-date", HeaderValue::from_static("true"));
+    }
+    if page.closed {
+        response.headers_mut().insert("stream-closed", HeaderValue::from_static("true"));
+    }
+    Ok(response)
+}
+
+/// Public current position and namespace of the segmented change log. The segment list is useful
+/// to an external consumer only for diagnostics; positioned reads still follow each closed
+/// segment's control pointer one hop at a time.
+async fn changes_position(State(engine): State<Engine>) -> Result<Json<serde_json::Value>, AppError> {
+    engine.ensure_not_degraded()?;
+    Ok(Json(serde_json::json!({
+        "generation": engine.changes_generation(),
+        "position": engine.changes_position(),
+        "segments": engine.changes_segments(),
+    })))
+}
+
+async fn pin_consumer(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+    Json(request): Json<ConsumerPinRequest>,
+) -> Result<Json<ConsumerResponse>, AppError> {
+    engine.ensure_not_degraded()?;
+    let position = crate::changelog::LogPosition { segment: request.segment, offset: request.offset };
+    let result = engine.pin_consumer(id.clone(), position.clone()).await;
+    if let Err(error) = result {
+        let msg = error.to_string();
+        return Err(AppError {
+            status: if msg.contains("backwards") { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST },
+            msg,
+            retry_after: false,
+        });
+    }
+    let (_, position, lag_segments) = engine
+        .consumers()
+        .into_iter()
+        .find(|(consumer_id, _, _)| consumer_id == &id)
+        .expect("durable pin is installed before the response");
+    Ok(Json(ConsumerResponse {
+        id,
+        pinned_segments: engine
+            .changes_segments()
+            .keys()
+            .copied()
+            .filter(|segment| *segment >= position.segment)
+            .collect(),
+        position,
+        lag_segments,
+    }))
+}
+
+async fn list_consumers(State(engine): State<Engine>) -> Result<Json<Vec<ConsumerResponse>>, AppError> {
+    engine.ensure_not_degraded()?;
+    let segments = engine.changes_segments();
+    Ok(Json(
+        engine
+            .consumers()
+            .into_iter()
+            .map(|(id, position, lag_segments)| ConsumerResponse {
+                pinned_segments: segments.keys().copied().filter(|segment| *segment >= position.segment).collect(),
+                id,
+                position,
+                lag_segments,
+            })
+            .collect(),
+    ))
+}
+
+async fn delete_consumer(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    engine.ensure_not_degraded()?;
+    engine.remove_consumer(&id).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// Liveness and private deployment control deliberately bypass this gate. Every other route is a

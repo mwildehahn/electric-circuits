@@ -624,6 +624,13 @@ impl DsClient {
         &self.base
     }
 
+    /// Immutable query-generation namespace of the scoped store this client reads.  A public
+    /// positioned cursor includes this value so a reader can refuse to replay a cursor issued by
+    /// an older query generation instead of mistaking its path for a newly missing segment.
+    pub fn query_generation(&self) -> &str {
+        &self.scope.query_generation
+    }
+
     pub fn stream_url(&self, path: &str) -> String {
         match self.scope.qualify(path) {
             Ok(path) => format!("{}/{path}", self.base.trim_end_matches('/')),

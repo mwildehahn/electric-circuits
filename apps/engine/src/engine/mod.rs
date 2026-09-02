@@ -3,7 +3,7 @@
 //! equality shapes routed by key, and appends the filtered deltas (as State-Protocol envelopes) to
 //! the shape streams. Shapes backfill from Postgres on registration; see `add_shape_routed`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::value::{Tup2, ZWeight};
@@ -391,6 +391,9 @@ pub struct Engine {
     /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
     /// the retention sweeper deletes segments and the epoch reset rotates one.
     changes: ChangeLogWriter,
+    /// Explicit, caller-named external replay positions. Unlike a page read these are durable
+    /// retention claims, so only catalog-confirmed entries are allowed to constrain deletion.
+    consumers: Arc<std::sync::Mutex<BTreeMap<String, LogPosition>>>,
     /// Change-log position the sequencer starts from (set by catalog restore before the spawn).
     seq_start: Arc<std::sync::Mutex<LogPosition>>,
     /// The `(lsn, seq)` de-duplication highwater the sequencer starts from, restored with the
@@ -1158,6 +1161,7 @@ impl Engine {
             #[cfg(test)]
             purge_test_hook: Arc::new(PurgeTestHook::default()),
             changes,
+            consumers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
             seq_highwater: Arc::new(std::sync::Mutex::new(None)),
             restore_reads_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2485,6 +2489,76 @@ impl Engine {
     /// the tail.
     pub fn changes_position(&self) -> LogPosition {
         self.changes.state().position()
+    }
+
+    /// Immutable query generation that names the current change-log namespace.  Consumers bind
+    /// a stored position to this value; a mismatch is a terminal re-sync signal, never a guess at
+    /// whether an identically numbered segment exists in a different generation.
+    pub fn changes_generation(&self) -> &str {
+        self.changes.ds().query_generation()
+    }
+
+    /// Every retained change-log segment and the unix second it became current.
+    pub fn changes_segments(&self) -> std::collections::BTreeMap<u32, u64> {
+        self.changes.state().segments()
+    }
+
+    /// Record a caller-owned replay position after its catalog event is durable. A retried PUT at
+    /// the same position is idempotent; a backwards position is refused rather than widening the
+    /// deletion floor after a caller has declared it finished.
+    pub async fn pin_consumer(&self, id: String, position: LogPosition) -> Result<()> {
+        if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            bail!("consumer id must use only alphanumeric, '_' or '-', and be at most 128 bytes");
+        }
+        if position.segment > self.changes.state().current()
+            || (position.segment != self.changes.state().current()
+                && !self.changes.state().segments().contains_key(&position.segment))
+        {
+            bail!("consumer position names an unretained segment: {}", position.segment);
+        }
+        let previous = self.consumers.lock().unwrap().get(&id).cloned();
+        if previous.as_ref().is_some_and(|old| position < *old) {
+            bail!("consumer position cannot move backwards");
+        }
+        if previous.as_ref() == Some(&position) {
+            return Ok(());
+        }
+        self.catalog_tx
+            .send_durable(CatalogEvent::ConsumerPinned { id: id.clone(), position: position.clone() })
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.consumers.lock().unwrap().insert(id, position);
+        Ok(())
+    }
+
+    /// Release an explicit external consumer pin, durably before the registry forgets it.
+    pub async fn remove_consumer(&self, id: &str) -> Result<()> {
+        if !self.consumers.lock().unwrap().contains_key(id) {
+            return Ok(());
+        }
+        self.catalog_tx
+            .send_durable(CatalogEvent::ConsumerEvicted { id: id.to_string() })
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.consumers.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    /// Snapshot consumers with their segment lag against the current open segment.
+    pub fn consumers(&self) -> Vec<(String, LogPosition, u32)> {
+        let current = self.changes.state().current();
+        self.consumers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, pos)| (id.clone(), pos.clone(), current.saturating_sub(pos.segment)))
+            .collect()
+    }
+
+    /// Read one positioned page of the external change-log contract. The ingestor remains its only
+    /// writer; this is deliberately a byte-level view over the same segment the sequencer reads.
+    pub async fn read_changes(&self, segment: u32, offset: &str, live: bool) -> anyhow::Result<crate::ds::ReadResult> {
+        self.changes.ds().read(&crate::changelog::segment_path(segment), offset, live).await
     }
 
     /// The table's current circuit topology (shared families + standalone count), or `None` if no

@@ -333,6 +333,11 @@ impl ChangeLogWriter {
         &self.state
     }
 
+    /// The scoped durable-stream client shared by the ingestor and read-only change-log readers.
+    pub fn ds(&self) -> &DsClient {
+        &self.ds
+    }
+
     pub fn config(&self) -> &ChangeLogConfig {
         &self.cfg
     }
@@ -777,6 +782,36 @@ mod tests {
         let plan = plan_segment_deletion(&segs, 3, 3, &pins, Duration::from_secs(100), 410);
         assert_eq!(plan.evict, vec!["old".to_string()]);
         assert_eq!(plan.delete, vec![0, 1], "segment 2 is still pinned by 'mid'");
+    }
+
+    #[test]
+    fn a_consumer_pin_holds_old_segments_until_it_advances() {
+        let segs = segments(&[(0, 100), (1, 200), (2, 300)]);
+        let consumer_at_zero = vec![SegmentPin { shape_id: "consumer:kernel".into(), segment: 0, evictable: true }];
+        let held = plan_segment_deletion(&segs, 2, 2, &consumer_at_zero, Duration::from_secs(60), 250);
+        assert!(held.evict.is_empty());
+        assert!(held.delete.is_empty(), "a consumer at segment 0 pins 0 and 1");
+
+        let consumer_at_two = vec![SegmentPin { shape_id: "consumer:kernel".into(), segment: 2, evictable: true }];
+        let advanced = plan_segment_deletion(&segs, 2, 2, &consumer_at_two, Duration::from_secs(60), 250);
+        assert_eq!(advanced.delete, vec![0, 1], "advancing the consumer frees earlier segments");
+    }
+
+    #[test]
+    fn a_stale_consumer_is_evicted_before_only_its_segments_are_deleted() {
+        let segs = segments(&[(0, 100), (1, 200), (2, 300)]);
+        let pins = vec![
+            SegmentPin { shape_id: "consumer:stale".into(), segment: 0, evictable: true },
+            SegmentPin { shape_id: "consumer:live".into(), segment: 1, evictable: true },
+        ];
+        let plan = plan_segment_deletion(&segs, 2, 2, &pins, Duration::from_secs(60), 300);
+        assert_eq!(plan.evict, vec!["consumer:stale".to_string()]);
+        assert_eq!(plan.delete, vec![0], "the fresh consumer still pins segment 1");
+
+        // A failed eviction leaves the pin in the second, retain-disabled plan, so it cannot
+        // license deletion merely because the first plan proposed it for eviction.
+        let deferred = plan_segment_deletion(&segs, 2, 2, &pins, Duration::ZERO, 300);
+        assert!(deferred.delete.is_empty(), "a failed eviction defers its pinned segments");
     }
 
     #[test]

@@ -41,3 +41,10 @@ crash can never leave a boot resuming inside a segment a sweep has deleted — a
 restored position names a segment storage does not have refuses to start rather than spin on a 404.
 A reader leaving a closed segment steps to exactly the next one, never to the first open one: the
 segments in between are unread changes.
+
+The same rules apply to a supported external reader: it drops `__circuits.control` by type, holds
+until `last`, deduplicates by `(lsn, seq)`, and crosses only after the closed segment is drained.
+Its checkpoint also includes the immutable query generation returned by `GET /changes/position`; it
+presents that value as `generation=` on reads. A mismatch is a named `410 Gone`
+(`stale-generation`), not a 404: the reader must rebuild from state instead of treating an old
+store/query generation as an absent segment in the current one.

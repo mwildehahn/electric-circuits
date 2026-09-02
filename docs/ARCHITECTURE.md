@@ -59,7 +59,13 @@ Three ideas carry the whole design:
   segmented `changes/<n>` change log for all tables (the write log; the envelope's `type` carries the table's
   canonical `schema.name` — always qualified, see ADR-0002),
   one `shape/<id>` stream per distinct shape (the
-  result feed). The decoupling boundary between write and read paths.
+  result feed). The decoupling boundary between write and read paths. External consumers read an
+  unmodified positioned page through `GET /changes/{segment}?offset=<offset>&live=long-poll`; the
+  response preserves the stream body and `stream-next-offset`, `stream-up-to-date`, and
+  `stream-closed` headers. `GET /changes/position` supplies the current query generation, tail and
+  known segments. A consumer persists that generation with its position and supplies it as
+  `generation=` on subsequent reads: a mismatch returns named `410 Gone` (`stale-generation`) so a
+  prior store/query generation is re-synced rather than confused with a missing stream.
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
   shapes/subqueries/aggregations, the native versioned REST/OpenAPI surface (`/v1/*`), and the
   Electric-compatible `GET /v1/shape` endpoint.
@@ -210,7 +216,10 @@ unconditionally by every reader before anything else looks at the batch, so they
 executor or a shape stream — never by position, since an abandoned rotation (the close failed) leaves
 a pointer mid-segment. Every position in the log is a `(segment, offset)` pair; a rotated-out segment
 is deleted once the **durable** checkpoint is past it and nothing resumes inside it (§5.1, and the
-retention lifecycle for the evict-before-delete rule).
+retention lifecycle for the evict-before-delete rule). External change-log consumers use the same
+positioned reader protocol and explicitly catalog a pin; their positions participate in this
+deletion floor beside dormant-shape resumes. The retain window evicts a stale consumer durably
+before deleting the segments it alone pinned, and a failed eviction defers deletion (ADR-0010).
 
 Delivery to the table streams is therefore **at-least-once** (a partial multi-table append failure,
 or acknowledgements not yet flushed at a crash, re-deliver whole transactions). Deltas are *not*
@@ -782,7 +791,7 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 | client-facing mutation → catalog | **durable-before-ack** = every record a CLIENT is told about: `Created`, the `Joined` of a NEW claim, and the `Left`/`Dropped` of a native `DELETE` — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`; a retry of an idempotent removal waits on the same barrier via `CatalogWriter::wait_durable`). **Queued-never-dropped** = what the engine does to itself: a *renewal's* `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the epoch reset, retention and the `/v1/shape` adapter. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream — and an acknowledged release or purge is in it too, so neither comes back. That matters most under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, a supported setting that disables lease expiry: there is no lease repair to fall back on. A queued record cannot be lost, only delayed — and if a process dies with one still queued, the **lease** reconverges it: the shape comes back with its subscriptions' restored ages, so a `Left` that never landed is re-applied within one idle window, and a `Dropped` that never landed leaves a shape whose stale claims lapse the same way. The cost is availability: a create, a release or a purge while storage is down **waits** rather than lying. A client that times out and gives up loses only its answer — the record still lands, and the teardown a purge promised is finished by a spawned task, not by the dropped request future |
 | shape ids → streams | the boot resumes `next_shape_id` past the maximum id of every `Created` in the log, dropped ones included (`CatalogFold::max_shape_id`) | an id is never re-minted while the `shape/*` stream it named still exists: a new shape can never inherit a dead one\'s stream (and its rows), and a pending retirement can never delete a live shape\'s stream |
 | shape removal → stream removal | `Dropped` (intent) is written BEFORE the retirement, `Retired` (completion) only after storage accepts the delete; failures go to a background queue that retries to completion, and every boot re-queues each `Dropped` with no `Retired` — ADR-0007 | no shape stream outlives its shape, whatever storage was doing at the moment it was retired or which process was alive at the time; this is also the orphan-`shape/*` GC, bounded by the catalog rather than a storage listing |
-| change log ↔ disk | segment rotation by size/age + delete-when-nothing-can-resume (the DURABLE checkpoint past it AND no shape pinning it; a dormant shape pinning past the retain window is evicted first, a reactivating one is never evicted mid-replay) — ADR-0006 | the log is bounded without prefix trimming; no reader ever loses its place (positions are `(segment, offset)`, the pointer is followed, the current segment is never deleted) |
+| change log ↔ disk | segment rotation by size/age + delete-when-nothing-can-resume (the DURABLE checkpoint past it AND no dormant-shape or external-consumer pinning it; a stale pin is evicted durably first, while a reactivating shape is never evicted mid-replay) — ADR-0006, ADR-0010 | the log is bounded without prefix trimming; no reader ever loses its place (positions are `(segment, offset)`, the pointer is followed, the current segment is never deleted) |
 | engine restart | durable shape catalog (`meta/catalog`: create/join/leave (each naming a subscription + its lease time)/drop/retire + change-log position checkpoints + segment rotations, every event carrying an `eid`) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
 | compiled schema ↔ Postgres | fingerprint compare on every `Relation` + a 60 s catalog reconciler; drift/TRUNCATE/identity regression retires that table's dependents, and a per-table schema generation refuses any create that overlapped it (ADR-0005) | never serves rows over a schema Postgres no longer has; the catalog records `schemaChanged` as the audit trail for the drops |
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
