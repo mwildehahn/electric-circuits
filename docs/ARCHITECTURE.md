@@ -59,7 +59,10 @@ Three ideas carry the whole design:
   segmented `changes/<n>` change log for all tables (the write log; the envelope's `type` carries the table's
   canonical `schema.name` — always qualified, see ADR-0002),
   one `shape/<id>` stream per distinct shape (the
-  result feed). The decoupling boundary between write and read paths.
+  result feed). The decoupling boundary between write and read paths. External consumers read an
+  unmodified positioned page through `GET /changes/{segment}?offset=<offset>&live=long-poll`; the
+  response preserves the stream body and `stream-next-offset`, `stream-up-to-date`, and
+  `stream-closed` headers.
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
   shapes/subqueries/aggregations, the native versioned REST/OpenAPI surface (`/v1/*`), and the
   Electric-compatible `GET /v1/shape` endpoint.
