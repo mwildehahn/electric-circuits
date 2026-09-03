@@ -104,6 +104,10 @@ pub struct Metrics {
     pub shapes_reactivated: AtomicU64, // retention: dormant -> active (table-stream replay)
     pub reactivations_started: AtomicU64,
     pub reactivations_coalesced: AtomicU64,
+    pub reactivation_scans_coalesced: AtomicU64,
+    pub reactivations_replayed: AtomicU64,
+    pub reactivations_recreated: AtomicU64,
+    pub reactivations_evicted_unresumable: AtomicU64,
     pub reactivations_completed: AtomicU64,
     pub reactivations_failed: AtomicU64,
     pub reactivation_bytes_scanned: AtomicU64,
@@ -187,6 +191,10 @@ pub fn metrics() -> &'static Metrics {
         shapes_reactivated: AtomicU64::new(0),
         reactivations_started: AtomicU64::new(0),
         reactivations_coalesced: AtomicU64::new(0),
+        reactivation_scans_coalesced: AtomicU64::new(0),
+        reactivations_replayed: AtomicU64::new(0),
+        reactivations_recreated: AtomicU64::new(0),
+        reactivations_evicted_unresumable: AtomicU64::new(0),
         reactivations_completed: AtomicU64::new(0),
         reactivations_failed: AtomicU64::new(0),
         reactivation_bytes_scanned: AtomicU64::new(0),
@@ -232,6 +240,10 @@ impl Metrics {
                 "shapes_reactivated": self.shapes_reactivated.load(Ordering::Relaxed),
                 "reactivations_started": self.reactivations_started.load(Ordering::Relaxed),
                 "reactivations_coalesced": self.reactivations_coalesced.load(Ordering::Relaxed),
+                "reactivation_scans_coalesced": self.reactivation_scans_coalesced.load(Ordering::Relaxed),
+                "reactivations_replayed": self.reactivations_replayed.load(Ordering::Relaxed),
+                "reactivations_recreated": self.reactivations_recreated.load(Ordering::Relaxed),
+                "reactivations_evicted_unresumable": self.reactivations_evicted_unresumable.load(Ordering::Relaxed),
                 "reactivations_completed": self.reactivations_completed.load(Ordering::Relaxed),
                 "reactivations_failed": self.reactivations_failed.load(Ordering::Relaxed),
                 "reactivation_bytes_scanned": self.reactivation_bytes_scanned.load(Ordering::Relaxed),
@@ -279,6 +291,10 @@ impl Metrics {
         self.shapes_reactivated.store(0, Ordering::Relaxed);
         self.reactivations_started.store(0, Ordering::Relaxed);
         self.reactivations_coalesced.store(0, Ordering::Relaxed);
+        self.reactivation_scans_coalesced.store(0, Ordering::Relaxed);
+        self.reactivations_replayed.store(0, Ordering::Relaxed);
+        self.reactivations_recreated.store(0, Ordering::Relaxed);
+        self.reactivations_evicted_unresumable.store(0, Ordering::Relaxed);
         self.reactivations_completed.store(0, Ordering::Relaxed);
         self.reactivations_failed.store(0, Ordering::Relaxed);
         self.reactivation_bytes_scanned.store(0, Ordering::Relaxed);

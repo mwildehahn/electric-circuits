@@ -410,6 +410,9 @@ pub struct Engine {
     /// Bounds concurrent dormant replays; each permit covers one replay scan and its page-sized
     /// transient allocations. Shapes joining an in-flight replay wait on its lifecycle channel.
     pub(crate) reactivation_permits: Arc<tokio::sync::Semaphore>,
+    /// Pending same-table/cursor replay requests coalesced into one page scan.
+    pub(crate) reactivation_batches:
+        Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<crate::engine::lifecycle::ReplayBatch>>>>>,
     /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
     /// Set once the background schema reconciler has been spawned (see `engine::drift`).
@@ -1177,6 +1180,7 @@ impl Engine {
                     .unwrap_or(2)
                     .max(1),
             )),
+            reactivation_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconciler_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resolving: Arc::new(drift::Resolving::default()),

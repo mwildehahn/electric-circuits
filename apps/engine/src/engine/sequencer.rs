@@ -1231,6 +1231,7 @@ pub(crate) async fn activate_shape(
 /// incomplete, on a stream the shape is not live on yet. The live loop's rule is what governs from
 /// the moment the shape is registered.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn replay_changes_for_shape(
     ds: &DsClient,
     ts: &TableSchema,
@@ -1331,6 +1332,149 @@ pub(crate) async fn replay_changes_for_shape(
     Ok(emitted)
 }
 
+/// Replay one exact cursor page for several shapes of the same table. The caller groups requests
+/// with the same `(table, segment, offset)`; each target still applies its own predicate/gate and
+/// appends to its own stream. A target append failure is isolated so other waiters can complete.
+pub(crate) struct ReplayTarget {
+    pub ts: TableSchema,
+    pub table: TableRef,
+    pub pred: Arc<CompiledPredicate>,
+    pub out_cols: Option<Arc<Vec<usize>>>,
+    pub gate: crate::pg::SnapshotGate,
+    pub stream_path: String,
+    pub from: LogPosition,
+    pub library_mode: bool,
+}
+
+pub(crate) async fn replay_changes_for_targets(
+    ds: &DsClient,
+    mut targets: Vec<ReplayTarget>,
+    shutdown: &crate::shutdown::ShutdownToken,
+) -> Vec<Result<u64>> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let table = targets[0].table.clone();
+    let mut pos = targets[0].from.clone();
+    let mut emitted = vec![0u64; targets.len()];
+    let mut errors: Vec<Option<anyhow::Error>> = (0..targets.len()).map(|_| None).collect();
+    let mut rotate_to = None;
+    loop {
+        let page_start = crate::changelog::offset_bytes(&pos.offset);
+        let rr = match ds.read_for_table(&pos.path(), &pos.offset, false, table.as_str()).await {
+            Ok(rr) => rr,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                for err in &mut errors {
+                    if err.is_none() {
+                        *err = Some(anyhow::anyhow!("coalesced replay read: {msg}"));
+                    }
+                }
+                break;
+            }
+        };
+        if let Some(n) = crate::changelog::rotation_target_in(&rr.envelopes) {
+            rotate_to = Some(n);
+        }
+        for (idx, target) in targets.iter_mut().enumerate() {
+            if errors[idx].is_some() {
+                continue;
+            }
+            let mut outs = Vec::new();
+            for env in &rr.envelopes {
+                if target.from.segment == pos.segment {
+                    if let (Some(want), Some(got)) = (
+                        crate::changelog::offset_bytes(&target.from.offset),
+                        env.headers.offset.as_deref().and_then(crate::changelog::offset_bytes),
+                    ) {
+                        if got < want {
+                            continue;
+                        }
+                    }
+                }
+                if env.type_ != target.table.as_str() {
+                    continue;
+                }
+                let Ok((delta, txid, lsn)) = apply_envelope(&target.ts, env) else { continue };
+                let absolute = target.library_mode && needs_absolute_emission(env);
+                if delta.is_empty() && !absolute {
+                    continue;
+                }
+                let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+                let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+                if target.gate.should_skip(lsn_u64, xid) {
+                    continue;
+                }
+                if absolute {
+                    let held =
+                        delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| target.pred.matches(r));
+                    if let Some(e) = absolute_envelope(
+                        &target.ts,
+                        &env.key,
+                        held,
+                        txid,
+                        lsn,
+                        target.out_cols.as_deref().map(Vec::as_slice),
+                    ) {
+                        outs.push(e);
+                    }
+                } else {
+                    let matched = eval_standalone(&target.pred, &delta);
+                    if !matched.is_empty() {
+                        outs.extend(translate_output(
+                            &target.ts,
+                            matched,
+                            txid,
+                            lsn,
+                            target.out_cols.as_deref().map(Vec::as_slice),
+                        ));
+                    }
+                }
+            }
+            if !outs.is_empty() {
+                emitted[idx] += outs.len() as u64;
+                if let Err(e) =
+                    ds.append_retrying(&target.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await
+                {
+                    errors[idx] = Some(e.context("append coalesced replay"));
+                }
+            }
+        }
+        let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
+        if let (Some(start), Some(end)) =
+            (page_start, rr.next_offset.as_deref().and_then(crate::changelog::offset_bytes))
+        {
+            metrics().reactivation_bytes_scanned.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+        }
+        if let Some(n) = rr.next_offset {
+            pos.offset = n;
+        }
+        if rr.closed && (rr.envelopes.is_empty() || !advanced) {
+            let next = match rotate_to.take() {
+                Some(n) => n,
+                None => match crate::changelog::next_segment_for_reader(ds, pos.segment).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        for err in &mut errors {
+                            if err.is_none() {
+                                *err = Some(anyhow::anyhow!("{msg}"));
+                            }
+                        }
+                        break;
+                    }
+                },
+            };
+            pos = LogPosition::start_of(next);
+            continue;
+        }
+        if !advanced || (rr.up_to_date && !rr.closed) {
+            break;
+        }
+    }
+    errors.into_iter().zip(emitted).map(|(err, n)| err.map_or(Ok(n), Err)).collect()
+}
+
 /// Creator-side half of the two-phase shape creation: await the pending-buffer ack, **stream** the
 /// Postgres backfill on a pooled connection (appending it chunk by chunk for a plain shape, folding
 /// it for an aggregate), then activate. The sequencer keeps processing other work the whole time —
@@ -1360,7 +1504,7 @@ pub(crate) async fn backfill_and_activate(
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
     ack_rx: tokio::sync::oneshot::Receiver<()>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<BackfillStats, String> {
     let abort = || {
         let _ = cmd_tx.send(SequencerCmd::AbortShape { table: table.clone(), shape_id: shape_id.to_string() });
     };
@@ -1371,8 +1515,8 @@ pub(crate) async fn backfill_and_activate(
     // SELECT; `matches()` is the final authority (a safety net if the SQL is ever a looser
     // superset). A `changes_only` feed skips the backfill and forwards only future matches
     // (passthrough gate) — the non-materialized live tail a subset query follows.
-    let (gate, agg_seed, emitted_seed) = if changes_only {
-        (crate::pg::SnapshotGate::passthrough(), None, 0u64)
+    let (gate, agg_seed, emitted_seed, stats) = if changes_only {
+        (crate::pg::SnapshotGate::passthrough(), None, 0u64, BackfillStats::default())
     } else {
         let t0 = std::time::Instant::now();
         match stream_backfill(ds, pg_url, ts, pred, out_cols, stream_path, aggregate, shutdown, t0).await {
@@ -1397,7 +1541,14 @@ pub(crate) async fn backfill_and_activate(
     {
         return Err("sequencer is gone".to_string());
     }
-    ready_rx.await.unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+    ready_rx.await.unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))?;
+    Ok(stats)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BackfillStats {
+    pub rows: u64,
+    pub estimated_bytes: u64,
 }
 
 /// What a create is refused with when a shutdown interrupts it. The client's move is to retry
@@ -1421,11 +1572,16 @@ async fn stream_backfill(
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
     t0: std::time::Instant,
-) -> std::result::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64), String> {
+) -> std::result::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64, BackfillStats), String> {
     // Library/no-source mode: the shape simply starts empty (and an aggregate starts at its
     // empty-set value), exactly as the materialising version did.
     let Some(url) = pg_url.as_deref() else {
-        return Ok((crate::pg::SnapshotGate::passthrough(), aggregate.map(|_| AggSeed::default()), 0));
+        return Ok((
+            crate::pg::SnapshotGate::passthrough(),
+            aggregate.map(|_| AggSeed::default()),
+            0,
+            BackfillStats::default(),
+        ));
     };
     let client = crate::pg::pool_for(url).get().await.map_err(|e| format!("{e:#}"))?;
     let mut reader =
@@ -1482,11 +1638,12 @@ async fn stream_backfill(
             "large backfill appended in chunks"
         );
     }
+    let estimated_bytes = reader.estimated_bytes_read();
     let fences = reader.finish().await;
     if agg_seed.is_none() {
         crate::statsd::snapshot_stored(rows_total, snapshot_bytes, t0.elapsed().as_secs_f64() * 1000.0);
     }
-    Ok((fences.gate, agg_seed, emitted_seed))
+    Ok((fences.gate, agg_seed, emitted_seed, BackfillStats { rows: rows_total, estimated_bytes }))
 }
 
 #[allow(clippy::too_many_arguments)]
