@@ -730,8 +730,11 @@ async fn a_join_waiting_on_a_stalled_reactivation_gives_up_and_asks_for_a_recrea
     let waited = started.elapsed();
     assert!(waited >= std::time::Duration::from_secs(20), "waited {waited:?}, below the configured bound");
     assert!(waited < std::time::Duration::from_secs(30), "waited {waited:?}, past the gateway's 30s timeout");
-    // The detached reactivation is untouched: the shape is still reactivating behind the stall.
-    assert_eq!(engine.shape_lifecycle("s1").await, Some("reactivating"));
+    assert_eq!(
+        engine.shape_lifecycle("s1").await,
+        None,
+        "a timed-out join must retire the old shape so create can fall through"
+    );
     drop(outcome_tx);
 }
 

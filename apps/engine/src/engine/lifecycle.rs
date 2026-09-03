@@ -50,7 +50,8 @@ fn retry_create(
         // redone: the shape is still reactivating, so the redo would rejoin the same replay and
         // spend another full timeout — exactly the overrun this bounds.
         Err(e)
-            if e.downcast_ref::<ReactivationRecreate>().is_some_and(|r| r.reason == RecreateReason::OverBudget)
+            if e.downcast_ref::<ReactivationRecreate>()
+                .is_some_and(|r| matches!(r.reason, RecreateReason::OverBudget | RecreateReason::JoinTimedOut))
                 && attempt < CREATE_RACE_ATTEMPTS =>
         {
             tracing::info!("{what} create found an over-budget dormant shape; retrying as a fresh create");
@@ -1505,6 +1506,11 @@ impl Engine {
                                             "gave up waiting on an in-flight reactivation; the replay continues \
                                              and the caller is told to recreate"
                                         );
+                                        // A timed-out create/join must have the same actionable
+                                        // recreate semantics as an over-budget replay. Retire the
+                                        // old identity now; the detached task will observe the
+                                        // missing lifecycle entry and settle harmlessly.
+                                        let _ = self.purge_shape(id).await;
                                         return Err(anyhow::Error::new(ReactivationRecreate::join_timed_out(id)));
                                     }
                                     Err(_) => bail!("shape '{id}' reactivator died; retry the read"),
