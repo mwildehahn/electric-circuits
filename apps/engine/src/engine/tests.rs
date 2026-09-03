@@ -914,6 +914,54 @@ async fn ensure_active_burst_coalesces_more_than_two_same_table_shapes() {
 }
 
 #[tokio::test]
+async fn replay_stops_at_admission_tail_when_the_log_grows() {
+    let page = |next: &str, key: &str, up_to_date: bool| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key}}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![
+            page("0000000000000000_0000000000000100", "1", false),
+            page("0000000000000000_0000000000000200", "2", true),
+        ]),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = crate::engine::sequencer::ReplayTarget {
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred,
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: "shape/frontier".into(),
+        from: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+        library_mode: true,
+        until: Some(LogPosition { segment: 0, offset: "0000000000000000_0000000000000100".into() }),
+    };
+    crate::metrics::metrics().reactivation_bytes_scanned.store(0, std::sync::atomic::Ordering::Relaxed);
+    let result =
+        crate::engine::sequencer::replay_changes_for_targets(&ds, vec![target], &crate::shutdown::ShutdownToken::new())
+            .await;
+    assert!(result[0].is_ok());
+    assert_eq!(
+        store.read_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "growth after admission belongs to live ingestion"
+    );
+    assert_eq!(crate::metrics::metrics().reactivation_bytes_scanned.load(std::sync::atomic::Ordering::Relaxed), 100);
+    let body = &store.appended.lock().unwrap()[0].2;
+    let envelopes: Vec<Envelope> = serde_json::from_slice(body).unwrap();
+    assert_eq!(envelopes.iter().map(|env| env.key.as_str()).collect::<Vec<_>>(), vec!["1"]);
+}
+
+#[tokio::test]
 async fn coalesced_reactivation_respects_distinct_page_cursors() {
     let page = |next: &str, up_to_date: bool, key: u64| {
         (
