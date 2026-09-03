@@ -89,6 +89,8 @@ pub(crate) fn validate_in_process_test_url(base_url: &str) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreReadinessV1 {
     pub identity: StoreIdentityV1,
+    /// Maximum response page advertised by the server. `None`/zero means an uncapped server.
+    pub max_chunk_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -97,6 +99,7 @@ pub enum StoreReadinessError {
     Malformed { detail: String },
     NotReady { status: String },
     IdentityMismatch { expected: StoreIdentityV1, observed: StoreIdentityV1 },
+    PageCapability { detail: String },
 }
 
 impl std::fmt::Display for StoreReadinessError {
@@ -108,6 +111,7 @@ impl std::fmt::Display for StoreReadinessError {
             Self::IdentityMismatch { expected, observed } => {
                 write!(f, "storage identity mismatch: expected {expected:?}, observed {observed:?}")
             }
+            Self::PageCapability { detail } => write!(f, "storage page capability is incompatible: {detail}"),
         }
     }
 }
@@ -612,7 +616,8 @@ impl DsClient {
         let store = Arc::new(HttpDurableStreamsStore::new(&config)?);
         let client = Self::with_store(config.base_url, config.scope, store);
         // A production client is not constructible until the store has attested the exact identity.
-        client.preflight_readiness(&expected).await?;
+        let readiness = client.preflight_readiness(&expected).await?;
+        validate_page_cap(&readiness, ds_read_max_bytes())?;
         Ok(client)
     }
 
@@ -1111,6 +1116,8 @@ struct ReadinessWire {
     manifest: ManifestWire,
     recovery: RecoveryWire,
     reserve: ReserveWire,
+    #[serde(default)]
+    max_chunk_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1231,7 +1238,19 @@ fn decode_readiness(body: &str) -> Result<StoreReadinessV1> {
         wire.reserve.minimum_free_bytes,
         wire.reserve.minimum_free_inodes,
     );
-    Ok(StoreReadinessV1 { identity })
+    Ok(StoreReadinessV1 { identity, max_chunk_bytes: wire.max_chunk_bytes })
+}
+
+pub(crate) fn validate_page_cap(readiness: &StoreReadinessV1, client_cap: u64) -> Result<()> {
+    match readiness.max_chunk_bytes {
+        Some(observed) if observed > 0 && observed <= client_cap => Ok(()),
+        Some(observed) => Err(anyhow::Error::new(StoreReadinessError::PageCapability {
+            detail: format!("max_chunk_bytes={observed} exceeds client cap {client_cap}"),
+        })),
+        None => Err(anyhow::Error::new(StoreReadinessError::PageCapability {
+            detail: format!("max_chunk_bytes is missing (uncapped server); client cap is {client_cap}"),
+        })),
+    }
 }
 
 fn is_artifact_digest(value: &str) -> bool {
@@ -1636,6 +1655,18 @@ mod tests {
         assert!(decode_readiness(&noncanonical).is_err());
         let fractional = readiness_json(&identity).replace("2026-08-27T19:00:00Z", "2026-08-27T19:00:00.001Z");
         assert!(decode_readiness(&fractional).is_err());
+    }
+
+    #[test]
+    fn readiness_page_cap_must_fit_client_cap() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let body = readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":33554432,\"reserve\":{");
+        let readiness = decode_readiness(&body).unwrap();
+        let error = validate_page_cap(&readiness, 16 * 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("max_chunk_bytes=33554432 exceeds client cap 16777216"));
+        let missing = decode_readiness(&readiness_json(&identity)).unwrap();
+        let error = validate_page_cap(&missing, 16 * 1024 * 1024).unwrap_err();
+        assert!(error.to_string().contains("max_chunk_bytes is missing (uncapped server)"));
     }
 
     /// The boot classification of a durable-streams failure. Getting this wrong is expensive in

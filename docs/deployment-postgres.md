@@ -94,7 +94,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | no | `604800` | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted and the segment deleted (`0` = pin forever). |
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | no | `21600` | Dormancy idle threshold (6 hours; `0` disables dormancy). |
 | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | no | `1800` | Native subscription lease window (30 minutes; `0` disables lease expiry). |
-| `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | no | `16777216` | Client-side Durable Streams response cap (16 MiB, four times the 4 MiB server page). |
+| `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | no | `16777216` | Client-side Durable Streams response cap (16 MiB, four times the 4 MiB server page). Postgres-mode boot refuses a readiness response with a missing, zero, or larger advertised page. |
 | `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` | no | `2` | Maximum concurrent dormant replay scans. |
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | no | `16777216` | Minimum replay span budget (16 MiB). |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | no | `4` | Multiplier for replay admission against recorded backfill bytes. |
