@@ -45,16 +45,6 @@ use electric_circuits_engine::{pg, statsd};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    #[cfg(unix)]
-    // Return freed replay/transient pages to the OS promptly while retaining jemalloc's bounded
-    // arenas. Operators can override this with MALLOC_CONF when tuning a container.
-    if std::env::var_os("MALLOC_CONF").is_none() {
-        // SAFETY: this runs at process entry before Tokio starts worker threads or any other
-        // code reads process environment; no concurrent environment mutation is possible here.
-        unsafe {
-            std::env::set_var("MALLOC_CONF", "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000");
-        }
-    }
     // Anchor process-uptime / boot-to-ready timing before anything else runs.
     statsd::mark_start();
 
@@ -74,6 +64,17 @@ async fn main() -> Result<()> {
         tracing::info!("accepted (no-op) ELECTRIC_* vars: {}", config.noop_vars.join(", "));
     }
     tracing::info!("resolved config: {}", config.redacted());
+    #[cfg(unix)]
+    {
+        let allocator = electric_circuits_engine::mem::allocator_config();
+        tracing::info!(
+            event = "jemalloc_config",
+            background_thread = ?allocator.background_thread,
+            dirty_decay_ms = ?allocator.dirty_decay_ms,
+            muzzy_decay_ms = ?allocator.muzzy_decay_ms,
+            "effective jemalloc decay configuration"
+        );
+    }
 
     // Publish request-path globals. Metrics transport is initialized only after storage admission,
     // so readiness stays the first network operation.

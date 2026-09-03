@@ -188,9 +188,49 @@ pub fn allocator_memory() -> (u64, u64, u64) {
     )
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct AllocatorConfig {
+    pub background_thread: Option<bool>,
+    pub dirty_decay_ms: Option<i64>,
+    pub muzzy_decay_ms: Option<i64>,
+}
+
+#[cfg(unix)]
+pub fn allocator_config() -> AllocatorConfig {
+    // These options are read-only `opt.*` values: unlike `MALLOC_CONF`, querying them verifies
+    // what jemalloc initialized with, including the prefixed `_rjem_` build used by this crate.
+    unsafe {
+        AllocatorConfig {
+            background_thread: tikv_jemalloc_ctl::raw::read(b"opt.background_thread\0").ok(),
+            dirty_decay_ms: tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0").ok(),
+            muzzy_decay_ms: tikv_jemalloc_ctl::raw::read(b"opt.muzzy_decay_ms\0").ok(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct AllocatorConfig;
+
+#[cfg(not(unix))]
+pub fn allocator_config() -> AllocatorConfig {
+    AllocatorConfig
+}
+
 #[cfg(not(unix))]
 pub fn allocator_memory() -> (u64, u64, u64) {
     (0, 0, 0)
+}
+
+#[cfg(all(test, unix))]
+mod allocator_tests {
+    #[test]
+    fn jemalloc_decay_config_is_reported() {
+        let config = super::allocator_config();
+        assert_eq!(config.dirty_decay_ms, Some(1000));
+        assert_eq!(config.muzzy_decay_ms, Some(1000));
+    }
 }
 
 /// cgroup memory counters for the container. ECS exposes task-level memory in Container
@@ -409,6 +449,7 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
     let g = gauges();
     let (rss, virt) = process_memory();
     let (allocator_allocated, allocator_resident, allocator_retained) = allocator_memory();
+    let allocator_config = allocator_config();
     g.rss_bytes.store(rss, Ordering::Relaxed);
     g.virtual_bytes.store(virt, Ordering::Relaxed);
     serde_json::json!({
@@ -419,6 +460,7 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "allocator_allocated_bytes": allocator_allocated,
             "allocator_resident_bytes": allocator_resident,
             "allocator_retained_bytes": allocator_retained,
+            "allocator_config": allocator_config,
         },
         "cardinalities": {
             "shapes": g.shapes.load(Ordering::Relaxed),
