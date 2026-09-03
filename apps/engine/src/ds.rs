@@ -1372,6 +1372,8 @@ mod tests {
         pub(crate) fail_read_body: bool,
         pub(crate) read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
         pub(crate) read_count: std::sync::atomic::AtomicUsize,
+        pub(crate) head_count: std::sync::atomic::AtomicUsize,
+        pub(crate) head_offsets: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_append_path: Option<String>,
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: Option<String>,
@@ -1441,7 +1443,14 @@ mod tests {
         }
 
         fn head<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
-            Box::pin(async { Ok(response(200)) })
+            Box::pin(async move {
+                self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut res = response(200);
+                if let Some(offset) = self.head_offsets.lock().unwrap().pop() {
+                    res.next_offset = Some(offset);
+                }
+                Ok(res)
+            })
         }
 
         fn close<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {

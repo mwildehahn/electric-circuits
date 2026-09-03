@@ -788,6 +788,30 @@ async fn coalesced_reactivation_respects_distinct_page_cursors() {
     assert_eq!(keys("shape/c"), vec!["3"]);
 }
 
+#[tokio::test]
+async fn dormant_span_cache_heads_each_segment_once_per_sweep() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        head_offsets: std::sync::Mutex::new(vec![
+            "0000000000000000_0000000000000300".into(),
+            "0000000000000000_0000000000000200".into(),
+            "0000000000000000_0000000000000100".into(),
+        ]),
+        ..Default::default()
+    });
+    let engine =
+        Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+    let mut starts = std::collections::BTreeMap::new();
+    starts.insert(0, 1);
+    starts.insert(1, 2);
+    starts.insert(2, 3);
+    engine.changes.state().adopt(2, starts, Some("0000000000000000_0000000000000300".into()));
+    let resume = LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() };
+    let mut cache = std::collections::HashMap::new();
+    assert_eq!(engine.dormant_replay_span_cached(&resume, &mut cache).await, Some(600));
+    assert_eq!(engine.dormant_replay_span_cached(&resume, &mut cache).await, Some(600));
+    assert_eq!(store.head_count.load(std::sync::atomic::Ordering::Relaxed), 3);
+}
+
 fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_json::Value>) -> Envelope {
     Envelope {
         type_: "users".into(),

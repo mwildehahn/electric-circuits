@@ -45,6 +45,10 @@ fn retry_create(
             );
             Err(())
         }
+        Err(e) if e.downcast_ref::<ReactivationRecreate>().is_some() && attempt < CREATE_RACE_ATTEMPTS => {
+            tracing::info!("{what} create found an over-budget dormant shape; retrying as a fresh create");
+            Err(())
+        }
         _ => Ok(res),
     }
 }
@@ -66,18 +70,36 @@ impl Engine {
     /// complete HEAD size; for the current segment stop at the engine's processed tail. A missing
     /// HEAD means rotation/retention already removed the cursor and is an immediate eviction.
     async fn dormant_replay_span(&self, resume: &LogPosition) -> Option<u64> {
+        let mut cache = std::collections::HashMap::new();
+        self.dormant_replay_span_cached(resume, &mut cache).await
+    }
+
+    pub(crate) async fn dormant_replay_span_cached(
+        &self,
+        resume: &LogPosition,
+        heads: &mut std::collections::HashMap<u32, Option<u64>>,
+    ) -> Option<u64> {
         let tail = self.changes_position();
         if resume.segment > tail.segment {
             return Some(0);
         }
         let mut total = 0u64;
         for segment in resume.segment..=tail.segment {
-            let head = self.ds.head(&crate::changelog::segment_path(segment)).await.ok().flatten()?;
+            if !heads.contains_key(&segment) {
+                let value = self
+                    .ds
+                    .head(&crate::changelog::segment_path(segment))
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|head| head.next_offset.as_deref().and_then(crate::changelog::offset_bytes));
+                heads.insert(segment, value);
+            }
+            let segment_head = heads.get(&segment).copied().flatten()?;
             let end = if segment == tail.segment {
-                crate::changelog::offset_bytes(&tail.offset)
-                    .or_else(|| head.next_offset.as_deref().and_then(crate::changelog::offset_bytes))?
+                crate::changelog::offset_bytes(&tail.offset).unwrap_or(segment_head)
             } else {
-                head.next_offset.as_deref().and_then(crate::changelog::offset_bytes)?
+                segment_head
             };
             let start =
                 if segment == resume.segment { crate::changelog::offset_bytes(&resume.offset).unwrap_or(0) } else { 0 };
@@ -1380,7 +1402,12 @@ impl Engine {
                     let outcome = *rx.borrow_and_update();
                     match outcome {
                         Some(true) => return Ok(()),
-                        Some(false) => bail!("shape '{id}' reactivation failed; retry the read"),
+                        Some(false) => {
+                            if !self.lives.lock().unwrap().contains_key(id) {
+                                return Err(anyhow::Error::new(ReactivationRecreate(id.to_string())));
+                            }
+                            bail!("shape '{id}' reactivation failed; retry the read")
+                        }
                         None => {
                             if rx.changed().await.is_err() {
                                 bail!("shape '{id}' reactivator died; retry the read");
@@ -1710,13 +1737,14 @@ impl Engine {
                 .collect()
         };
         let mut snapshot = snapshot;
+        let mut head_cache = std::collections::HashMap::new();
         for s in &mut snapshot {
             let resume = self.lives.lock().unwrap().get(&s.id).and_then(|life| match &life.state {
                 LifeState::Dormant { resume, .. } => Some(resume.clone()),
                 _ => None,
             });
             if let Some(resume) = resume {
-                s.replay_span_bytes = self.dormant_replay_span(&resume).await;
+                s.replay_span_bytes = self.dormant_replay_span_cached(&resume, &mut head_cache).await;
             }
         }
         let plan = crate::retention::plan_sweep(&cfg, &snapshot);
