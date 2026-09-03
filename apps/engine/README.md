@@ -764,12 +764,14 @@ maintained:
   clients **must** treat `stream-closed`, `404` and `410` alike: re-subscribe. (A **dormant**
   shape's stream is never closed — reactivation appends to it.)
 
-Eviction is layered, least-recently-read first, and **dormant-only** (active shapes are never
-evicted): the dormancy TTL (hygiene), the `ELECTRIC_CIRCUITS_MAX_SHAPES` count cap (engine cost bound),
+Eviction is layered, least-recently-read first: ordinary shapes retire from dormant (dormancy TTL,
+count cap, and disk budget), while active non-parkable shapes retire after the full idle+dormancy
+grace. Active ordinary shapes are never evicted: the `ELECTRIC_CIRCUITS_MAX_SHAPES` count cap (engine cost bound),
 and the disk budget (hard backstop). When a cap/budget is exceeded with nothing dormant to evict,
 the engine logs loudly and bumps the `retention_pressure` metric instead of evicting.
 
 Subquery and aggregate shapes never go dormant (their state is not rebuildable from a bounded
 replay); once unsubscribed, the TTL layer instead evicts them straight from active after the same
 total grace an ordinary shape gets (idle timeout + dormancy TTL). Lifecycle state is in-memory
-today — restart recovery (persistent catalog, GH #8) will persist it.
+today — restart recovery (persistent catalog, GH #8) will persist it. A restored dormant shape's
+dormancy age starts at process boot, so repeated restarts conservatively extend wall-clock retention.

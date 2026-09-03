@@ -937,7 +937,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_checked`, `append_reliable`, `head`, `close_stream`, `retire_stream`, `delete_stream`, reads |
 | `apps/engine/src/changelog.rs` | the segmented change log (ADR-0006): `LogPosition`, the control envelope, the rotation writer + boot walk-forward, the segment-deletion planner |
 | `apps/engine/src/http.rs` | control-plane HTTP |
-| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
+| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant eviction and active non-parkable retirement |
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |

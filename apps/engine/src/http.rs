@@ -1262,7 +1262,6 @@ async fn get_shape_log(
     let mut offset = "-1".to_string();
     loop {
         let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
-        let empty = r.envelopes.is_empty();
         for env in r.envelopes {
             total += 1;
             let (op, old) = if env.headers.operation == "delete" {
@@ -1285,7 +1284,7 @@ async fn get_shape_log(
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || closed || empty || !advanced {
+        if r.up_to_date || closed || !advanced {
             break;
         }
     }
@@ -1320,7 +1319,6 @@ async fn get_shape_rows(
     let mut offset = "-1".to_string();
     loop {
         let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
-        let empty = r.envelopes.is_empty();
         for env in r.envelopes {
             if env.headers.operation == "delete" {
                 rows.remove(&env.key);
@@ -1334,7 +1332,7 @@ async fn get_shape_rows(
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || closed || empty || !advanced {
+        if r.up_to_date || closed || !advanced {
             break;
         }
     }

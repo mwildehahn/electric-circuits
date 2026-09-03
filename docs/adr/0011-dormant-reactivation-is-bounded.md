@@ -35,11 +35,10 @@ A wake that is admitted can still outlast the request that triggered it: a large
 measured at ~40s in production against an API gateway whose read timeout is 30s, so the client got
 a 503 carrying nothing to act on. A touch therefore waits at most
 `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` (default 20s, deliberately under that gateway
-timeout; `0` waits forever) and then returns the same typed recreate outcome with reason
-`JoinTimedOut`. The shape is NOT retired and the detached replay runs to completion, so a later
-touch finds it active. Unlike the over-budget reason, a timed-out join is not redone as a fresh
-create inside the same request: the shape is still reactivating, so a redo would rejoin the same
-replay and spend another full timeout — the overrun this exists to bound.
+timeout; `0` waits forever) and then retires the old identity, returning the same typed recreate
+outcome with reason `JoinTimedOut`. Create callers fall through to a fresh shape id; read/join
+callers receive the surface-specific recreate signal. The detached replay is discarded when it
+settles.
 
 ## Alternatives considered
 
@@ -59,7 +58,10 @@ number: a store that advertises a page gets 16 MiB (four of its pages, so the ca
 and a store that advertises none gets 64 MiB, because it answers a read with the whole remainder of
 the stream and a cap below the backlog does not bound memory — the sequencer retries the identical
 read and it fails identically forever, so no data flows at all. A deployment that wants the tighter
-bound guaranteed sets `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1` and runs a store that pages. Reactivation latency can queue behind the semaphore. `changes_only` shapes
+bound guaranteed sets `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1` and runs a store that pages. If a
+live read nevertheless exceeds its cap, the sequencer records a typed cap failure, increments
+`sequencer_read_cap_failures_total`, logs an error, and halts further reads until restart rather
+than retrying the same page forever. Reactivation latency can queue behind the semaphore. `changes_only` shapes
 remain active and therefore consume their normal routing state because recreation would lose their
 dormant-period history. Durable Streams server paging (PR #4) improves the normal page size, but
 the engine-side cap remains mandatory defense in depth. Cross-segment span calculation HEADs each
