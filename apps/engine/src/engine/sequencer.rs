@@ -1246,7 +1246,9 @@ pub(crate) async fn replay_changes_for_shape(
     let mut pos = from.clone();
     let mut rotate_to: Option<u32> = None;
     let mut emitted = 0u64;
+    metrics().reactivation_spans.fetch_add(1, Ordering::Relaxed);
     loop {
+        let page_start_bytes = crate::changelog::offset_bytes(&pos.offset);
         let rr = ds
             .read_for_table(&pos.path(), &pos.offset, false, table.as_str())
             .await
@@ -1299,6 +1301,11 @@ pub(crate) async fn replay_changes_for_shape(
                 .context("append replay to retained stream")?;
         }
         let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
+        if let (Some(start), Some(end)) =
+            (page_start_bytes, rr.next_offset.as_deref().and_then(crate::changelog::offset_bytes))
+        {
+            metrics().reactivation_bytes_scanned.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+        }
         if let Some(n) = rr.next_offset {
             pos.offset = n;
         }

@@ -102,6 +102,12 @@ pub struct Metrics {
     pub family_steps: AtomicU64,       // family circuit transactions (write path)
     pub shapes_dormanted: AtomicU64,   // retention: active -> dormant transitions
     pub shapes_reactivated: AtomicU64, // retention: dormant -> active (table-stream replay)
+    pub reactivations_started: AtomicU64,
+    pub reactivations_coalesced: AtomicU64,
+    pub reactivations_completed: AtomicU64,
+    pub reactivations_failed: AtomicU64,
+    pub reactivation_bytes_scanned: AtomicU64,
+    pub reactivation_spans: AtomicU64,
     pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
     /// ADR-0008 COUNTER: subscriptions released by the sweeper because their lease was not renewed
@@ -179,6 +185,12 @@ pub fn metrics() -> &'static Metrics {
         family_steps: AtomicU64::new(0),
         shapes_dormanted: AtomicU64::new(0),
         shapes_reactivated: AtomicU64::new(0),
+        reactivations_started: AtomicU64::new(0),
+        reactivations_coalesced: AtomicU64::new(0),
+        reactivations_completed: AtomicU64::new(0),
+        reactivations_failed: AtomicU64::new(0),
+        reactivation_bytes_scanned: AtomicU64::new(0),
+        reactivation_spans: AtomicU64::new(0),
         shapes_evicted: AtomicU64::new(0),
         retention_pressure: AtomicU64::new(0),
         subscriptions_lapsed: AtomicU64::new(0),
@@ -218,6 +230,12 @@ impl Metrics {
                 "family_steps": self.family_steps.load(Ordering::Relaxed),
                 "shapes_dormanted": self.shapes_dormanted.load(Ordering::Relaxed),
                 "shapes_reactivated": self.shapes_reactivated.load(Ordering::Relaxed),
+                "reactivations_started": self.reactivations_started.load(Ordering::Relaxed),
+                "reactivations_coalesced": self.reactivations_coalesced.load(Ordering::Relaxed),
+                "reactivations_completed": self.reactivations_completed.load(Ordering::Relaxed),
+                "reactivations_failed": self.reactivations_failed.load(Ordering::Relaxed),
+                "reactivation_bytes_scanned": self.reactivation_bytes_scanned.load(Ordering::Relaxed),
+                "reactivation_spans": self.reactivation_spans.load(Ordering::Relaxed),
                 "shapes_evicted": self.shapes_evicted.load(Ordering::Relaxed),
                 "retention_pressure": self.retention_pressure.load(Ordering::Relaxed),
                 "subscriptions_lapsed_total": self.subscriptions_lapsed.load(Ordering::Relaxed),
@@ -259,6 +277,12 @@ impl Metrics {
         self.family_steps.store(0, Ordering::Relaxed);
         self.shapes_dormanted.store(0, Ordering::Relaxed);
         self.shapes_reactivated.store(0, Ordering::Relaxed);
+        self.reactivations_started.store(0, Ordering::Relaxed);
+        self.reactivations_coalesced.store(0, Ordering::Relaxed);
+        self.reactivations_completed.store(0, Ordering::Relaxed);
+        self.reactivations_failed.store(0, Ordering::Relaxed);
+        self.reactivation_bytes_scanned.store(0, Ordering::Relaxed);
+        self.reactivation_spans.store(0, Ordering::Relaxed);
         self.shapes_evicted.store(0, Ordering::Relaxed);
         self.retention_pressure.store(0, Ordering::Relaxed);
         self.subscriptions_lapsed.store(0, Ordering::Relaxed);

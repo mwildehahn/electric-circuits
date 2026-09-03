@@ -1189,7 +1189,10 @@ impl Engine {
                         match &life.state {
                             LifeState::Active => Step::Done,
                             LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
-                            LifeState::Reactivating { done, .. } => Step::WaitReactivate(done.clone()),
+                            LifeState::Reactivating { done, .. } => {
+                                metrics().reactivations_coalesced.fetch_add(1, Ordering::Relaxed);
+                                Step::WaitReactivate(done.clone())
+                            }
                             LifeState::Dormant { resume, gate, .. } => {
                                 let control = self.admit_control()?;
                                 // Kick off the replay in a DETACHED task: `ensure_active` futures
@@ -1204,8 +1207,25 @@ impl Engine {
                                 life.state = LifeState::Reactivating { done: rx.clone(), resume: resume.clone() };
                                 let engine = self.clone();
                                 let id = id.to_string();
+                                metrics().reactivations_started.fetch_add(1, Ordering::Relaxed);
                                 tokio::spawn(async move {
                                     let _control = control;
+                                    let _permit = match engine.reactivation_permits.clone().acquire_owned().await {
+                                        Ok(permit) => permit,
+                                        Err(_) => {
+                                            tracing::warn!("reactivation scheduler closed while waking shape {id}");
+                                            if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                                life.state = LifeState::Dormant {
+                                                    since: std::time::Instant::now(),
+                                                    resume: resume.clone(),
+                                                    gate: gate.clone(),
+                                                };
+                                            }
+                                            metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
+                                            let _ = tx.send(Some(false));
+                                            return;
+                                        }
+                                    };
                                     let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
                                     let err = match res {
                                         Ok(()) => {
@@ -1215,6 +1235,7 @@ impl Engine {
                                                 life.last_read = std::time::Instant::now();
                                             }
                                             drop(lives);
+                                            metrics().reactivations_completed.fetch_add(1, Ordering::Relaxed);
                                             let _ = tx.send(Some(true));
                                             return;
                                         }
@@ -1245,6 +1266,7 @@ impl Engine {
                                             tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
                                         }
                                         let _ = tx.send(Some(false));
+                                        metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
                                         return;
                                     }
                                     tracing::warn!("reactivating shape {id} failed: {err:#}");
@@ -1253,6 +1275,7 @@ impl Engine {
                                         life.state =
                                             LifeState::Dormant { since: std::time::Instant::now(), resume, gate };
                                     }
+                                    metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
                                     let _ = tx.send(Some(false));
                                 });
                                 Step::WaitReactivate(rx)

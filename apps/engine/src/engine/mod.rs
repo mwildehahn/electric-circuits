@@ -407,6 +407,9 @@ pub struct Engine {
     lives: Arc<std::sync::Mutex<HashMap<String, ShapeLife>>>,
     /// Retention policy knobs (see `crate::retention`).
     retention: Arc<RetentionConfig>,
+    /// Bounds concurrent dormant replays; each permit covers one replay scan and its page-sized
+    /// transient allocations. Shapes joining an in-flight replay wait on its lifecycle channel.
+    pub(crate) reactivation_permits: Arc<tokio::sync::Semaphore>,
     /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
     /// Set once the background schema reconciler has been spawned (see `engine::drift`).
@@ -1167,6 +1170,13 @@ impl Engine {
             restore_reads_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
+            reactivation_permits: Arc::new(tokio::sync::Semaphore::new(
+                std::env::var("ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(2)
+                    .max(1),
+            )),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconciler_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resolving: Arc::new(drift::Resolving::default()),
