@@ -380,6 +380,10 @@ pub(crate) async fn sequencer_loop(
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut paused = start_paused;
+    // A bounded body breach is terminal for this live loop: retrying the same uncapped page can
+    // never make progress. Commands and shutdown remain serviced, but reads stay halted until a
+    // restart with a compatible store/cap.
+    let mut read_cap_failed = false;
     let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
     // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
@@ -578,7 +582,7 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true), if !paused => match res {
+            res = ds.read(&read_path, &read_off, true), if !paused && !read_cap_failed => match res {
                 Ok(rr) => {
                     // A PauseReads command may win immediately after an in-flight HTTP read returns.
                     // Discard that page before touching the cursor or checkpoint so an existing
@@ -977,8 +981,15 @@ pub(crate) async fn sequencer_loop(
                     back_off(&shutdown, std::time::Duration::from_secs(5)).await;
                 }
                 Err(e) => {
-                    tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
-                    back_off(&shutdown, std::time::Duration::from_millis(200)).await;
+                    if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
+                        metrics().sequencer_read_cap_failures.fetch_add(1, Ordering::Relaxed);
+                        read_cap_failed = true;
+                        tracing::error!(path = %cap.path, observed = cap.observed, limit = cap.limit,
+                            "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
+                    } else {
+                        tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
+                        back_off(&shutdown, std::time::Duration::from_millis(200)).await;
+                    }
                 }
             },
         }

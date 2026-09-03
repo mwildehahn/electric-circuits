@@ -157,6 +157,7 @@ pub struct Metrics {
     /// segment-deletion floor — so a hold that does not end must be visible as a level, not only as
     /// a once-a-minute log line.
     pub sequencer_held_run: AtomicU64,
+    pub sequencer_read_cap_failures: AtomicU64,
     /// GAUGE: 1 once a `SIGTERM`/`SIGINT` graceful shutdown has begun (see [`crate::shutdown`]).
     pub shutdown_in_progress: AtomicU64,
     /// ADR-0008 GAUGE: live subscriptions across every shape — the claims pinning shapes against
@@ -219,6 +220,7 @@ pub fn metrics() -> &'static Metrics {
         backfill_chunked_appends: AtomicU64::new(0),
         sequencer_orphan_fragments: AtomicU64::new(0),
         sequencer_held_run: AtomicU64::new(0),
+        sequencer_read_cap_failures: AtomicU64::new(0),
         shutdown_in_progress: AtomicU64::new(0),
         replication_slot_retained_wal_bytes: AtomicU64::new(0),
         replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
@@ -272,6 +274,7 @@ impl Metrics {
             "gauges": {
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
                 "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
+                "sequencer_read_cap_failures_total": self.sequencer_read_cap_failures.load(Ordering::Relaxed),
                 "shutdown_in_progress": self.shutdown_in_progress.load(Ordering::Relaxed),
                 "subscriptions_live": self.subscriptions_live.load(Ordering::Relaxed),
                 "retirements_pending": self.retirements_pending.load(Ordering::Relaxed),

@@ -409,6 +409,25 @@ const DEFAULT_DS_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1`) as the way to demand a store that pages.
 const UNCAPPED_STORE_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) struct ReadCapExceeded {
+    pub path: String,
+    pub observed: u64,
+    pub limit: u64,
+}
+
+impl std::fmt::Display for ReadCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GET {} response body exceeded {} bytes (observed at least {} bytes)",
+            self.path, self.limit, self.observed
+        )
+    }
+}
+
+impl std::error::Error for ReadCapExceeded {}
+
 /// The cap in force for this process, chosen at boot from the store's readiness. Zero means boot has
 /// not resolved it yet, in which case the configured or default value applies.
 static EFFECTIVE_READ_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -443,7 +462,7 @@ async fn read_body_bounded(mut response: reqwest::Response, limit: u64, path: &s
         let size = body.len() as u64 + chunk.len() as u64;
         if size > limit {
             tracing::error!(path, size, limit, "durable-streams response exceeded client body limit");
-            bail!("GET {path} response body exceeded {limit} bytes (observed at least {size} bytes)");
+            return Err(anyhow::Error::new(ReadCapExceeded { path: path.to_string(), observed: size, limit }));
         }
         body.extend_from_slice(&chunk);
     }
