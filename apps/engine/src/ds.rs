@@ -436,6 +436,50 @@ impl std::fmt::Display for ReadCapExceeded {
 
 impl std::error::Error for ReadCapExceeded {}
 
+/// A single Durable Streams read the store accepted and never finished.
+///
+/// The pinned HTTP store carries reqwest's own connect/read/request deadlines, but those bind that
+/// one provider adapter, not the port: any [`DurableStreamStore`] whose `read` future never resolves
+/// would otherwise park the caller forever. That caller is the coalesced reactivation worker, which
+/// holds a reactivation permit for the whole scan — so an unbounded read leaves the shape
+/// `Reactivating`, pins the permit, and queues every later reactivation behind it. This is the
+/// engine's own bound on one replay page, and it is typed so callers can tell a dead transport from
+/// a missing stream or a malformed page.
+#[derive(Debug)]
+pub(crate) struct DsReadTimeout {
+    pub path: String,
+    pub after: std::time::Duration,
+}
+
+impl std::fmt::Display for DsReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GET {} did not complete within {}s (ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS); the store accepted the read and never finished it",
+            self.path,
+            self.after.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DsReadTimeout {}
+
+/// How long one replay page read may take before it is abandoned. It shares
+/// `ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS` with the HTTP store's transport read deadline so an
+/// operator has one number to reason about: no single page read outlives it, whichever layer
+/// notices first.
+pub(crate) const DEFAULT_DS_READ_TIMEOUT_SECS: u64 = 30;
+
+fn ds_read_deadline() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_DS_READ_TIMEOUT_SECS),
+    )
+}
+
 /// The cap in force for this process, chosen at boot from the store's readiness. Zero means boot has
 /// not resolved it yet, in which case the configured or default value applies.
 static EFFECTIVE_READ_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -544,7 +588,10 @@ impl HttpDurableStreamsStore {
             .add_root_certificate(ca)
             .identity(identity)
             .connect_timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS", 10)))
-            .read_timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS", 30)))
+            .read_timeout(std::time::Duration::from_secs(timeout(
+                "ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS",
+                DEFAULT_DS_READ_TIMEOUT_SECS,
+            )))
             .timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS", 60)))
             .build()
             .context("building Durable Streams mTLS client")?;
@@ -1157,7 +1204,20 @@ impl DsClient {
     /// every item, but unrelated table rows remain borrowed raw bytes until discarded.
     pub async fn read_for_table(&self, path: &str, offset: &str, live: bool, table: &str) -> Result<ReadResult> {
         let physical_path = self.physical_path(path)?;
-        let res = self.store.read(&physical_path, offset, live).await?;
+        // A replay page is a bounded request, so it gets a deadline of its own; a long-poll is not
+        // and keeps the store's own idle semantics.
+        let res = if live {
+            self.store.read(&physical_path, offset, live).await?
+        } else {
+            let deadline = ds_read_deadline();
+            match tokio::time::timeout(deadline, self.store.read(&physical_path, offset, live)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    tracing::error!(path, deadline_secs = deadline.as_secs(), "durable-streams read never completed");
+                    return Err(anyhow::Error::new(DsReadTimeout { path: path.to_string(), after: deadline }));
+                }
+            }
+        };
         if res.status == 204 {
             return Ok(ReadResult {
                 envelopes: Vec::new(),
@@ -1541,6 +1601,13 @@ mod tests {
         pub(crate) head_count: std::sync::atomic::AtomicUsize,
         pub(crate) head_offsets: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_append_path: Option<String>,
+        /// How many non-live reads the store accepts and then never finishes. It models a provider
+        /// that answers a replay `GET` and then stops yielding body bytes: the store call itself
+        /// never resolves, exactly as the HTTP store's response future would not.
+        pub(crate) stall_nonlive_reads: std::sync::atomic::AtomicUsize,
+        /// Park every long-poll forever, which is what an idle tail read does. Only scaffolding: a
+        /// spawned sequencer must not spin on a synthetic empty page while a stall is under test.
+        pub(crate) stall_live_reads: bool,
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
         pub(crate) head_status: u16,
@@ -1587,10 +1654,20 @@ mod tests {
             })
         }
 
-        fn read<'a>(&'a self, _path: &'a str, offset: &'a str, _live: bool) -> StoreFuture<'a> {
+        fn read<'a>(&'a self, _path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.read_offsets.lock().unwrap().push(offset.to_string());
+                let stalled = !live
+                    && self
+                        .stall_nonlive_reads
+                        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                            (n > 0).then(|| n - 1)
+                        })
+                        .is_ok();
+                if stalled || (live && self.stall_live_reads) {
+                    std::future::pending::<()>().await;
+                }
                 let mut res = response(200);
                 res.next_offset = Some("tempting-next-offset".to_string());
                 if self.fail_read_body {
@@ -1733,6 +1810,43 @@ mod tests {
         let page = client.read_for_table("changes/0", "-1", false, "public.items").await.unwrap();
         assert_eq!(page.envelopes.len(), 1);
         assert_eq!(page.envelopes[0].type_, "public.items");
+    }
+
+    /// A store that accepts a replay `GET` and then never finishes the response must not park the
+    /// caller. The caller here is the coalesced reactivation worker, which holds a reactivation
+    /// permit for the whole scan, so an unbounded read is what leaves a shape `Reactivating` and
+    /// queues every later reactivation behind a permit nothing will ever return. Virtual time keeps
+    /// the deadline the production default instead of a test-only value.
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_page_the_store_never_finishes_fails_with_a_typed_read_timeout() {
+        let store = Arc::new(ScriptedStore {
+            stall_nonlive_reads: std::sync::atomic::AtomicUsize::new(1),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
+
+        let started = tokio::time::Instant::now();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            client.read_for_table("changes/0", "-1", false, "public.items"),
+        )
+        .await
+        .expect("a replay page the store never finishes must be bounded by the engine, not read forever");
+
+        let Err(error) = read else { panic!("a page whose response never arrived is not a page") };
+        let timeout = error
+            .downcast_ref::<DsReadTimeout>()
+            .expect("a dead transport must be typed, not folded into a generic read failure");
+        assert_eq!(timeout.path, "changes/0");
+        assert_eq!(timeout.after, std::time::Duration::from_secs(DEFAULT_DS_READ_TIMEOUT_SECS));
+        let waited = started.elapsed();
+        assert!(waited >= timeout.after, "waited {waited:?}, short of the configured read deadline");
+        assert!(waited < std::time::Duration::from_secs(600), "waited {waited:?}, the outer guard, not the deadline");
+        assert_eq!(
+            store.read_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the abandoned read is not retried inside the port"
+        );
     }
 
     fn readiness_json(identity: &StoreIdentityV1) -> String {

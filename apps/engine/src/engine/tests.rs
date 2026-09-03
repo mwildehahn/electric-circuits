@@ -885,6 +885,90 @@ async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     assert_eq!(store.read_count.load(std::sync::atomic::Ordering::Relaxed), 1, "one page read must serve both shapes");
 }
 
+/// The detached wake half of the same production incident the join-timeout regression covers from
+/// the caller's side. A store that accepts the replay `GET` and then never finishes the response
+/// leaves the coalesced worker parked in `read_for_table` **holding a reactivation permit**: the
+/// shape never leaves `Reactivating`, and because the engine only ever grants two permits, every
+/// later reactivation queues behind one nothing will return. Bounding the read is what lets the
+/// permit come back and the retired identity be recreated.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_replay_page_returns_its_reactivation_permit_and_leaves_a_recreatable_shape() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        head_offsets: std::sync::Mutex::new(vec![
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+        ]),
+        // Exactly one replay page is accepted and never finished; the sequencer's own tail read
+        // parks the way an idle long-poll does so it cannot spin through this test.
+        stall_nonlive_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store));
+    let ts = users();
+    {
+        let mut state = engine.state.lock().await;
+        state.tables.insert(ts.table.clone(), ts.clone());
+        state.shapes.insert(
+            "s1".into(),
+            ShapeRecord {
+                id: "s1".into(),
+                table: ts.table.clone(),
+                stream_path: "shape/s1".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+                backfill_rows: Some(1),
+                backfill_bytes: Some(1),
+            },
+        );
+    }
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(600), engine.ensure_active("s1"))
+        .await
+        .expect("the join must bound its own wait even behind a replay page that never arrives");
+    joined.expect_err("a reactivation whose replay page never arrived is not an active shape");
+
+    // The permit is the shared resource the stall was pinning: reclaiming BOTH of them proves the
+    // detached worker gave its own back rather than parking in the read forever.
+    let reclaimed = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        engine.reactivation_permits.clone().acquire_many_owned(2),
+    )
+    .await
+    .expect("a replay page that never arrives must release its reactivation permit, not pin it forever")
+    .expect("the reactivation semaphore is never closed");
+    drop(reclaimed);
+
+    assert_eq!(
+        engine.shape_lifecycle("s1").await,
+        None,
+        "a stalled reactivation must not strand the shape in `Reactivating`"
+    );
+    tokio::time::timeout(std::time::Duration::from_millis(50), engine.ensure_active("s1"))
+        .await
+        .expect("a create for the same predicate must fall through, not rejoin the abandoned replay")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn ensure_active_burst_coalesces_more_than_two_same_table_shapes() {
     let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
