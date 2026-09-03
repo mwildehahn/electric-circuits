@@ -1413,7 +1413,7 @@ impl Engine {
     pub(crate) async fn deactivate_shape(&self, id: &str) -> Result<()> {
         let st = self.state.lock().await;
         let Some(rec) = st.shapes.get(id).cloned() else { return Ok(()) }; // already gone
-        if rec.is_subquery || rec.aggregate.is_some() {
+        if rec.is_subquery || rec.aggregate.is_some() || rec.changes_only {
             return Ok(()); // never dormant (state not rebuildable from a bounded replay)
         }
         if st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
@@ -1556,7 +1556,10 @@ impl Engine {
                         idle,
                         dormant_for,
                         in_transition,
-                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none(),
+                        // `changes_only` feeds cannot be recreated from a snapshot without
+                        // losing the dormant-period change history promised by the client API;
+                        // keep them active until a correct replay/reconcile path exists.
+                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
                         stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
                     }
                 })
@@ -1595,7 +1598,7 @@ impl Engine {
     }
 
     /// The lease half of a sweep (ADR-0008): release every subscription that has not been renewed
-    /// within [`RetentionConfig::idle_timeout`], exactly as an explicit `DELETE` would.
+    /// within [`RetentionConfig::subscription_lease_timeout`], exactly as an explicit `DELETE` would.
     ///
     /// This is the only liveness signal the engine has for a native subscriber. Its reads go
     /// straight to durable-streams, so an un-renewed subscription is indistinguishable from a
@@ -1604,13 +1607,13 @@ impl Engine {
     /// ordinary lifecycle: idle → dormant → evicted, with the same grace as any other.
     ///
     /// A lapse is a `Left` like any other, marked `lapsed` so the durable record says who released
-    /// it. `idle_timeout == 0` disables dormancy, and with it leases: an engine that never parks a
-    /// shape has no use for the signal.
+    /// it. `subscription_lease_timeout == 0` disables lease expiry; dormancy is controlled
+    /// independently by `idle_timeout`.
     async fn sweep_leases(&self, cfg: &crate::retention::RetentionConfig) {
         let lapsed = {
             let mut st = self.state.lock().await;
             let now = crate::changelog::now_secs();
-            let expired = st.lapsed_subscriptions(cfg.idle_timeout, now);
+            let expired = st.lapsed_subscriptions(cfg.subscription_lease_timeout, now);
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);
             }
@@ -1620,7 +1623,7 @@ impl Engine {
         for (shape, subscription) in lapsed {
             tracing::debug!(
                 "retention: subscription {subscription} on shape {shape} was not renewed within {:?}; released",
-                cfg.idle_timeout
+                cfg.subscription_lease_timeout
             );
             self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription, lapsed: true });
             metrics().subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
@@ -2949,6 +2952,7 @@ mod subscription_tests {
         let engine = engine_with_share("s1", &[("stale", now - 60), ("renewed", now)]).await;
         let cfg = crate::retention::RetentionConfig {
             idle_timeout: std::time::Duration::from_secs(5),
+            subscription_lease_timeout: std::time::Duration::from_secs(5),
             ..crate::retention::RetentionConfig::default()
         };
 

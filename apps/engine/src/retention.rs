@@ -57,17 +57,26 @@ use crate::pg::SnapshotGate;
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` (30 min) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
+/// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
+/// | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Time since the last renewal before a native subscription lease lapses. `0` disables lease expiry. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
+/// | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum change-log span budget for dormant replay. |
+/// | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Replay budget multiplier applied to the shape's recorded backfill bytes. |
 /// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Total shape-count cap; over it, least-recently-read dormant shapes are evicted. `0` = unlimited. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Cap on tracked shape-stream bytes; over it, least-recently-read dormant shapes are evicted. |
 /// | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Sweep interval of the background retention task. |
 #[derive(Clone, Debug)]
 pub struct RetentionConfig {
-    /// Active → dormant idle threshold (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, default 30 min; 0 = never).
+    /// Active → dormant idle threshold (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, default 6 hours; 0 = never).
     pub idle_timeout: Duration,
+    /// Native subscription lease window (`ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`, default 30 min; 0 = never).
+    pub subscription_lease_timeout: Duration,
     /// Dormant → evicted hygiene TTL (`ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS`, default 7 days; 0 = never).
     pub dormant_ttl: Duration,
+    /// Minimum dormant replay span in bytes (`ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES`).
+    pub replay_min_bytes: u64,
+    /// Backfill-size multiplier for replay admission (`ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER`).
+    pub replay_multiplier: u64,
     /// Total shape-count cap (`ELECTRIC_CIRCUITS_MAX_SHAPES`, default 10000; 0 = unlimited).
     pub max_shapes: usize,
     /// Shape-stream disk budget in bytes (`ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB`, default 0 = disabled).
@@ -83,8 +92,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
 impl Default for RetentionConfig {
     fn default() -> Self {
         RetentionConfig {
-            idle_timeout: Duration::from_secs(1800),
+            idle_timeout: Duration::from_secs(6 * 3600),
+            subscription_lease_timeout: Duration::from_secs(1800),
             dormant_ttl: Duration::from_secs(7 * 24 * 3600),
+            replay_min_bytes: 16 * 1024 * 1024,
+            replay_multiplier: 4,
             max_shapes: 10_000,
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
@@ -93,14 +105,24 @@ impl Default for RetentionConfig {
 }
 
 impl RetentionConfig {
+    pub fn replay_budget(&self, backfill_bytes: u64) -> u64 {
+        self.replay_min_bytes.max(backfill_bytes.saturating_mul(self.replay_multiplier))
+    }
+
     pub fn from_env() -> Self {
         let d = RetentionConfig::default();
         RetentionConfig {
             idle_timeout: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
+            subscription_lease_timeout: Duration::from_secs(env_u64(
+                "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS",
+                d.subscription_lease_timeout.as_secs(),
+            )),
             dormant_ttl: Duration::from_secs(env_u64(
                 "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS",
                 d.dormant_ttl.as_secs(),
             )),
+            replay_min_bytes: env_u64("ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES", d.replay_min_bytes),
+            replay_multiplier: env_u64("ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER", d.replay_multiplier),
             max_shapes: env_u64("ELECTRIC_CIRCUITS_MAX_SHAPES", d.max_shapes as u64) as usize,
             disk_budget_bytes: env_u64("ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
             sweep_interval: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", 60).max(1)),
@@ -332,7 +354,10 @@ mod tests {
     fn cfg() -> RetentionConfig {
         RetentionConfig {
             idle_timeout: Duration::from_secs(1800),
+            subscription_lease_timeout: Duration::from_secs(1800),
             dormant_ttl: Duration::from_secs(7 * 24 * 3600),
+            replay_min_bytes: 16 * 1024 * 1024,
+            replay_multiplier: 4,
             max_shapes: 0,
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
