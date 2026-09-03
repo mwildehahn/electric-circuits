@@ -64,7 +64,11 @@ test('mutation fixtures cover tracked/staged/untracked source observations', () 
 test('every scripts node:test file has an explicit product-gate or planner-audit lane', () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), '..')
   const scripts = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).scripts as Record<string, string>
-  const productGate = ['scripts/postgres-image-version.test.ts', 'scripts/readiness-evidence.test.ts']
+  const productGate = [
+    'scripts/allocator-build-config.test.ts',
+    'scripts/postgres-image-version.test.ts',
+    'scripts/readiness-evidence.test.ts',
+  ]
   const plannerAudit = ['scripts/readiness-plan.test.ts']
   const discovered = readdirSync(join(root, 'scripts'))
     .filter((name) => name.endsWith('.test.ts'))
