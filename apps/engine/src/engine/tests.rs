@@ -848,6 +848,12 @@ async fn transient_replay_head_failure_is_deferred_not_evicted() {
 #[tokio::test]
 async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        head_offsets: std::sync::Mutex::new(vec![
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+        ]),
         read_pages: std::sync::Mutex::new(vec![
             ("tail".into(), true, "[{\"type\":\"public.users\",\"key\":\"1\",\"value\":{\"id\":1,\"name\":\"a\",\"active\":true},\"headers\":{\"operation\":\"insert\",\"offset\":\"0\"}}]".into()),
         ]),
@@ -877,6 +883,34 @@ async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     assert!(results[0].is_ok(), "one shape must complete despite another append failing");
     assert!(results[1].is_err(), "the failing shape must receive its own error");
     assert_eq!(store.read_count.load(std::sync::atomic::Ordering::Relaxed), 1, "one page read must serve both shapes");
+}
+
+#[tokio::test]
+async fn ensure_active_burst_coalesces_more_than_two_same_table_shapes() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let (tx, rx) = tokio::sync::watch::channel(Some(true));
+    for n in 1..=4 {
+        let id = format!("s{n}");
+        engine.lives.lock().unwrap().insert(
+            id,
+            crate::retention::ShapeLife {
+                last_read: std::time::Instant::now(),
+                state: crate::retention::LifeState::Reactivating {
+                    done: rx.clone(),
+                    resume: LogPosition { segment: 0, offset: "0".into() },
+                },
+            },
+        );
+    }
+    let (a, b, c, d) = tokio::join!(
+        engine.ensure_active("s1"),
+        engine.ensure_active("s2"),
+        engine.ensure_active("s3"),
+        engine.ensure_active("s4")
+    );
+    assert!(a.is_ok() && b.is_ok() && c.is_ok() && d.is_ok());
+    assert!(crate::metrics::metrics().reactivations_coalesced.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+    drop(tx);
 }
 
 #[tokio::test]
