@@ -91,6 +91,8 @@ pub struct StoreReadinessV1 {
     pub identity: StoreIdentityV1,
     /// Maximum response page advertised by the server. `None`/zero means an uncapped server.
     pub max_chunk_bytes: Option<u64>,
+    /// Maximum size of one value on the store. This is diagnostic only and never sizes reads.
+    pub max_value_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -414,14 +416,20 @@ pub(crate) struct ReadCapExceeded {
     pub path: String,
     pub observed: u64,
     pub limit: u64,
+    pub max_value_bytes: Option<u64>,
 }
 
 impl std::fmt::Display for ReadCapExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "GET {} response body exceeded {} bytes (observed at least {} bytes)",
-            self.path, self.limit, self.observed
+            "GET {} response body exceeded {} bytes (observed at least {} bytes); store advertises single messages up to {}; this response was {} bytes against client cap {}",
+            self.path,
+            self.limit,
+            self.observed,
+            self.max_value_bytes.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+            self.observed,
+            self.limit
         )
     }
 }
@@ -431,6 +439,7 @@ impl std::error::Error for ReadCapExceeded {}
 /// The cap in force for this process, chosen at boot from the store's readiness. Zero means boot has
 /// not resolved it yet, in which case the configured or default value applies.
 static EFFECTIVE_READ_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADVERTISED_MAX_VALUE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn configured_ds_read_max_bytes() -> Option<u64> {
     std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES")
@@ -462,7 +471,16 @@ async fn read_body_bounded(mut response: reqwest::Response, limit: u64, path: &s
         let size = body.len() as u64 + chunk.len() as u64;
         if size > limit {
             tracing::error!(path, size, limit, "durable-streams response exceeded client body limit");
-            return Err(anyhow::Error::new(ReadCapExceeded { path: path.to_string(), observed: size, limit }));
+            let max_value_bytes = match ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => None,
+                value => Some(value),
+            };
+            return Err(anyhow::Error::new(ReadCapExceeded {
+                path: path.to_string(),
+                observed: size,
+                limit,
+                max_value_bytes,
+            }));
         }
         body.extend_from_slice(&chunk);
     }
@@ -675,6 +693,7 @@ impl DsClient {
         let verdict = assess_page_cap(&readiness, configured.unwrap_or(DEFAULT_DS_READ_MAX_BYTES));
         let cap = effective_read_max_bytes(verdict, configured);
         EFFECTIVE_READ_MAX_BYTES.store(cap, std::sync::atomic::Ordering::Relaxed);
+        ADVERTISED_MAX_VALUE_BYTES.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         if let Some(advisory) = enforce_page_cap(verdict, cap, require_ds_chunk_cap())? {
             warn_page_cap_once(&advisory);
         }
@@ -772,6 +791,21 @@ impl DsClient {
             }));
         }
         Ok(observed)
+    }
+
+    /// Re-attest the store after a transport reconnect. Readiness is deliberately not cached:
+    /// page capabilities are startup state that can change independently of store identity.
+    pub(crate) async fn refresh_readiness(&self, expected: &StoreIdentityV1) -> Result<PageCapVerdict> {
+        let readiness = self.preflight_readiness(expected).await?;
+        let configured = configured_ds_read_max_bytes();
+        let verdict = assess_page_cap(&readiness, configured.unwrap_or(DEFAULT_DS_READ_MAX_BYTES));
+        EFFECTIVE_READ_MAX_BYTES
+            .store(effective_read_max_bytes(verdict, configured), std::sync::atomic::Ordering::Relaxed);
+        ADVERTISED_MAX_VALUE_BYTES.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        if let Some(advisory) = enforce_page_cap(verdict, ds_read_max_bytes(), require_ds_chunk_cap())? {
+            warn_page_cap_once(&advisory);
+        }
+        Ok(verdict)
     }
 
     fn physical_path(&self, logical_path: &str) -> Result<String> {
@@ -1178,6 +1212,8 @@ struct ReadinessWire {
     reserve: ReserveWire,
     #[serde(default)]
     max_chunk_bytes: Option<u64>,
+    #[serde(default)]
+    max_value_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1298,7 +1334,7 @@ fn decode_readiness(body: &str) -> Result<StoreReadinessV1> {
         wire.reserve.minimum_free_bytes,
         wire.reserve.minimum_free_inodes,
     );
-    Ok(StoreReadinessV1 { identity, max_chunk_bytes: wire.max_chunk_bytes })
+    Ok(StoreReadinessV1 { identity, max_chunk_bytes: wire.max_chunk_bytes, max_value_bytes: wire.max_value_bytes })
 }
 
 /// What the client concluded about the read page the store advertises in its readiness response.
@@ -1317,7 +1353,7 @@ pub(crate) enum PageCapVerdict {
 pub(crate) fn assess_page_cap(readiness: &StoreReadinessV1, client_cap: u64) -> PageCapVerdict {
     match readiness.max_chunk_bytes {
         Some(0) => PageCapVerdict::Unknown,
-        Some(observed) if observed <= client_cap => PageCapVerdict::Compatible { observed },
+        Some(observed) if observed.saturating_add(2) <= client_cap => PageCapVerdict::Compatible { observed },
         Some(observed) => PageCapVerdict::Exceeds { observed },
         None => PageCapVerdict::Unknown,
     }
@@ -1514,7 +1550,7 @@ mod tests {
         pub(crate) head_offsets: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_append_path: Option<String>,
         pub(crate) readiness_status: u16,
-        pub(crate) readiness_body: Option<String>,
+        pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
         pub(crate) head_status: u16,
     }
 
@@ -1533,7 +1569,7 @@ mod tests {
             Box::pin(async move {
                 self.operations.lock().unwrap().push("ready".to_string());
                 let mut response = response(if self.readiness_status == 0 { 200 } else { self.readiness_status });
-                response.body = Some(Ok(self.readiness_body.clone().unwrap_or_default()));
+                response.body = Some(Ok(self.readiness_body.lock().unwrap().clone().unwrap_or_default()));
                 Ok(response)
             })
         }
@@ -1746,7 +1782,10 @@ mod tests {
         let expected = StoreIdentityV1::in_process_test_identity();
         let mut observed = expected.clone();
         observed.store_generation = "aa8b5fa6-e786-4994-8da0-f14e9e79f318".to_string();
-        let store = Arc::new(ScriptedStore { readiness_body: Some(readiness_json(&observed)), ..Default::default() });
+        let store = Arc::new(ScriptedStore {
+            readiness_body: std::sync::Mutex::new(Some(readiness_json(&observed))),
+            ..Default::default()
+        });
         let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
 
         let error =
@@ -1754,6 +1793,23 @@ mod tests {
         assert!(error.downcast_ref::<StoreReadinessError>().is_some());
         assert_eq!(*store.operations.lock().unwrap(), vec!["ready".to_string()]);
         assert!(store.appended.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn readiness_is_reread_and_verdict_rederived_after_reconnect() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let store = Arc::new(ScriptedStore { readiness_body: std::sync::Mutex::new(None), ..Default::default() });
+        // Replace the helper's decoded value with a wire body for the first and second connections.
+        *store.readiness_body.lock().unwrap() =
+            Some(readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{"));
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
+        assert_eq!(
+            client.refresh_readiness(&identity).await.unwrap(),
+            PageCapVerdict::Compatible { observed: 4194304 }
+        );
+        *store.readiness_body.lock().unwrap() =
+            Some(readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":33554432,\"reserve\":{"));
+        assert_eq!(client.refresh_readiness(&identity).await.unwrap(), PageCapVerdict::Exceeds { observed: 33554432 });
     }
 
     #[tokio::test]
@@ -1787,6 +1843,24 @@ mod tests {
     }
 
     #[test]
+    fn readiness_preserves_max_value_bytes_separately_from_page_cap() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let body = readiness_json(&identity)
+            .replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"max_value_bytes\":1073741824,\"reserve\":{");
+        let readiness = decode_readiness(&body).unwrap();
+        assert!(format!("{readiness:?}").contains("max_value_bytes: Some(1073741824)"));
+        assert_eq!(assess_page_cap(&readiness, TEST_CLIENT_CAP), PageCapVerdict::Compatible { observed: 4194304 });
+        let message = ReadCapExceeded {
+            path: "changes/0".to_string(),
+            observed: TEST_CLIENT_CAP + 1,
+            limit: TEST_CLIENT_CAP,
+            max_value_bytes: readiness.max_value_bytes,
+        }
+        .to_string();
+        assert!(message.contains("single messages up to 1073741824"));
+    }
+
+    #[test]
     fn a_store_that_advertises_no_page_cap_is_read_as_unknown() {
         let identity = StoreIdentityV1::in_process_test_identity();
         let missing = decode_readiness(&readiness_json(&identity)).unwrap();
@@ -1804,6 +1878,13 @@ mod tests {
             assess_page_cap(&oversized, TEST_CLIENT_CAP),
             PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }
         );
+    }
+
+    #[test]
+    fn json_page_cap_includes_two_bytes_of_array_framing() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let readiness = readiness_with_cap(&identity, TEST_CLIENT_CAP);
+        assert_eq!(assess_page_cap(&readiness, TEST_CLIENT_CAP), PageCapVerdict::Exceeds { observed: TEST_CLIENT_CAP });
     }
 
     /// No released durable-streams build advertises `max_chunk_bytes`, so refusing an unverifiable
