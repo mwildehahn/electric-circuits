@@ -1248,7 +1248,7 @@ pub(crate) async fn replay_changes_for_shape(
     let mut emitted = 0u64;
     loop {
         let rr = ds
-            .read(&pos.path(), &pos.offset, false)
+            .read_for_table(&pos.path(), &pos.offset, false, table.as_str())
             .await
             .with_context(|| format!("replaying the change log from {pos}"))?;
         if let Some(n) = crate::changelog::rotation_target_in(&rr.envelopes) {

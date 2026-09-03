@@ -165,6 +165,31 @@ pub struct EnvelopeHeaders {
     pub last: Option<bool>,
 }
 
+/// Envelope framing used by the replay reader. Row bodies stay as raw JSON until the envelope's
+/// `type` has been matched to the waking shape's table, avoiding allocation for unrelated tables
+/// in the global change log.
+#[derive(Debug, Deserialize)]
+struct LazyEnvelope {
+    #[serde(rename = "type")]
+    type_: String,
+    key: String,
+    #[serde(default)]
+    value: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default)]
+    old: Option<Box<serde_json::value::RawValue>>,
+    headers: EnvelopeHeaders,
+}
+
+impl LazyEnvelope {
+    fn into_envelope(self) -> Result<Envelope> {
+        let value =
+            self.value.map(|raw| serde_json::from_str(raw.get())).transpose().context("decoding envelope value")?;
+        let old =
+            self.old.map(|raw| serde_json::from_str(raw.get())).transpose().context("decoding envelope old value")?;
+        Ok(Envelope { type_: self.type_, key: self.key, value, old, headers: self.headers })
+    }
+}
+
 impl crate::heap_size::HeapSize for EnvelopeHeaders {
     fn heap_bytes(&self) -> usize {
         self.operation.heap_bytes() + self.txid.heap_bytes() + self.offset.heap_bytes() + self.lsn.heap_bytes()
@@ -1035,6 +1060,43 @@ impl DsClient {
         };
         Ok(ReadResult { envelopes, next_offset, up_to_date, closed })
     }
+
+    /// Read one page while decoding row bodies only for `table` and change-log control envelopes.
+    /// This is the replay path's cheap-page variant: framing and headers are still validated for
+    /// every item, but unrelated table rows remain borrowed raw bytes until discarded.
+    pub async fn read_for_table(&self, path: &str, offset: &str, live: bool, table: &str) -> Result<ReadResult> {
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.read(&physical_path, offset, live).await?;
+        if res.status == 204 {
+            return Ok(ReadResult {
+                envelopes: Vec::new(),
+                next_offset: res.next_offset,
+                up_to_date: res.up_to_date,
+                closed: res.closed,
+            });
+        }
+        if res.status == 404 || res.status == 410 {
+            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
+        }
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("GET", path, res.status, ""));
+        }
+        let next_offset = res.next_offset.clone();
+        let up_to_date = res.up_to_date;
+        let closed = res.closed;
+        let body = res.required_body()?;
+        let mut envelopes = Vec::new();
+        if !body.trim().is_empty() {
+            let raw: Vec<LazyEnvelope> =
+                serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?;
+            for item in raw {
+                if item.type_ == table || item.type_ == crate::changelog::CONTROL_TYPE {
+                    envelopes.push(item.into_envelope()?);
+                }
+            }
+        }
+        Ok(ReadResult { envelopes, next_offset, up_to_date, closed })
+    }
 }
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {
@@ -1467,6 +1529,23 @@ mod tests {
         assert_eq!(second.next_offset.as_deref(), Some("tail"));
         assert!(second.up_to_date);
         assert!(second.envelopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn table_read_discards_unmatched_rows_before_decoding_their_bodies() {
+        let store = Arc::new(ScriptedStore {
+            read_pages: std::sync::Mutex::new(vec![(
+                "tail".to_string(),
+                true,
+                "[{\"type\":\"public.other\",\"key\":\"x\",\"value\":{\"large\":true},\"headers\":{\"operation\":\"upsert\"}},{\"type\":\"public.items\",\"key\":\"1\",\"value\":{\"id\":1},\"headers\":{\"operation\":\"upsert\"}}]".to_string(),
+            )]),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store);
+
+        let page = client.read_for_table("changes/0", "-1", false, "public.items").await.unwrap();
+        assert_eq!(page.envelopes.len(), 1);
+        assert_eq!(page.envelopes[0].type_, "public.items");
     }
 
     fn readiness_json(identity: &StoreIdentityV1) -> String {
