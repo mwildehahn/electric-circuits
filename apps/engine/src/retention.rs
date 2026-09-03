@@ -105,8 +105,8 @@ impl Default for RetentionConfig {
 }
 
 impl RetentionConfig {
-    pub fn replay_budget(&self, backfill_bytes: u64) -> u64 {
-        self.replay_min_bytes.max(backfill_bytes.saturating_mul(self.replay_multiplier))
+    pub fn replay_budget(&self, backfill_bytes: Option<u64>) -> u64 {
+        self.replay_min_bytes.max(backfill_bytes.unwrap_or(0).saturating_mul(self.replay_multiplier))
     }
 
     pub fn from_env() -> Self {
@@ -202,6 +202,10 @@ pub struct SweepShape {
     pub dormancy_eligible: bool,
     /// Tracked bytes appended to the shape's stream (engine-side accounting).
     pub stream_bytes: u64,
+    /// Bytes from the dormant cursor to the current tail. `None` means the cursor's segment is gone.
+    pub replay_span_bytes: Option<u64>,
+    /// Last plain-shape backfill estimate. `None` is an old/unknown catalog record.
+    pub backfill_bytes: Option<u64>,
 }
 
 /// Did an eviction actually happen?
@@ -231,6 +235,7 @@ pub enum EvictReason {
     /// segment so it can be deleted — the change log must not be held hostage by a shape nobody has
     /// touched in a week.
     ChangeLogRetention,
+    ReplayBudget,
 }
 
 impl EvictReason {
@@ -240,6 +245,7 @@ impl EvictReason {
             EvictReason::MaxShapes => "max-shapes",
             EvictReason::DiskBudget => "disk-budget",
             EvictReason::ChangeLogRetention => "change-log-retention",
+            EvictReason::ReplayBudget => "replay-budget",
         }
     }
 }
@@ -275,6 +281,21 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     }
 
     let mut evicted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    // A parked cursor that points into an expired segment, or whose replay span has grown beyond
+    // the shape's bounded replay budget, is no longer safely reactivatable. Retire it now so the
+    // next subscriber recreates from a fresh snapshot.
+    for s in shapes {
+        if s.dormant_for.is_some() {
+            if s.replay_span_bytes.is_none() {
+                plan.evict.push((s.id.clone(), EvictReason::ChangeLogRetention));
+                evicted.insert(&s.id);
+            } else if s.replay_span_bytes.unwrap_or(0) > cfg.replay_budget(s.backfill_bytes) {
+                plan.evict.push((s.id.clone(), EvictReason::ReplayBudget));
+                evicted.insert(&s.id);
+            }
+        }
+    }
 
     // Tier 1 — dormancy TTL (hygiene, independent of pressure).
     if !cfg.dormant_ttl.is_zero() {
@@ -373,6 +394,8 @@ mod tests {
             in_transition: false,
             dormancy_eligible: true,
             stream_bytes: 0,
+            replay_span_bytes: None,
+            backfill_bytes: None,
         }
     }
 
@@ -380,6 +403,7 @@ mod tests {
         SweepShape {
             idle: Duration::from_secs(idle_secs),
             dormant_for: Some(Duration::from_secs(dormant_secs)),
+            replay_span_bytes: Some(0),
             ..shape(id)
         }
     }
@@ -479,6 +503,22 @@ mod tests {
         let plan = plan_sweep(&c, &shapes);
         assert!(plan.evict.is_empty());
         assert!(plan.over_budget);
+    }
+
+    #[test]
+    fn replay_budget_evicts_over_budget_and_unknown_uses_minimum() {
+        let c = RetentionConfig { replay_min_bytes: 100, replay_multiplier: 4, ..cfg() };
+        let over = SweepShape { replay_span_bytes: Some(401), backfill_bytes: Some(100), ..dormant("over", 1, 1) };
+        let unknown_ok = SweepShape { replay_span_bytes: Some(100), backfill_bytes: None, ..dormant("unknown", 1, 1) };
+        let plan = plan_sweep(&c, &[over, unknown_ok]);
+        assert_eq!(plan.evict, vec![("over".to_string(), EvictReason::ReplayBudget)]);
+    }
+
+    #[test]
+    fn missing_replay_segment_is_evicted_immediately() {
+        let shape = SweepShape { replay_span_bytes: None, ..dormant("gone", 1, 1) };
+        let plan = plan_sweep(&cfg(), &[shape]);
+        assert_eq!(plan.evict, vec![("gone".to_string(), EvictReason::ChangeLogRetention)]);
     }
 
     #[test]

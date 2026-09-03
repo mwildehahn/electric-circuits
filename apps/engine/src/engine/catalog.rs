@@ -72,6 +72,13 @@ pub(crate) enum CatalogEvent {
     Reactivated {
         id: String,
     },
+    /// Plain-shape backfill sizing, emitted after the streamed snapshot completes. Older records
+    /// simply omit this event and therefore have unknown sizing at reactivation time.
+    BackfillSized {
+        id: String,
+        rows: u64,
+        bytes: u64,
+    },
     Dropped {
         id: String,
     },
@@ -512,6 +519,7 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
         CatalogEvent::Left { .. } => "left",
         CatalogEvent::Dormant { .. } => "dormant",
         CatalogEvent::Reactivated { .. } => "reactivated",
+        CatalogEvent::BackfillSized { .. } => "backfillSized",
         CatalogEvent::Dropped { .. } => "dropped",
         CatalogEvent::Retired { .. } => "retired",
         CatalogEvent::Offset { .. } => "offset",
@@ -929,6 +937,12 @@ impl CatalogFold {
             CatalogEvent::Reactivated { id } => {
                 if let Some(e) = self.recs.get_mut(&id) {
                     e.3 = None;
+                }
+            }
+            CatalogEvent::BackfillSized { id, rows, bytes } => {
+                if let Some((rec, ..)) = self.recs.get_mut(&id) {
+                    rec.backfill_rows = Some(rows);
+                    rec.backfill_bytes = Some(bytes);
                 }
             }
             // The record goes; the obligation to retire its stream stays until a `Retired` says it
@@ -1506,6 +1520,7 @@ impl Engine {
             ack_rx,
         )
         .await
+        .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))
     }
 }

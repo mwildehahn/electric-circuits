@@ -9,9 +9,13 @@ type before materializing row bodies. `changes_only` feeds are exempt from dorma
 from a Postgres snapshot would silently discard the changes-only history promised to subscribers.
 
 The replay span budget is configurable with `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` (default 16 MiB)
-and `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` (default 4) and is represented in `RetentionConfig`.
-Persisting per-shape backfill sizing and enforcing replay-vs-recreate admission is follow-up work;
-until then the budget knobs are reserved and no shape is silently recreated.
+and `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` (default 4). Plain-shape catalog records persist the
+last streamed backfill's row and byte estimates (missing values from older catalogs mean unknown).
+At wake, the engine computes the byte span across retained segment HEADs and replays only when
+`span <= max(min_bytes, multiplier * backfill_bytes)`; unknown sizing uses `min_bytes` alone.
+Over-budget or unresumable shapes are retired through the closed-stream path so subscribers
+recreate them from a fresh snapshot. The retention sweeper applies the same admission check before
+pressure/TTL eviction.
 
 ## Alternatives considered
 
@@ -27,6 +31,8 @@ until then the budget knobs are reserved and no shape is silently recreated.
 
 Replay memory is bounded by the response cap, parsed page, and scheduler permits rather than log
 size or shape count. Reactivation latency can queue behind the semaphore. `changes_only` shapes
-remain active and therefore consume their normal routing state until a correct recreate/reconcile
-implementation exists. Durable Streams server paging (PR #4) improves the normal page size, but
-the engine-side cap remains mandatory defense in depth.
+remain active and therefore consume their normal routing state because recreation would lose their
+dormant-period history. Durable Streams server paging (PR #4) improves the normal page size, but
+the engine-side cap remains mandatory defense in depth. Cross-segment span calculation HEADs each
+segment, subtracts the parked byte offset on the first, sums complete intermediate segments, and
+stops at the current processed tail.

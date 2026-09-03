@@ -43,6 +43,11 @@ pub struct ShapeRecord {
     /// this field existed) and is treated as a mismatch by the restore.
     #[serde(default)]
     pub fingerprint: Option<crate::schema::SchemaFingerprint>,
+    /// Snapshot size used by dormant reactivation admission. Missing on older catalog records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_bytes: Option<u64>,
 }
 
 /// Strict table deserializer for the durable catalog: the stored string must ALREADY be the
@@ -951,6 +956,8 @@ mod tests {
             is_subquery: false,
             aggregate: None,
             fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
         };
         assert_eq!(
             empty.heap_bytes(),
@@ -969,7 +976,22 @@ mod tests {
             is_subquery: false,
             aggregate: Some(AggInfo { func: AggFn::Count, col: Some("qty".to_string()) }),
             fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
         };
         assert!(populated.heap_bytes() > 0, "a populated ShapeRecord should report non-zero owned heap");
+    }
+
+    #[test]
+    fn catalog_round_trips_backfill_size_fields() {
+        let input = serde_json::json!({
+            "id":"s1", "table":"public.items", "stream_path":"shape/s1", "changes_only":false,
+            "where_json":null, "columns":null, "family_key":null, "is_subquery":false,
+            "aggregate":null, "fingerprint":null, "backfill_rows":12, "backfill_bytes":3456
+        });
+        let rec: ShapeRecord = serde_json::from_value(input).unwrap();
+        let out = serde_json::to_value(rec).unwrap();
+        assert_eq!(out["backfill_rows"], 12);
+        assert_eq!(out["backfill_bytes"], 3456);
     }
 }

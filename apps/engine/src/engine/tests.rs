@@ -539,6 +539,8 @@ async fn graph_includes_counts_pipeline_and_consumers() {
             is_subquery: false,
             aggregate: Some(AggInfo { func: AggFn::Count, col: None }),
             fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
         },
     );
 
@@ -1666,6 +1668,8 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
             is_subquery: false,
             aggregate: None,
             fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
         },
     );
 

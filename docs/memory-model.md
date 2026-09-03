@@ -20,6 +20,24 @@ post:
 
 ---
 
+## 6. Per-operation transient budgets
+
+The engine now bounds transient work independently of the durable-stream server:
+
+| operation | bound / accounting |
+|---|---|
+| ingest transaction | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (default 32 MiB), with spill chunks |
+| Postgres backfill | one `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` chunk; reader records rows and estimated bytes |
+| dormant replay | one Durable Streams page, capped by `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` (default 64 MiB), and at most `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` concurrent scans (default 2) |
+| emission | one translated envelope batch per append; stream bytes are tracked for retention |
+| subquery seeds/query-backs | streamed chunks for outer feeds; inner contributor state is covered by the circuit counters below |
+
+`/memory` and memory snapshot logs expose allocator `allocated`, `resident`, and `retained` bytes
+when jemalloc is available, alongside engine counters such as `bytes_feed_sets`,
+`bytes_subquery_registry`, and replay `reactivation_bytes_scanned`. Allocator counters describe
+process heap state; engine counters describe owned data structures, so they must not be summed.
+
+
 ## 1. The memory map
 
 ### In the DBSP circuits (derived, reseedable, in-memory)

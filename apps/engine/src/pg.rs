@@ -1296,6 +1296,11 @@ impl<'a> BackfillReader<'a> {
         self.chunks
     }
 
+    /// Estimated serialized bytes traversed by this snapshot.
+    pub fn estimated_bytes_read(&self) -> u64 {
+        self.estimated_bytes
+    }
+
     /// The next chunk of rows, in snapshot order, or `None` when the snapshot is exhausted.
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<Row>>> {
         if self.stream.is_none() && self.pending.is_none() {
