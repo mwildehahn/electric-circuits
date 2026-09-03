@@ -60,8 +60,8 @@ the stream and a cap below the backlog does not bound memory — the sequencer r
 read and it fails identically forever, so no data flows at all. A deployment that wants the tighter
 bound guaranteed sets `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1` and runs a store that pages. If a
 live read nevertheless exceeds its cap, the sequencer records a typed cap failure, increments
-`sequencer_read_cap_failures_total`, logs an error, and halts further reads until restart rather
-than retrying the same page forever. Reactivation latency can queue behind the semaphore. `changes_only` shapes
+`sequencer_read_cap_failures_total`, logs an error, latches the engine `degraded`/not-ready status,
+and halts further reads until restart rather than retrying the same page forever. Reactivation latency can queue behind the semaphore. `changes_only` shapes
 remain active and therefore consume their normal routing state because recreation would lose their
 dormant-period history. Durable Streams server paging (PR #4) improves the normal page size, but
 the engine-side cap remains mandatory defense in depth. Cross-segment span calculation HEADs each

@@ -427,6 +427,8 @@ pub struct Engine {
     pending_flips: Arc<std::sync::atomic::AtomicI64>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
+    /// Latched when the live sequencer encounters an unrecoverable body-cap breach.
+    pub(crate) read_cap_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Table schemas shared with the sequencer task and the replication ingestor — the set of
     /// tables the engine can **currently decode and route**, and the single place a drift swaps a
     /// schema (ADR-0005).
@@ -1221,6 +1223,7 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
+            read_cap_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
             retirements,
@@ -1780,6 +1783,7 @@ impl Engine {
                 self.pg_url.is_none(),
                 self.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire),
                 self.restore_reads_paused.clone(),
+                self.read_cap_failed.clone(),
                 self.shutdown.clone(),
             ));
         }
@@ -1813,7 +1817,10 @@ impl Engine {
                 ManagedRole::Active => {}
             }
         }
-        if self.degraded() || self.epoch_broken().is_some() {
+        if self.degraded()
+            || self.epoch_broken().is_some()
+            || self.read_cap_failed.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return "degraded";
         }
         match self.health.load(std::sync::atomic::Ordering::Relaxed) {

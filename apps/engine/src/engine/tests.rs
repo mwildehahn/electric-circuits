@@ -38,6 +38,15 @@ async fn managed_public_traffic_waits_for_full_engine_readiness_after_claim() {
 }
 
 #[tokio::test]
+async fn live_read_cap_failure_withdraws_readiness_once() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    assert_eq!(engine.readiness_status(), "active");
+    engine.read_cap_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(engine.readiness_status(), "degraded");
+    assert_eq!(engine.readiness_status(), "degraded");
+}
+
+#[tokio::test]
 async fn quiesce_requires_a_receipt_after_admission_is_preclosed_and_drained() {
     let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     assert!(engine.ensure_control_admitted().is_ok());

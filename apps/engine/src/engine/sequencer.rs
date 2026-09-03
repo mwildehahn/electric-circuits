@@ -146,6 +146,7 @@ pub(crate) fn spawn_sequencer(
     library_mode: bool,
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
+    read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -175,6 +176,7 @@ pub(crate) fn spawn_sequencer(
         library_mode,
         start_paused,
         pause_gate,
+        read_cap_latch,
         shutdown,
         party,
     ));
@@ -374,6 +376,7 @@ pub(crate) async fn sequencer_loop(
     library_mode: bool,
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
+    read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
@@ -984,6 +987,7 @@ pub(crate) async fn sequencer_loop(
                     if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
                         metrics().sequencer_read_cap_failures.fetch_add(1, Ordering::Relaxed);
                         read_cap_failed = true;
+                        read_cap_latch.store(true, Ordering::SeqCst);
                         tracing::error!(path = %cap.path, observed = cap.observed, limit = cap.limit,
                             "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
                     } else {
