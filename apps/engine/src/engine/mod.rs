@@ -2533,11 +2533,11 @@ impl Engine {
         self.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
     }
 
-    /// The lease window a subscription must renew within (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`),
-    /// handed to clients in every create response so the renewal cadence is the server's to set.
-    /// `0` = dormancy is off, so leases never lapse.
+    /// The lease window a subscription must renew within
+    /// (`ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`), handed to clients in every create response.
+    /// This is independent from the dormancy idle timeout.
     pub fn lease_seconds(&self) -> u64 {
-        self.retention.idle_timeout.as_secs()
+        self.retention.subscription_lease_timeout.as_secs()
     }
 
     /// The change-log position up to which the sequencer has processed (global — all tables share

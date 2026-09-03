@@ -1032,7 +1032,7 @@ struct ShapeResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     subscription: Option<String>,
     /// How long a subscription may go unrenewed before the engine releases it
-    /// (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse, because dormancy is off).
+    /// (`ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`; `0` = leases never lapse).
     /// The renewal cadence is the server's to set, so clients read it from here rather than guess.
     #[serde(skip_serializing_if = "Option::is_none")]
     lease_seconds: Option<u64>,

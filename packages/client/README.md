@@ -135,7 +135,7 @@ the claim under that name and returns it on the handle together with `leaseSecon
   reference on a shared shape.) `client.close()` tears down everything still open.
 - **The subscription is a lease, so the client renews it.** Native reads go straight to
   durable-streams, where the engine cannot see them, so an un-renewed claim is released after
-  `leaseSeconds` (the engine's `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`) and the shape follows its
+  `leaseSeconds` (the engine's `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`) and the shape follows its
   retention lifecycle. Each open materialization renews on a third of that window automatically; a
   caller whose timers do not run (a suspended tab, a test that controls time) can say it explicitly
   with `shape.renew()` / `subset.renew()` / `aggregate.renew()` — the same create with the same id,

@@ -781,6 +781,16 @@ async fn dormant_replay_retirement_ignores_a_provisional_join_claim() {
 }
 
 #[tokio::test]
+async fn advertised_lease_matches_subscription_lease_timeout() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    assert_eq!(
+        engine.lease_seconds(),
+        engine.retention.subscription_lease_timeout.as_secs(),
+        "leaseSeconds must describe the enforced subscription lease, not dormancy idle timeout"
+    );
+}
+
+#[tokio::test]
 async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {
         read_pages: std::sync::Mutex::new(vec![

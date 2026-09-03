@@ -410,11 +410,11 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   achieves is making its own claim the expendable one).
 - **A subscription is a lease.** Native reads go straight to durable-streams, so the engine never
   sees them: a claim counts as live only while it is created or renewed within
-  `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
+  `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
   The retention sweeper releases an unrenewed one exactly as an explicit `DELETE` would, and the
   shape then follows the ordinary lifecycle (idle → dormant → evicted). A client that renews late
-  simply re-subscribes and may find a fresh shape. `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` disables
-  dormancy and, with it, leases. Watch `subscriptions_live` (gauge) and
+  simply re-subscribes and may find a fresh shape. `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS=0`
+  disables lease expiry; `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` independently disables dormancy. Watch `subscriptions_live` (gauge) and
   `subscriptions_lapsed_total` (counter); `GET /shapes/{id}` reports the per-shape count.
 - **Every catalog event carries an `eid`**, assigned when it is queued, and the boot fold ignores an
   `eid` it has already applied — so the writer's retry-in-place (a response lost after the append
