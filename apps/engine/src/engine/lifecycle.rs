@@ -92,17 +92,21 @@ impl Engine {
         }
         let mut total = 0u64;
         for segment in resume.segment..=tail.segment {
-            if !heads.contains_key(&segment) {
-                let value = self
-                    .ds
-                    .head(&crate::changelog::segment_path(segment))
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|head| head.next_offset.as_deref().and_then(crate::changelog::offset_bytes));
-                heads.insert(segment, value);
-            }
-            let segment_head = heads.get(&segment).copied().flatten()?;
+            let head = match heads.get(&segment).copied() {
+                Some(cached) => cached,
+                None => {
+                    let value = self
+                        .ds
+                        .head(&crate::changelog::segment_path(segment))
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|head| head.next_offset.as_deref().and_then(crate::changelog::offset_bytes));
+                    heads.insert(segment, value);
+                    value
+                }
+            };
+            let segment_head = head?;
             let end = if segment == tail.segment {
                 crate::changelog::offset_bytes(&tail.offset).unwrap_or(segment_head)
             } else {
@@ -1543,6 +1547,7 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn replay_coalesced(
         &self,
         ts: TableSchema,

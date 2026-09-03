@@ -1259,7 +1259,7 @@ pub(crate) enum PageCapVerdict {
 
 pub(crate) fn assess_page_cap(readiness: &StoreReadinessV1, client_cap: u64) -> PageCapVerdict {
     match readiness.max_chunk_bytes {
-        Some(observed) if observed == 0 => PageCapVerdict::Unknown,
+        Some(0) => PageCapVerdict::Unknown,
         Some(observed) if observed <= client_cap => PageCapVerdict::Compatible { observed },
         Some(observed) => PageCapVerdict::Exceeds { observed },
         None => PageCapVerdict::Unknown,
@@ -1431,6 +1431,9 @@ impl<'de> Deserialize<'de> for StrictJson {
         deserializer.deserialize_any(Visitor)
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::ScriptedStore;
 
 #[cfg(test)]
 mod tests {
@@ -1837,6 +1840,3 @@ mod tests {
         assert!(format!("{five:#}").contains("502"));
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::ScriptedStore;

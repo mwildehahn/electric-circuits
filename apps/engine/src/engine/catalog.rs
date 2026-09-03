@@ -21,6 +21,11 @@ pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
 /// not the value. The fold ignores an `eid` it has already applied, which is what makes the writer's
 /// retry-in-place (no event is ever dropped, ADR-0007) safe for a record whose effect is not
 /// naturally idempotent.
+// `Created` carries a whole `ShapeRecord` and is much larger than the other variants. Boxing it
+// would move the allocation onto every create rather than removing it: these events are built one at
+// a time, sent through the writer's channel and serialized immediately, so the enum's size is never
+// multiplied by anything.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "camelCase")]
 pub(crate) enum CatalogEvent {
