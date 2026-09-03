@@ -33,6 +33,10 @@ use anyhow::{Context, Result};
 use electric_circuits_engine::config::{self, Config};
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
+
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use electric_circuits_engine::shutdown::{self, ShutdownToken};
 use electric_circuits_engine::store_identity::StoreBound;
 #[cfg(feature = "test-support")]
@@ -41,6 +45,16 @@ use electric_circuits_engine::{pg, statsd};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(unix)]
+    // Return freed replay/transient pages to the OS promptly while retaining jemalloc's bounded
+    // arenas. Operators can override this with MALLOC_CONF when tuning a container.
+    if std::env::var_os("MALLOC_CONF").is_none() {
+        // SAFETY: this runs at process entry before Tokio starts worker threads or any other
+        // code reads process environment; no concurrent environment mutation is possible here.
+        unsafe {
+            std::env::set_var("MALLOC_CONF", "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000");
+        }
+    }
     // Anchor process-uptime / boot-to-ready timing before anything else runs.
     statsd::mark_start();
 

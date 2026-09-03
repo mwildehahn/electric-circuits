@@ -87,7 +87,7 @@ fn default_spill_dir() -> PathBuf {
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | In-memory bytes of ONE transaction before it spills to disk. `0` = never spill. |
+/// | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `33554432` (32 MiB) | In-memory bytes of ONE transaction before it spills to disk. `0` = never spill. Lowered to leave headroom for replay pages and concurrent shape work. |
 /// | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Largest POST body one commit's append may build. Must be > 0 and ≤ [`DS_MAX_BODY_BYTES`]. |
 /// | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Where spill files are written. Needs room for the largest transaction. |
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,7 +105,7 @@ pub struct TxnBufferConfig {
 impl Default for TxnBufferConfig {
     fn default() -> Self {
         TxnBufferConfig {
-            memory_bytes: 128 * 1024 * 1024,
+            memory_bytes: 32 * 1024 * 1024,
             append_bytes: 64 * 1024 * 1024,
             spill_dir: default_spill_dir(),
         }
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn config_defaults_and_overrides() {
         let d = TxnBufferConfig::resolve(|_| None).unwrap();
-        assert_eq!(d.memory_bytes, 128 * 1024 * 1024);
+        assert_eq!(d.memory_bytes, 32 * 1024 * 1024);
         assert_eq!(d.append_bytes, 64 * 1024 * 1024);
         assert_eq!(d.spill_dir, default_spill_dir(), "a private per-uid subdir, not the shared temp dir");
         assert!(d.spill_dir.starts_with(std::env::temp_dir()));

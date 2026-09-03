@@ -176,6 +176,23 @@ pub fn process_memory() -> (u64, u64) {
     }
 }
 
+/// Jemalloc counters for transient allocator slack. Returns `(allocated, resident, retained)`;
+/// zeroes on targets where the process uses the platform allocator.
+#[cfg(unix)]
+pub fn allocator_memory() -> (u64, u64, u64) {
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    (
+        tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as u64,
+        tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as u64,
+        tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0) as u64,
+    )
+}
+
+#[cfg(not(unix))]
+pub fn allocator_memory() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 /// cgroup memory counters for the container. ECS exposes task-level memory in Container
 /// Insights, but these files give us the engine's own 5-second view and preserve the `oom_kill`
 /// edge that a one-minute CloudWatch sample can miss. ECS EC2 hosts may still mount cgroup v1,
@@ -255,6 +272,7 @@ pub fn cgroup_memory() -> CgroupMemory {
 
 fn log_memory_snapshot(card: &Cardinalities, bytes: Option<&HeapBytes>) {
     let (rss_bytes, virtual_bytes) = process_memory();
+    let (allocator_allocated_bytes, allocator_resident_bytes, allocator_retained_bytes) = allocator_memory();
     let cgroup = cgroup_memory();
     let (
         bytes_shape_records,
@@ -287,6 +305,9 @@ fn log_memory_snapshot(card: &Cardinalities, bytes: Option<&HeapBytes>) {
         event = "memory_snapshot",
         rss_bytes,
         virtual_bytes,
+        allocator_allocated_bytes,
+        allocator_resident_bytes,
+        allocator_retained_bytes,
         cgroup_memory_current_bytes = cgroup.current_bytes.unwrap_or(0),
         cgroup_memory_max_bytes = cgroup.max_bytes.unwrap_or(0),
         cgroup_memory_high_events = cgroup.high_events.unwrap_or(0),
@@ -387,6 +408,7 @@ pub fn publish(card: &Cardinalities) {
 pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
     let g = gauges();
     let (rss, virt) = process_memory();
+    let (allocator_allocated, allocator_resident, allocator_retained) = allocator_memory();
     g.rss_bytes.store(rss, Ordering::Relaxed);
     g.virtual_bytes.store(virt, Ordering::Relaxed);
     serde_json::json!({
@@ -394,6 +416,9 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "rss_bytes": rss,
             "rss_mib": rss / (1024 * 1024),
             "virtual_bytes": virt,
+            "allocator_allocated_bytes": allocator_allocated,
+            "allocator_resident_bytes": allocator_resident,
+            "allocator_retained_bytes": allocator_retained,
         },
         "cardinalities": {
             "shapes": g.shapes.load(Ordering::Relaxed),
