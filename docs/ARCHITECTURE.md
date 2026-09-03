@@ -103,16 +103,17 @@ Three ideas carry the whole design:
   and reported by `GET /memory`, and **exact from boot**: library mode has no catalog checkpoint to
   resume from, so a starting process replays the change log from its origin and rebuilds the view
   in full. Postgres mode allocates none of it.
-- **Absolute emission** covers the one reader that is not at the log's head. A shape reactivating
-  out of dormancy replays the change log from *its* resume position, where the per-key view does
-  not apply, so each old-less envelope states that shape's membership outright: matches the
-  predicate now ⇒ `upsert`, otherwise ⇒ `delete <key>` (`engine::output::absolute_envelope`; the
-  rule the subquery registry uses, §6, for the same reason — a delta with no `-1` half cannot
-  express a move-out). A delete for a key the shape never held is a deliberate no-op. On the live
-  path the rule costs a visit to every shape on the table, so it is reserved for envelopes that
-  genuinely have no before-image. What remains is library mode's lack of a **backfill**: a shape or
-  aggregate created at time T holds only what changed after T (aggregates never go dormant, so the
-  replay path never applies to one). The delta algebra
+- **Absolute emission** is used by the library-mode dormant reader, which is not backed by
+  Postgres before-images. It replays the change log from *its* resume position, where the per-key
+  view does not apply, so each old-less envelope states that shape's membership outright: matches
+  the predicate now ⇒ `upsert`, otherwise ⇒ `delete <key>` (`engine::output::absolute_envelope`;
+  the rule the subquery registry uses, §6, for the same reason — a delta with no `-1` half cannot
+  express a move-out). Postgres-mode replay retains the replicated `old` image and uses ordinary
+  deltas; it does not claim absolute emission. A delete for a key the shape never held is a
+  deliberate no-op. On the live path the rule costs a visit to every shape on the table, so it is
+  reserved for envelopes that genuinely have no before-image. What remains is library mode's lack
+  of a **backfill**: a shape or aggregate created at time T holds only what changed after T
+  (aggregates never go dormant, so the replay path never applies to one). The delta algebra
   is [`dbsp`](https://crates.io/crates/dbsp)'s — `Tup2` and `ZWeight` are dbsp's own, and
   `Value`/`Row` carry the `DBData` derive stack. Routing- and fallback-tier shapes are evaluated
   by plain Rust (key routing + stateless predicate evaluation; internals doc §1); the circuit
@@ -357,7 +358,7 @@ restart resumes in the right stream. A closed segment whose pointer this process
 checkpoint it booted from was already past it) steps to **exactly** the next segment, verified to
 exist; jumping to the first open segment would skip the closed ones in between, which are unread
 changes. A closed segment with **no** successor is refused — logged and backed off, never skipped
-past. `replay_changes_for_shape` — the dormant reactivation path — follows the same pointers, one
+past. The coalesced dormant reactivation scanner follows the same pointers, one
 segment at a time, until it reaches the tail of the open segment.
 
 Shape creation is **two-phase** so a Postgres backfill never stalls the pipeline: `BeginShape`

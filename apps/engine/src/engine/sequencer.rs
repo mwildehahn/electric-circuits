@@ -256,7 +256,7 @@ pub(crate) struct TableExec {
     /// mode has no catalog checkpoint to resume from (`apply_catalog` runs only on the Postgres
     /// boot), so a starting process replays the log from `LogPosition::start()` and rebuilds the
     /// whole view before it serves anything. The one reader this cannot serve is
-    /// `replay_changes_for_shape`, which reads the log at a DORMANT SHAPE's resume position while
+    /// the coalesced replay scanner, which reads the log at DORMANT SHAPE resume positions while
     /// the view is at the head; that path decides membership absolutely instead
     /// (`output::absolute_envelope`).
     pub(crate) library_rows: HashMap<String, serde_json::Value>,
@@ -326,7 +326,7 @@ pub(crate) struct PendingShape {
 ///
 /// **Strict, deliberately.** A non-canonical spelling (a bare `users`) is refused rather than
 /// resolved, because resolving it here would be resolved in only HALF the engine: the live fan-out
-/// would route it while `replay_changes_for_shape` — the dormant-reactivation / retained-stream
+/// would route it while the dormant-reactivation / retained-stream
 /// catch-up — compares `env.type_ != table.as_str()` and would skip the very same envelopes, so a
 /// shape's live stream and its replayed stream would disagree. No legitimate writer produces a
 /// non-canonical `type`: the replication ingestor stamps `TableRef::to_string()`, and library-mode
@@ -1230,108 +1230,6 @@ pub(crate) async fn activate_shape(
 /// the rest — no delta is counted twice and no intermediate state is wrong, only briefly
 /// incomplete, on a stream the shape is not live on yet. The live loop's rule is what governs from
 /// the moment the shape is registered.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) async fn replay_changes_for_shape(
-    ds: &DsClient,
-    ts: &TableSchema,
-    table: &TableRef,
-    pred: &CompiledPredicate,
-    out_cols: Option<&Arc<Vec<usize>>>,
-    gate: &crate::pg::SnapshotGate,
-    stream_path: &str,
-    from: &LogPosition,
-    library_mode: bool,
-    shutdown: &crate::shutdown::ShutdownToken,
-) -> Result<u64> {
-    let mut pos = from.clone();
-    let mut rotate_to: Option<u32> = None;
-    let mut emitted = 0u64;
-    metrics().reactivation_spans.fetch_add(1, Ordering::Relaxed);
-    loop {
-        let page_start_bytes = crate::changelog::offset_bytes(&pos.offset);
-        let rr = ds
-            .read_for_table(&pos.path(), &pos.offset, false, table.as_str())
-            .await
-            .with_context(|| format!("replaying the change log from {pos}"))?;
-        if let Some(n) = crate::changelog::rotation_target_in(&rr.envelopes) {
-            rotate_to = Some(n);
-        }
-        let delivered = rr.envelopes.len();
-        let mut outs: Vec<Envelope> = Vec::new();
-        for env in &rr.envelopes {
-            // The change log's `type` is the canonical `schema.name`; a control envelope's never
-            // is, so it is skipped by TYPE here as everywhere else.
-            if env.type_ != table.as_str() {
-                continue;
-            }
-            let Ok((delta, txid, lsn)) = apply_envelope(ts, env) else { continue };
-            // Library mode replays RAW change-log envelopes: nothing stamped a before-image on
-            // them (the sequencer's per-key view is the state at the log's HEAD, not at this
-            // replay position), so membership is decided ABSOLUTELY per pk — matches now ⇒
-            // `upsert`, otherwise ⇒ `delete <key>`. Without this a shape coming back from
-            // dormancy would never learn about the deletes it slept through.
-            let absolute = library_mode && needs_absolute_emission(env);
-            if delta.is_empty() && !absolute {
-                continue;
-            }
-            let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
-            let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
-            if gate.should_skip(lsn_u64, xid) {
-                continue;
-            }
-            if absolute {
-                let held = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| pred.matches(r));
-                if let Some(e) = absolute_envelope(ts, &env.key, held, txid, lsn, out_cols.map(|c| c.as_slice())) {
-                    outs.push(e);
-                }
-                continue;
-            }
-            let matched = eval_standalone(pred, &delta);
-            if matched.is_empty() {
-                continue;
-            }
-            outs.extend(translate_output(ts, matched, txid, lsn, out_cols.map(|c| c.as_slice())));
-        }
-        if !outs.is_empty() {
-            emitted += outs.len() as u64;
-            // A reactivation that fails is EVICTED (its subscribers lose the shape), so a transient
-            // storage failure is retried rather than propagated — same rule as the aggregate re-seed.
-            ds.append_retrying(stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown)
-                .await
-                .context("append replay to retained stream")?;
-        }
-        let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
-        if let (Some(start), Some(end)) =
-            (page_start_bytes, rr.next_offset.as_deref().and_then(crate::changelog::offset_bytes))
-        {
-            metrics().reactivation_bytes_scanned.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
-        }
-        if let Some(n) = rr.next_offset {
-            pos.offset = n;
-        }
-        if rr.closed && (delivered == 0 || !advanced) {
-            // The segment is drained AND closed: follow the pointer, exactly as the live loop does.
-            let next = match rotate_to.take() {
-                Some(n) => n,
-                // No pointer seen on this page: step to EXACTLY the next segment (verified to
-                // exist). A walk to the first open segment would skip the closed ones in between,
-                // and this replay is precisely what has to read them.
-                None => crate::changelog::next_segment_for_reader(ds, pos.segment).await?,
-            };
-            pos = LogPosition::start_of(next);
-            continue;
-        }
-        if !advanced {
-            break; // the segment stopped advancing and is still open: nothing more to replay
-        }
-        if rr.up_to_date && !rr.closed {
-            break;
-        }
-    }
-    Ok(emitted)
-}
-
 /// Replay one exact cursor page for several shapes of the same table. The caller groups requests
 /// with the same `(table, segment, offset)`; each target still applies its own predicate/gate and
 /// appends to its own stream. A target append failure is isolated so other waiters can complete.
