@@ -368,6 +368,29 @@ enum BodyRead {
     Always,
 }
 
+const DEFAULT_DS_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+fn ds_read_max_bytes() -> u64 {
+    std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DS_READ_MAX_BYTES)
+}
+
+async fn read_body_bounded(mut response: reqwest::Response, limit: u64, path: &str) -> Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(anyhow::Error::new)? {
+        let size = body.len() as u64 + chunk.len() as u64;
+        if size > limit {
+            tracing::error!(path, size, limit, "durable-streams response exceeded client body limit");
+            bail!("GET {path} response body exceeded {limit} bytes (observed at least {size} bytes)");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("durable-streams response body was not UTF-8")
+}
+
 type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send + 'a>>;
 
 /// The engine-owned, provider-neutral single-attempt Durable Streams port.
@@ -397,6 +420,7 @@ trait DurableStreamStore: Send + Sync {
 struct HttpDurableStreamsStore {
     base: String,
     http: reqwest::Client,
+    read_max_bytes: u64,
 }
 
 impl HttpDurableStreamsStore {
@@ -423,19 +447,19 @@ impl HttpDurableStreamsStore {
             .identity(identity)
             .build()
             .context("building Durable Streams mTLS client")?;
-        Ok(Self { base: config.base_url.clone(), http })
+        Ok(Self { base: config.base_url.clone(), http, read_max_bytes: ds_read_max_bytes() })
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn new_in_process(base: String) -> Self {
-        Self { base, http: reqwest::Client::new() }
+        Self { base, http: reqwest::Client::new(), read_max_bytes: ds_read_max_bytes() }
     }
 
     fn stream_url(&self, path: &str) -> String {
         format!("{}/{}", self.base.trim_end_matches('/'), path.trim_start_matches('/'))
     }
 
-    async fn response(res: reqwest::Response, body_read: BodyRead) -> StoreResponse {
+    async fn response(&self, res: reqwest::Response, body_read: BodyRead, path: Option<&str>) -> StoreResponse {
         let status = res.status().as_u16();
         let next_offset = header(&res, "stream-next-offset");
         let up_to_date = res.headers().get("stream-up-to-date").is_some();
@@ -451,7 +475,11 @@ impl HttpDurableStreamsStore {
         // `read` and `read_json` used `res.text().await?` after a successful GET; turning an
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // The selected mode otherwise preserves the legacy per-operation best-effort behavior.
-        let body = if should_read { Some(res.text().await.map_err(anyhow::Error::new)) } else { None };
+        let body = if should_read {
+            Some(read_body_bounded(res, self.read_max_bytes, path.unwrap_or("<unknown>")).await)
+        } else {
+            None
+        };
         StoreResponse { status, body, next_offset, up_to_date, closed }
     }
 }
@@ -460,7 +488,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
     fn ready<'a>(&'a self) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.get(format!("{}/_admin/ready", self.base)).send().await.context("GET /_admin/ready")?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, None).await)
         })
     }
 
@@ -473,7 +501,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
                 .send()
                 .await
                 .with_context(|| format!("PUT {path}"))?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, Some(path)).await)
         })
     }
 
@@ -493,7 +521,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
                 .send()
                 .await
                 .with_context(|| format!("POST {path}"))?;
-            Ok(Self::response(res, response_body).await)
+            Ok(self.response(res, response_body, Some(path)).await)
         })
     }
 
@@ -504,14 +532,14 @@ impl DurableStreamStore for HttpDurableStreamsStore {
                 url.push_str("&live=long-poll");
             }
             let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
-            Ok(Self::response(res, BodyRead::OnData).await)
+            Ok(self.response(res, BodyRead::OnData, Some(path)).await)
         })
     }
 
     fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.head(self.stream_url(path)).send().await.with_context(|| format!("HEAD {path}"))?;
-            Ok(Self::response(res, BodyRead::Never).await)
+            Ok(self.response(res, BodyRead::Never, Some(path)).await)
         })
     }
 
@@ -524,14 +552,14 @@ impl DurableStreamStore for HttpDurableStreamsStore {
                 .send()
                 .await
                 .with_context(|| format!("POST {path} (close)"))?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, Some(path)).await)
         })
     }
 
     fn delete<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.delete(self.stream_url(path)).send().await.with_context(|| format!("DELETE {path}"))?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, Some(path)).await)
         })
     }
 }
@@ -1276,6 +1304,7 @@ mod tests {
         appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
         operations: std::sync::Mutex<Vec<String>>,
         fail_read_body: bool,
+        read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
         readiness_status: u16,
         readiness_body: Option<String>,
     }
@@ -1324,6 +1353,16 @@ mod tests {
                 res.next_offset = Some("tempting-next-offset".to_string());
                 if self.fail_read_body {
                     res.body = Some(Err(anyhow::anyhow!("scripted stream body failure")));
+                } else {
+                    let page = {
+                        let mut pages = self.read_pages.lock().unwrap();
+                        (!pages.is_empty()).then(|| pages.remove(0))
+                    };
+                    if let Some((next, up_to_date, body)) = page {
+                        res.next_offset = Some(next);
+                        res.up_to_date = up_to_date;
+                        res.body = Some(Ok(body));
+                    }
                 }
                 Ok(res)
             })
@@ -1402,6 +1441,32 @@ mod tests {
             format!("{json_err:#}").contains("scripted stream body failure"),
             "the source body failure must survive the facade boundary"
         );
+    }
+
+    #[tokio::test]
+    async fn scripted_reads_preserve_partial_page_metadata_for_callers_to_page() {
+        let store = Arc::new(ScriptedStore {
+            read_pages: std::sync::Mutex::new(vec![
+                (
+                    "page-2".to_string(),
+                    false,
+                    "[{\"type\":\"public.items\",\"key\":\"1\",\"headers\":{\"operation\":\"upsert\"}}]".to_string(),
+                ),
+                ("tail".to_string(), true, "[]".to_string()),
+            ]),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store);
+
+        let first = client.read("changes/0", "page-1", false).await.unwrap();
+        assert_eq!(first.next_offset.as_deref(), Some("page-2"));
+        assert!(!first.up_to_date, "partial pages must not be treated as drained");
+        assert_eq!(first.envelopes.len(), 1);
+
+        let second = client.read("changes/0", "page-2", false).await.unwrap();
+        assert_eq!(second.next_offset.as_deref(), Some("tail"));
+        assert!(second.up_to_date);
+        assert!(second.envelopes.is_empty());
     }
 
     fn readiness_json(identity: &StoreIdentityV1) -> String {
