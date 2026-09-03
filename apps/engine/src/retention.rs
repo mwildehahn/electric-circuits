@@ -223,6 +223,8 @@ pub struct SweepShape {
     pub stream_bytes: u64,
     /// Bytes from the dormant cursor to the current tail. `None` means the cursor's segment is gone.
     pub replay_span_bytes: Option<u64>,
+    /// A transient HEAD failure prevented measuring the span this sweep; defer eviction.
+    pub replay_span_deferred: bool,
     /// Last plain-shape backfill estimate. `None` is an old/unknown catalog record.
     pub backfill_bytes: Option<u64>,
 }
@@ -306,7 +308,9 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // next subscriber recreates from a fresh snapshot.
     for s in shapes {
         if s.dormant_for.is_some() {
-            if s.replay_span_bytes.is_none() {
+            if s.replay_span_deferred {
+                continue;
+            } else if s.replay_span_bytes.is_none() {
                 plan.evict.push((s.id.clone(), EvictReason::ChangeLogRetention));
                 evicted.insert(&s.id);
             } else if s.replay_span_bytes.unwrap_or(0) > cfg.replay_budget(s.backfill_bytes) {
@@ -417,6 +421,7 @@ mod tests {
             dormancy_eligible: true,
             stream_bytes: 0,
             replay_span_bytes: None,
+            replay_span_deferred: false,
             backfill_bytes: None,
         }
     }

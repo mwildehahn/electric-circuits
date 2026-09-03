@@ -64,8 +64,10 @@ impl Engine {
     /// Decide whether a parked plain shape may replay. A missing segment is terminal; callers
     /// retire the stream so a subscriber receives the ADR-0007 closed-stream signal and recreates.
     async fn reactivation_admission(&self, id: &str, resume: &LogPosition) -> Result<bool> {
-        let span =
-            self.dormant_replay_span(resume).await.context("dormant replay cursor points into an expired segment")?;
+        let span = self
+            .dormant_replay_span_result(resume)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("dormant replay cursor points into an expired segment"))?;
         let backfill = self.state.lock().await.shapes.get(id).and_then(|r| r.backfill_bytes);
         let budget = self.retention.replay_budget(backfill);
         tracing::debug!(shape_id = id, span_bytes = span, budget_bytes = budget, backfill_bytes = ?backfill, "reactivation admission");
@@ -79,6 +81,50 @@ impl Engine {
     async fn dormant_replay_span(&self, resume: &LogPosition) -> Option<u64> {
         let mut cache = std::collections::HashMap::new();
         self.dormant_replay_span_cached(resume, &mut cache).await
+    }
+
+    async fn dormant_replay_span_result(&self, resume: &LogPosition) -> Result<Option<u64>> {
+        let mut cache = std::collections::HashMap::new();
+        self.dormant_replay_span_result_cached(resume, &mut cache).await
+    }
+
+    async fn dormant_replay_span_result_cached(
+        &self,
+        resume: &LogPosition,
+        heads: &mut std::collections::HashMap<u32, std::result::Result<Option<u64>, String>>,
+    ) -> Result<Option<u64>> {
+        let tail = self.changes_position();
+        if resume.segment > tail.segment {
+            return Ok(Some(0));
+        }
+        let mut total = 0u64;
+        for segment in resume.segment..=tail.segment {
+            let head = match heads.get(&segment) {
+                Some(cached) => cached.clone().map_err(anyhow::Error::msg),
+                None => {
+                    let result = self
+                        .ds
+                        .head(&crate::changelog::segment_path(segment))
+                        .await
+                        .map(|head| {
+                            head.and_then(|head| head.next_offset.as_deref().and_then(crate::changelog::offset_bytes))
+                        })
+                        .map_err(|e| format!("{e:#}"));
+                    heads.insert(segment, result.clone());
+                    result.map_err(|e| anyhow::Error::new(crate::engine::ReplayHeadUnavailable).context(e))
+                }
+            }?;
+            let Some(segment_head) = head else { return Ok(None) };
+            let end = if segment == tail.segment {
+                crate::changelog::offset_bytes(&tail.offset).unwrap_or(segment_head)
+            } else {
+                segment_head
+            };
+            let start =
+                if segment == resume.segment { crate::changelog::offset_bytes(&resume.offset).unwrap_or(0) } else { 0 };
+            total = total.saturating_add(end.saturating_sub(start));
+        }
+        Ok(Some(total))
     }
 
     pub(crate) async fn dormant_replay_span_cached(
@@ -1319,6 +1365,21 @@ impl Engine {
                                         }
                                     };
                                     let admission = engine.reactivation_admission(&id, &resume).await;
+                                    if let Err(error) = &admission {
+                                        if error.downcast_ref::<crate::engine::ReplayHeadUnavailable>().is_some() {
+                                            tracing::warn!("reactivation admission for {id} deferred: {error:#}");
+                                            if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                                life.state = LifeState::Dormant {
+                                                    since: std::time::Instant::now(),
+                                                    resume: resume.clone(),
+                                                    gate: gate.clone(),
+                                                };
+                                            }
+                                            metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
+                                            let _ = tx.send(Some(false));
+                                            return;
+                                        }
+                                    }
                                     if admission.is_err() || !admission.as_ref().copied().unwrap_or(false) {
                                         let reason = if admission.is_err() {
                                             EvictReason::ChangeLogRetention
@@ -1778,20 +1839,27 @@ impl Engine {
                         dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
                         stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
                         replay_span_bytes: None,
+                        replay_span_deferred: false,
                         backfill_bytes: rec.backfill_bytes,
                     }
                 })
                 .collect()
         };
         let mut snapshot = snapshot;
-        let mut head_cache = std::collections::HashMap::new();
+        let mut result_cache = std::collections::HashMap::new();
         for s in &mut snapshot {
             let resume = self.lives.lock().unwrap().get(&s.id).and_then(|life| match &life.state {
                 LifeState::Dormant { resume, .. } => Some(resume.clone()),
                 _ => None,
             });
             if let Some(resume) = resume {
-                s.replay_span_bytes = self.dormant_replay_span_cached(&resume, &mut head_cache).await;
+                match self.dormant_replay_span_result_cached(&resume, &mut result_cache).await {
+                    Ok(span) => s.replay_span_bytes = span,
+                    Err(error) => {
+                        tracing::warn!(shape_id = %s.id, "retention: changelog HEAD unavailable; deferring replay eviction: {error:#}");
+                        s.replay_span_deferred = true;
+                    }
+                }
             }
         }
         let plan = crate::retention::plan_sweep(&cfg, &snapshot);

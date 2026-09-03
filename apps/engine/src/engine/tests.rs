@@ -791,6 +791,45 @@ async fn advertised_lease_matches_subscription_lease_timeout() {
 }
 
 #[tokio::test]
+async fn transient_replay_head_failure_is_deferred_not_evicted() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore { head_status: 503, ..Default::default() });
+    let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store));
+    {
+        let mut state = engine.state.lock().await;
+        state.shapes.insert(
+            "s1".into(),
+            ShapeRecord {
+                id: "s1".into(),
+                table: "users".into(),
+                stream_path: "shape/s1".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+                backfill_rows: Some(1),
+                backfill_bytes: Some(1),
+            },
+        );
+    }
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+    engine.retention_sweep().await;
+    assert!(engine.get_shape("s1").await.is_some(), "a transient HEAD error must not evict a retained shape");
+}
+
+#[tokio::test]
 async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {
         read_pages: std::sync::Mutex::new(vec![

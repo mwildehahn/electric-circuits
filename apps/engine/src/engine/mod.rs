@@ -177,6 +177,19 @@ pub struct ReactivationRecreate {
     pub reason: RecreateReason,
 }
 
+/// A transient changelog HEAD failure. Unlike a missing segment, it is not evidence that a
+/// dormant cursor is unrecoverable and must never trigger eviction.
+#[derive(Debug)]
+pub(crate) struct ReplayHeadUnavailable;
+
+impl std::fmt::Display for ReplayHeadUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("change-log HEAD unavailable; retaining dormant shape for a later retry")
+    }
+}
+
+impl std::error::Error for ReplayHeadUnavailable {}
+
 impl ReactivationRecreate {
     pub(crate) fn over_budget(shape: impl Into<String>) -> Self {
         Self { shape: shape.into(), reason: RecreateReason::OverBudget }

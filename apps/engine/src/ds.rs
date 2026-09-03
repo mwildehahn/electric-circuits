@@ -1490,6 +1490,7 @@ mod tests {
         pub(crate) fail_append_path: Option<String>,
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: Option<String>,
+        pub(crate) head_status: u16,
     }
 
     fn response(status: u16) -> StoreResponse {
@@ -1559,7 +1560,7 @@ mod tests {
         fn head<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut res = response(200);
+                let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
                 if let Some(offset) = self.head_offsets.lock().unwrap().pop() {
                     res.next_offset = Some(offset);
                 }
