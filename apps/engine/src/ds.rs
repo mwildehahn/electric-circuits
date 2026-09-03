@@ -361,7 +361,7 @@ pub type GoneReconciler = std::sync::Arc<
 /// provider boundary is being extracted: DSP-003 will replace the status-oriented compatibility
 /// mapping with a closed outcome vocabulary.  Until then it lets the existing facade preserve its
 /// exact error/retry behavior while keeping HTTP mechanics below the port.
-struct StoreResponse {
+pub(crate) struct StoreResponse {
     status: u16,
     /// The response body is deliberately retained as an outcome rather than normalized to text.
     /// Successful stream reads must fail if their body cannot be acquired: accepting the advertised
@@ -386,7 +386,7 @@ impl StoreResponse {
 }
 
 #[derive(Clone, Copy)]
-enum BodyRead {
+pub(crate) enum BodyRead {
     Never,
     OnFailure,
     OnData,
