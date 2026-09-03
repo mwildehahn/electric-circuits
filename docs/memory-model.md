@@ -203,3 +203,19 @@ Safe and precise:
 
 Avoid: "memory is flat" unqualified, and "the circuit maintains all state needed by the
 queries" (the per-feed key sets and the reconcile reverse index are host-side by design).
+
+## 6. Transient operation budgets
+
+The following terms are intentionally separate from retained engine cardinalities:
+
+| operation | bounded memory | accounting/observation |
+|---|---|---|
+| logical-replication ingest | one transaction buffer (default 32 MiB) plus one append chunk (default 64 MiB) | `txn_spills`, `txn_spill_bytes`, `txn_chunked_appends`; RSS and allocator counters |
+| Postgres backfill | one streamed backfill chunk (`ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`) | `backfill_chunked_appends`, backfill diagnostics' `estimated_bytes` |
+| dormant replay | one Durable Streams body and parsed page, each capped by `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` (default 64 MiB), with at most `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` concurrent replays (default 2) | `reactivations_started/completed/failed`, `reactivation_bytes_scanned`, `reactivation_spans` |
+| shape emission | bounded sequencer append batches; durable-streams applies backpressure at the append boundary | `shape_appends`, append latency histogram, RSS/allocator counters |
+| subquery seeds | streamed Postgres chunks; contributor/feed structures remain the retained terms described above | `bytes_subquery_registry`, `bytes_feed_sets`, seed diagnostics |
+
+`GET /memory` reports process RSS plus jemalloc `allocated`, `resident`, and `retained` bytes. The
+allocator counters expose fragmentation/decay slack that engine-owned heap walks cannot see; they
+are not additive with the retained `bytes_*` fields.
