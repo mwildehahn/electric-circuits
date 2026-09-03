@@ -1696,7 +1696,15 @@ impl Engine {
             if !evictable {
                 return Ok(Evicted::Skipped);
             }
-            if st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
+            // A dormant replay retirement is terminal: the retained cursor can no longer be
+            // served, so any claim taken by a joiner while admission was in flight must not pin
+            // the shape and turn the typed recreate outcome into a generic 500. Dormant shapes
+            // normally have no claims; if one appears here it is precisely that provisional join
+            // race. Active/non-parkable retirement still respects real subscribers.
+            let provisional_replay_retirement =
+                matches!(lives.get(id).map(|l| &l.state), Some(LifeState::Dormant { .. }))
+                    && matches!(reason, EvictReason::ReplayBudget | EvictReason::ChangeLogRetention);
+            if !provisional_replay_retirement && st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
                 return Ok(Evicted::Skipped);
             }
             lives.remove(id);

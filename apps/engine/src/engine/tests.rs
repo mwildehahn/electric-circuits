@@ -736,6 +736,51 @@ async fn a_join_waiting_on_a_stalled_reactivation_gives_up_and_asks_for_a_recrea
 }
 
 #[tokio::test]
+async fn dormant_replay_retirement_ignores_a_provisional_join_claim() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let mut state = engine.state.lock().await;
+    state.shapes.insert(
+        "s1".into(),
+        ShapeRecord {
+            id: "s1".into(),
+            table: "users".into(),
+            stream_path: "shape/s1".into(),
+            changes_only: false,
+            where_json: None,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: None,
+            fingerprint: None,
+            backfill_rows: Some(1),
+            backfill_bytes: Some(1),
+        },
+    );
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(crate::engine::ShareOutcome::Ready);
+    let _ = ready_tx;
+    let sig = crate::engine::shape_signature(&"users".into(), &None, &None, false);
+    state.feed_by_sig.insert(sig.clone(), "s1".into());
+    let mut share = crate::engine::FeedShare { sig, subs: Default::default(), ready: ready_rx };
+    share.subs.insert("joiner".into(), crate::changelog::now_secs());
+    state.feed_shares.insert("s1".into(), share);
+    drop(state);
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+
+    let evicted = engine.evict_shape("s1", crate::retention::EvictReason::ReplayBudget).await.unwrap();
+    assert_eq!(evicted, crate::retention::Evicted::Yes, "a provisional join must not block replay retirement");
+}
+
+#[tokio::test]
 async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {
         read_pages: std::sync::Mutex::new(vec![
