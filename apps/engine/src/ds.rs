@@ -424,7 +424,7 @@ type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send
 /// reconciliation, envelope codec, retirement, or byte-accounting policy: those are Circuits
 /// invariants and remain on [`DsClient`].  It is private because no external crate is entitled to
 /// rely on this first compatibility-shaped outcome representation.
-trait DurableStreamStore: Send + Sync {
+pub(crate) trait DurableStreamStore: Send + Sync {
     fn ready<'a>(&'a self) -> StoreFuture<'a>;
     fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a>;
     fn append<'a>(
@@ -644,7 +644,7 @@ impl DsClient {
     }
 
     #[cfg(test)]
-    fn with_test_store(base: String, store: Arc<dyn DurableStreamStore>) -> Self {
+    pub(crate) fn with_test_store(base: String, store: Arc<dyn DurableStreamStore>) -> Self {
         Self::with_store(base, StreamScope::in_process_test_scope(), store)
     }
 
@@ -1362,13 +1362,15 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct ScriptedStore {
-        appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
-        operations: std::sync::Mutex<Vec<String>>,
-        fail_read_body: bool,
-        read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
-        readiness_status: u16,
-        readiness_body: Option<String>,
+    pub(crate) struct ScriptedStore {
+        pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+        pub(crate) operations: std::sync::Mutex<Vec<String>>,
+        pub(crate) fail_read_body: bool,
+        pub(crate) read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
+        pub(crate) read_count: std::sync::atomic::AtomicUsize,
+        pub(crate) fail_append_path: Option<String>,
+        pub(crate) readiness_status: u16,
+        pub(crate) readiness_body: Option<String>,
     }
 
     fn response(status: u16) -> StoreResponse {
@@ -1403,6 +1405,9 @@ mod tests {
             _response_body: BodyRead,
         ) -> StoreFuture<'a> {
             Box::pin(async move {
+                if self.fail_append_path.as_deref().is_some_and(|p| path.ends_with(p)) {
+                    return Err(anyhow::anyhow!("scripted append failure"));
+                }
                 self.operations.lock().unwrap().push("append".to_string());
                 self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));
                 Ok(response(204))
@@ -1411,6 +1416,7 @@ mod tests {
 
         fn read<'a>(&'a self, _path: &'a str, _offset: &'a str, _live: bool) -> StoreFuture<'a> {
             Box::pin(async move {
+                self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut res = response(200);
                 res.next_offset = Some("tempting-next-offset".to_string());
                 if self.fail_read_body {
@@ -1675,3 +1681,6 @@ mod tests {
         assert!(format!("{five:#}").contains("502"));
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::ScriptedStore;

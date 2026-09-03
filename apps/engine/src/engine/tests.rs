@@ -673,6 +673,64 @@ fn users() -> TableSchema {
     TableSchema::from_def(&"users".into(), &def).unwrap()
 }
 
+#[tokio::test]
+async fn reactivation_concurrency_never_exceeds_two_scans() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let semaphore = engine.reactivation_permits.clone();
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let semaphore = semaphore.clone();
+        let active = active.clone();
+        let maximum = maximum.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.unwrap();
+            let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(maximum.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+}
+
+#[tokio::test]
+async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![
+            ("tail".into(), true, "[{\"type\":\"public.users\",\"key\":\"1\",\"value\":{\"id\":1,\"name\":\"a\",\"active\":true},\"headers\":{\"operation\":\"insert\",\"offset\":\"0\"}}]".into()),
+        ]),
+        fail_append_path: Some("shape/fail".into()),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = |path: &str| crate::engine::sequencer::ReplayTarget {
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred: pred.clone(),
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: path.into(),
+        from: LogPosition { segment: 0, offset: "0".into() },
+        library_mode: true,
+    };
+    let results = crate::engine::sequencer::replay_changes_for_targets(
+        &ds,
+        vec![target("shape/ok"), target("shape/fail")],
+        &crate::shutdown::ShutdownToken::new(),
+    )
+    .await;
+    assert!(results[0].is_ok(), "one shape must complete despite another append failing");
+    assert!(results[1].is_err(), "the failing shape must receive its own error");
+    assert_eq!(store.read_count.load(std::sync::atomic::Ordering::Relaxed), 1, "one page read must serve both shapes");
+}
+
 fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_json::Value>) -> Envelope {
     Envelope {
         type_: "users".into(),
