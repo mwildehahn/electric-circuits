@@ -157,6 +157,19 @@ pub struct SubscriptionConflict {
     pub shape: String,
 }
 
+/// The retained shape was deliberately retired because replay exceeded its budget; the caller
+/// should fall through to creating a replacement rather than receive a generic 500.
+#[derive(Debug)]
+pub struct ReactivationRecreate(pub String);
+
+impl std::fmt::Display for ReactivationRecreate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shape '{}' was retired; recreate from a fresh backfill", self.0)
+    }
+}
+
+impl std::error::Error for ReactivationRecreate {}
+
 impl std::fmt::Display for SubscriptionConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

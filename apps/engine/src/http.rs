@@ -1689,6 +1689,8 @@ impl From<anyhow::Error> for AppError {
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Conflict))
         {
             StatusCode::CONFLICT
+        } else if e.downcast_ref::<crate::engine::ReactivationRecreate>().is_some() {
+            StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
@@ -1726,6 +1728,12 @@ mod tests {
         assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);
         assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
+    }
+
+    #[test]
+    fn over_budget_reactivation_is_a_typed_conflict() {
+        let err = AppError::from(anyhow::Error::new(crate::engine::ReactivationRecreate("shape/s1".into())));
+        assert_eq!(err.status, StatusCode::CONFLICT);
     }
 
     #[test]
