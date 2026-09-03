@@ -688,15 +688,7 @@ impl DsClient {
         let store = Arc::new(HttpDurableStreamsStore::new(&config)?);
         let client = Self::with_store(config.base_url, config.scope, store);
         // A production client is not constructible until the store has attested the exact identity.
-        let readiness = client.preflight_readiness(&expected).await?;
-        let configured = configured_ds_read_max_bytes();
-        let verdict = assess_page_cap(&readiness, configured.unwrap_or(DEFAULT_DS_READ_MAX_BYTES));
-        let cap = effective_read_max_bytes(verdict, configured);
-        EFFECTIVE_READ_MAX_BYTES.store(cap, std::sync::atomic::Ordering::Relaxed);
-        ADVERTISED_MAX_VALUE_BYTES.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-        if let Some(advisory) = enforce_page_cap(verdict, cap, require_ds_chunk_cap())? {
-            warn_page_cap_once(&advisory);
-        }
+        client.refresh_readiness(&expected).await?;
         Ok(client)
     }
 
