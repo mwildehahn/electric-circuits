@@ -494,7 +494,8 @@ mod tests {
     #[test]
     fn config_defaults_are_sensible() {
         let d = RetentionConfig::default();
-        assert_eq!(d.idle_timeout, Duration::from_secs(1800));
+        assert_eq!(d.idle_timeout, Duration::from_secs(6 * 3600));
+        assert_eq!(d.subscription_lease_timeout, Duration::from_secs(1800));
         assert_eq!(d.dormant_ttl, Duration::from_secs(604800));
         assert_eq!(d.max_shapes, 10_000);
         assert_eq!(d.disk_budget_bytes, 0);

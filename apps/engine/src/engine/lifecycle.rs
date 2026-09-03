@@ -3018,14 +3018,13 @@ mod subscription_tests {
         );
     }
 
-    /// `idle_timeout == 0` turns dormancy off, and with it leases: an engine that never parks a
-    /// shape has no use for the signal, and expiring subscriptions under it would only break
-    /// sharing for long-lived subscribers.
+    /// `subscription_lease_timeout == 0` disables lease expiry independently of dormancy.
     #[tokio::test(flavor = "multi_thread")]
     async fn leases_never_lapse_when_dormancy_is_disabled() {
         let engine = engine_with_share("s1", &[("ancient", 1)]).await;
         let cfg = crate::retention::RetentionConfig {
             idle_timeout: std::time::Duration::ZERO,
+            subscription_lease_timeout: std::time::Duration::ZERO,
             ..crate::retention::RetentionConfig::default()
         };
         engine.sweep_leases(&cfg).await;
