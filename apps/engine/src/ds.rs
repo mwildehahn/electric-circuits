@@ -1359,6 +1359,10 @@ impl<'de> Deserialize<'de> for StrictJson {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_body_cap_defaults_to_64_mib() {
+        assert_eq!(ds_read_max_bytes(), 64 * 1024 * 1024);
+    }
     use super::*;
 
     #[derive(Default)]
