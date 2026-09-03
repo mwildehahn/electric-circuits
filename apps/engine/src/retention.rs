@@ -111,12 +111,19 @@ impl RetentionConfig {
 
     pub fn from_env() -> Self {
         let d = RetentionConfig::default();
+        // Backward compatibility: deployments and the conformance harness historically set the
+        // idle knob to accelerate both dormancy and lease expiry. An explicit lease knob wins;
+        // otherwise preserve that legacy coupling only when the old env var is actually supplied.
+        let legacy_idle =
+            std::env::var("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let lease_secs = std::env::var("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or(legacy_idle)
+            .unwrap_or(d.subscription_lease_timeout.as_secs());
         RetentionConfig {
-            idle_timeout: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
-            subscription_lease_timeout: Duration::from_secs(env_u64(
-                "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS",
-                d.subscription_lease_timeout.as_secs(),
-            )),
+            idle_timeout: Duration::from_secs(legacy_idle.unwrap_or(d.idle_timeout.as_secs())),
+            subscription_lease_timeout: Duration::from_secs(lease_secs),
             dormant_ttl: Duration::from_secs(env_u64(
                 "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS",
                 d.dormant_ttl.as_secs(),
