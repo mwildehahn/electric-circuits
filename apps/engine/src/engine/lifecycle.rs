@@ -1611,7 +1611,11 @@ impl Engine {
         // No record: the shape is already gone, so whatever it held (a change-log segment pin
         // included) is released — that IS the outcome the caller asked for.
         let Some(rec) = st.shapes.get(id).cloned() else { return Ok(Evicted::Yes) };
-        let parkable = !rec.is_subquery && rec.aggregate.is_none();
+        // `changes_only` feeds are intentionally never parked: recreating one from a snapshot
+        // would lose the dormant-period change history promised by the client contract. They are
+        // therefore treated like other non-parkable feeds and retired directly after the full
+        // idle+dormancy grace once their last lease lapses.
+        let parkable = !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only;
         {
             let mut lives = self.lives.lock().unwrap();
             let evictable = match lives.get(id) {

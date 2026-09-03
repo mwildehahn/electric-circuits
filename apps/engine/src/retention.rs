@@ -312,10 +312,12 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
                 evicted.insert(&s.id);
             }
         }
-        // Shapes that cannot park (subquery / aggregate — their state is not rebuildable from a
-        // bounded replay) would otherwise be immortal once unsubscribed: evict them straight from
-        // active after the same total grace an eligible shape gets (idle timeout + dormancy TTL).
-        // They are recreatable — a returning client gets 404 / must-refetch and recreates.
+        // Shapes that cannot park (subquery / aggregate state is not rebuildable from a bounded
+        // replay; changes_only feeds would lose their dormant-period history) would otherwise be
+        // immortal once unsubscribed: evict them straight from active after the same total grace
+        // an eligible shape gets (idle timeout + dormancy TTL). They are recreatable — a returning
+        // client gets 404 / must-refetch and recreates; changes_only callers receive a fresh feed
+        // rather than a silently incomplete dormant replay.
         if !cfg.idle_timeout.is_zero() {
             for s in shapes {
                 if !s.dormancy_eligible
