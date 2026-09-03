@@ -393,7 +393,7 @@ pub(crate) enum BodyRead {
     Always,
 }
 
-const DEFAULT_DS_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_DS_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 fn ds_read_max_bytes() -> u64 {
     std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES")
@@ -1360,8 +1360,8 @@ impl<'de> Deserialize<'de> for StrictJson {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn read_body_cap_defaults_to_64_mib() {
-        assert_eq!(ds_read_max_bytes(), 64 * 1024 * 1024);
+    fn read_body_cap_defaults_to_16_mib() {
+        assert_eq!(ds_read_max_bytes(), 16 * 1024 * 1024);
     }
     use super::*;
 

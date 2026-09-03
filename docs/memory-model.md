@@ -26,9 +26,9 @@ The engine now bounds transient work independently of the durable-stream server:
 
 | operation | bound / accounting |
 |---|---|
-| ingest transaction | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (default 32 MiB), with spill chunks |
+| ingest transaction | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (default 128 MiB), with spill chunks |
 | Postgres backfill | one `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` chunk; reader records rows and estimated bytes |
-| dormant replay | one Durable Streams page, capped by `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` (default 64 MiB), and at most `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` concurrent scans (default 2) |
+| dormant replay | one Durable Streams page, capped by `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` (default 16 MiB), and at most `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` concurrent scans (default 2) |
 | emission | one translated envelope batch per append; stream bytes are tracked for retention |
 | subquery seeds/query-backs | streamed chunks for outer feeds; inner contributor state is covered by the circuit counters below |
 
@@ -228,9 +228,9 @@ The following terms are intentionally separate from retained engine cardinalitie
 
 | operation | bounded memory | accounting/observation |
 |---|---|---|
-| logical-replication ingest | one transaction buffer (default 32 MiB) plus one append chunk (default 64 MiB) | `txn_spills`, `txn_spill_bytes`, `txn_chunked_appends`; RSS and allocator counters |
+| logical-replication ingest | one transaction buffer (default 128 MiB) plus one append chunk (default 64 MiB) | `txn_spills`, `txn_spill_bytes`, `txn_chunked_appends`; RSS and allocator counters |
 | Postgres backfill | one streamed backfill chunk (`ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`) | `backfill_chunked_appends`, backfill diagnostics' `estimated_bytes` |
-| dormant replay | one Durable Streams body and parsed page, each capped by `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` (default 64 MiB), with at most `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` concurrent replays (default 2) | `reactivations_started/completed/failed`, `reactivation_bytes_scanned`, `reactivation_spans` |
+| dormant replay | one Durable Streams body and parsed page, each capped by `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` (default 16 MiB), with at most `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` concurrent replays (default 2) | `reactivations_started/completed/failed`, `reactivation_bytes_scanned`, `reactivation_spans` |
 | shape emission | bounded sequencer append batches; durable-streams applies backpressure at the append boundary | `shape_appends`, append latency histogram, RSS/allocator counters |
 | subquery seeds | streamed Postgres chunks; contributor/feed structures remain the retained terms described above | `bytes_subquery_registry`, `bytes_feed_sets`, seed diagnostics |
 
