@@ -684,6 +684,10 @@ fn health_json(status: &str) -> String {
     format!("{{\"status\":\"{status}\"}}")
 }
 
+fn page_should_continue(offset: &str, next: Option<&str>, up_to_date: bool, closed: bool) -> bool {
+    !up_to_date && !closed && next.is_some_and(|candidate| candidate != offset)
+}
+
 /// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200, `degraded` → 503 (the engine lost
 /// membership effects and only a restart fixes it; 503 keeps a load balancer from routing to it).
 /// Caches are disabled so the fleet's 500ms poll always sees the live phase.
@@ -1280,11 +1284,12 @@ async fn get_shape_log(
         // the page was empty, or the offset failed to advance (a defensive guard against a non-empty
         // page with a missing/unchanged next offset looping forever).
         let closed = r.closed;
-        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
+        let previous = offset.clone();
+        let next = r.next_offset.clone();
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || closed || !advanced {
+        if !page_should_continue(&previous, next.as_deref(), r.up_to_date, closed) {
             break;
         }
     }
@@ -1328,11 +1333,12 @@ async fn get_shape_rows(
         }
         // Same breaks as get_shape_log: caught up, closed (retired), empty, or non-advancing.
         let closed = r.closed;
-        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
+        let previous = offset.clone();
+        let next = r.next_offset.clone();
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || closed || !advanced {
+        if !page_should_continue(&previous, next.as_deref(), r.up_to_date, closed) {
             break;
         }
     }
@@ -1719,7 +1725,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AppError, CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json,
+        AppError, CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json, page_should_continue,
         require_private_admin_with_secret, router_with_introspection,
     };
     use crate::predicate::PredicateJson;
@@ -1732,6 +1738,13 @@ mod tests {
         assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);
         assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
+    }
+
+    #[test]
+    fn empty_advanced_pages_continue_rows_and_log_folds() {
+        assert!(page_should_continue("offset-1", Some("offset-2"), false, false));
+        assert!(!page_should_continue("offset-2", Some("offset-2"), false, false));
+        assert!(!page_should_continue("offset-1", Some("offset-2"), true, false));
     }
 
     /// The iOS SDK's one "gone, get a fresh one" vocabulary is 404/410 (`StreamMaterialization`
