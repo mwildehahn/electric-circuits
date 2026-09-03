@@ -1253,7 +1253,19 @@ pub(crate) async fn replay_changes_for_targets(
         return Vec::new();
     }
     let table = targets[0].table.clone();
-    let mut pos = targets[0].from.clone();
+    // Start at the EARLIEST parked cursor in the batch. Targets arrive in touch order, not cursor
+    // order, and each one is routed below by comparing its cursor to the page range — so a scan
+    // that began at `targets[0]` would silently drop `[earliest, targets[0].from)` for every target
+    // parked before it.
+    let mut pos = targets
+        .iter()
+        .map(|target| target.from.clone())
+        .min_by(|a, b| {
+            a.segment
+                .cmp(&b.segment)
+                .then_with(|| crate::changelog::offset_bytes(&a.offset).cmp(&crate::changelog::offset_bytes(&b.offset)))
+        })
+        .expect("targets is non-empty");
     let mut emitted = vec![0u64; targets.len()];
     let mut errors: Vec<Option<anyhow::Error>> = (0..targets.len()).map(|_| None).collect();
     let mut rotate_to = None;

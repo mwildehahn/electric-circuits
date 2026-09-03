@@ -788,6 +788,73 @@ async fn coalesced_reactivation_respects_distinct_page_cursors() {
     assert_eq!(keys("shape/c"), vec!["3"]);
 }
 
+/// The batch collects targets in ARRIVAL order, so `targets[0]` is not the earliest cursor. Routing
+/// gates each target on the page range, which means a scan that began anywhere later than the
+/// earliest parked cursor silently drops `[earliest, start)` for every target parked before it —
+/// the coalescing defect this branch exists to close, just from the other side.
+#[tokio::test]
+async fn coalesced_reactivation_starts_at_the_earliest_cursor() {
+    let page = |next: &str, up_to_date: bool, key: u64| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"n\",\"active\":true}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![
+            page("0000000000000000_0000000000000100", false, 1),
+            page("0000000000000000_0000000000000200", false, 2),
+            page("0000000000000000_0000000000000300", true, 3),
+        ]),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = |path: &str, offset: &str| crate::engine::sequencer::ReplayTarget {
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred: pred.clone(),
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: path.into(),
+        from: LogPosition { segment: 0, offset: offset.into() },
+        library_mode: true,
+    };
+    // Descending arrival order: the LAST target parked earliest.
+    let results = crate::engine::sequencer::replay_changes_for_targets(
+        &ds,
+        vec![
+            target("shape/c", "0000000000000000_0000000000000200"),
+            target("shape/b", "0000000000000000_0000000000000100"),
+            target("shape/a", "0000000000000000_0000000000000000"),
+        ],
+        &crate::shutdown::ShutdownToken::new(),
+    )
+    .await;
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(
+        store.read_offsets.lock().unwrap().first().map(String::as_str),
+        Some("0000000000000000_0000000000000000"),
+        "the scan must start at the earliest parked cursor in the batch, not at targets[0]"
+    );
+    let appended = store.appended.lock().unwrap();
+    let keys = |path: &str| {
+        appended
+            .iter()
+            .filter(|(p, _, _)| p.ends_with(path))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+            .map(|env| env.key)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys("shape/a"), vec!["1", "2", "3"]);
+    assert_eq!(keys("shape/b"), vec!["2", "3"]);
+    assert_eq!(keys("shape/c"), vec!["3"]);
+}
+
 #[tokio::test]
 async fn dormant_span_cache_heads_each_segment_once_per_sweep() {
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {

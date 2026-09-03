@@ -1520,8 +1520,9 @@ impl Engine {
         stream_path: String,
         from: LogPosition,
     ) -> Result<u64> {
-        // Requests on the same segment are admitted to one scan window. Envelope offsets let the
-        // worker discard the prefix before each parked cursor, so nearby cursors remain correct.
+        // Requests on the same segment are admitted to one scan window. The worker scans from the
+        // earliest cursor in the batch and routes each page by its byte range, so targets parked at
+        // different cursors each receive exactly the envelopes after their own cursor.
         let key = format!("{}:{}", table, from.segment);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batch = {
