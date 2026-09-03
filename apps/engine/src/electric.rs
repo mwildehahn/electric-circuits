@@ -426,7 +426,10 @@ impl From<anyhow::Error> for ApiError {
                 must_refetch: false,
             };
         }
-        if crate::ds::is_stream_gone(&e) {
+        // A shape retired because its dormant replay exceeded the budget is gone in exactly the
+        // sense `must-refetch` describes: the client's stream no longer exists and the answer is a
+        // fresh subscription, not a server error.
+        if crate::ds::is_stream_gone(&e) || e.downcast_ref::<crate::engine::ReactivationRecreate>().is_some() {
             return ApiError::must_refetch();
         }
         ApiError {
@@ -1087,6 +1090,16 @@ mod tests {
     use crate::schema::{ColumnDef, TableDef};
     use crate::shutdown::ShutdownToken;
     use std::collections::BTreeMap;
+
+    /// An Electric client's recreate signal is the protocol's own `must-refetch` (409 + the control
+    /// message), not a 500. A shape retired because its dormant replay exceeded the budget is
+    /// exactly that: the stream the client holds is gone and the answer is a fresh subscription.
+    #[test]
+    fn an_over_budget_reactivation_tells_an_electric_client_to_refetch() {
+        let error: ApiError = anyhow::Error::new(crate::engine::ReactivationRecreate("s1".into())).into();
+        assert!(error.must_refetch, "an Electric client must be told to refetch, not handed a 500");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
 
     #[test]
     fn managed_deployment_not_ready_is_an_electric_retryable_response() {

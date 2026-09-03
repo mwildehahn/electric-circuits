@@ -17,6 +17,20 @@ Over-budget or unresumable shapes are retired through the closed-stream path so 
 recreate them from a fresh snapshot. The retention sweeper applies the same admission check before
 pressure/TTL eviction.
 
+The retirement is typed (`ReactivationRecreate`), and each surface answers it in its own recreate
+vocabulary rather than as a server fault:
+
+* **Native create/join** (`POST /v1/shapes`, `POST /v1/subset-feeds`): the request falls through to
+  a fresh create in the same round trip and returns `2xx` carrying a NEW shape id. This is the only
+  outcome today's iOS SDK recreates from on its own — it treats a create/join answer whose shape id
+  differs from the one it asked for as a replacement and reseeds.
+* **Native read routes** (`/shapes/{id}/rows`, `/shapes/{id}/log`, and a create whose fall-through
+  is exhausted): `410 Gone`. `410` is what that SDK's stream reader already maps to "gone, get a
+  fresh one"; `409` it classifies as a terminal failure with no reseed, and `404` is ambiguous with
+  an unknown shape id.
+* **Electric `/v1/shape`**: the protocol's own `must-refetch` (`409` plus the control message), the
+  same answer a genuinely gone stream produces.
+
 ## Alternatives considered
 
 * **Unbounded replay:** preserves stream identity but makes cost proportional to global log growth

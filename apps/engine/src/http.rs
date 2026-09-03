@@ -1690,7 +1690,13 @@ impl From<anyhow::Error> for AppError {
         {
             StatusCode::CONFLICT
         } else if e.downcast_ref::<crate::engine::ReactivationRecreate>().is_some() {
-            StatusCode::CONFLICT
+            // GONE, not CONFLICT. The create/join path never reaches here in the ordinary case —
+            // `retry_create` redoes the attempt as a fresh create and the client receives a 2xx
+            // carrying a NEW shape id, which the iOS SDK already treats as a replacement and
+            // reseeds from. This status is what a *read* route (rows/log) and an exhausted
+            // fall-through return, and 410 is the code that SDK's stream reader already maps to
+            // "gone, get a fresh one"; 409 it classifies as a terminal failure with no reseed.
+            StatusCode::GONE
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
@@ -1730,10 +1736,14 @@ mod tests {
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
     }
 
+    /// The iOS SDK's one "gone, get a fresh one" vocabulary is 404/410 (`StreamMaterialization`
+    /// turns those into `.notFound`/`.gone` and reseeds); 409 it classifies as a terminal
+    /// `ClientError.http` with no reseed. 410 also cannot be confused with an unknown shape id or
+    /// route, and it keeps 409 for the ElectricSQL protocol's own must-refetch code.
     #[test]
-    fn over_budget_reactivation_is_a_typed_conflict() {
+    fn over_budget_reactivation_is_gone_not_a_conflict() {
         let err = AppError::from(anyhow::Error::new(crate::engine::ReactivationRecreate("shape/s1".into())));
-        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.status, StatusCode::GONE);
     }
 
     #[test]
