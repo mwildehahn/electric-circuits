@@ -1887,6 +1887,16 @@ mod tests {
         assert_eq!(assess_page_cap(&readiness, TEST_CLIENT_CAP), PageCapVerdict::Exceeds { observed: TEST_CLIENT_CAP });
     }
 
+    #[test]
+    fn json_page_cap_fits_when_observed_plus_two_is_within_client_cap() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let readiness = readiness_with_cap(&identity, TEST_CLIENT_CAP - 2);
+        assert_eq!(
+            assess_page_cap(&readiness, TEST_CLIENT_CAP),
+            PageCapVerdict::Compatible { observed: TEST_CLIENT_CAP - 2 }
+        );
+    }
+
     /// No released durable-streams build advertises `max_chunk_bytes`, so refusing an unverifiable
     /// page cap refuses every real store — including the deployed one and the conformance harness.
     /// The default must boot and warn; the read path is what stays fail-closed.
