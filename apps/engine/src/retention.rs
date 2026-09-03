@@ -1,5 +1,5 @@
 //! Shape retention: the three-tier lifecycle (active / dormant / evicted) and its layered,
-//! dormant-only eviction policy.
+//! dormant eviction policy plus active retirement for non-parkable feeds.
 //!
 //! Replaces delete-on-refcount-0 (extended API) and the "handle TTL drops the shape" behavior of
 //! the `/v1/shape` adapter as the primary lifecycle (a deliberate divergence from upstream
@@ -18,7 +18,8 @@
 //! - **Evicted** — stream and record deleted; a returning `/v1/shape` client gets `409
 //!   must-refetch` and re-snapshots, an extended-API client gets `404` and recreates.
 //!
-//! Eviction is **layered** and applies to dormant shapes only (active shapes are never evicted),
+//! Eviction is **layered**: ordinary shapes are evicted from dormant, while non-parkable active
+//! shapes (subqueries, aggregates, changes-only) retire after the full idle+dormancy grace,
 //! least-recently-read first:
 //! 1. **Dormancy TTL** (hygiene): dormant longer than [`RetentionConfig::dormant_ttl`] → evict.
 //!    Reaps dead shapes even with no resource pressure.
@@ -30,7 +31,7 @@
 //!    the durable-streams server exposes no per-stream sizes yet — so it undercounts streams
 //!    written before the current process started.
 //!
-//! If a cap/budget is exceeded but nothing dormant is left to evict, the sweep logs loudly and
+//! If a cap/budget is exceeded but nothing eligible is left to evict, the sweep logs loudly and
 //! bumps a metric instead of evicting active shapes.
 //!
 //! Subquery and aggregate shapes are exempt from dormancy (their engine state — inner-set
@@ -334,16 +335,14 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
         // an eligible shape gets (idle timeout + dormancy TTL). They are recreatable — a returning
         // client gets 404 / must-refetch and recreates; changes_only callers receive a fresh feed
         // rather than a silently incomplete dormant replay.
-        if !cfg.idle_timeout.is_zero() {
-            for s in shapes {
-                if !s.dormancy_eligible
-                    && !s.in_transition
-                    && s.refcount == 0
-                    && s.idle >= cfg.idle_timeout + cfg.dormant_ttl
-                {
-                    plan.evict.push((s.id.clone(), EvictReason::DormantTtl));
-                    evicted.insert(&s.id);
-                }
+        for s in shapes {
+            if !s.dormancy_eligible
+                && !s.in_transition
+                && s.refcount == 0
+                && s.idle >= cfg.idle_timeout + cfg.dormant_ttl
+            {
+                plan.evict.push((s.id.clone(), EvictReason::DormantTtl));
+                evicted.insert(&s.id);
             }
         }
     }
@@ -482,6 +481,17 @@ mod tests {
         let plan = plan_sweep(&cfg(), &shapes);
         assert_eq!(plan.evict, vec![("agg-old".to_string(), EvictReason::DormantTtl)]);
         assert!(plan.deactivate.is_empty(), "non-parkable shapes never deactivate");
+    }
+
+    #[test]
+    fn non_parkable_retirement_still_runs_when_dormancy_is_disabled() {
+        let c = RetentionConfig {
+            idle_timeout: Duration::ZERO,
+            subscription_lease_timeout: Duration::from_secs(1800),
+            ..cfg()
+        };
+        let shapes = vec![SweepShape { idle: c.dormant_ttl, dormancy_eligible: false, ..shape("changes-only") }];
+        assert_eq!(plan_sweep(&c, &shapes).evict, vec![("changes-only".to_string(), EvictReason::DormantTtl)]);
     }
 
     #[test]
