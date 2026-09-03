@@ -1819,6 +1819,14 @@ impl Engine {
                 }
             }
         };
+        tracing::info!(
+            target: "electric_circuits_engine::shape_create",
+            shape_id = id,
+            table = %table,
+            changes_only,
+            subquery_nodes = begin.seeds.len() as u64,
+            "subquery shape create started"
+        );
         // Phase B (no registry lock): seed fresh nodes + backfill the shape, all from pooled PG.
         let phase_b = async {
             let mut node_seeds = Vec::with_capacity(begin.seeds.len());
@@ -1836,7 +1844,25 @@ impl Engine {
                 // `collect`: an inner-set node's seed IS engine state — the set it will maintain
                 // — so there is nothing to stream it to. It is read through the same streamed
                 // reader as every other backfill, so the transport (and the fences) are identical.
+                let seed_started = std::time::Instant::now();
+                tracing::info!(
+                    target: "electric_circuits_engine::shape_create",
+                    shape_id = id,
+                    table = %table,
+                    inner_table = %inner_table,
+                    inner_where_present = inner_where.is_some(),
+                    "subquery inner seed started"
+                );
                 let (rows, fences) = crate::pg::backfill_where_reader(&client, &ts, wsql).await?.collect().await?;
+                tracing::info!(
+                    target: "electric_circuits_engine::shape_create",
+                    shape_id = id,
+                    table = %table,
+                    inner_table = %inner_table,
+                    rows = rows.len() as u64,
+                    duration_ms = seed_started.elapsed().as_millis() as u64,
+                    "subquery inner seed finished"
+                );
                 node_seeds.push((sig.clone(), rows, fences.gate));
             }
             let outer_ts =
@@ -1888,6 +1914,14 @@ impl Engine {
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
         let finished =
             self.subqueries.lock().await.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
+        tracing::info!(
+            target: "electric_circuits_engine::shape_create",
+            shape_id = id,
+            table = %table,
+            changes_only,
+            seeded,
+            "subquery shape create finished"
+        );
         enqueue_finished_create_work(&self.flip_tx, &self.pending_flips, id, finished)?;
         Ok(())
     }

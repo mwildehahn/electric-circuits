@@ -1272,6 +1272,11 @@ pub struct BackfillReader<'a> {
     fences: BackfillFences,
     rows: u64,
     chunks: u64,
+    /// Approximate serialized row/envelope bytes read from Postgres. This is
+    /// deliberately an estimate, but it lets us correlate a memory jump with
+    /// the amount of data a backfill actually traversed without logging rows.
+    estimated_bytes: u64,
+    where_present: bool,
 }
 
 impl<'a> BackfillReader<'a> {
@@ -1318,6 +1323,19 @@ impl<'a> BackfillReader<'a> {
         }
         self.rows += chunk.len() as u64;
         self.chunks += 1;
+        if self.chunks == 1 || self.chunks % 8 == 0 {
+            tracing::info!(
+                target: "electric_circuits_engine::backfill",
+                table = %self.ts.table,
+                where_present = self.where_present,
+                chunk_rows = chunk.len() as u64,
+                chunk_estimated_bytes = body,
+                rows_read = self.rows,
+                estimated_bytes = self.estimated_bytes,
+                chunks_read = self.chunks,
+                "backfill progress"
+            );
+        }
         Ok(Some(chunk))
     }
 
@@ -1336,7 +1354,9 @@ impl<'a> BackfillReader<'a> {
         let obj = j.as_object().context("backfill row expr did not return an object")?;
         let r = self.ts.row_from_json(obj)?;
         let key_bytes = self.ts.key_string(&r).map(|k| k.len() as u64).unwrap_or(0);
-        Ok(Some((r, value_bytes + key_bytes + self.frame)))
+        let estimated_bytes = value_bytes + key_bytes + self.frame;
+        self.estimated_bytes = self.estimated_bytes.saturating_add(estimated_bytes);
+        Ok(Some((r, estimated_bytes)))
     }
 
     /// Read the whole snapshot into memory.
@@ -1350,11 +1370,29 @@ impl<'a> BackfillReader<'a> {
         while let Some(mut chunk) = self.next_chunk().await? {
             all.append(&mut chunk);
         }
+        tracing::info!(
+            target: "electric_circuits_engine::backfill",
+            table = %self.ts.table,
+            where_present = self.where_present,
+            rows = all.len() as u64,
+            chunks = self.chunks,
+            estimated_bytes = self.estimated_bytes,
+            "backfill materialized in memory"
+        );
         Ok((all, self.finish().await))
     }
 
     /// Close the snapshot transaction and hand back its fences.
     pub async fn finish(mut self) -> BackfillFences {
+        tracing::info!(
+            target: "electric_circuits_engine::backfill",
+            table = %self.ts.table,
+            where_present = self.where_present,
+            rows = self.rows,
+            chunks = self.chunks,
+            estimated_bytes = self.estimated_bytes,
+            "backfill finished"
+        );
         // Drop the cursor before COMMIT: tokio-postgres discards whatever is left of an abandoned
         // portal, and the transaction is READ ONLY, so nothing is lost either way.
         self.stream = None;
@@ -1423,6 +1461,7 @@ async fn backfill_open_in_txn<'a>(
     let seed_lsn: String = fence.get(0);
     let snap: String = fence.get(1);
     let gate = SnapshotGate::parse(&snap, &seed_lsn);
+    let where_present = where_sql.is_some();
     let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
         None => (String::new(), Vec::new()),
@@ -1442,6 +1481,8 @@ async fn backfill_open_in_txn<'a>(
         fences: BackfillFences { seed_lsn, gate },
         rows: 0,
         chunks: 0,
+        estimated_bytes: 0,
+        where_present,
     })
 }
 
