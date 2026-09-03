@@ -78,6 +78,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | `16777216` (16 MiB) | Durable Streams: client-side hard cap for any response body; exceeding it fails the read with the stream path and observed size |
 | `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP` | unset | Postgres-mode boot refuses a store whose readiness does not advertise a `max_chunk_bytes` at or below `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES`. Unset (the default) logs one WARN naming the observed/absent server page and the client cap, and boots — no released durable-streams build advertises the field yet |
 | `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` | `2` | Maximum concurrent dormant replay scans |
+| `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` | `20` | How long a create/join/read waits on an in-flight reactivation before giving up with the typed recreate outcome. The detached replay continues. `0` = wait forever |
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum replay span budget; combined with the recorded backfill size when replay-vs-recreate admission is enabled |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Multiplier applied to recorded backfill bytes for replay admission |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM) |

@@ -45,7 +45,14 @@ fn retry_create(
             );
             Err(())
         }
-        Err(e) if e.downcast_ref::<ReactivationRecreate>().is_some() && attempt < CREATE_RACE_ATTEMPTS => {
+        // Only an OVER-BUDGET recreate is redone here. The shape has been retired, so the redo
+        // finds nothing to join and takes a fresh backfill. A JOIN-TIMED-OUT recreate must not be
+        // redone: the shape is still reactivating, so the redo would rejoin the same replay and
+        // spend another full timeout — exactly the overrun this bounds.
+        Err(e)
+            if e.downcast_ref::<ReactivationRecreate>().is_some_and(|r| r.reason == RecreateReason::OverBudget)
+                && attempt < CREATE_RACE_ATTEMPTS =>
+        {
             tracing::info!("{what} create found an over-budget dormant shape; retrying as a fresh create");
             Err(())
         }
@@ -1398,23 +1405,49 @@ impl Engine {
                         }
                     }
                 }
-                Step::WaitReactivate(mut rx) => loop {
-                    let outcome = *rx.borrow_and_update();
-                    match outcome {
-                        Some(true) => return Ok(()),
-                        Some(false) => {
-                            if !self.lives.lock().unwrap().contains_key(id) {
-                                return Err(anyhow::Error::new(ReactivationRecreate(id.to_string())));
+                Step::WaitReactivate(mut rx) => {
+                    // The reactivation is DETACHED and unbounded — a large-span replay can run for
+                    // tens of seconds. This request is not: past the join timeout it gives up with
+                    // a typed recreate outcome and lets the replay finish on its own, rather than
+                    // being cut off by the API gateway's read timeout with nothing to act on.
+                    let deadline = (!self.retention.reactivation_join_timeout.is_zero())
+                        .then(|| tokio::time::Instant::now() + self.retention.reactivation_join_timeout);
+                    loop {
+                        let outcome = *rx.borrow_and_update();
+                        match outcome {
+                            Some(true) => return Ok(()),
+                            Some(false) => {
+                                if !self.lives.lock().unwrap().contains_key(id) {
+                                    return Err(anyhow::Error::new(ReactivationRecreate::over_budget(id)));
+                                }
+                                bail!("shape '{id}' reactivation failed; retry the read")
                             }
-                            bail!("shape '{id}' reactivation failed; retry the read")
-                        }
-                        None => {
-                            if rx.changed().await.is_err() {
-                                bail!("shape '{id}' reactivator died; retry the read");
+                            None => {
+                                let changed = match deadline {
+                                    None => rx.changed().await.map(Some),
+                                    Some(deadline) => match tokio::time::timeout_at(deadline, rx.changed()).await {
+                                        Ok(changed) => changed.map(Some),
+                                        Err(_) => Ok(None),
+                                    },
+                                };
+                                match changed {
+                                    Ok(Some(())) => {}
+                                    Ok(None) => {
+                                        metrics().reactivation_joins_timed_out.fetch_add(1, Ordering::Relaxed);
+                                        tracing::warn!(
+                                            shape_id = id,
+                                            timeout_secs = self.retention.reactivation_join_timeout.as_secs(),
+                                            "gave up waiting on an in-flight reactivation; the replay continues \
+                                             and the caller is told to recreate"
+                                        );
+                                        return Err(anyhow::Error::new(ReactivationRecreate::join_timed_out(id)));
+                                    }
+                                    Err(_) => bail!("shape '{id}' reactivator died; retry the read"),
+                                }
                             }
                         }
                     }
-                },
+                }
             }
         }
     }

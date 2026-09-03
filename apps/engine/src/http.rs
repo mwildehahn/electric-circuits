@@ -1742,7 +1742,10 @@ mod tests {
     /// route, and it keeps 409 for the ElectricSQL protocol's own must-refetch code.
     #[test]
     fn over_budget_reactivation_is_gone_not_a_conflict() {
-        let err = AppError::from(anyhow::Error::new(crate::engine::ReactivationRecreate("shape/s1".into())));
+        let err = AppError::from(anyhow::Error::new(crate::engine::ReactivationRecreate {
+            shape: "shape/s1".into(),
+            reason: crate::engine::RecreateReason::OverBudget,
+        }));
         assert_eq!(err.status, StatusCode::GONE);
     }
 

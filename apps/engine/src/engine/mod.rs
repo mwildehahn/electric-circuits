@@ -157,14 +157,49 @@ pub struct SubscriptionConflict {
     pub shape: String,
 }
 
-/// The retained shape was deliberately retired because replay exceeded its budget; the caller
-/// should fall through to creating a replacement rather than receive a generic 500.
+/// Why a touch cannot hand back the shape it was asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecreateReason {
+    /// The dormant replay span exceeded its budget, so the shape was deliberately retired. The
+    /// shape is gone from the lifecycle map, so a create can fall through to a fresh one.
+    OverBudget,
+    /// The reactivation is admitted and still running, but the joining request reached
+    /// `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`. The shape is NOT retired and the detached
+    /// replay continues; only this request gives up.
+    JoinTimedOut,
+}
+
+/// The touch cannot return the retained shape; the caller should obtain a replacement rather than
+/// receive a generic 500. See [`RecreateReason`] for which of the two situations produced it.
 #[derive(Debug)]
-pub struct ReactivationRecreate(pub String);
+pub struct ReactivationRecreate {
+    pub shape: String,
+    pub reason: RecreateReason,
+}
+
+impl ReactivationRecreate {
+    pub(crate) fn over_budget(shape: impl Into<String>) -> Self {
+        Self { shape: shape.into(), reason: RecreateReason::OverBudget }
+    }
+
+    pub(crate) fn join_timed_out(shape: impl Into<String>) -> Self {
+        Self { shape: shape.into(), reason: RecreateReason::JoinTimedOut }
+    }
+}
 
 impl std::fmt::Display for ReactivationRecreate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "shape '{}' was retired; recreate from a fresh backfill", self.0)
+        match self.reason {
+            RecreateReason::OverBudget => {
+                write!(f, "shape '{}' was retired; recreate from a fresh backfill", self.shape)
+            }
+            RecreateReason::JoinTimedOut => write!(
+                f,
+                "shape '{}' is still replaying its change log; the join gave up before the gateway would. \
+                 Recreate from a fresh backfill or retry later",
+                self.shape
+            ),
+        }
     }
 }
 

@@ -65,6 +65,7 @@ use crate::pg::SnapshotGate;
 /// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Total shape-count cap; over it, least-recently-read dormant shapes are evicted. `0` = unlimited. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Cap on tracked shape-stream bytes; over it, least-recently-read dormant shapes are evicted. |
 /// | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Sweep interval of the background retention task. |
+/// | `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` | `20` | How long a create/join/read may wait on a dormant shape's reactivation before it gives up with a typed recreate outcome. The reactivation itself continues. `0` = wait forever. |
 #[derive(Clone, Debug)]
 pub struct RetentionConfig {
     /// Active → dormant idle threshold (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, default 6 hours; 0 = never).
@@ -83,6 +84,12 @@ pub struct RetentionConfig {
     pub disk_budget_bytes: u64,
     /// Background sweep interval (`ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS`, default 60s).
     pub sweep_interval: Duration,
+    /// How long a touch may wait on an in-flight reactivation before giving up with a typed
+    /// recreate outcome (`ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`, default 20s; 0 = wait
+    /// forever). The default sits under the API gateway's 30s read timeout: a large-span replay
+    /// takes longer than the gateway will wait, and a caller that is going to be cut off anyway is
+    /// better served by an answer it can act on than by the gateway's 503.
+    pub reactivation_join_timeout: Duration,
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -100,6 +107,7 @@ impl Default for RetentionConfig {
             max_shapes: 10_000,
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
+            reactivation_join_timeout: Duration::from_secs(20),
         }
     }
 }
@@ -133,6 +141,10 @@ impl RetentionConfig {
             max_shapes: env_u64("ELECTRIC_CIRCUITS_MAX_SHAPES", d.max_shapes as u64) as usize,
             disk_budget_bytes: env_u64("ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
             sweep_interval: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", 60).max(1)),
+            reactivation_join_timeout: Duration::from_secs(env_u64(
+                "ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS",
+                d.reactivation_join_timeout.as_secs(),
+            )),
         }
     }
 }
@@ -391,6 +403,7 @@ mod tests {
             max_shapes: 0,
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
+            reactivation_join_timeout: Duration::from_secs(20),
         }
     }
 

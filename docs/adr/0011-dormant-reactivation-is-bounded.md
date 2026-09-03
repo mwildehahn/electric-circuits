@@ -31,6 +31,16 @@ vocabulary rather than as a server fault:
 * **Electric `/v1/shape`**: the protocol's own `must-refetch` (`409` plus the control message), the
   same answer a genuinely gone stream produces.
 
+A wake that is admitted can still outlast the request that triggered it: a large-span replay was
+measured at ~40s in production against an API gateway whose read timeout is 30s, so the client got
+a 503 carrying nothing to act on. A touch therefore waits at most
+`ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` (default 20s, deliberately under that gateway
+timeout; `0` waits forever) and then returns the same typed recreate outcome with reason
+`JoinTimedOut`. The shape is NOT retired and the detached replay runs to completion, so a later
+touch finds it active. Unlike the over-budget reason, a timed-out join is not redone as a fresh
+create inside the same request: the shape is still reactivating, so a redo would rejoin the same
+replay and spend another full timeout — the overrun this exists to bound.
+
 ## Alternatives considered
 
 * **Unbounded replay:** preserves stream identity but makes cost proportional to global log growth

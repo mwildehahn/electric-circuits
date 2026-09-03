@@ -97,6 +97,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | no | `16777216` | Client-side Durable Streams response cap (16 MiB, four times the 4 MiB server page). A page above it fails the read with a typed error; it is never truncated. |
 | `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP` | no | unset | `1` refuses the boot when readiness does not advertise a `max_chunk_bytes` within the client cap. Unset warns once and boots, because the store advertises no such field today. |
 | `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` | no | `2` | Maximum concurrent dormant replay scans. |
+| `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` | no | `20` | Bound on how long one request waits for an in-flight reactivation. Keep it under the gateway's read timeout (30s today); past it the request returns the typed recreate outcome while the replay continues. `0` = wait forever. |
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | no | `16777216` | Minimum replay span budget (16 MiB). |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | no | `4` | Multiplier for replay admission against recorded backfill bytes. |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | no | `134217728` | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below. |

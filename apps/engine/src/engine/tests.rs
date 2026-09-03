@@ -698,6 +698,43 @@ async fn reactivation_concurrency_never_exceeds_two_scans() {
     assert!(maximum.load(std::sync::atomic::Ordering::SeqCst) <= 2);
 }
 
+/// A dormant wake is detached and unbounded; the joining request is not. In production a large-span
+/// replay ran ~40s while the API gateway's read timeout is 30s, so the client got a 503 with nothing
+/// to act on. The join must give up first and hand back the same typed recreate outcome an
+/// over-budget wake produces, while the reactivation itself keeps running.
+#[tokio::test(start_paused = true)]
+async fn a_join_waiting_on_a_stalled_reactivation_gives_up_and_asks_for_a_recreate() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    // A reactivation that never publishes an outcome: the sender is held for the whole test, so the
+    // join's watch channel stays pending exactly as it does behind a change-log page that stalls.
+    let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
+    engine.lives.lock().unwrap().insert(
+        "s1".to_string(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Reactivating {
+                done: outcome_rx,
+                resume: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+            },
+        },
+    );
+    let started = tokio::time::Instant::now();
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(600), engine.ensure_active("s1"))
+        .await
+        .expect("the join must bound its own wait, not run until the caller's deadline");
+    let error = joined.expect_err("a join that gave up must not report the shape active");
+    let recreate = error
+        .downcast_ref::<crate::engine::ReactivationRecreate>()
+        .expect("the give-up must be the same typed recreate outcome an over-budget wake returns");
+    assert_eq!(recreate.reason, crate::engine::RecreateReason::JoinTimedOut);
+    let waited = started.elapsed();
+    assert!(waited >= std::time::Duration::from_secs(20), "waited {waited:?}, below the configured bound");
+    assert!(waited < std::time::Duration::from_secs(30), "waited {waited:?}, past the gateway's 30s timeout");
+    // The detached reactivation is untouched: the shape is still reactivating behind the stall.
+    assert_eq!(engine.shape_lifecycle("s1").await, Some("reactivating"));
+    drop(outcome_tx);
+}
+
 #[tokio::test]
 async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {

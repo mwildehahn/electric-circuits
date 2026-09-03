@@ -1096,7 +1096,11 @@ mod tests {
     /// exactly that: the stream the client holds is gone and the answer is a fresh subscription.
     #[test]
     fn an_over_budget_reactivation_tells_an_electric_client_to_refetch() {
-        let error: ApiError = anyhow::Error::new(crate::engine::ReactivationRecreate("s1".into())).into();
+        let error: ApiError = anyhow::Error::new(crate::engine::ReactivationRecreate {
+            shape: "s1".into(),
+            reason: crate::engine::RecreateReason::OverBudget,
+        })
+        .into();
         assert!(error.must_refetch, "an Electric client must be told to refetch, not handed a 500");
         assert_eq!(error.status, StatusCode::CONFLICT);
     }

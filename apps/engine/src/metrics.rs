@@ -110,6 +110,8 @@ pub struct Metrics {
     pub reactivations_evicted_unresumable: AtomicU64,
     pub reactivations_completed: AtomicU64,
     pub reactivations_failed: AtomicU64,
+    /// Touches that gave up waiting on an in-flight reactivation (`ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`).
+    pub reactivation_joins_timed_out: AtomicU64,
     pub reactivation_bytes_scanned: AtomicU64,
     pub reactivation_spans: AtomicU64,
     pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
@@ -197,6 +199,7 @@ pub fn metrics() -> &'static Metrics {
         reactivations_evicted_unresumable: AtomicU64::new(0),
         reactivations_completed: AtomicU64::new(0),
         reactivations_failed: AtomicU64::new(0),
+        reactivation_joins_timed_out: AtomicU64::new(0),
         reactivation_bytes_scanned: AtomicU64::new(0),
         reactivation_spans: AtomicU64::new(0),
         shapes_evicted: AtomicU64::new(0),
@@ -246,6 +249,7 @@ impl Metrics {
                 "reactivations_evicted_unresumable": self.reactivations_evicted_unresumable.load(Ordering::Relaxed),
                 "reactivations_completed": self.reactivations_completed.load(Ordering::Relaxed),
                 "reactivations_failed": self.reactivations_failed.load(Ordering::Relaxed),
+                "reactivation_joins_timed_out": self.reactivation_joins_timed_out.load(Ordering::Relaxed),
                 "reactivation_bytes_scanned": self.reactivation_bytes_scanned.load(Ordering::Relaxed),
                 "reactivation_spans": self.reactivation_spans.load(Ordering::Relaxed),
                 "shapes_evicted": self.shapes_evicted.load(Ordering::Relaxed),
@@ -297,6 +301,7 @@ impl Metrics {
         self.reactivations_evicted_unresumable.store(0, Ordering::Relaxed);
         self.reactivations_completed.store(0, Ordering::Relaxed);
         self.reactivations_failed.store(0, Ordering::Relaxed);
+        self.reactivation_joins_timed_out.store(0, Ordering::Relaxed);
         self.reactivation_bytes_scanned.store(0, Ordering::Relaxed);
         self.reactivation_spans.store(0, Ordering::Relaxed);
         self.shapes_evicted.store(0, Ordering::Relaxed);
