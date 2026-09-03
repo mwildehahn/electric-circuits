@@ -75,7 +75,8 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Change log: rotate once the current segment is this old. `0` disables the age criterion (both `0` = never rotate, i.e. an unbounded log) |
 | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | Change log: how long a rotated-out segment may stay pinned by a **dormant** shape before that shape is evicted and the segment deleted. `0` = a dormant shape pins its segment forever |
-| `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | `16777216` (16 MiB) | Durable Streams: client-side hard cap for any response body; exceeding it fails the read with the stream path and observed size. Postgres-mode boot also requires readiness to advertise a non-zero page no larger than this cap. |
+| `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | `16777216` (16 MiB) | Durable Streams: client-side hard cap for any response body; exceeding it fails the read with the stream path and observed size |
+| `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP` | unset | Postgres-mode boot refuses a store whose readiness does not advertise a `max_chunk_bytes` at or below `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES`. Unset (the default) logs one WARN naming the observed/absent server page and the client cap, and boots — no released durable-streams build advertises the field yet |
 | `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` | `2` | Maximum concurrent dormant replay scans |
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum replay span budget; combined with the recorded backfill size when replay-vs-recreate admission is enabled |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Multiplier applied to recorded backfill bytes for replay admission |

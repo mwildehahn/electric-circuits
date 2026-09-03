@@ -617,7 +617,10 @@ impl DsClient {
         let client = Self::with_store(config.base_url, config.scope, store);
         // A production client is not constructible until the store has attested the exact identity.
         let readiness = client.preflight_readiness(&expected).await?;
-        validate_page_cap(&readiness, ds_read_max_bytes())?;
+        let cap = ds_read_max_bytes();
+        if let Some(advisory) = enforce_page_cap(assess_page_cap(&readiness, cap), cap, require_ds_chunk_cap())? {
+            warn_page_cap_once(&advisory);
+        }
         Ok(client)
     }
 
@@ -1241,15 +1244,68 @@ fn decode_readiness(body: &str) -> Result<StoreReadinessV1> {
     Ok(StoreReadinessV1 { identity, max_chunk_bytes: wire.max_chunk_bytes })
 }
 
-pub(crate) fn validate_page_cap(readiness: &StoreReadinessV1, client_cap: u64) -> Result<()> {
+/// What the client concluded about the read page the store advertises in its readiness response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageCapVerdict {
+    /// The store advertises a page that fits inside the client body cap.
+    Compatible { observed: u64 },
+    /// Readiness carries no cap field, or advertises zero. Every durable-streams build shipped so
+    /// far omits the field, so this is the ordinary verdict, not an anomaly.
+    Unknown,
+    /// The store advertises a page larger than the client body cap; a full page would be refused
+    /// by [`read_body_bounded`].
+    Exceeds { observed: u64 },
+}
+
+pub(crate) fn assess_page_cap(readiness: &StoreReadinessV1, client_cap: u64) -> PageCapVerdict {
     match readiness.max_chunk_bytes {
-        Some(observed) if observed > 0 && observed <= client_cap => Ok(()),
-        Some(observed) => Err(anyhow::Error::new(StoreReadinessError::PageCapability {
-            detail: format!("max_chunk_bytes={observed} exceeds client cap {client_cap}"),
-        })),
-        None => Err(anyhow::Error::new(StoreReadinessError::PageCapability {
-            detail: format!("max_chunk_bytes is missing (uncapped server); client cap is {client_cap}"),
-        })),
+        Some(observed) if observed == 0 => PageCapVerdict::Unknown,
+        Some(observed) if observed <= client_cap => PageCapVerdict::Compatible { observed },
+        Some(observed) => PageCapVerdict::Exceeds { observed },
+        None => PageCapVerdict::Unknown,
+    }
+}
+
+/// `1` makes an unadvertised or oversized store page a boot refusal instead of a warning. Left
+/// unset (the default) because no released durable-streams build advertises a cap at all, so a
+/// refusal would reject every real store including the deployed one.
+fn require_ds_chunk_cap() -> bool {
+    std::env::var("ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP").is_ok_and(|value| value.trim() == "1")
+}
+
+/// Advisory by default: the read path already fails closed on an oversized page
+/// ([`read_body_bounded`] returns a typed error naming the path, the observed size and the cap), so
+/// an unverifiable server capability is a diagnosable warning rather than a reason to refuse the
+/// boot. `Ok(None)` means nothing to say; `Ok(Some(message))` is the warning to log once; `Err` is
+/// the strict-mode refusal.
+pub(crate) fn enforce_page_cap(verdict: PageCapVerdict, client_cap: u64, strict: bool) -> Result<Option<String>> {
+    let detail = match verdict {
+        PageCapVerdict::Compatible { .. } => return Ok(None),
+        PageCapVerdict::Unknown => format!(
+            "durable-streams readiness advertises no max_chunk_bytes (uncapped or older store); \
+             client body cap is {client_cap} bytes and a larger page will fail the read"
+        ),
+        PageCapVerdict::Exceeds { observed } => format!(
+            "durable-streams readiness advertises max_chunk_bytes={observed}, larger than the \
+             client body cap of {client_cap} bytes; a full page will fail the read"
+        ),
+    };
+    if strict {
+        return Err(anyhow::Error::new(StoreReadinessError::PageCapability { detail }));
+    }
+    Ok(Some(detail))
+}
+
+/// The advisory is a property of the store, not of the request, so it is logged once per process
+/// however many clients are constructed.
+fn warn_page_cap_once(message: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            advisory = message,
+            strict_env = "ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP",
+            "durable-streams read page capability could not be verified"
+        );
     }
 }
 
@@ -1657,16 +1713,68 @@ mod tests {
         assert!(decode_readiness(&fractional).is_err());
     }
 
+    const TEST_CLIENT_CAP: u64 = 16 * 1024 * 1024;
+
+    fn readiness_with_cap(identity: &StoreIdentityV1, cap: u64) -> StoreReadinessV1 {
+        let body =
+            readiness_json(identity).replace("\"reserve\":{", &format!("\"max_chunk_bytes\":{cap},\"reserve\":{{"));
+        decode_readiness(&body).unwrap()
+    }
+
     #[test]
-    fn readiness_page_cap_must_fit_client_cap() {
+    fn a_store_that_advertises_no_page_cap_is_read_as_unknown() {
         let identity = StoreIdentityV1::in_process_test_identity();
-        let body = readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":33554432,\"reserve\":{");
-        let readiness = decode_readiness(&body).unwrap();
-        let error = validate_page_cap(&readiness, 16 * 1024 * 1024).unwrap_err();
-        assert!(error.to_string().contains("max_chunk_bytes=33554432 exceeds client cap 16777216"));
         let missing = decode_readiness(&readiness_json(&identity)).unwrap();
-        let error = validate_page_cap(&missing, 16 * 1024 * 1024).unwrap_err();
-        assert!(error.to_string().contains("max_chunk_bytes is missing (uncapped server)"));
+        assert_eq!(assess_page_cap(&missing, TEST_CLIENT_CAP), PageCapVerdict::Unknown);
+        // A server that advertises zero means "unlimited", which is the same unknown page size.
+        let zero = readiness_with_cap(&identity, 0);
+        assert_eq!(assess_page_cap(&zero, TEST_CLIENT_CAP), PageCapVerdict::Unknown);
+        let fitting = readiness_with_cap(&identity, 4 * 1024 * 1024);
+        assert_eq!(
+            assess_page_cap(&fitting, TEST_CLIENT_CAP),
+            PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }
+        );
+        let oversized = readiness_with_cap(&identity, 32 * 1024 * 1024);
+        assert_eq!(
+            assess_page_cap(&oversized, TEST_CLIENT_CAP),
+            PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }
+        );
+    }
+
+    /// No released durable-streams build advertises `max_chunk_bytes`, so refusing an unverifiable
+    /// page cap refuses every real store — including the deployed one and the conformance harness.
+    /// The default must boot and warn; the read path is what stays fail-closed.
+    #[test]
+    fn an_unverifiable_page_cap_is_advisory_by_default_and_refused_only_in_strict_mode() {
+        for verdict in [PageCapVerdict::Unknown, PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }] {
+            let advisory = enforce_page_cap(verdict, TEST_CLIENT_CAP, false)
+                .expect("an unverifiable page cap must not refuse the boot by default")
+                .expect("an unverifiable page cap must produce a warning");
+            assert!(advisory.contains("16777216"), "the advisory names the client body cap: {advisory}");
+
+            let refusal = enforce_page_cap(verdict, TEST_CLIENT_CAP, true)
+                .expect_err("strict mode must refuse an unverifiable page cap");
+            assert!(refusal.to_string().contains("storage page capability is incompatible"), "{refusal}");
+        }
+        assert!(
+            enforce_page_cap(PageCapVerdict::Unknown, TEST_CLIENT_CAP, false)
+                .unwrap()
+                .unwrap()
+                .contains("no max_chunk_bytes")
+        );
+        assert!(
+            enforce_page_cap(PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }, TEST_CLIENT_CAP, false)
+                .unwrap()
+                .unwrap()
+                .contains("max_chunk_bytes=33554432")
+        );
+    }
+
+    #[test]
+    fn a_compatible_page_cap_says_nothing_in_either_mode() {
+        let verdict = PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 };
+        assert!(enforce_page_cap(verdict, TEST_CLIENT_CAP, false).unwrap().is_none());
+        assert!(enforce_page_cap(verdict, TEST_CLIENT_CAP, true).unwrap().is_none());
     }
 
     /// The boot classification of a durable-streams failure. Getting this wrong is expensive in
