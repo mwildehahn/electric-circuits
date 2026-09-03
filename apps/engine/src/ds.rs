@@ -397,14 +397,44 @@ pub(crate) enum BodyRead {
     Always,
 }
 
+/// The cap against a store that advertises a page: four of the 4 MiB pages the server serves, so it
+/// is pure defense in depth and is never reached in normal operation.
 const DEFAULT_DS_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-fn ds_read_max_bytes() -> u64 {
+/// The cap against a store that advertises NO page. Such a store answers a read with the whole
+/// remainder of the stream, so the client cap is the only thing between a large backlog and a
+/// **permanently stalled live loop**: the read fails, the sequencer retries the identical read, and
+/// it fails identically forever — no data flows and nothing recovers it. A larger ceiling does not
+/// make that store safe; it makes progress the default and leaves the boot WARN (and
+/// `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1`) as the way to demand a store that pages.
+const UNCAPPED_STORE_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The cap in force for this process, chosen at boot from the store's readiness. Zero means boot has
+/// not resolved it yet, in which case the configured or default value applies.
+static EFFECTIVE_READ_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn configured_ds_read_max_bytes() -> Option<u64> {
     std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DS_READ_MAX_BYTES)
+}
+
+fn ds_read_max_bytes() -> u64 {
+    match EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => configured_ds_read_max_bytes().unwrap_or(DEFAULT_DS_READ_MAX_BYTES),
+        installed => installed,
+    }
+}
+
+/// An explicit `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` is always obeyed: an operator who names a cap
+/// has decided what this process may buffer, including against an uncapped store.
+pub(crate) fn effective_read_max_bytes(verdict: PageCapVerdict, configured: Option<u64>) -> u64 {
+    match (configured, verdict) {
+        (Some(explicit), _) => explicit,
+        (None, PageCapVerdict::Compatible { .. }) => DEFAULT_DS_READ_MAX_BYTES,
+        (None, PageCapVerdict::Unknown | PageCapVerdict::Exceeds { .. }) => UNCAPPED_STORE_READ_MAX_BYTES,
+    }
 }
 
 async fn read_body_bounded(mut response: reqwest::Response, limit: u64, path: &str) -> Result<String> {
@@ -449,7 +479,6 @@ pub(crate) trait DurableStreamStore: Send + Sync {
 struct HttpDurableStreamsStore {
     base: String,
     http: reqwest::Client,
-    read_max_bytes: u64,
 }
 
 impl HttpDurableStreamsStore {
@@ -476,12 +505,12 @@ impl HttpDurableStreamsStore {
             .identity(identity)
             .build()
             .context("building Durable Streams mTLS client")?;
-        Ok(Self { base: config.base_url.clone(), http, read_max_bytes: ds_read_max_bytes() })
+        Ok(Self { base: config.base_url.clone(), http })
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn new_in_process(base: String) -> Self {
-        Self { base, http: reqwest::Client::new(), read_max_bytes: ds_read_max_bytes() }
+        Self { base, http: reqwest::Client::new() }
     }
 
     fn stream_url(&self, path: &str) -> String {
@@ -505,7 +534,7 @@ impl HttpDurableStreamsStore {
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // The selected mode otherwise preserves the legacy per-operation best-effort behavior.
         let body = if should_read {
-            Some(read_body_bounded(res, self.read_max_bytes, path.unwrap_or("<unknown>")).await)
+            Some(read_body_bounded(res, ds_read_max_bytes(), path.unwrap_or("<unknown>")).await)
         } else {
             None
         };
@@ -617,8 +646,11 @@ impl DsClient {
         let client = Self::with_store(config.base_url, config.scope, store);
         // A production client is not constructible until the store has attested the exact identity.
         let readiness = client.preflight_readiness(&expected).await?;
-        let cap = ds_read_max_bytes();
-        if let Some(advisory) = enforce_page_cap(assess_page_cap(&readiness, cap), cap, require_ds_chunk_cap())? {
+        let configured = configured_ds_read_max_bytes();
+        let verdict = assess_page_cap(&readiness, configured.unwrap_or(DEFAULT_DS_READ_MAX_BYTES));
+        let cap = effective_read_max_bytes(verdict, configured);
+        EFFECTIVE_READ_MAX_BYTES.store(cap, std::sync::atomic::Ordering::Relaxed);
+        if let Some(advisory) = enforce_page_cap(verdict, cap, require_ds_chunk_cap())? {
             warn_page_cap_once(&advisory);
         }
         Ok(client)
@@ -1775,6 +1807,40 @@ mod tests {
                 .unwrap()
                 .contains("max_chunk_bytes=33554432")
         );
+    }
+
+    /// A store that does not page answers a read with the whole remainder of the stream. A cap
+    /// below that backlog does not bound memory — it stops the live loop entirely, because the
+    /// sequencer retries the identical read and it fails identically forever. Sized for the store,
+    /// not for a number.
+    #[test]
+    fn an_uncapped_store_raises_the_read_ceiling_unless_an_operator_named_one() {
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None),
+            16 * 1024 * 1024,
+            "a store that pages needs only defense in depth"
+        );
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Unknown, None),
+            64 * 1024 * 1024,
+            "a store that does not page must not be able to stall the live loop at 16 MiB"
+        );
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }, None),
+            64 * 1024 * 1024,
+            "a store whose page exceeds the client cap is the same hazard"
+        );
+        for verdict in [
+            PageCapVerdict::Unknown,
+            PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 },
+            PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 },
+        ] {
+            assert_eq!(
+                effective_read_max_bytes(verdict, Some(8 * 1024 * 1024)),
+                8 * 1024 * 1024,
+                "an operator who names a cap has decided what this process may buffer"
+            );
+        }
     }
 
     #[test]

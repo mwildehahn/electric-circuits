@@ -54,7 +54,12 @@ replay and spend another full timeout — the overrun this exists to bound.
 ## Consequences
 
 Replay memory is bounded by the response cap, parsed page, and scheduler permits rather than log
-size or shape count. Reactivation latency can queue behind the semaphore. `changes_only` shapes
+size or shape count. The response cap is sized from the store's own readiness, not from a fixed
+number: a store that advertises a page gets 16 MiB (four of its pages, so the cap is never reached),
+and a store that advertises none gets 64 MiB, because it answers a read with the whole remainder of
+the stream and a cap below the backlog does not bound memory — the sequencer retries the identical
+read and it fails identically forever, so no data flows at all. A deployment that wants the tighter
+bound guaranteed sets `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1` and runs a store that pages. Reactivation latency can queue behind the semaphore. `changes_only` shapes
 remain active and therefore consume their normal routing state because recreation would lose their
 dormant-period history. Durable Streams server paging (PR #4) improves the normal page size, but
 the engine-side cap remains mandatory defense in depth. Cross-segment span calculation HEADs each
