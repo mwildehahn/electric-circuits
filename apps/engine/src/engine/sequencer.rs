@@ -1253,6 +1253,7 @@ pub(crate) struct ReplayTarget {
     pub stream_path: String,
     pub from: LogPosition,
     pub library_mode: bool,
+    pub until: Option<LogPosition>,
 }
 
 pub(crate) async fn replay_changes_for_targets(
@@ -1374,6 +1375,9 @@ pub(crate) async fn replay_changes_for_targets(
         }
         if let Some(n) = rr.next_offset {
             pos.offset = n;
+        }
+        if targets.iter().all(|target| target.until.as_ref().is_some_and(|until| pos >= *until)) {
+            break;
         }
         if rr.closed && (rr.envelopes.is_empty() || !advanced) {
             let next = match rotate_to.take() {

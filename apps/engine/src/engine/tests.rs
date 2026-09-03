@@ -853,6 +853,7 @@ async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
         stream_path: path.into(),
         from: LogPosition { segment: 0, offset: "0".into() },
         library_mode: true,
+        until: None,
     };
     let results = crate::engine::sequencer::replay_changes_for_targets(
         &ds,
@@ -896,6 +897,7 @@ async fn coalesced_reactivation_respects_distinct_page_cursors() {
         stream_path: path.into(),
         from: LogPosition { segment: 0, offset: offset.into() },
         library_mode: true,
+        until: None,
     };
     let results = crate::engine::sequencer::replay_changes_for_targets(
         &ds,
@@ -957,6 +959,7 @@ async fn coalesced_reactivation_starts_at_the_earliest_cursor() {
         stream_path: path.into(),
         from: LogPosition { segment: 0, offset: offset.into() },
         library_mode: true,
+        until: None,
     };
     // Descending arrival order: the LAST target parked earliest.
     let results = crate::engine::sequencer::replay_changes_for_targets(

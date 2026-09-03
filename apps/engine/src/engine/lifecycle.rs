@@ -1345,26 +1345,11 @@ impl Engine {
                                 let (tx, rx) = tokio::sync::watch::channel(None);
                                 life.state = LifeState::Reactivating { done: rx.clone(), resume: resume.clone() };
                                 let engine = self.clone();
+                                let admitted_tail = engine.changes_position();
                                 let id = id.to_string();
                                 metrics().reactivations_started.fetch_add(1, Ordering::Relaxed);
                                 tokio::spawn(async move {
                                     let _control = control;
-                                    let _permit = match engine.reactivation_permits.clone().acquire_owned().await {
-                                        Ok(permit) => permit,
-                                        Err(_) => {
-                                            tracing::warn!("reactivation scheduler closed while waking shape {id}");
-                                            if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
-                                                life.state = LifeState::Dormant {
-                                                    since: std::time::Instant::now(),
-                                                    resume: resume.clone(),
-                                                    gate: gate.clone(),
-                                                };
-                                            }
-                                            metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
-                                            let _ = tx.send(Some(false));
-                                            return;
-                                        }
-                                    };
                                     let admission = engine.reactivation_admission(&id, &resume).await;
                                     if let Err(error) = &admission {
                                         if error.downcast_ref::<crate::engine::ReplayHeadUnavailable>().is_some() {
@@ -1403,7 +1388,9 @@ impl Engine {
                                         return;
                                     }
                                     metrics().reactivations_replayed.fetch_add(1, Ordering::Relaxed);
-                                    let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
+                                    let res = engine
+                                        .resume_dormant(&id, resume.clone(), gate.clone(), admitted_tail.clone())
+                                        .await;
                                     let err = match res {
                                         Ok(()) => {
                                             let mut lives = engine.lives.lock().unwrap();
@@ -1534,6 +1521,7 @@ impl Engine {
         id: &str,
         resume: LogPosition,
         gate: crate::pg::SnapshotGate,
+        admitted_tail: LogPosition,
     ) -> Result<()> {
         let (rec, ts, pred, out_cols, num_id, cmd_tx, gens) = {
             let mut st = self.state.lock().await;
@@ -1572,6 +1560,7 @@ impl Engine {
                 gate.clone(),
                 rec.stream_path.clone(),
                 resume.clone(),
+                Some(admitted_tail),
             )
             .await
         {
@@ -1624,6 +1613,7 @@ impl Engine {
         gate: crate::pg::SnapshotGate,
         stream_path: String,
         from: LogPosition,
+        until: Option<LogPosition>,
     ) -> Result<u64> {
         // Requests on the same segment are admitted to one scan window. The worker scans from the
         // earliest cursor in the batch and routes each page by its byte range, so targets parked at
@@ -1645,12 +1635,17 @@ impl Engine {
                     engine.reactivation_batches.lock().unwrap().remove(&key);
                     let targets = std::mem::take(&mut batch_for_task.lock().unwrap().targets);
                     let (targets, waiters): (Vec<_>, Vec<_>) = targets.into_iter().unzip();
-                    let results = crate::engine::sequencer::replay_changes_for_targets(
-                        &engine.ds,
-                        targets,
-                        &engine.shutdown_token(),
-                    )
-                    .await;
+                    let permit = engine.reactivation_permits.clone().acquire_owned().await;
+                    let results = if permit.is_ok() {
+                        crate::engine::sequencer::replay_changes_for_targets(
+                            &engine.ds,
+                            targets,
+                            &engine.shutdown_token(),
+                        )
+                        .await
+                    } else {
+                        (0..waiters.len()).map(|_| Err(anyhow::anyhow!("reactivation scheduler closed"))).collect()
+                    };
                     for (waiter, result) in waiters.into_iter().zip(results) {
                         let _ = waiter.send(result);
                     }
@@ -1668,6 +1663,7 @@ impl Engine {
                 stream_path,
                 from,
                 library_mode: self.pg_url.is_none(),
+                until,
             },
             tx,
         ));
