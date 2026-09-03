@@ -1380,18 +1380,23 @@ pub(crate) async fn replay_changes_for_targets(
             if errors[idx].is_some() {
                 continue;
             }
+            // Durable Streams offsets identify the byte cut *between pages*; individual change
+            // envelopes do not carry offsets. A target whose parked cursor is after this page's
+            // start must wait for a later page. Cursors before this page (including an earlier
+            // segment) receive the whole page. This deliberately uses the page range rather than
+            // the absent per-envelope `headers.offset` field, which would otherwise duplicate or
+            // silently drop rows when coalescing different cursors.
+            let target_is_after_page_start = target.from.segment > pos.segment
+                || (target.from.segment == pos.segment
+                    && match (crate::changelog::offset_bytes(&target.from.offset), page_start) {
+                        (Some(target_offset), Some(page_offset)) => target_offset > page_offset,
+                        _ => target.from.offset != pos.offset,
+                    });
+            if target_is_after_page_start {
+                continue;
+            }
             let mut outs = Vec::new();
             for env in &rr.envelopes {
-                if target.from.segment == pos.segment {
-                    if let (Some(want), Some(got)) = (
-                        crate::changelog::offset_bytes(&target.from.offset),
-                        env.headers.offset.as_deref().and_then(crate::changelog::offset_bytes),
-                    ) {
-                        if got < want {
-                            continue;
-                        }
-                    }
-                }
                 if env.type_ != target.table.as_str() {
                     continue;
                 }

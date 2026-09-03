@@ -731,6 +731,63 @@ async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     assert_eq!(store.read_count.load(std::sync::atomic::Ordering::Relaxed), 1, "one page read must serve both shapes");
 }
 
+#[tokio::test]
+async fn coalesced_reactivation_respects_distinct_page_cursors() {
+    let page = |next: &str, up_to_date: bool, key: u64| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"n\",\"active\":true}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![
+            page("0000000000000000_0000000000000100", false, 1),
+            page("0000000000000000_0000000000000200", false, 2),
+            page("0000000000000000_0000000000000300", true, 3),
+        ]),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = |path: &str, offset: &str| crate::engine::sequencer::ReplayTarget {
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred: pred.clone(),
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: path.into(),
+        from: LogPosition { segment: 0, offset: offset.into() },
+        library_mode: true,
+    };
+    let results = crate::engine::sequencer::replay_changes_for_targets(
+        &ds,
+        vec![
+            target("shape/a", "0000000000000000_0000000000000000"),
+            target("shape/b", "0000000000000000_0000000000000100"),
+            target("shape/c", "0000000000000000_0000000000000200"),
+        ],
+        &crate::shutdown::ShutdownToken::new(),
+    )
+    .await;
+    assert!(results.iter().all(Result::is_ok));
+    let appended = store.appended.lock().unwrap();
+    let keys = |path: &str| {
+        appended
+            .iter()
+            .filter(|(p, _, _)| p.ends_with(path))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+            .map(|env| env.key)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys("shape/a"), vec!["1", "2", "3"]);
+    assert_eq!(keys("shape/b"), vec!["2", "3"]);
+    assert_eq!(keys("shape/c"), vec!["3"]);
+}
+
 fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_json::Value>) -> Envelope {
     Envelope {
         type_: "users".into(),
