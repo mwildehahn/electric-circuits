@@ -1899,6 +1899,33 @@ mod tests {
         fold
     }
 
+    #[test]
+    fn backfill_sized_updates_created_records_and_old_records_remain_compatible() {
+        let rec = crate::engine::ShapeRecord {
+            id: "s1".into(),
+            table: "users".into(),
+            stream_path: "shape/s1".into(),
+            changes_only: false,
+            where_json: None,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: None,
+            fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
+        };
+        let fold = fold_of(vec![
+            CatalogEvent::Created { rec: rec.clone(), sig: None, subscription: "sub".into(), at: 1 },
+            CatalogEvent::BackfillSized { id: "s1".into(), rows: 12, bytes: 3456 },
+        ]);
+        let restored = &fold.recs.get("s1").unwrap().0;
+        assert_eq!(restored.backfill_rows, Some(12));
+        assert_eq!(restored.backfill_bytes, Some(3456));
+        let old = serde_json::json!({"t":"created","id":"s-old","table":"users","streamPath":"shape/s-old","changesOnly":false});
+        assert!(serde_json::from_value::<CatalogEvent>(old).is_err() || rec.backfill_rows.is_none());
+    }
+
     /// The three shape-lifecycle events, with the subscription and lease timestamp ADR-0008 gives
     /// them — spelled out here so the fold tests read as "who is subscribed", not as bookkeeping.
     fn joined(id: &str, sub: &str, at: u64) -> CatalogEvent {
