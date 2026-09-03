@@ -517,11 +517,17 @@ impl HttpDurableStreamsStore {
         identity_pem.extend(key);
         let identity =
             reqwest::Identity::from_pem(&identity_pem).context("parsing Durable Streams client certificate/key")?;
+        let timeout = |name: &str, default: u64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v > 0).unwrap_or(default)
+        };
         let http = reqwest::Client::builder()
             .https_only(true)
             .tls_built_in_root_certs(false)
             .add_root_certificate(ca)
             .identity(identity)
+            .connect_timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS", 10)))
+            .read_timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS", 30)))
+            .timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS", 60)))
             .build()
             .context("building Durable Streams mTLS client")?;
         Ok(Self { base: config.base_url.clone(), http })
