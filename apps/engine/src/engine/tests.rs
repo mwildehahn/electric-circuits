@@ -735,6 +735,10 @@ async fn a_join_waiting_on_a_stalled_reactivation_gives_up_and_asks_for_a_recrea
         None,
         "a timed-out join must retire the old shape so create can fall through"
     );
+    tokio::time::timeout(std::time::Duration::from_millis(50), engine.ensure_active("s1"))
+        .await
+        .expect("a repeat create after 410 must not rejoin the timed-out replay")
+        .unwrap();
     drop(outcome_tx);
 }
 
