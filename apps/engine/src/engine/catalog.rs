@@ -2594,9 +2594,9 @@ mod tests {
         assert_eq!(st.subscription_owner("sub-b"), Some(&"s1".to_string()), "the id index is restored too");
     }
 
-    /// A shape that cannot be re-registered is a restore failure, not an empty-catalog success.
-    /// The Postgres boot boundary must see this error before it starts serving, so it can apply
-    /// the ordinary retry/fatal boot classification instead of resuming from missing state.
+    /// A transport failure while checking a retained stream is a restore failure, not an
+    /// empty-catalog success. The Postgres boot boundary must see this error before it starts
+    /// serving, so it can apply the ordinary retry/fatal boot classification.
     #[tokio::test(flavor = "multi_thread")]
     async fn restore_failure_is_returned_to_the_boot_boundary() {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
@@ -2611,18 +2611,22 @@ mod tests {
         assert!(format!("{err:#}").contains("public.users"), "restore failure keeps shape context: {err:#}");
     }
 
-    /// Restore validates every retained shape stream before installing any record or routing
-    /// entry. A missing second stream must fail the whole restore, leaving the first valid shape
-    /// neither registered nor served; two present streams are the unaffected control.
+    /// A missing retained stream is a definitive storage answer: only that shape is retired and
+    /// the rest of the catalog restores with its sharing state intact.
     #[tokio::test(flavor = "multi_thread")]
-    async fn restore_preflights_all_shape_streams_atomically() {
+    async fn restore_retires_a_missing_shape_stream_and_restores_the_others() {
         fn dormant(id: &str, path: &str, table: &str) -> Vec<CatalogEvent> {
             let mut created = created_event(table);
             created["rec"]["id"] = serde_json::json!(id);
             created["rec"]["stream_path"] = serde_json::json!(path);
+            created["sig"] = serde_json::json!(format!("sig-{id}"));
             let created = serde_json::from_value::<CatalogEvent>(created).unwrap();
             let gate = crate::pg::SnapshotGate::passthrough();
-            vec![created, CatalogEvent::Dormant { id: id.to_string(), resume: pos(0, "5"), gate }]
+            vec![
+                created,
+                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200 },
+                CatalogEvent::Dormant { id: id.to_string(), resume: pos(0, "5"), gate },
+            ]
         }
 
         let missing_server = FakeDs::start().await;
@@ -2631,56 +2635,175 @@ mod tests {
             dormant("s1", "shape/s1", "public.users")
                 .into_iter()
                 .chain(dormant("s2", "shape/s2", "public.accounts"))
+                .chain(dormant("s3", "shape/s3", "public.events"))
                 .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
                 .collect(),
         );
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(missing_server.url()));
-        let err = engine
+        engine
             .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
             .await
-            .expect_err("a missing retained stream must fail the whole restore");
-        let detail = format!("{err:#}");
-        assert!(detail.contains("s2"), "restore error names the missing shape: {detail}");
+            .expect("a missing stream is retired while the rest of the catalog restores");
         let st = engine.state.lock().await;
-        assert!(st.shapes.is_empty(), "no restored shape is installed after preflight failure");
-        assert!(st.feed_shares.is_empty(), "no sharing/routing entry is installed after preflight failure");
+        assert_eq!(st.shapes.len(), 2);
+        assert!(st.shapes.contains_key("s1") && st.shapes.contains_key("s3"));
+        assert_eq!(st.feed_shares.len(), 2, "the surviving shapes retain their sharing entries");
+        assert_eq!(st.feed_shares["s1"].subs.get("sub-s1"), Some(&200));
+        assert_eq!(st.feed_shares["s3"].subs.get("sub-s3"), Some(&200));
+        assert!(!st.shapes.contains_key("s2"), "the missing shape is not installed");
         drop(st);
-        assert!(engine.table_stats(&TableRef::parse("public.users").unwrap()).await.is_none());
-        assert!(engine.table_stats(&TableRef::parse("public.accounts").unwrap()).await.is_none());
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        let events = missing_server.catalog_events();
+        assert!(events.iter().any(|event| event["t"] == "dropped" && event["id"] == "s2"), "{events:?}");
+        assert!(events.iter().any(|event| event["t"] == "retired" && event["id"] == "s2"), "{events:?}");
+        assert!(missing_server.deletes() >= 1, "the absent stream still takes the idempotent delete path");
+    }
+
+    /// A closed retained stream is the same definitive storage answer as a missing one: retire
+    /// just that shape and continue restoring the others.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_a_closed_shape_stream_and_restores_the_others() {
+        fn dormant(id: &str, table: &str) -> Vec<CatalogEvent> {
+            let mut created = created_event(table);
+            created["rec"]["id"] = serde_json::json!(id);
+            created["rec"]["stream_path"] = serde_json::json!(format!("shape/{id}"));
+            created["sig"] = serde_json::json!(format!("sig-{id}"));
+            let created = serde_json::from_value::<CatalogEvent>(created).unwrap();
+            vec![
+                created,
+                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200 },
+                CatalogEvent::Dormant {
+                    id: id.to_string(),
+                    resume: pos(0, "5"),
+                    gate: crate::pg::SnapshotGate::passthrough(),
+                },
+            ]
+        }
 
         let closed_server = FakeDs::start().await;
         closed_server.mark_stream_closed("shape/s2");
         let closed_fold = fold_of(
-            dormant("s1", "shape/s1", "public.users")
+            dormant("s1", "public.users")
                 .into_iter()
-                .chain(dormant("s2", "shape/s2", "public.accounts"))
+                .chain(dormant("s2", "public.accounts"))
+                .chain(dormant("s3", "public.events"))
                 .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
                 .collect(),
         );
         let closed_engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(closed_server.url()));
-        let err = closed_engine
+        closed_engine
             .apply_catalog(closed_fold, &HashMap::new(), RestoreMode::Resume)
             .await
-            .expect_err("a closed retained stream must fail the whole restore");
-        let detail = format!("{err:#}");
-        assert!(detail.contains("s2") && detail.contains("closed"), "restore error names the closed shape: {detail}");
-        assert!(closed_engine.state.lock().await.shapes.is_empty());
+            .expect("a closed stream is retired while the rest of the catalog restores");
+        let st = closed_engine.state.lock().await;
+        assert_eq!(st.shapes.len(), 2);
+        assert!(st.shapes.contains_key("s1") && st.shapes.contains_key("s3"));
+        assert_eq!(st.feed_shares.len(), 2);
+        assert!(!st.shapes.contains_key("s2"));
+        drop(st);
+        assert!(closed_engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        let events = closed_server.catalog_events();
+        assert!(events.iter().any(|event| event["t"] == "dropped" && event["id"] == "s2"), "{events:?}");
+        assert!(events.iter().any(|event| event["t"] == "retired" && event["id"] == "s2"), "{events:?}");
+        assert!(closed_server.deletes() >= 1);
+    }
 
-        let valid_server = FakeDs::start().await;
-        let valid_fold = fold_of(
-            dormant("s1", "shape/s1", "public.users")
-                .into_iter()
-                .chain(dormant("s2", "shape/s2", "public.accounts"))
-                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
-                .collect(),
-        );
-        let valid_engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(valid_server.url()));
-        valid_engine
-            .apply_catalog(valid_fold, &HashMap::new(), RestoreMode::Resume)
+    /// A connection error while preflighting a stream is not a definitive missing/closed answer
+    /// and therefore still aborts restore before any record is installed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_transport_failure_is_returned_before_installation() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            created,
+            CatalogEvent::Dormant {
+                id: "s1".to_string(),
+                resume: pos(0, "5"),
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        ]);
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let err = engine
+            .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
             .await
-            .expect("present open streams retain the existing restore behavior");
-        let st = valid_engine.state.lock().await;
-        assert_eq!(st.shapes.len(), 2, "the valid-stream control restores both records");
+            .expect_err("a stream HEAD connection error must abort restore");
+        assert!(format!("{err:#}").contains("checking shape s1 stream"));
+        assert!(engine.state.lock().await.shapes.is_empty());
+    }
+
+    /// This is the production SIGKILL window: the catalog has a Created event, but the stream PUT
+    /// never happened. Restore retires the orphan and still advances the id allocator past s7.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_a_shape_left_by_the_create_boot_window() {
+        let mut created = created_event("public.calendar_event");
+        created["rec"]["id"] = serde_json::json!("s7");
+        created["rec"]["stream_path"] = serde_json::json!("shape/s7");
+        let created = serde_json::from_value::<CatalogEvent>(created).unwrap();
+        let fold = fold_of(vec![created]);
+        let server = FakeDs::start().await;
+        server.mark_stream_missing("shape/s7");
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        engine
+            .apply_catalog(fold, &HashMap::new(), RestoreMode::Resume)
+            .await
+            .expect("the boot-window orphan is repaired by retirement");
+        assert_eq!(engine.state.lock().await.next_shape_id, 8);
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        let events = server.catalog_events();
+        assert!(events.iter().any(|event| event["t"] == "dropped" && event["id"] == "s7"), "{events:?}");
+        assert!(events.iter().any(|event| event["t"] == "retired" && event["id"] == "s7"), "{events:?}");
+    }
+
+    /// Once Dropped and Retired are both in the durable catalog, a second boot has no pending
+    /// retirement and does not probe or delete the stream again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_is_idempotent_after_a_boot_retirement_pair() {
+        let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
+        let fold = fold_of(vec![
+            created,
+            CatalogEvent::Dropped { id: "s1".into() },
+            CatalogEvent::Retired { id: "s1".into() },
+        ]);
+        let server = FakeDs::start().await;
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert_eq!(server.deletes(), 0);
+        assert!(server.catalog_events().is_empty());
+    }
+
+    /// Every definitive missing answer is handled independently; there is no count threshold that
+    /// turns a large orphan set back into a boot refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_three_missing_shape_streams_without_a_threshold() {
+        let events = (1..=3)
+            .flat_map(|n| {
+                let mut created = created_event("public.users");
+                created["rec"]["id"] = serde_json::json!(format!("s{n}"));
+                created["rec"]["stream_path"] = serde_json::json!(format!("shape/s{n}"));
+                let created = serde_json::from_value::<CatalogEvent>(created).unwrap();
+                [
+                    created,
+                    CatalogEvent::Dormant {
+                        id: format!("s{n}"),
+                        resume: pos(0, "5"),
+                        gate: crate::pg::SnapshotGate::passthrough(),
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let fold = fold_of(events);
+        let server = FakeDs::start().await;
+        for n in 1..=3 {
+            server.mark_stream_missing(&format!("shape/s{n}"));
+        }
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+        assert!(engine.state.lock().await.shapes.is_empty());
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        let catalog_events = server.catalog_events();
+        assert_eq!(catalog_events.iter().filter(|event| event["t"] == "dropped").count(), 3);
+        assert_eq!(catalog_events.iter().filter(|event| event["t"] == "retired").count(), 3);
+        assert_eq!(server.deletes(), 3);
     }
 
     /// Even a dormant-only catalog must fail closed when the existing sequencer command receiver
