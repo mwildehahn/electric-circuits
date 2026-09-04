@@ -437,8 +437,9 @@ pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
     // The boot also talks to durable-streams (the catalog fold, the change log). A storage server
     // that is not up yet is the same kind of "not yet" as a database that is not up yet — and in a
     // compose/Kubernetes start it is the NORMAL one — so it backs off rather than exiting 78. Only
-    // the transport is forgiven: a malformed catalog, a stream that is gone, an unusable
-    // ELECTRIC_CIRCUITS_DS_URL stay fatal (see `ds::is_unavailable`).
+    // the transport is forgiven: a malformed catalog, a change-log segment that is gone, an
+    // unusable ELECTRIC_CIRCUITS_DS_URL stay fatal (see `ds::is_unavailable`). A shape stream that
+    // is gone is not a boot failure at all any more — restore retires the record (ADR-0011).
     if crate::ds::is_unavailable(e) {
         return BootFailure::Retryable;
     }
