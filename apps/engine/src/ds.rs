@@ -1735,6 +1735,9 @@ mod tests {
         /// How many long-polls are answered with a transport failure before the rest are served
         /// normally (or parked). It models the store going away and the client reconnecting.
         pub(crate) fail_live_reads: std::sync::atomic::AtomicUsize,
+        /// How long each page takes to come back. Under `start_paused` this is virtual time, which
+        /// is how a test can say "the remaining span is ten minutes of pages" without spending any.
+        pub(crate) page_delay: Option<std::time::Duration>,
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
         pub(crate) head_status: u16,
@@ -1804,6 +1807,9 @@ mod tests {
                         .is_ok();
                 if stalled || (live && self.stall_live_reads) {
                     std::future::pending::<()>().await;
+                }
+                if let Some(delay) = self.page_delay {
+                    tokio::time::sleep(delay).await;
                 }
                 let keyed = {
                     let pages = self.pages_by_offset.lock().unwrap();

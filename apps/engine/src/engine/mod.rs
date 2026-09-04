@@ -500,6 +500,12 @@ pub struct Engine {
     /// Bounds concurrent dormant replays; each permit covers one replay scan and its page-sized
     /// transient allocations. Shapes joining an in-flight replay wait on its lifecycle channel.
     pub(crate) reactivation_permits: Arc<tokio::sync::Semaphore>,
+    /// Cancellation flags for in-flight replay scans, keyed by shape id. A scan that is still
+    /// paging for a shape nothing is waiting for any more (a join timeout purged it, the sweeper
+    /// evicted it) holds a reactivation permit until it happens to append — which a predicate that
+    /// matches nothing in the remaining span never does. Retiring a shape sets its flag; the scan
+    /// drops that target at the next page boundary and gives the permit back.
+    pub(crate) reactivation_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Pending same-table/cursor replay requests coalesced into one page scan.
     pub(crate) reactivation_batches:
         Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<crate::engine::lifecycle::ReplayBatch>>>>>,
@@ -1271,6 +1277,7 @@ impl Engine {
                     .unwrap_or(2)
                     .max(1),
             )),
+            reactivation_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reactivation_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconciler_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),

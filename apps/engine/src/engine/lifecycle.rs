@@ -1124,6 +1124,7 @@ impl Engine {
 
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
+        self.cancel_reactivation_scan(id);
         self.lives.lock().unwrap().remove(id);
         st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
@@ -1563,6 +1564,7 @@ impl Engine {
         // Replay everything the retained stream is missing (buffering live deltas meanwhile).
         let emitted = match self
             .replay_coalesced(
+                id,
                 ts.clone(),
                 rec.table.clone(),
                 pred.clone(),
@@ -1616,6 +1618,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn replay_coalesced(
         &self,
+        shape_id: &str,
         ts: TableSchema,
         table: TableRef,
         pred: Arc<CompiledPredicate>,
@@ -1663,8 +1666,14 @@ impl Engine {
                 batch
             }
         };
+        // Registered before the target is queued, so a retirement that lands while the batch is
+        // still coalescing (or waiting for a permit) is seen by the scan when it starts.
+        let purged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.reactivation_cancels.lock().unwrap().insert(shape_id.to_string(), purged.clone());
         batch.lock().unwrap().targets.push((
             crate::engine::sequencer::ReplayTarget {
+                shape_id: shape_id.to_string(),
+                purged,
                 ts,
                 table,
                 pred,
@@ -1677,7 +1686,17 @@ impl Engine {
             },
             tx,
         ));
-        rx.await.map_err(|_| anyhow::anyhow!("coalesced replay worker stopped"))?
+        let outcome = rx.await;
+        self.reactivation_cancels.lock().unwrap().remove(shape_id);
+        outcome.map_err(|_| anyhow::anyhow!("coalesced replay worker stopped"))?
+    }
+
+    /// Tell an in-flight replay scan that the shape it is scanning for is gone, so it can stop at
+    /// its next page instead of holding a reactivation permit for the rest of the span.
+    pub(crate) fn cancel_reactivation_scan(&self, id: &str) {
+        if let Some(purged) = self.reactivation_cancels.lock().unwrap().get(id) {
+            purged.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Move an idle refcount-0 shape from active to dormant: the sequencer unregisters its
@@ -1782,6 +1801,7 @@ impl Engine {
             }
             lives.remove(id);
         }
+        self.cancel_reactivation_scan(id);
         st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
             st.feed_by_sig.remove(&share.sig);

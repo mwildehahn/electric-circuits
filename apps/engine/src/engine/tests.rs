@@ -864,6 +864,8 @@ async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     let ts = users();
     let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
     let target = |path: &str| crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ts: ts.clone(),
         table: ts.table.clone(),
         pred: pred.clone(),
@@ -1019,6 +1021,8 @@ async fn replay_stops_at_admission_tail_when_the_log_grows() {
     let ts = users();
     let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
     let target = crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ts: ts.clone(),
         table: ts.table.clone(),
         pred,
@@ -1068,6 +1072,8 @@ async fn coalesced_reactivation_respects_distinct_page_cursors() {
     let ts = users();
     let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
     let target = |path: &str, offset: &str| crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ts: ts.clone(),
         table: ts.table.clone(),
         pred: pred.clone(),
@@ -1130,6 +1136,8 @@ async fn coalesced_reactivation_starts_at_the_earliest_cursor() {
     let ts = users();
     let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
     let target = |path: &str, offset: &str| crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ts: ts.clone(),
         table: ts.table.clone(),
         pred: pred.clone(),
@@ -2507,4 +2515,58 @@ async fn a_reconnect_re_attests_readiness_and_rederives_the_read_cap() {
         64 * 1024 * 1024,
         "the verdict re-derived on reconnect must be the one the read path uses"
     );
+}
+
+/// A join that times out purges the shape, but the coalesced scan replaying for it keeps a
+/// reactivation permit until its next append fails — and a predicate that matches nothing in the
+/// remaining span never appends, so it holds the permit for the whole span. Two such orphans
+/// serialise every other reactivation behind them, whose joiners then time out and purge in turn.
+/// The scan must notice the purge at a page boundary and give the permit back there.
+#[tokio::test(start_paused = true)]
+async fn a_purged_shapes_scan_returns_its_permit_at_the_next_page() {
+    // A long remaining span of pages that match nothing: no appends, so nothing else can tell the
+    // worker its shape is gone. One virtual second per page, ten virtual minutes in total.
+    let pages: Vec<(String, bool, String)> =
+        (1..=600).map(|n| (format!("0000000000000000_{:016}", n * 0x100), false, "[]".to_string())).collect();
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(pages),
+        head_offsets: std::sync::Mutex::new(vec!["0000000000000000_0000000000000200".into(); 8]),
+        page_delay: Some(std::time::Duration::from_secs(1)),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store));
+    let ts = users();
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        // The sequencer starts far ahead of the parked cursor, so the replay's fence is the whole
+        // scripted span rather than the first page.
+        *engine.seq_start.lock().unwrap() =
+            LogPosition { segment: 0, offset: "0000000000000000_0000009999999999".into() };
+        engine.ensure_sequencer(&mut st);
+    }
+    engine
+        .park_dormant_shape_for_test(
+            "s1",
+            "users",
+            LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+        )
+        .await;
+
+    let joined = engine.ensure_active("s1").await;
+    joined.expect_err("the join must give up and retire the identity");
+    assert_eq!(engine.shape_lifecycle("s1").await, None, "the timed-out join purges the shape");
+
+    let started = tokio::time::Instant::now();
+    let permits = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        engine.reactivation_permits.clone().acquire_many_owned(2),
+    )
+    .await
+    .expect("a scan whose shape was purged must return its permit at the next page, not at the end of the span")
+    .expect("the reactivation semaphore is never closed");
+    drop(permits);
+    assert!(started.elapsed() <= std::time::Duration::from_secs(3), "waited {:?}", started.elapsed());
 }

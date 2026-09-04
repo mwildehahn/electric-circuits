@@ -64,7 +64,11 @@ streak — the only reconnect signal the HTTP client offers — so a store upgra
 back to one that does not, changes the cap in force without a restart. If a
 live read nevertheless exceeds its cap, the sequencer records a typed cap failure, increments
 `sequencer_read_cap_failures_total`, logs an error, latches the engine `degraded`/not-ready status,
-and halts further reads until restart rather than retrying the same page forever. Reactivation latency can queue behind the semaphore. `changes_only` shapes
+and halts further reads until restart rather than retrying the same page forever. A scan whose shape is retired underneath it — a
+join timeout that purged the identity, a sweeper eviction — drops that target at the next page
+boundary and returns its permit there, rather than at its next append, which for a predicate that
+matches nothing in the remaining span never comes. Reactivation latency can queue behind the
+semaphore. `changes_only` shapes
 remain active and therefore consume their normal routing state because recreation would lose their
 dormant-period history. Durable Streams server paging (PR #4) improves the normal page size, but
 the engine-side cap remains mandatory defense in depth. Cross-segment span calculation HEADs each

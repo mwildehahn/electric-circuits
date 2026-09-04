@@ -1279,6 +1279,9 @@ pub(crate) async fn activate_shape(
 /// with the same `(table, segment, offset)`; each target still applies its own predicate/gate and
 /// appends to its own stream. A target append failure is isolated so other waiters can complete.
 pub(crate) struct ReplayTarget {
+    pub shape_id: String,
+    /// Set when the shape is retired underneath the scan (see `Engine::reactivation_cancels`).
+    pub purged: Arc<std::sync::atomic::AtomicBool>,
     pub ts: TableSchema,
     pub table: TableRef,
     pub pred: Arc<CompiledPredicate>,
@@ -1316,6 +1319,20 @@ pub(crate) async fn replay_changes_for_targets(
     let mut errors: Vec<Option<anyhow::Error>> = (0..targets.len()).map(|_| None).collect();
     let mut rotate_to = None;
     loop {
+        // A target whose shape has been retired is dropped HERE, at a page boundary, rather than at
+        // its next append: a selective predicate can match nothing for the whole remaining span, and
+        // until this scan ends it holds one of the engine's two reactivation permits.
+        for (idx, target) in targets.iter().enumerate() {
+            if errors[idx].is_none() && target.purged.load(Ordering::Relaxed) {
+                errors[idx] = Some(anyhow::anyhow!(
+                    "shape '{}' was retired while its change-log replay was still scanning",
+                    target.shape_id
+                ));
+            }
+        }
+        if errors.iter().all(Option::is_some) {
+            break;
+        }
         let page_start = crate::changelog::offset_bytes(&pos.offset);
         let rr = match ds.read_for_table(&pos.path(), &pos.offset, false, table.as_str()).await {
             Ok(rr) => rr,
