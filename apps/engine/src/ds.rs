@@ -1582,11 +1582,50 @@ pub(crate) use tests::ScriptedStore;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The effective read cap is process-wide state that `refresh_readiness` installs, so any test
+    /// that attests a store moves it under every other test in the same binary. Tests that read or
+    /// write it hold this guard: it serialises them and restores the previous values on drop, which
+    /// is what makes their assertions independent of scheduling order.
+    static READ_CAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) struct ReadCapTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        cap: u64,
+        max_value: u64,
+    }
+
+    impl Drop for ReadCapTestGuard {
+        fn drop(&mut self) {
+            EFFECTIVE_READ_MAX_BYTES.store(self.cap, std::sync::atomic::Ordering::Relaxed);
+            ADVERTISED_MAX_VALUE_BYTES.store(self.max_value, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn read_cap_test_guard() -> ReadCapTestGuard {
+        // A panicking test must not make every later one fail on a poisoned lock; the guard's whole
+        // job is restoring the statics, which the drop below does either way.
+        let lock = READ_CAP_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ReadCapTestGuard {
+            _lock: lock,
+            cap: EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            max_value: ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     #[test]
     fn read_body_cap_defaults_to_16_mib() {
+        // The default is a property of the sizing rule, not of whatever another test last attested.
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None),
+            16 * 1024 * 1024
+        );
+        // And with nothing installed, that is what the read path uses.
+        let _guard = read_cap_test_guard();
+        EFFECTIVE_READ_MAX_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(ds_read_max_bytes(), 16 * 1024 * 1024);
     }
-    use super::*;
 
     #[derive(Default)]
     pub(crate) struct ScriptedStore {
@@ -1931,6 +1970,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_is_reread_and_verdict_rederived_after_reconnect() {
+        let _guard = read_cap_test_guard();
         let identity = StoreIdentityV1::in_process_test_identity();
         let store = Arc::new(ScriptedStore { readiness_body: std::sync::Mutex::new(None), ..Default::default() });
         // Replace the helper's decoded value with a wire body for the first and second connections.
