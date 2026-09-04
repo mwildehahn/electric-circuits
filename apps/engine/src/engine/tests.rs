@@ -2570,3 +2570,82 @@ async fn a_purged_shapes_scan_returns_its_permit_at_the_next_page() {
     drop(permits);
     assert!(started.elapsed() <= std::time::Duration::from_secs(3), "waited {:?}", started.elapsed());
 }
+
+/// The other half of the pending-buffer bound: once the buffer is dropped, the shape must not be
+/// activated from what is left. Its stream would be missing exactly the changes the buffer was
+/// holding, and nothing downstream could tell. Activation refuses with a typed outcome instead, and
+/// the caller recreates from a fresh backfill.
+#[tokio::test(start_paused = true)]
+async fn an_overflowed_pending_buffer_refuses_activation() {
+    let envelope = |key: u64| {
+        format!(
+            "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"{}\"}},\"headers\":{{\"operation\":\"insert\"}}}}]",
+            "x".repeat(4096)
+        )
+    };
+    let offset = |n: u64| format!("0000000000000000_{n:016}");
+    let mut pages = HashMap::new();
+    pages.insert("-1".to_string(), (offset(1), false, envelope(1)));
+    for n in 1..4 {
+        pages.insert(offset(n), (offset(n + 1), false, envelope(n + 1)));
+    }
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        pages_by_offset: std::sync::Mutex::new(pages),
+        // Slow enough that the `BeginShape` below is handled before the first page arrives, which
+        // is what puts the buffer in front of the whole scripted write burst.
+        page_delay: Some(std::time::Duration::from_secs(1)),
+        ..Default::default()
+    });
+    let mut engine =
+        Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+    engine.retention = std::sync::Arc::new(crate::retention::RetentionConfig {
+        pending_buffer_max_bytes: 8 * 1024,
+        ..crate::retention::RetentionConfig::default()
+    });
+    let ts = users();
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    let cmd_tx = {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        engine.ensure_sequencer(&mut st).cmd_tx.clone()
+    };
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(crate::engine::sequencer::SequencerCmd::BeginShape {
+            table: ts.table.clone(),
+            shape_id: "s1".into(),
+            num_id: 1,
+            stream_path: "shape/s1".into(),
+            pred: std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap()),
+            out_cols: None,
+            kind: crate::engine::sequencer::CreateKind::Plain,
+            ack: ack_tx,
+        })
+        .unwrap();
+    ack_rx.await.expect("the pending buffer is registered");
+
+    // Let the scripted write burst run past the cap.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while crate::metrics::metrics().pending_buffer_overflows.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the buffer never overflowed");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(crate::engine::sequencer::SequencerCmd::ActivateShape {
+            table: ts.table.clone(),
+            shape_id: "s1".into(),
+            gate: crate::pg::SnapshotGate::passthrough(),
+            agg_seed: None,
+            emitted_seed: 0,
+            ready: ready_tx,
+        })
+        .unwrap();
+    let outcome = ready_rx.await.expect("the sequencer answers the activation");
+    assert!(
+        matches!(outcome, Err(crate::engine::sequencer::ActivateFailure::PendingBufferOverflow)),
+        "a shape whose buffered deltas were dropped must not be activated: {outcome:?}"
+    );
+}

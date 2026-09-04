@@ -64,7 +64,13 @@ streak — the only reconnect signal the HTTP client offers — so a store upgra
 back to one that does not, changes the cap in force without a restart. If a
 live read nevertheless exceeds its cap, the sequencer records a typed cap failure, increments
 `sequencer_read_cap_failures_total`, logs an error, latches the engine `degraded`/not-ready status,
-and halts further reads until restart rather than retrying the same page forever. A scan whose shape is retired underneath it — a
+and halts further reads until restart rather than retrying the same page forever. The other side of a permit wait is the shape's pending buffer: from the
+`BeginShape` ack until activation, every delta of its table is cloned into it, so the queue depth
+that bounds scan concurrency also lengthens the window that buffer grows over. It is capped per
+shape by `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` (default 64 MiB), counted in the executor heap
+walk so `GET /memory` shows it, and dropped whole past the cap — a prefix of a shape's missing
+deltas is a silently wrong stream, so activation refuses and the client recreates from a fresh
+backfill. A scan whose shape is retired underneath it — a
 join timeout that purged the identity, a sweeper eviction — drops that target at the next page
 boundary and returns its permit there, rather than at its next append, which for a predicate that
 matches nothing in the remaining span never comes. Reactivation latency can queue behind the

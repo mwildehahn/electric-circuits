@@ -58,7 +58,7 @@ pub(crate) enum SequencerCmd {
         agg_seed: Option<AggSeed>,
         /// Snapshot envelopes the creator appended (seeds the shape's emit counter).
         emitted_seed: u64,
-        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<(), ActivateFailure>>,
     },
     /// Creation failed after `BeginShape`: drop the pending buffer.
     AbortShape {
@@ -153,6 +153,8 @@ pub(crate) fn spawn_sequencer(
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
+    // Per-shape ceiling for the pending-creation buffer (see `buffer_pending`).
+    pending_buffer_max_bytes: u64,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -183,6 +185,7 @@ pub(crate) fn spawn_sequencer(
         start_paused,
         pause_gate,
         read_cap_latch,
+        pending_buffer_max_bytes,
         shutdown,
         party,
     ));
@@ -314,6 +317,31 @@ impl TableExec {
     }
 }
 
+/// Why `ActivateShape` refused. Typed because one of the two answers is actionable in a way a
+/// message is not: an overflowed pending buffer means this identity can never be brought up, and
+/// the caller must recreate from a fresh backfill instead of retrying.
+#[derive(Debug)]
+pub(crate) enum ActivateFailure {
+    /// The shape's pending buffer passed `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` and was
+    /// dropped, so the deltas it was holding are not anywhere any more.
+    PendingBufferOverflow,
+    Failed(String),
+}
+
+impl std::fmt::Display for ActivateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActivateFailure::PendingBufferOverflow => f.write_str(
+                "the pending-shape buffer exceeded ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES and was dropped; \
+                 this shape must be recreated from a fresh backfill",
+            ),
+            ActivateFailure::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ActivateFailure {}
+
 /// A shape between `BeginShape` and `ActivateShape`: buffers every processed delta of its table so
 /// activation can replay exactly what the backfill snapshot did not see (through the gate).
 pub(crate) struct PendingShape {
@@ -323,6 +351,46 @@ pub(crate) struct PendingShape {
     pub(crate) out_cols: Option<Arc<Vec<usize>>>,
     pub(crate) kind: CreateKind,
     pub(crate) buffered: Vec<Envelope>,
+    /// What `buffered` costs to hold, in the same unit `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` uses.
+    pub(crate) buffered_bytes: u64,
+    /// The buffer passed its cap and was dropped. The shape can no longer be activated from it —
+    /// its stream would be missing exactly the changes the buffer was holding — so activation
+    /// refuses and the caller recreates from a fresh backfill.
+    pub(crate) overflowed: bool,
+}
+
+impl crate::heap_size::HeapSize for PendingShape {
+    fn heap_bytes(&self) -> usize {
+        self.stream_path.heap_bytes() + self.buffered.heap_bytes()
+    }
+}
+
+/// Buffer one processed envelope for a pending shape, or refuse it because the shape's buffer is
+/// over its cap.
+///
+/// The buffer holds every delta of the table between `BeginShape` and `ActivateShape`. That window
+/// is a Postgres backfill for a create, and for a wake it is the replay — which now also includes
+/// the wait for a reactivation permit, so a burst of wakes behind two long scans lengthens it to
+/// "replay duration x queue depth". Unbounded, it is a write-rate-driven allocation with no ceiling
+/// and no owner. Bounded, the shape is retired and recreated from a fresh backfill, which is the
+/// same outcome an over-budget replay produces and one every client surface already handles.
+///
+/// The whole buffer is dropped on overflow rather than truncated: a prefix of the deltas is not a
+/// cheaper answer, it is a silently wrong stream.
+pub(crate) fn buffer_pending(pending: &mut PendingShape, env: &Envelope, cap: u64) -> bool {
+    if pending.overflowed {
+        return false;
+    }
+    let cost = crate::ds::envelope_memory_bytes(env);
+    if cap > 0 && pending.buffered_bytes.saturating_add(cost) > cap {
+        pending.overflowed = true;
+        pending.buffered = Vec::new();
+        pending.buffered_bytes = 0;
+        return false;
+    }
+    pending.buffered_bytes = pending.buffered_bytes.saturating_add(cost);
+    pending.buffered.push(env.clone());
+    true
 }
 
 /// Get (or lazily create) the executor for `table`; `None` if `table` is not a known table's
@@ -383,6 +451,7 @@ pub(crate) async fn sequencer_loop(
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
+    pending_buffer_max_bytes: u64,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
@@ -454,7 +523,16 @@ pub(crate) async fn sequencer_loop(
                         Some(exec) => {
                             exec.pending.insert(
                                 shape_id,
-                                PendingShape { num_id, stream_path, pred, out_cols, kind, buffered: Vec::new() },
+                                PendingShape {
+                                    num_id,
+                                    stream_path,
+                                    pred,
+                                    out_cols,
+                                    kind,
+                                    buffered: Vec::new(),
+                                    buffered_bytes: 0,
+                                    overflowed: false,
+                                },
                             );
                         }
                         None => tracing::error!("begin_shape: unknown table '{table}'"),
@@ -469,7 +547,7 @@ pub(crate) async fn sequencer_loop(
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
                     }
-                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
+                    let _ = ready.send(res);
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::AbortShape { table, shape_id }) => {
@@ -812,8 +890,18 @@ pub(crate) async fn sequencer_loop(
                             // Buffer for in-flight creations on this table: their `BeginShape` was
                             // acknowledged before the creator's snapshot, so everything the
                             // snapshot cannot contain lands in the buffer.
-                            for pending in exec.pending.values_mut() {
-                                pending.buffered.push(envs[k].clone());
+                            for (pending_id, pending) in exec.pending.iter_mut() {
+                                let was_overflowed = pending.overflowed;
+                                if !buffer_pending(pending, &envs[k], pending_buffer_max_bytes) && !was_overflowed {
+                                    metrics().pending_buffer_overflows.fetch_add(1, Ordering::Relaxed);
+                                    tracing::error!(
+                                        shape_id = pending_id,
+                                        cap_bytes = pending_buffer_max_bytes,
+                                        "pending shape buffer exceeded ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES \
+                                         while the shape was still being created or replayed; dropping the buffer \
+                                         and refusing activation, so the caller recreates from a fresh backfill"
+                                    );
+                                }
                             }
                             if let Err(e) = process_envelope(
                                 &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
@@ -1144,9 +1232,17 @@ pub(crate) async fn activate_shape(
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
     shutdown: &crate::shutdown::ShutdownToken,
-) -> Result<()> {
-    let exec = execs.get_mut(table.as_str()).with_context(|| format!("no executor for table '{table}'"))?;
-    let p = exec.pending.remove(shape_id).with_context(|| format!("no pending shape '{shape_id}' (aborted?)"))?;
+) -> std::result::Result<(), ActivateFailure> {
+    let exec = execs
+        .get_mut(table.as_str())
+        .ok_or_else(|| ActivateFailure::Failed(format!("no executor for table '{table}'")))?;
+    let p = exec
+        .pending
+        .remove(shape_id)
+        .ok_or_else(|| ActivateFailure::Failed(format!("no pending shape '{shape_id}' (aborted?)")))?;
+    if p.overflowed {
+        return Err(ActivateFailure::PendingBufferOverflow);
+    }
     if emitted_seed > 0 {
         emitted.insert(shape_id.to_string(), emitted_seed);
     }
@@ -1248,7 +1344,9 @@ pub(crate) async fn activate_shape(
             // Retried, not propagated on the first failure: at RESTORE this append's error is what
             // makes `apply_catalog` drop and retire an acknowledged aggregate, so one transient 503
             // during a boot used to delete a live subscription permanently.
-            ds.append_retrying(&p.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await?;
+            ds.append_retrying(&p.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown)
+                .await
+                .map_err(|e| ActivateFailure::Failed(format!("{e:#}")))?;
             exec.agg_index.insert(shape_id, &agg.pred);
             exec.aggregates.insert(shape_id.to_string(), agg);
         }
@@ -1522,7 +1620,10 @@ pub(crate) async fn backfill_and_activate(
     {
         return Err("sequencer is gone".to_string());
     }
-    ready_rx.await.unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))?;
+    ready_rx
+        .await
+        .unwrap_or_else(|_| Err(ActivateFailure::Failed("sequencer dropped the ready channel".to_string())))
+        .map_err(|e| e.to_string())?;
     Ok(stats)
 }
 
@@ -2110,5 +2211,102 @@ mod source_fence_tests {
         let subquery = handle(0);
         subquery.degrade.mark();
         assert!(!wait_for_source_effects(&subquery, &crate::shutdown::ShutdownToken::new()).await);
+    }
+}
+
+#[cfg(test)]
+mod pending_buffer_tests {
+    use super::*;
+    use crate::schema::TableDef;
+
+    fn users() -> TableSchema {
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "name": {"type":"text"} },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        TableSchema::from_def(&"users".into(), &def).unwrap()
+    }
+
+    fn envelope(key: u64, filler: usize) -> Envelope {
+        Envelope {
+            type_: "public.users".to_string(),
+            key: key.to_string(),
+            value: Some(serde_json::json!({ "id": key, "name": "x".repeat(filler) })),
+            old: None,
+            headers: crate::ds::EnvelopeHeaders {
+                operation: "insert".to_string(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        }
+    }
+
+    fn pending(ts: &TableSchema, buffered: Vec<Envelope>) -> PendingShape {
+        PendingShape {
+            num_id: 1,
+            stream_path: "shape/s1".to_string(),
+            pred: Arc::new(CompiledPredicate::compile_opt(None, ts).unwrap()),
+            out_cols: None,
+            kind: CreateKind::Plain,
+            buffered_bytes: buffered.iter().map(crate::ds::envelope_memory_bytes).sum(),
+            buffered,
+            overflowed: false,
+        }
+    }
+
+    /// The buffer is a ceiling, not a ration: past the cap the whole thing goes, because a prefix
+    /// of a shape's missing deltas is not a cheaper answer — it is a stream that is silently wrong.
+    /// The shape is retired and recreated from a fresh backfill instead.
+    #[test]
+    fn a_pending_buffer_stops_at_its_cap_and_drops_what_it_held() {
+        let ts = users();
+        let mut pending_shape = pending(&ts, Vec::new());
+        let cap = 8 * 1024;
+        let accepted = (0..100).filter(|key| buffer_pending(&mut pending_shape, &envelope(*key, 1024), cap)).count();
+        assert!(accepted > 0, "a buffer under its cap still buffers");
+        assert!(accepted < 100, "a buffer over its cap stops");
+        assert!(pending_shape.overflowed);
+        assert!(pending_shape.buffered.is_empty(), "the deltas it was holding are dropped, not truncated");
+        assert_eq!(pending_shape.buffered_bytes, 0);
+        assert!(
+            !buffer_pending(&mut pending_shape, &envelope(101, 1), cap),
+            "an overflowed buffer stays overflowed; it cannot half-recover"
+        );
+    }
+
+    /// `0` is the documented escape hatch, and it has to mean "no ceiling" rather than "zero bytes".
+    #[test]
+    fn a_zero_cap_means_no_cap() {
+        let ts = users();
+        let mut pending_shape = pending(&ts, Vec::new());
+        for key in 0..100 {
+            assert!(buffer_pending(&mut pending_shape, &envelope(key, 1024), 0));
+        }
+        assert!(!pending_shape.overflowed);
+        assert_eq!(pending_shape.buffered.len(), 100);
+    }
+
+    /// Everything the sequencer processes for a table while a shape of that table is between
+    /// `BeginShape` and `ActivateShape` is cloned into that shape's buffer. That is the term that
+    /// grows with the write rate times the replay duration times the permit queue depth, so it is
+    /// exactly the term `/memory` has to show.
+    #[test]
+    fn a_pending_shapes_buffer_is_reported_as_engine_memory() {
+        let ts = users();
+        let mut exec = TableExec::new(ts.clone());
+        let empty = crate::engine::introspection::exec_heap_bytes(&exec);
+        let buffered: Vec<Envelope> = (0..100).map(|key| envelope(key, 1024)).collect();
+        exec.pending.insert("s1".to_string(), pending(&ts, buffered));
+        let with_buffer = crate::engine::introspection::exec_heap_bytes(&exec);
+        assert!(
+            with_buffer - empty >= 100 * 1024,
+            "a pending shape's buffered deltas must be visible as engine memory, not invisible until OOM \
+             (reported growth: {} bytes)",
+            with_buffer - empty
+        );
     }
 }

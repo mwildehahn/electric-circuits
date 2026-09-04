@@ -91,6 +91,12 @@ pub struct RetentionConfig {
     /// takes longer than the gateway will wait, and a caller that is going to be cut off anyway is
     /// better served by an answer it can act on than by the gateway's 503.
     pub reactivation_join_timeout: Duration,
+    /// Per-shape ceiling for the buffer of live deltas a shape accumulates between `BeginShape` and
+    /// `ActivateShape` (`ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES`, default 64 MiB; 0 = no cap).
+    /// That window is a Postgres backfill for a create and a change-log replay for a wake — plus,
+    /// since replays are permit-gated, the wait for a permit, which makes the window "replay
+    /// duration x queue depth". Past the cap the buffer is dropped and the shape answers recreate.
+    pub pending_buffer_max_bytes: u64,
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -109,6 +115,7 @@ impl Default for RetentionConfig {
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
             reactivation_join_timeout: Duration::from_secs(20),
+            pending_buffer_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -146,6 +153,7 @@ impl RetentionConfig {
                 "ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS",
                 d.reactivation_join_timeout.as_secs(),
             )),
+            pending_buffer_max_bytes: env_u64("ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES", d.pending_buffer_max_bytes),
         }
     }
 }
@@ -407,6 +415,7 @@ mod tests {
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
             reactivation_join_timeout: Duration::from_secs(20),
+            pending_buffer_max_bytes: 64 * 1024 * 1024,
         }
     }
 

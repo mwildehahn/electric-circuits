@@ -1409,6 +1409,27 @@ impl Engine {
                                     // back as dormant with a resume position that will 404 on every
                                     // future touch. Subscribers get 404 / `stream-closed` and
                                     // recreate, which backfills them from Postgres.
+                                    // The buffer of live deltas this wake accumulated passed its
+                                    // cap and was dropped, so the shape can never be activated from
+                                    // it: retire the identity and answer recreate, the same
+                                    // outcome an over-budget replay produces and one every client
+                                    // surface already handles.
+                                    if err.downcast_ref::<crate::engine::PendingBufferOverflow>().is_some() {
+                                        tracing::error!("reactivating shape {id}: {err:#}");
+                                        if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                            life.state = LifeState::Dormant {
+                                                since: std::time::Instant::now(),
+                                                resume: resume.clone(),
+                                                gate: gate.clone(),
+                                            };
+                                        }
+                                        if let Err(e) = engine.evict_shape(&id, EvictReason::ReplayBudget).await {
+                                            tracing::warn!("retiring overflowed shape {id} failed: {e:#}");
+                                        }
+                                        metrics().reactivations_recreated.fetch_add(1, Ordering::Relaxed);
+                                        let _ = tx.send(Some(false));
+                                        return;
+                                    }
                                     if crate::ds::is_stream_gone(&err) {
                                         tracing::error!(
                                             "reactivating shape {id}: its change-log resume segment {} is gone \
@@ -1595,10 +1616,18 @@ impl Engine {
                 ready: ready_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-        ready_rx
-            .await
-            .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
-            .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e}"))?;
+        // An overflowed pending buffer is not a retryable failure: the deltas the shape needed are
+        // gone, so it is retired and recreated from a fresh backfill exactly as an over-budget
+        // replay is. Every other activation failure keeps its message.
+        match ready_rx.await.unwrap_or_else(|_| {
+            Err(crate::engine::sequencer::ActivateFailure::Failed("sequencer dropped the ready channel".to_string()))
+        }) {
+            Ok(()) => {}
+            Err(crate::engine::sequencer::ActivateFailure::PendingBufferOverflow) => {
+                return Err(anyhow::Error::new(PendingBufferOverflow { shape: id.to_string() }));
+            }
+            Err(other) => return Err(anyhow::anyhow!("shape '{id}' reactivation failed: {other}")),
+        }
         // The replay read the change log through the schema captured above; if the table drifted
         // meanwhile the shape has been retired underneath us and must not be reported live.
         if let Err(e) = self.ensure_schema_unchanged(&gens).await {

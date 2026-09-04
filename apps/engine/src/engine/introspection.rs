@@ -694,6 +694,11 @@ pub(crate) fn exec_heap_bytes(exec: &TableExec) -> usize {
         // Library mode's per-key row view (empty in Postgres mode) — the one term here that grows
         // with the DATA rather than with the shape count, so it has to be visible on `GET /memory`.
         + exec.library_rows.heap_bytes()
+        // Shapes between `BeginShape` and `ActivateShape` buffer every delta of their table. That
+        // window is a Postgres backfill for a create and a change-log replay (plus its wait for a
+        // reactivation permit) for a wake, so this term grows with the write rate for as long as
+        // the slowest of those runs — it belongs on `/memory`, not in the allocator's dark matter.
+        + exec.pending.heap_bytes()
 }
 
 /// Deep-dump one node's internal state for `GET /state/node` (see `SequencerCmd::DumpNode`).

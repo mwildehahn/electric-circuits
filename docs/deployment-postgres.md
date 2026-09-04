@@ -103,6 +103,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` | no | `2` | Maximum concurrent dormant replay scans. |
 | `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` | no | `20` | Bound on how long one request waits for an in-flight reactivation. Keep it under the gateway's read timeout (30s today); past it the request returns the typed recreate outcome while the replay continues. `0` = wait forever. |
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | no | `16777216` | Minimum replay span budget (16 MiB). |
+| `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | no | `67108864` | Per-shape ceiling for the deltas buffered while a shape is being created or woken. Past it the shape is retired and the client recreates it (`pending_buffer_overflows`). `0` = no ceiling. |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | no | `4` | Multiplier for replay admission against recorded backfill bytes. |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | no | `134217728` | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below. |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | no | `67108864` | Byte budget for one append when a large commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — outside that, the engine refuses to boot. |

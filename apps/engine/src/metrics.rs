@@ -113,6 +113,10 @@ pub struct Metrics {
     /// Touches that gave up waiting on an in-flight reactivation (`ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`).
     pub reactivation_joins_timed_out: AtomicU64,
     pub reactivation_bytes_scanned: AtomicU64,
+    /// Pending-shape buffers dropped for exceeding `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES`.
+    /// Each one is a create or wake that answers "recreate" instead of activating a shape whose
+    /// stream would be missing the deltas the buffer was holding.
+    pub pending_buffer_overflows: AtomicU64,
     pub reactivation_spans: AtomicU64,
     pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
@@ -197,6 +201,7 @@ pub fn metrics() -> &'static Metrics {
         reactivation_scans_coalesced: AtomicU64::new(0),
         reactivations_replayed: AtomicU64::new(0),
         reactivations_recreated: AtomicU64::new(0),
+        pending_buffer_overflows: AtomicU64::new(0),
         reactivations_evicted_unresumable: AtomicU64::new(0),
         reactivations_completed: AtomicU64::new(0),
         reactivations_failed: AtomicU64::new(0),
@@ -253,6 +258,7 @@ impl Metrics {
                 "reactivations_failed": self.reactivations_failed.load(Ordering::Relaxed),
                 "reactivation_joins_timed_out": self.reactivation_joins_timed_out.load(Ordering::Relaxed),
                 "reactivation_bytes_scanned": self.reactivation_bytes_scanned.load(Ordering::Relaxed),
+                "pending_buffer_overflows": self.pending_buffer_overflows.load(Ordering::Relaxed),
                 "reactivation_spans": self.reactivation_spans.load(Ordering::Relaxed),
                 "shapes_evicted": self.shapes_evicted.load(Ordering::Relaxed),
                 "retention_pressure": self.retention_pressure.load(Ordering::Relaxed),
@@ -301,6 +307,7 @@ impl Metrics {
         self.reactivation_scans_coalesced.store(0, Ordering::Relaxed);
         self.reactivations_replayed.store(0, Ordering::Relaxed);
         self.reactivations_recreated.store(0, Ordering::Relaxed);
+        self.pending_buffer_overflows.store(0, Ordering::Relaxed);
         self.reactivations_evicted_unresumable.store(0, Ordering::Relaxed);
         self.reactivations_completed.store(0, Ordering::Relaxed);
         self.reactivations_failed.store(0, Ordering::Relaxed);

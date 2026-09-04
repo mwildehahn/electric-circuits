@@ -204,6 +204,27 @@ pub struct ReactivationRecreate {
     pub reason: RecreateReason,
 }
 
+/// A pending shape's buffer of live deltas passed its cap and was dropped. The shape cannot be
+/// activated from it — its stream would be missing exactly those changes — so this is a recreate
+/// outcome, not a retry.
+#[derive(Debug)]
+pub(crate) struct PendingBufferOverflow {
+    pub shape: String,
+}
+
+impl std::fmt::Display for PendingBufferOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shape '{}' buffered more live change than ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES allows while it \
+             was being replayed; recreate it from a fresh backfill",
+            self.shape
+        )
+    }
+}
+
+impl std::error::Error for PendingBufferOverflow {}
+
 /// A transient changelog HEAD failure. Unlike a missing segment, it is not evidence that a
 /// dormant cursor is unrecoverable and must never trigger eviction.
 #[derive(Debug)]
@@ -1855,6 +1876,7 @@ impl Engine {
                 self.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire),
                 self.restore_reads_paused.clone(),
                 self.read_cap_failed.clone(),
+                self.retention.pending_buffer_max_bytes,
                 self.shutdown.clone(),
             ));
         }
