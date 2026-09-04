@@ -2361,3 +2361,104 @@ async fn ingest_progress_checkpoint_and_task_exit_are_not_source_receipts() {
         "only a durable SourceDrained catalog event can satisfy drained-through"
     );
 }
+
+/// A shape parked at the log start, woken while the sequencer is still consuming the log. The
+/// admission fence must be taken where the pending buffer STARTS — the sequencer's position at the
+/// `BeginShape` ack — not from the ingestor's tail at touch time. Everything the sequencer
+/// processes between those two points is past a touch-time fence (so the replay stops short of it)
+/// and predates the pending buffer (so nothing else carries it): on a store that cuts its last
+/// replay page before the tail, that is a silent, permanent gap in the reactivated stream.
+#[tokio::test]
+async fn a_wake_replays_up_to_where_the_pending_buffer_starts() {
+    let page = |next: &str, key: &str, up_to_date: bool| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"n\",\"active\":true}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    const FIRST: &str = "0000000000000000_0000000000000100";
+    const SECOND: &str = "0000000000000000_0000000000000200";
+    let mut pages = HashMap::new();
+    // The sequencer starts at the segment sentinel, the parked shape at byte 0: the same first page.
+    pages.insert("-1".to_string(), page(FIRST, "1", false));
+    pages.insert("0000000000000000_0000000000000000".to_string(), page(FIRST, "1", false));
+    pages.insert(FIRST.to_string(), page(SECOND, "2", true));
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        pages_by_offset: std::sync::Mutex::new(pages),
+        head_offsets: std::sync::Mutex::new(vec![SECOND.into(); 8]),
+        ..Default::default()
+    });
+    let engine =
+        Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+    let ts = users();
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        st.shapes.insert(
+            "s1".into(),
+            ShapeRecord {
+                id: "s1".into(),
+                table: ts.table.clone(),
+                stream_path: "shape/s1".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+                backfill_rows: Some(1),
+                backfill_bytes: Some(1024 * 1024),
+            },
+        );
+        engine.ensure_sequencer(&mut st);
+    }
+
+    // The sequencer consumes both pages BEFORE the shape is touched, exactly as it keeps consuming
+    // while the touch runs its admission HEADs. The ingestor tail never moves in this process, so
+    // its position is the stale fence a touch-time capture would install.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if engine.table_offset(&ts.table).await == Some(LogPosition { segment: 0, offset: SECOND.into() }) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the sequencer never reached the scripted tail");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        engine.changes_position() < LogPosition { segment: 0, offset: SECOND.into() },
+        "the ingestor tail must lag the sequencer for this to be the production race"
+    );
+
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+    engine.ensure_active("s1").await.expect("the wake must complete");
+
+    let keys: Vec<String> = store
+        .appended
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _, _)| path.ends_with("shape/s1"))
+        .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+        .map(|env| env.key)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["1".to_string(), "2".to_string()],
+        "every envelope the sequencer processed before the pending buffer existed must be replayed, exactly once"
+    );
+}

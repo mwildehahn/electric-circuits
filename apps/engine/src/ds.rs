@@ -1594,6 +1594,13 @@ mod tests {
         pub(crate) operations: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_read_body: bool,
         pub(crate) read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
+        /// Pages keyed by the offset the reader asked for. A single ordered log two readers share
+        /// (the sequencer's live tail and a replay scan) cannot be modelled by one pop-front queue:
+        /// whichever read arrives first consumes the other's page. When this map is non-empty it
+        /// takes over from `read_pages`: an offset it knows answers with that page, an offset it
+        /// does not know parks a live read (an idle long-poll) and answers a replay read with an
+        /// empty up-to-date page (the end of the log).
+        pub(crate) pages_by_offset: std::sync::Mutex<HashMap<String, (String, bool, String)>>,
         pub(crate) read_count: std::sync::atomic::AtomicUsize,
         /// Every offset a read was asked for, in order. A coalesced scan's routing is only correct
         /// if the scan STARTS at the earliest parked cursor, which is invisible from the pages.
@@ -1667,6 +1674,27 @@ mod tests {
                         .is_ok();
                 if stalled || (live && self.stall_live_reads) {
                     std::future::pending::<()>().await;
+                }
+                let keyed = {
+                    let pages = self.pages_by_offset.lock().unwrap();
+                    (!pages.is_empty()).then(|| pages.get(offset).cloned())
+                };
+                if let Some(keyed) = keyed {
+                    let mut res = response(200);
+                    match keyed {
+                        Some((next, up_to_date, body)) => {
+                            res.next_offset = Some(next);
+                            res.up_to_date = up_to_date;
+                            res.body = Some(Ok(body));
+                        }
+                        None if live => std::future::pending::<()>().await,
+                        None => {
+                            res.next_offset = Some(offset.to_string());
+                            res.up_to_date = true;
+                            res.body = Some(Ok("[]".to_string()));
+                        }
+                    }
+                    return Ok(res);
                 }
                 let mut res = response(200);
                 res.next_offset = Some("tempting-next-offset".to_string());

@@ -1345,7 +1345,6 @@ impl Engine {
                                 let (tx, rx) = tokio::sync::watch::channel(None);
                                 life.state = LifeState::Reactivating { done: rx.clone(), resume: resume.clone() };
                                 let engine = self.clone();
-                                let admitted_tail = engine.changes_position();
                                 let id = id.to_string();
                                 metrics().reactivations_started.fetch_add(1, Ordering::Relaxed);
                                 tokio::spawn(async move {
@@ -1388,9 +1387,7 @@ impl Engine {
                                         return;
                                     }
                                     metrics().reactivations_replayed.fetch_add(1, Ordering::Relaxed);
-                                    let res = engine
-                                        .resume_dormant(&id, resume.clone(), gate.clone(), admitted_tail.clone())
-                                        .await;
+                                    let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
                                     let err = match res {
                                         Ok(()) => {
                                             let mut lives = engine.lives.lock().unwrap();
@@ -1521,7 +1518,6 @@ impl Engine {
         id: &str,
         resume: LogPosition,
         gate: crate::pg::SnapshotGate,
-        admitted_tail: LogPosition,
     ) -> Result<()> {
         let (rec, ts, pred, out_cols, num_id, cmd_tx, gens) = {
             let mut st = self.state.lock().await;
@@ -1549,7 +1545,13 @@ impl Engine {
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-        ack_rx.await.map_err(|_| anyhow::anyhow!("sequencer dropped the begin-shape ack"))?;
+        // The fence for the replay comes back WITH the ack: it is the sequencer's published
+        // position at the instant this shape's pending buffer started collecting. Taking it any
+        // earlier (the ingestor's tail when the touch was accepted, before the admission HEADs and
+        // the state lock) leaves every envelope processed in between to neither the replay — which
+        // stops at the fence, and on a chunked store cuts its last page short of the tail — nor the
+        // buffer, which did not exist yet.
+        let buffer_start = ack_rx.await.map_err(|_| anyhow::anyhow!("sequencer dropped the begin-shape ack"))?;
         // Replay everything the retained stream is missing (buffering live deltas meanwhile).
         let emitted = match self
             .replay_coalesced(
@@ -1560,7 +1562,7 @@ impl Engine {
                 gate.clone(),
                 rec.stream_path.clone(),
                 resume.clone(),
-                Some(admitted_tail),
+                Some(buffer_start),
             )
             .await
         {

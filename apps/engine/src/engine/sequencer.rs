@@ -35,7 +35,13 @@ pub(crate) enum SequencerCmd {
         /// Output projection (column indices to emit), or `None` for the full row.
         out_cols: Option<Arc<Vec<usize>>>,
         kind: CreateKind,
-        ack: tokio::sync::oneshot::Sender<()>,
+        /// Acknowledges the buffer registration, carrying the sequencer's PUBLISHED change-log
+        /// position at that instant — the exact point the pending buffer starts from. A
+        /// reactivation replay fences its scan there: earlier envelopes are the replay's to
+        /// deliver, later ones are the buffer's, and the two meet with no gap. Any fence captured
+        /// before this ack (the ingestor's tail when the touch was accepted, say) leaves the
+        /// envelopes processed in between to neither.
+        ack: tokio::sync::oneshot::Sender<LogPosition>,
     },
     /// Phase 2: the creator's backfill snapshot has been appended chunk by chunk (plain) or folded
     /// into `agg_seed` (aggregates); drain the buffered deltas through the shape's snapshot gate
@@ -447,7 +453,7 @@ pub(crate) async fn sequencer_loop(
                         }
                         None => tracing::error!("begin_shape: unknown table '{table}'"),
                     }
-                    let _ = ack.send(());
+                    let _ = ack.send(published(&pos, &held_from));
                 }
                 Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, ready }) => {
                     let res = activate_shape(
@@ -1437,7 +1443,7 @@ pub(crate) async fn backfill_and_activate(
     // than appended as snapshot envelopes.
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
-    ack_rx: tokio::sync::oneshot::Receiver<()>,
+    ack_rx: tokio::sync::oneshot::Receiver<LogPosition>,
 ) -> std::result::Result<BackfillStats, String> {
     let abort = || {
         let _ = cmd_tx.send(SequencerCmd::AbortShape { table: table.clone(), shape_id: shape_id.to_string() });

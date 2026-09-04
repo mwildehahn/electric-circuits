@@ -66,4 +66,15 @@ remain active and therefore consume their normal routing state because recreatio
 dormant-period history. Durable Streams server paging (PR #4) improves the normal page size, but
 the engine-side cap remains mandatory defense in depth. Cross-segment span calculation HEADs each
 segment, subtracts the parked byte offset on the first, sums complete intermediate segments, and
-stops at the current processed tail.
+stops at the ingestor's current tail (`Engine::changes_position`), which over-estimates the span by
+the sequencer's lag — deliberately, since an admission budget must never under-count.
+
+The replay itself is fenced at a different, exact point: the change-log position the sequencer
+carries back in the `BeginShape` ack, which is where that shape's pending buffer starts collecting.
+Everything before the fence is the replay's to deliver, everything after it is the buffer's, and the
+two meet with neither a gap nor a dependency on how far apart the ingestor's tail and the
+sequencer's cursor are. A fence captured earlier — the ingestor tail at touch time, before the
+admission HEADs and the sequencer's state lock — would leave the envelopes processed in between to
+neither path: the replay stops at the fence (and against a store that pages, its last page ends
+short of the tail), and the buffer did not exist yet. Overlap is harmless because the replay appends
+absolute per-pk rows; a gap is permanent.
