@@ -418,6 +418,9 @@ impl From<anyhow::Error> for ApiError {
         if e.downcast_ref::<crate::engine::CreateRaced>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
+            // A deferred reactivation is retryable on this surface too: the shape still exists, so
+            // `must-refetch` would throw away a stream that is about to come back.
+            || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()
         {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1103,6 +1106,18 @@ mod tests {
         .into();
         assert!(error.must_refetch, "an Electric client must be told to refetch, not handed a 500");
         assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    /// A deferred reactivation is the one reactivation outcome that is NOT `must-refetch`: the
+    /// shape still exists and is about to come back, so telling the client to throw its stream away
+    /// would turn a retry into a full re-subscribe.
+    #[test]
+    fn a_deferred_reactivation_is_an_electric_retryable_response() {
+        let error: ApiError =
+            anyhow::Error::new(crate::engine::ReactivationDeferred::new("s1", "change-log HEAD unavailable")).into();
+        assert!(!error.must_refetch, "the shape is still there; refetching would discard a live stream");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(1));
     }
 
     #[test]

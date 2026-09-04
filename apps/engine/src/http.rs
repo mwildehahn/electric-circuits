@@ -1675,6 +1675,9 @@ impl From<anyhow::Error> for AppError {
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
         let retry_after = e.downcast_ref::<crate::engine::CreateRaced>().is_some()
+            // A deferred reactivation is the caller's to retry, not evidence of a broken engine:
+            // the shape is still there, parked back as dormant, and the next touch replays it.
+            || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
@@ -1758,6 +1761,65 @@ mod tests {
             reason: crate::engine::RecreateReason::OverBudget,
         }));
         assert_eq!(err.status, StatusCode::GONE);
+    }
+
+    /// A reactivation that DEFERRED — a transient HEAD failure on the change log, a replay page
+    /// the store never finished — is not a bug in the engine and not a state the caller can act on
+    /// by recreating: the shape is parked back as dormant and the next touch retries it. Answering
+    /// it with a bare 500 tells a client that backs off on 5xx the same thing a panic would, and
+    /// tells an operator watching error rates nothing. It is a retryable refusal, with the
+    /// `Retry-After` every other retryable refusal on these routes carries.
+    #[tokio::test]
+    async fn a_deferred_reactivation_is_retryable_not_a_server_fault() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore { head_status: 503, ..Default::default() });
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+        engine
+            .park_dormant_shape_for_test(
+                "s1",
+                "users",
+                crate::changelog::LogPosition { segment: 0, offset: "0".into() },
+            )
+            .await;
+        let app = router_with_introspection(engine, false);
+        let response = app.oneshot(Request::get("/shapes/s1/rows").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a deferred reactivation is a retryable refusal, not a server fault"
+        );
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a caller told to retry must be told when"
+        );
+    }
+
+    /// The three answers a reactivation can produce, side by side, because the value of each one
+    /// is that it is not the other two: retry this exact shape, get a replacement, or resolve a
+    /// name you gave to two shapes. A 500 is none of them.
+    #[test]
+    fn reactivation_outcomes_map_to_distinct_actionable_statuses() {
+        let deferred = AppError::from(anyhow::Error::new(crate::engine::ReactivationDeferred::new(
+            "s1",
+            "change-log HEAD unavailable",
+        )));
+        assert_eq!(deferred.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(deferred.retry_after, "a retryable refusal carries Retry-After");
+
+        let recreate = AppError::from(anyhow::Error::new(crate::engine::ReactivationRecreate {
+            shape: "shape/s1".into(),
+            reason: crate::engine::RecreateReason::JoinTimedOut,
+        }));
+        assert_eq!(recreate.status, StatusCode::GONE);
+        assert!(!recreate.retry_after, "the same shape is not coming back; retrying it is not the action");
+
+        let conflict = AppError::from(anyhow::Error::new(crate::engine::SubscriptionConflict {
+            subscription: "sub-1".into(),
+            shape: "s2".into(),
+        }));
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        assert!(!conflict.retry_after);
     }
 
     #[test]

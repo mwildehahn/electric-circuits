@@ -164,10 +164,37 @@ pub enum RecreateReason {
     /// shape is gone from the lifecycle map, so a create can fall through to a fresh one.
     OverBudget,
     /// The reactivation is admitted and still running, but the joining request reached
-    /// `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`. The shape is NOT retired and the detached
-    /// replay continues; only this request gives up.
+    /// `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`. The old identity is retired so a create
+    /// in the same request falls through to a fresh shape; the detached replay continues until it
+    /// notices its shape is gone.
     JoinTimedOut,
 }
+
+/// The touch could not complete and the shape is still there: a transient change-log HEAD failure,
+/// a replay page the store never finished, a reactivator that went away. The shape has been parked
+/// back as dormant and the next touch retries it, so this is a RETRYABLE refusal — distinct from
+/// [`ReactivationRecreate`], where the identity is gone and only a replacement will do, and from a
+/// 500, which says the engine is broken.
+#[derive(Debug)]
+pub struct ReactivationDeferred {
+    pub shape: String,
+    /// What the failed attempt reported, kept for the response body and the log line.
+    pub detail: String,
+}
+
+impl ReactivationDeferred {
+    pub(crate) fn new(shape: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { shape: shape.into(), detail: detail.into() }
+    }
+}
+
+impl std::fmt::Display for ReactivationDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shape '{}' reactivation was deferred ({}); retry the read", self.shape, self.detail)
+    }
+}
+
+impl std::error::Error for ReactivationDeferred {}
 
 /// The touch cannot return the retained shape; the caller should obtain a replacement rather than
 /// receive a generic 500. See [`RecreateReason`] for which of the two situations produced it.
@@ -1552,6 +1579,43 @@ impl Engine {
         self.source_receipts.lock().unwrap().insert(source_commit_id.to_owned(), receipt.clone());
         *self.last_source_receipt.lock().unwrap() = Some(receipt);
         self.source_receipt_progress.lock().unwrap().record(source_commit_id);
+    }
+
+    /// Park a shape as dormant from outside the engine module, for tests that drive a wake through
+    /// a public surface (an HTTP route) rather than through `Engine`'s private state.
+    #[cfg(test)]
+    pub(crate) async fn park_dormant_shape_for_test(&self, id: &str, table: &str, resume: LogPosition) {
+        {
+            let mut st = self.state.lock().await;
+            st.shapes.insert(
+                id.to_string(),
+                ShapeRecord {
+                    id: id.to_string(),
+                    table: table.into(),
+                    stream_path: format!("shape/{id}"),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                    backfill_rows: Some(1),
+                    backfill_bytes: Some(1),
+                },
+            );
+        }
+        self.lives.lock().unwrap().insert(
+            id.to_string(),
+            crate::retention::ShapeLife {
+                last_read: std::time::Instant::now(),
+                state: crate::retention::LifeState::Dormant {
+                    since: std::time::Instant::now(),
+                    resume,
+                    gate: crate::pg::SnapshotGate::passthrough(),
+                },
+            },
+        );
     }
 
     fn restore_failed_promotion_role(&self) {

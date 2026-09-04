@@ -1470,7 +1470,10 @@ impl Engine {
                                 if !self.lives.lock().unwrap().contains_key(id) {
                                     return Err(anyhow::Error::new(ReactivationRecreate::over_budget(id)));
                                 }
-                                bail!("shape '{id}' reactivation failed; retry the read")
+                                return Err(anyhow::Error::new(ReactivationDeferred::new(
+                                    id,
+                                    "the attempt failed and the shape was parked back as dormant",
+                                )));
                             }
                             None => {
                                 let changed = match deadline {
@@ -1497,7 +1500,12 @@ impl Engine {
                                         let _ = self.purge_shape(id).await;
                                         return Err(anyhow::Error::new(ReactivationRecreate::join_timed_out(id)));
                                     }
-                                    Err(_) => bail!("shape '{id}' reactivator died; retry the read"),
+                                    Err(_) => {
+                                        return Err(anyhow::Error::new(ReactivationDeferred::new(
+                                            id,
+                                            "the reactivator went away before publishing an outcome",
+                                        )));
+                                    }
                                 }
                             }
                         }
