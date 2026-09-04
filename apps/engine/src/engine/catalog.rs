@@ -983,7 +983,6 @@ impl CatalogFold {
     ///
     /// Deliberately does NOT consider `pending_retire`: this asks "is there anything to INSTALL",
     /// and the boot enqueues outstanding retirements before it consults this at all.
-    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.recs.is_empty() && self.start_pos == LogPosition::start()
     }
@@ -1135,7 +1134,7 @@ impl Engine {
     /// [`RestoreMode::Park`], record them and stop there.
     pub(crate) async fn apply_catalog(
         &self,
-        fold: CatalogFold,
+        mut fold: CatalogFold,
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
@@ -1195,13 +1194,12 @@ impl Engine {
             let mut st = self.state.lock().await;
             st.next_shape_id = st.next_shape_id.max(max + 1);
         }
-        let CatalogFold { mut recs, start_pos, start_highwater, max_shape_id: _, .. } = fold;
         // A definitive missing/closed HEAD is a durable shape record whose storage disappeared
         // while the engine was down. Remove it from the install set, write the durable drop intent,
         // and send its stream through the normal close-then-delete retirement path.
         let mut dead_streams: Vec<(String, String)> = Vec::new();
         for (id, reason) in boot_retire {
-            if let Some((rec, _, _, _)) = recs.remove(&id) {
+            if let Some((rec, _, _, _)) = fold.recs.remove(&id) {
                 tracing::warn!(
                     shape_id = %id,
                     stream_path = %rec.stream_path,
@@ -1214,13 +1212,14 @@ impl Engine {
                 dead_streams.push((id, rec.stream_path));
             }
         }
-        if recs.is_empty() && start_pos == LogPosition::start() {
+        if fold.is_empty() {
             for (id, path) in dead_streams {
                 self.retire_shape_stream(&id, &path).await;
             }
             self.release_restore_reads().await?;
             return Ok(());
         }
+        let CatalogFold { recs, start_pos, start_highwater, .. } = fold;
         let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The restored checkpoint IS durable (it was read back out of the log), so it is the
