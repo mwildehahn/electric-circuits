@@ -2649,3 +2649,77 @@ async fn an_overflowed_pending_buffer_refuses_activation() {
         "a shape whose buffered deltas were dropped must not be activated: {outcome:?}"
     );
 }
+
+/// Against a store that advertises no page, the client cap is a guess, not a contract: the store
+/// answers a read with the whole remainder of the stream, so a backlog over the cap is a normal
+/// operational state and not evidence of anything being wrong. Latching the engine degraded there
+/// is worse than the memory spike it avoids — the health check replaces the task, the restart reads
+/// from the same checkpoint, fails identically, and the task cycles forever, where the previous
+/// engine read the page whole and made progress. The cap is raised and the read retried instead.
+#[tokio::test]
+async fn an_uncapped_store_raises_the_read_ceiling_rather_than_latching_degraded() {
+    let _cap = crate::ds::read_cap_test_guard();
+    let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        // No `max_chunk_bytes`: the verdict is Unknown, which is every released store today.
+        readiness_body: std::sync::Mutex::new(Some(crate::ds::readiness_json(&identity))),
+        cap_breach_live_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    ds.refresh_readiness(&identity).await.expect("the boot attestation");
+    let boot_cap = crate::ds::ds_read_max_bytes();
+    assert_eq!(boot_cap, 64 * 1024 * 1024, "an uncapped store starts at the uncapped ceiling");
+
+    let engine = Engine::new_for_in_process_test(ds);
+    {
+        let mut st = engine.state.lock().await;
+        engine.ensure_sequencer(&mut st);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::ds::ds_read_max_bytes() == boot_cap {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an oversized read against an uncapped store must raise the ceiling and retry, not halt the engine"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(crate::ds::ds_read_max_bytes() > boot_cap);
+    assert_eq!(
+        engine.readiness_status(),
+        "active",
+        "a raised ceiling is a WARN, not a degraded engine the fleet will replace and replace again"
+    );
+}
+
+/// The other branch: a store that DID advertise a page and then answered with more than it
+/// promised is broken in a way a bigger buffer does not fix, so the latch stays.
+#[tokio::test]
+async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it() {
+    let _cap = crate::ds::read_cap_test_guard();
+    let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+    let paging =
+        crate::ds::readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{");
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        readiness_body: std::sync::Mutex::new(Some(paging)),
+        cap_breach_live_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    ds.refresh_readiness(&identity).await.expect("the boot attestation");
+    let engine = Engine::new_for_in_process_test(ds);
+    {
+        let mut st = engine.state.lock().await;
+        engine.ensure_sequencer(&mut st);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine.readiness_status() != "degraded" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a store that broke its own advertised page must still withdraw readiness"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}

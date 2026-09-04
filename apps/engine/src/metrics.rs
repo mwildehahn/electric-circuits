@@ -117,6 +117,9 @@ pub struct Metrics {
     /// Each one is a create or wake that answers "recreate" instead of activating a shape whose
     /// stream would be missing the deltas the buffer was holding.
     pub pending_buffer_overflows: AtomicU64,
+    /// Body-cap breaches answered by raising the ceiling and retrying (an uncapped store) rather
+    /// than by halting. Every one of these is a WARN and a bigger buffer than the last.
+    pub sequencer_read_cap_raised: AtomicU64,
     pub reactivation_spans: AtomicU64,
     pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
@@ -202,6 +205,7 @@ pub fn metrics() -> &'static Metrics {
         reactivations_replayed: AtomicU64::new(0),
         reactivations_recreated: AtomicU64::new(0),
         pending_buffer_overflows: AtomicU64::new(0),
+        sequencer_read_cap_raised: AtomicU64::new(0),
         reactivations_evicted_unresumable: AtomicU64::new(0),
         reactivations_completed: AtomicU64::new(0),
         reactivations_failed: AtomicU64::new(0),
@@ -259,6 +263,7 @@ impl Metrics {
                 "reactivation_joins_timed_out": self.reactivation_joins_timed_out.load(Ordering::Relaxed),
                 "reactivation_bytes_scanned": self.reactivation_bytes_scanned.load(Ordering::Relaxed),
                 "pending_buffer_overflows": self.pending_buffer_overflows.load(Ordering::Relaxed),
+                "sequencer_read_cap_raised": self.sequencer_read_cap_raised.load(Ordering::Relaxed),
                 "reactivation_spans": self.reactivation_spans.load(Ordering::Relaxed),
                 "shapes_evicted": self.shapes_evicted.load(Ordering::Relaxed),
                 "retention_pressure": self.retention_pressure.load(Ordering::Relaxed),
@@ -308,6 +313,7 @@ impl Metrics {
         self.reactivations_replayed.store(0, Ordering::Relaxed);
         self.reactivations_recreated.store(0, Ordering::Relaxed);
         self.pending_buffer_overflows.store(0, Ordering::Relaxed);
+        self.sequencer_read_cap_raised.store(0, Ordering::Relaxed);
         self.reactivations_evicted_unresumable.store(0, Ordering::Relaxed);
         self.reactivations_completed.store(0, Ordering::Relaxed);
         self.reactivations_failed.store(0, Ordering::Relaxed);

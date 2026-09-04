@@ -525,6 +525,71 @@ fn ds_read_deadline() -> std::time::Duration {
     )
 }
 
+/// The hard ceiling a raised cap may not pass. Above this a single read really is unserviceable and
+/// halting is the honest answer; below it, raising and retrying is what keeps an uncapped store's
+/// backlog moving.
+const DEFAULT_DS_READ_MAX_CEILING_BYTES: u64 = 512 * 1024 * 1024;
+
+fn ds_read_max_ceiling_bytes() -> u64 {
+    std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_CEILING_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DS_READ_MAX_CEILING_BYTES)
+}
+
+/// Whether the store this process attested advertises a page size. It decides what an oversized
+/// read MEANS: against a store that promised a page it is the store breaking its promise, and
+/// against one that promised nothing it is an ordinary backlog the client guessed too small for.
+static STORE_ADVERTISES_PAGE_CAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What to do about a read that exceeded the body cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapBreachOutcome {
+    /// Retry with this larger cap. Only an uncapped store, below the hard ceiling, with no operator-named cap.
+    Raise { limit: u64 },
+    /// Stop reading and withdraw readiness: nothing about a retry can make this read fit.
+    Latch,
+}
+
+/// The policy behind [`raise_read_cap_after_breach`], separated from the process statics so it can
+/// be exercised as the decision table it is.
+pub(crate) fn cap_after_breach(
+    advertises_page: bool,
+    configured: Option<u64>,
+    current: u64,
+    ceiling: u64,
+) -> CapBreachOutcome {
+    // A store that advertises a page and then answers with more than it advertised is broken in a
+    // way a bigger buffer does not fix, and hiding it behind a raised cap would lose the only
+    // signal that says so.
+    if advertises_page {
+        return CapBreachOutcome::Latch;
+    }
+    // An operator who named a cap has decided what this process may buffer. Raising it silently
+    // would be the engine overruling that decision on its own.
+    if configured.is_some() {
+        return CapBreachOutcome::Latch;
+    }
+    let raised = current.saturating_mul(2).min(ceiling);
+    if raised <= current { CapBreachOutcome::Latch } else { CapBreachOutcome::Raise { limit: raised } }
+}
+
+/// Decide what an oversized live read means for THIS process, and install the raised cap when the
+/// answer is to retry.
+pub(crate) fn raise_read_cap_after_breach() -> CapBreachOutcome {
+    let outcome = cap_after_breach(
+        STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed),
+        configured_ds_read_max_bytes(),
+        ds_read_max_bytes(),
+        ds_read_max_ceiling_bytes(),
+    );
+    if let CapBreachOutcome::Raise { limit } = outcome {
+        EFFECTIVE_READ_MAX_BYTES.store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+    outcome
+}
+
 /// The cap in force for this process, chosen at boot from the store's readiness. Zero means boot has
 /// not resolved it yet, in which case the configured or default value applies.
 static EFFECTIVE_READ_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -910,6 +975,8 @@ impl DsClient {
         EFFECTIVE_READ_MAX_BYTES
             .store(effective_read_max_bytes(verdict, configured), std::sync::atomic::Ordering::Relaxed);
         ADVERTISED_MAX_VALUE_BYTES.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        STORE_ADVERTISES_PAGE_CAP
+            .store(matches!(verdict, PageCapVerdict::Compatible { .. }), std::sync::atomic::Ordering::Relaxed);
         if let Some(advisory) = enforce_page_cap(verdict, ds_read_max_bytes(), require_ds_chunk_cap())? {
             warn_page_cap_once(&advisory);
         }
@@ -1672,12 +1739,14 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
         cap: u64,
         max_value: u64,
+        advertises_page: bool,
     }
 
     impl Drop for ReadCapTestGuard {
         fn drop(&mut self) {
             EFFECTIVE_READ_MAX_BYTES.store(self.cap, std::sync::atomic::Ordering::Relaxed);
             ADVERTISED_MAX_VALUE_BYTES.store(self.max_value, std::sync::atomic::Ordering::Relaxed);
+            STORE_ADVERTISES_PAGE_CAP.store(self.advertises_page, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1689,6 +1758,7 @@ mod tests {
             _lock: lock,
             cap: EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed),
             max_value: ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            advertises_page: STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1735,6 +1805,9 @@ mod tests {
         /// How many long-polls are answered with a transport failure before the rest are served
         /// normally (or parked). It models the store going away and the client reconnecting.
         pub(crate) fail_live_reads: std::sync::atomic::AtomicUsize,
+        /// How many long-polls come back as a body that breached the client cap, which is what an
+        /// uncapped store does when the backlog is bigger than the ceiling.
+        pub(crate) cap_breach_live_reads: std::sync::atomic::AtomicUsize,
         /// How long each page takes to come back. Under `start_paused` this is virtual time, which
         /// is how a test can say "the remaining span is ten minutes of pages" without spending any.
         pub(crate) page_delay: Option<std::time::Duration>,
@@ -1784,10 +1857,28 @@ mod tests {
             })
         }
 
-        fn read<'a>(&'a self, _path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a> {
+        fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.read_offsets.lock().unwrap().push(offset.to_string());
+                if live
+                    && self
+                        .cap_breach_live_reads
+                        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                            (n > 0).then(|| n - 1)
+                        })
+                        .is_ok()
+                {
+                    let limit = ds_read_max_bytes();
+                    let mut res = response(200);
+                    res.body = Some(Err(anyhow::Error::new(ReadCapExceeded {
+                        path: path.to_string(),
+                        observed: limit + 1,
+                        limit,
+                        max_value_bytes: None,
+                    })));
+                    return Ok(res);
+                }
                 if live
                     && self
                         .fail_live_reads
@@ -2120,6 +2211,38 @@ mod tests {
         );
         assert!(timeouts.read < timeouts.live_read, "an ordinary read must stay bounded more tightly than a long-poll");
         assert_eq!(timeouts.read.as_secs(), DEFAULT_DS_READ_TIMEOUT_SECS);
+    }
+
+    /// The decision table behind a body-cap breach, in one place: raise only where a bigger buffer
+    /// is what the situation actually calls for.
+    #[test]
+    fn a_cap_breach_raises_only_against_an_uncapped_store_below_the_ceiling() {
+        let ceiling = 512 * 1024 * 1024;
+        assert_eq!(
+            cap_after_breach(false, None, 64 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Raise { limit: 128 * 1024 * 1024 },
+            "an uncapped store's backlog is not a fault; make progress on it"
+        );
+        assert_eq!(
+            cap_after_breach(true, None, 16 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Latch,
+            "a store that broke a page it advertised must stay visible, not be papered over"
+        );
+        assert_eq!(
+            cap_after_breach(false, Some(16 * 1024 * 1024), 16 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Latch,
+            "an operator who named a cap decided what this process may buffer"
+        );
+        assert_eq!(
+            cap_after_breach(false, None, ceiling, ceiling),
+            CapBreachOutcome::Latch,
+            "past the hard ceiling a single read really is unserviceable"
+        );
+        assert_eq!(
+            cap_after_breach(false, None, 400 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Raise { limit: ceiling },
+            "the last raise stops at the ceiling rather than overshooting it"
+        );
     }
 
     #[tokio::test]

@@ -1087,10 +1087,29 @@ pub(crate) async fn sequencer_loop(
                 Err(e) => {
                     if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
                         metrics().sequencer_read_cap_failures.fetch_add(1, Ordering::Relaxed);
-                        read_cap_failed = true;
-                        read_cap_latch.store(true, Ordering::SeqCst);
-                        tracing::error!(path = %cap.path, observed = cap.observed, limit = cap.limit,
-                            "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
+                        // Against a store that advertises no page — every released durable-streams
+                        // build — a read bigger than the cap is an ordinary backlog, not a broken
+                        // store: the whole remainder of the stream comes back in one response.
+                        // Halting there costs more than the memory it saves. The health check
+                        // replaces the task, the restart re-reads from the same checkpoint, and the
+                        // task cycles until an operator intervenes, where the previous engine read
+                        // the page whole and made progress. So the ceiling is raised, the read
+                        // retried, and the latch kept for a store that broke a page it advertised
+                        // or a backlog past the hard ceiling.
+                        match crate::ds::raise_read_cap_after_breach() {
+                            crate::ds::CapBreachOutcome::Raise { limit } => {
+                                metrics().sequencer_read_cap_raised.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(path = %cap.path, observed = cap.observed, was = cap.limit, now = limit,
+                                    "a Durable Streams read exceeded the client body cap against a store that                                      advertises no page; raising the cap and retrying. Deploy a store that pages,                                      or name a cap this process should not exceed");
+                                back_off(&shutdown, std::time::Duration::from_millis(200)).await;
+                            }
+                            crate::ds::CapBreachOutcome::Latch => {
+                                read_cap_failed = true;
+                                read_cap_latch.store(true, Ordering::SeqCst);
+                                tracing::error!(path = %cap.path, observed = cap.observed, limit = cap.limit,
+                                    "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
+                            }
+                        }
                     } else {
                         tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
                         // The next read reconnects, and a store's page capability is boot state
