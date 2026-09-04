@@ -103,16 +103,17 @@ Three ideas carry the whole design:
   and reported by `GET /memory`, and **exact from boot**: library mode has no catalog checkpoint to
   resume from, so a starting process replays the change log from its origin and rebuilds the view
   in full. Postgres mode allocates none of it.
-- **Absolute emission** covers the one reader that is not at the log's head. A shape reactivating
-  out of dormancy replays the change log from *its* resume position, where the per-key view does
-  not apply, so each old-less envelope states that shape's membership outright: matches the
-  predicate now ⇒ `upsert`, otherwise ⇒ `delete <key>` (`engine::output::absolute_envelope`; the
-  rule the subquery registry uses, §6, for the same reason — a delta with no `-1` half cannot
-  express a move-out). A delete for a key the shape never held is a deliberate no-op. On the live
-  path the rule costs a visit to every shape on the table, so it is reserved for envelopes that
-  genuinely have no before-image. What remains is library mode's lack of a **backfill**: a shape or
-  aggregate created at time T holds only what changed after T (aggregates never go dormant, so the
-  replay path never applies to one). The delta algebra
+- **Absolute emission** is used by the library-mode dormant reader, which is not backed by
+  Postgres before-images. It replays the change log from *its* resume position, where the per-key
+  view does not apply, so each old-less envelope states that shape's membership outright: matches
+  the predicate now ⇒ `upsert`, otherwise ⇒ `delete <key>` (`engine::output::absolute_envelope`;
+  the rule the subquery registry uses, §6, for the same reason — a delta with no `-1` half cannot
+  express a move-out). Postgres-mode replay retains the replicated `old` image and uses ordinary
+  deltas; it does not claim absolute emission. A delete for a key the shape never held is a
+  deliberate no-op. On the live path the rule costs a visit to every shape on the table, so it is
+  reserved for envelopes that genuinely have no before-image. What remains is library mode's lack
+  of a **backfill**: a shape or aggregate created at time T holds only what changed after T
+  (aggregates never go dormant, so the replay path never applies to one). The delta algebra
   is [`dbsp`](https://crates.io/crates/dbsp)'s — `Tup2` and `ZWeight` are dbsp's own, and
   `Value`/`Row` carry the `DBData` derive stack. Routing- and fallback-tier shapes are evaluated
   by plain Rust (key routing + stateless predicate evaluation; internals doc §1); the circuit
@@ -357,7 +358,7 @@ restart resumes in the right stream. A closed segment whose pointer this process
 checkpoint it booted from was already past it) steps to **exactly** the next segment, verified to
 exist; jumping to the first open segment would skip the closed ones in between, which are unread
 changes. A closed segment with **no** successor is refused — logged and backed off, never skipped
-past. `replay_changes_for_shape` — the dormant reactivation path — follows the same pointers, one
+past. The coalesced dormant reactivation scanner follows the same pointers, one
 segment at a time, until it reaches the tail of the open segment.
 
 Shape creation is **two-phase** so a Postgres backfill never stalls the pipeline: `BeginShape`
@@ -784,7 +785,7 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
-| subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
+| subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
 | catalog event → fold | every event carries an `eid` assigned at enqueue; the boot fold applies an `eid` at most once | the writer's retry-in-place (a response lost after the append committed) can never double-apply a join, a leave, a drop or a rotation |
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
@@ -936,7 +937,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_checked`, `append_reliable`, `head`, `close_stream`, `retire_stream`, `delete_stream`, reads |
 | `apps/engine/src/changelog.rs` | the segmented change log (ADR-0006): `LogPosition`, the control envelope, the rotation writer + boot walk-forward, the segment-deletion planner |
 | `apps/engine/src/http.rs` | control-plane HTTP |
-| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
+| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant eviction and active non-parkable retirement |
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |

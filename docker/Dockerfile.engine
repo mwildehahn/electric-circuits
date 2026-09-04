@@ -13,6 +13,10 @@ FROM rust:1.96.0-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# `.cargo/config.toml` bakes JEMALLOC_SYS_WITH_MALLOC_CONF into the allocator. jemalloc reads its
+# configuration before `main`, and the prefixed `_rjem_` build ignores the runtime `MALLOC_CONF`
+# name entirely, so leaving this out ships an image with jemalloc's default (never-returning) decay.
+COPY .cargo .cargo
 COPY apps/engine apps/engine
 RUN cargo build --release --locked -p electric-circuits-engine
 

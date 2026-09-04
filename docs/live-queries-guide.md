@@ -278,7 +278,7 @@ engine, each holding its own named **subscription** — always `close()` what yo
 one-shot, and now safe to repeat on the wire too: it releases a claim by name, so a retry after a
 lost response cannot take another subscriber's). A subscription is also a **lease**: the client
 renews it automatically while the query is open, because native reads bypass the engine and a claim
-nobody renews is released after `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (see
+nobody renews is released after `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (see
 `docs/adr/0008-subscriptions-are-identified-idempotent-and-leased.md`).
 
 ## 8. See also

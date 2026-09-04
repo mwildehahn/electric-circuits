@@ -38,6 +38,15 @@ async fn managed_public_traffic_waits_for_full_engine_readiness_after_claim() {
 }
 
 #[tokio::test]
+async fn live_read_cap_failure_withdraws_readiness_once() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    assert_eq!(engine.readiness_status(), "active");
+    engine.read_cap_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(engine.readiness_status(), "degraded");
+    assert_eq!(engine.readiness_status(), "degraded");
+}
+
+#[tokio::test]
 async fn quiesce_requires_a_receipt_after_admission_is_preclosed_and_drained() {
     let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     assert!(engine.ensure_control_admitted().is_ok());
@@ -539,6 +548,8 @@ async fn graph_includes_counts_pipeline_and_consumers() {
             is_subquery: false,
             aggregate: Some(AggInfo { func: AggFn::Count, col: None }),
             fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
         },
     );
 
@@ -669,6 +680,527 @@ fn users() -> TableSchema {
     }))
     .unwrap();
     TableSchema::from_def(&"users".into(), &def).unwrap()
+}
+
+#[tokio::test]
+async fn reactivation_concurrency_never_exceeds_two_scans() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let semaphore = engine.reactivation_permits.clone();
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let semaphore = semaphore.clone();
+        let active = active.clone();
+        let maximum = maximum.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.unwrap();
+            let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(maximum.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+}
+
+/// A dormant wake is detached and unbounded; the joining request is not. In production a large-span
+/// replay ran ~40s while the API gateway's read timeout is 30s, so the client got a 503 with nothing
+/// to act on. The join must give up first and hand back the same typed recreate outcome an
+/// over-budget wake produces, while the reactivation itself keeps running.
+#[tokio::test(start_paused = true)]
+async fn a_join_waiting_on_a_stalled_reactivation_gives_up_and_asks_for_a_recreate() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    // A reactivation that never publishes an outcome: the sender is held for the whole test, so the
+    // join's watch channel stays pending exactly as it does behind a change-log page that stalls.
+    let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
+    engine.lives.lock().unwrap().insert(
+        "s1".to_string(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Reactivating {
+                done: outcome_rx,
+                resume: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+            },
+        },
+    );
+    let started = tokio::time::Instant::now();
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(600), engine.ensure_active("s1"))
+        .await
+        .expect("the join must bound its own wait, not run until the caller's deadline");
+    let error = joined.expect_err("a join that gave up must not report the shape active");
+    let recreate = error
+        .downcast_ref::<crate::engine::ReactivationRecreate>()
+        .expect("the give-up must be the same typed recreate outcome an over-budget wake returns");
+    assert_eq!(recreate.reason, crate::engine::RecreateReason::JoinTimedOut);
+    let waited = started.elapsed();
+    assert!(waited >= std::time::Duration::from_secs(20), "waited {waited:?}, below the configured bound");
+    assert!(waited < std::time::Duration::from_secs(30), "waited {waited:?}, past the gateway's 30s timeout");
+    assert_eq!(
+        engine.shape_lifecycle("s1").await,
+        None,
+        "a timed-out join must retire the old shape so create can fall through"
+    );
+    tokio::time::timeout(std::time::Duration::from_millis(50), engine.ensure_active("s1"))
+        .await
+        .expect("a repeat create after 410 must not rejoin the timed-out replay")
+        .unwrap();
+    drop(outcome_tx);
+}
+
+#[tokio::test]
+async fn dormant_replay_retirement_ignores_a_provisional_join_claim() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let mut state = engine.state.lock().await;
+    state.shapes.insert(
+        "s1".into(),
+        ShapeRecord {
+            id: "s1".into(),
+            table: "users".into(),
+            stream_path: "shape/s1".into(),
+            changes_only: false,
+            where_json: None,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: None,
+            fingerprint: None,
+            backfill_rows: Some(1),
+            backfill_bytes: Some(1),
+        },
+    );
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(crate::engine::ShareOutcome::Ready);
+    let _ = ready_tx;
+    let sig = crate::engine::shape_signature(&"users".into(), &None, &None, false);
+    state.feed_by_sig.insert(sig.clone(), "s1".into());
+    let mut share = crate::engine::FeedShare { sig, subs: Default::default(), ready: ready_rx };
+    share.subs.insert("joiner".into(), crate::changelog::now_secs());
+    state.feed_shares.insert("s1".into(), share);
+    drop(state);
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+
+    let evicted = engine.evict_shape("s1", crate::retention::EvictReason::ReplayBudget).await.unwrap();
+    assert_eq!(evicted, crate::retention::Evicted::Yes, "a provisional join must not block replay retirement");
+}
+
+#[tokio::test]
+async fn advertised_lease_matches_subscription_lease_timeout() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    assert_eq!(
+        engine.lease_seconds(),
+        engine.retention.subscription_lease_timeout.as_secs(),
+        "leaseSeconds must describe the enforced subscription lease, not dormancy idle timeout"
+    );
+}
+
+#[tokio::test]
+async fn transient_replay_head_failure_is_deferred_not_evicted() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore { head_status: 503, ..Default::default() });
+    let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store));
+    {
+        let mut state = engine.state.lock().await;
+        state.shapes.insert(
+            "s1".into(),
+            ShapeRecord {
+                id: "s1".into(),
+                table: "users".into(),
+                stream_path: "shape/s1".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+                backfill_rows: Some(1),
+                backfill_bytes: Some(1),
+            },
+        );
+    }
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+    engine.retention_sweep().await;
+    assert!(engine.get_shape("s1").await.is_some(), "a transient HEAD error must not evict a retained shape");
+}
+
+#[tokio::test]
+async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        head_offsets: std::sync::Mutex::new(vec![
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+        ]),
+        read_pages: std::sync::Mutex::new(vec![
+            ("tail".into(), true, "[{\"type\":\"public.users\",\"key\":\"1\",\"value\":{\"id\":1,\"name\":\"a\",\"active\":true},\"headers\":{\"operation\":\"insert\",\"offset\":\"0\"}}]".into()),
+        ]),
+        fail_append_path: Some("shape/fail".into()),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = |path: &str| crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred: pred.clone(),
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: path.into(),
+        from: LogPosition { segment: 0, offset: "0".into() },
+        library_mode: true,
+        until: None,
+    };
+    let results = crate::engine::sequencer::replay_changes_for_targets(
+        &ds,
+        vec![target("shape/ok"), target("shape/fail")],
+        &crate::shutdown::ShutdownToken::new(),
+    )
+    .await;
+    assert!(results[0].is_ok(), "one shape must complete despite another append failing");
+    assert!(results[1].is_err(), "the failing shape must receive its own error");
+    assert_eq!(store.read_count.load(std::sync::atomic::Ordering::Relaxed), 1, "one page read must serve both shapes");
+}
+
+/// The detached wake half of the same production incident the join-timeout regression covers from
+/// the caller's side. A store that accepts the replay `GET` and then never finishes the response
+/// leaves the coalesced worker parked in `read_for_table` **holding a reactivation permit**: the
+/// shape never leaves `Reactivating`, and because the engine only ever grants two permits, every
+/// later reactivation queues behind one nothing will return. Bounding the read is what lets the
+/// permit come back and the retired identity be recreated.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_replay_page_returns_its_reactivation_permit_and_leaves_a_recreatable_shape() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        head_offsets: std::sync::Mutex::new(vec![
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+            "0000000000000000_0000000000000100".into(),
+        ]),
+        // Exactly one replay page is accepted and never finished; the sequencer's own tail read
+        // parks the way an idle long-poll does so it cannot spin through this test.
+        stall_nonlive_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store));
+    let ts = users();
+    {
+        let mut state = engine.state.lock().await;
+        state.tables.insert(ts.table.clone(), ts.clone());
+        state.shapes.insert(
+            "s1".into(),
+            ShapeRecord {
+                id: "s1".into(),
+                table: ts.table.clone(),
+                stream_path: "shape/s1".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+                backfill_rows: Some(1),
+                backfill_bytes: Some(1),
+            },
+        );
+    }
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(600), engine.ensure_active("s1"))
+        .await
+        .expect("the join must bound its own wait even behind a replay page that never arrives");
+    joined.expect_err("a reactivation whose replay page never arrived is not an active shape");
+
+    // The permit is the shared resource the stall was pinning: reclaiming BOTH of them proves the
+    // detached worker gave its own back rather than parking in the read forever.
+    let reclaimed = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        engine.reactivation_permits.clone().acquire_many_owned(2),
+    )
+    .await
+    .expect("a replay page that never arrives must release its reactivation permit, not pin it forever")
+    .expect("the reactivation semaphore is never closed");
+    drop(reclaimed);
+
+    assert_eq!(
+        engine.shape_lifecycle("s1").await,
+        None,
+        "a stalled reactivation must not strand the shape in `Reactivating`"
+    );
+    tokio::time::timeout(std::time::Duration::from_millis(50), engine.ensure_active("s1"))
+        .await
+        .expect("a create for the same predicate must fall through, not rejoin the abandoned replay")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ensure_active_burst_coalesces_more_than_two_same_table_shapes() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let (tx, rx) = tokio::sync::watch::channel(Some(true));
+    for n in 1..=4 {
+        let id = format!("s{n}");
+        engine.lives.lock().unwrap().insert(
+            id,
+            crate::retention::ShapeLife {
+                last_read: std::time::Instant::now(),
+                state: crate::retention::LifeState::Reactivating {
+                    done: rx.clone(),
+                    resume: LogPosition { segment: 0, offset: "0".into() },
+                },
+            },
+        );
+    }
+    let (a, b, c, d) = tokio::join!(
+        engine.ensure_active("s1"),
+        engine.ensure_active("s2"),
+        engine.ensure_active("s3"),
+        engine.ensure_active("s4")
+    );
+    assert!(a.is_ok() && b.is_ok() && c.is_ok() && d.is_ok());
+    assert!(crate::metrics::metrics().reactivations_coalesced.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+    drop(tx);
+}
+
+#[tokio::test]
+async fn replay_stops_at_admission_tail_when_the_log_grows() {
+    let page = |next: &str, key: &str, up_to_date: bool| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key}}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![
+            page("0000000000000000_0000000000000100", "1", false),
+            page("0000000000000000_0000000000000200", "2", true),
+        ]),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred,
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: "shape/frontier".into(),
+        from: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+        library_mode: true,
+        until: Some(LogPosition { segment: 0, offset: "0000000000000000_0000000000000100".into() }),
+    };
+    crate::metrics::metrics().reactivation_bytes_scanned.store(0, std::sync::atomic::Ordering::Relaxed);
+    let result =
+        crate::engine::sequencer::replay_changes_for_targets(&ds, vec![target], &crate::shutdown::ShutdownToken::new())
+            .await;
+    assert!(result[0].is_ok());
+    assert_eq!(
+        store.read_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "growth after admission belongs to live ingestion"
+    );
+    assert_eq!(crate::metrics::metrics().reactivation_bytes_scanned.load(std::sync::atomic::Ordering::Relaxed), 100);
+    let body = &store.appended.lock().unwrap()[0].2;
+    let envelopes: Vec<Envelope> = serde_json::from_slice(body).unwrap();
+    assert_eq!(envelopes.iter().map(|env| env.key.as_str()).collect::<Vec<_>>(), vec!["1"]);
+}
+
+#[tokio::test]
+async fn coalesced_reactivation_respects_distinct_page_cursors() {
+    let page = |next: &str, up_to_date: bool, key: u64| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"n\",\"active\":true}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![
+            page("0000000000000000_0000000000000100", false, 1),
+            page("0000000000000000_0000000000000200", false, 2),
+            page("0000000000000000_0000000000000300", true, 3),
+        ]),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = |path: &str, offset: &str| crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred: pred.clone(),
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: path.into(),
+        from: LogPosition { segment: 0, offset: offset.into() },
+        library_mode: true,
+        until: None,
+    };
+    let results = crate::engine::sequencer::replay_changes_for_targets(
+        &ds,
+        vec![
+            target("shape/a", "0000000000000000_0000000000000000"),
+            target("shape/b", "0000000000000000_0000000000000100"),
+            target("shape/c", "0000000000000000_0000000000000200"),
+        ],
+        &crate::shutdown::ShutdownToken::new(),
+    )
+    .await;
+    assert!(results.iter().all(Result::is_ok));
+    let appended = store.appended.lock().unwrap();
+    let keys = |path: &str| {
+        appended
+            .iter()
+            .filter(|(p, _, _)| p.ends_with(path))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+            .map(|env| env.key)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys("shape/a"), vec!["1", "2", "3"]);
+    assert_eq!(keys("shape/b"), vec!["2", "3"]);
+    assert_eq!(keys("shape/c"), vec!["3"]);
+}
+
+/// The batch collects targets in ARRIVAL order, so `targets[0]` is not the earliest cursor. Routing
+/// gates each target on the page range, which means a scan that began anywhere later than the
+/// earliest parked cursor silently drops `[earliest, start)` for every target parked before it —
+/// the coalescing defect this branch exists to close, just from the other side.
+#[tokio::test]
+async fn coalesced_reactivation_starts_at_the_earliest_cursor() {
+    let page = |next: &str, up_to_date: bool, key: u64| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"n\",\"active\":true}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![
+            page("0000000000000000_0000000000000100", false, 1),
+            page("0000000000000000_0000000000000200", false, 2),
+            page("0000000000000000_0000000000000300", true, 3),
+        ]),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let pred = std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+    let target = |path: &str, offset: &str| crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred: pred.clone(),
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: path.into(),
+        from: LogPosition { segment: 0, offset: offset.into() },
+        library_mode: true,
+        until: None,
+    };
+    // Descending arrival order: the LAST target parked earliest.
+    let results = crate::engine::sequencer::replay_changes_for_targets(
+        &ds,
+        vec![
+            target("shape/c", "0000000000000000_0000000000000200"),
+            target("shape/b", "0000000000000000_0000000000000100"),
+            target("shape/a", "0000000000000000_0000000000000000"),
+        ],
+        &crate::shutdown::ShutdownToken::new(),
+    )
+    .await;
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(
+        store.read_offsets.lock().unwrap().first().map(String::as_str),
+        Some("0000000000000000_0000000000000000"),
+        "the scan must start at the earliest parked cursor in the batch, not at targets[0]"
+    );
+    let appended = store.appended.lock().unwrap();
+    let keys = |path: &str| {
+        appended
+            .iter()
+            .filter(|(p, _, _)| p.ends_with(path))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+            .map(|env| env.key)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys("shape/a"), vec!["1", "2", "3"]);
+    assert_eq!(keys("shape/b"), vec!["2", "3"]);
+    assert_eq!(keys("shape/c"), vec!["3"]);
+}
+
+#[tokio::test]
+async fn dormant_span_cache_heads_each_segment_once_per_sweep() {
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        head_offsets: std::sync::Mutex::new(vec![
+            "0000000000000000_0000000000000300".into(),
+            "0000000000000000_0000000000000200".into(),
+            "0000000000000000_0000000000000100".into(),
+        ]),
+        ..Default::default()
+    });
+    let engine =
+        Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+    let mut starts = std::collections::BTreeMap::new();
+    starts.insert(0, 1);
+    starts.insert(1, 2);
+    starts.insert(2, 3);
+    engine.changes.state().adopt(2, starts, Some("0000000000000000_0000000000000300".into()));
+    let resume = LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() };
+    let mut cache = std::collections::HashMap::new();
+    assert_eq!(engine.dormant_replay_span_cached(&resume, &mut cache).await, Some(600));
+    assert_eq!(engine.dormant_replay_span_cached(&resume, &mut cache).await, Some(600));
+    assert_eq!(store.head_count.load(std::sync::atomic::Ordering::Relaxed), 3);
 }
 
 fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_json::Value>) -> Envelope {
@@ -1666,6 +2198,8 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
             is_subquery: false,
             aggregate: None,
             fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
         },
     );
 
@@ -1834,4 +2368,358 @@ async fn ingest_progress_checkpoint_and_task_exit_are_not_source_receipts() {
         None,
         "only a durable SourceDrained catalog event can satisfy drained-through"
     );
+}
+
+/// A shape parked at the log start, woken while the sequencer is still consuming the log. The
+/// admission fence must be taken where the pending buffer STARTS — the sequencer's position at the
+/// `BeginShape` ack — not from the ingestor's tail at touch time. Everything the sequencer
+/// processes between those two points is past a touch-time fence (so the replay stops short of it)
+/// and predates the pending buffer (so nothing else carries it): on a store that cuts its last
+/// replay page before the tail, that is a silent, permanent gap in the reactivated stream.
+#[tokio::test]
+async fn a_wake_replays_up_to_where_the_pending_buffer_starts() {
+    let page = |next: &str, key: &str, up_to_date: bool| {
+        (
+            next.to_string(),
+            up_to_date,
+            format!(
+                "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"n\",\"active\":true}},\"headers\":{{\"operation\":\"insert\"}}}}]"
+            ),
+        )
+    };
+    const FIRST: &str = "0000000000000000_0000000000000100";
+    const SECOND: &str = "0000000000000000_0000000000000200";
+    let mut pages = HashMap::new();
+    // The sequencer starts at the segment sentinel, the parked shape at byte 0: the same first page.
+    pages.insert("-1".to_string(), page(FIRST, "1", false));
+    pages.insert("0000000000000000_0000000000000000".to_string(), page(FIRST, "1", false));
+    pages.insert(FIRST.to_string(), page(SECOND, "2", true));
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        pages_by_offset: std::sync::Mutex::new(pages),
+        head_offsets: std::sync::Mutex::new(vec![SECOND.into(); 8]),
+        ..Default::default()
+    });
+    let engine =
+        Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+    let ts = users();
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        st.shapes.insert(
+            "s1".into(),
+            ShapeRecord {
+                id: "s1".into(),
+                table: ts.table.clone(),
+                stream_path: "shape/s1".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+                backfill_rows: Some(1),
+                backfill_bytes: Some(1024 * 1024),
+            },
+        );
+        engine.ensure_sequencer(&mut st);
+    }
+
+    // The sequencer consumes both pages BEFORE the shape is touched, exactly as it keeps consuming
+    // while the touch runs its admission HEADs. The ingestor tail never moves in this process, so
+    // its position is the stale fence a touch-time capture would install.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if engine.table_offset(&ts.table).await == Some(LogPosition { segment: 0, offset: SECOND.into() }) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the sequencer never reached the scripted tail");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        engine.changes_position() < LogPosition { segment: 0, offset: SECOND.into() },
+        "the ingestor tail must lag the sequencer for this to be the production race"
+    );
+
+    engine.lives.lock().unwrap().insert(
+        "s1".into(),
+        crate::retention::ShapeLife {
+            last_read: std::time::Instant::now(),
+            state: crate::retention::LifeState::Dormant {
+                since: std::time::Instant::now(),
+                resume: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+        },
+    );
+    engine.ensure_active("s1").await.expect("the wake must complete");
+
+    let keys: Vec<String> = store
+        .appended
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _, _)| path.ends_with("shape/s1"))
+        .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+        .map(|env| env.key)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["1".to_string(), "2".to_string()],
+        "every envelope the sequencer processed before the pending buffer existed must be replayed, exactly once"
+    );
+}
+
+/// Readiness is boot state that can change while the engine runs: a store can be upgraded to
+/// advertise a page, or downgraded to advertise none, under a running client. The engine attested
+/// it once, at `DsClient::connect`, and never again — so a store that stopped paging kept the
+/// 16 MiB verdict's cap until the next restart, and the live loop halted on the first backlog over
+/// it. Every reconnect must re-attest, and the re-derived verdict must be the one in force.
+#[tokio::test]
+async fn a_reconnect_re_attests_readiness_and_rederives_the_read_cap() {
+    let _cap = crate::ds::read_cap_test_guard();
+    let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+    let paging =
+        crate::ds::readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{");
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        readiness_body: std::sync::Mutex::new(Some(paging)),
+        // One long-poll fails; the reconnect that follows is what must re-attest. Later reads park
+        // so the loop cannot spin through the assertions below.
+        fail_live_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    ds.refresh_readiness(&identity).await.expect("the boot attestation");
+    assert_eq!(crate::ds::ds_read_max_bytes(), 16 * 1024 * 1024, "a store that pages caps reads at four pages");
+
+    // The store is replaced by one that advertises no page while the engine is running.
+    *store.readiness_body.lock().unwrap() = Some(crate::ds::readiness_json(&identity));
+
+    let engine = Engine::new_for_in_process_test(ds);
+    {
+        let mut st = engine.state.lock().await;
+        engine.ensure_sequencer(&mut st);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while store.operations.lock().unwrap().iter().filter(|op| *op == "ready").count() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a store reconnect must re-attest readiness; the store saw only the boot attestation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        crate::ds::ds_read_max_bytes(),
+        64 * 1024 * 1024,
+        "the verdict re-derived on reconnect must be the one the read path uses"
+    );
+}
+
+/// A join that times out purges the shape, but the coalesced scan replaying for it keeps a
+/// reactivation permit until its next append fails — and a predicate that matches nothing in the
+/// remaining span never appends, so it holds the permit for the whole span. Two such orphans
+/// serialise every other reactivation behind them, whose joiners then time out and purge in turn.
+/// The scan must notice the purge at a page boundary and give the permit back there.
+#[tokio::test(start_paused = true)]
+async fn a_purged_shapes_scan_returns_its_permit_at_the_next_page() {
+    // A long remaining span of pages that match nothing: no appends, so nothing else can tell the
+    // worker its shape is gone. One virtual second per page, ten virtual minutes in total.
+    let pages: Vec<(String, bool, String)> =
+        (1..=600).map(|n| (format!("0000000000000000_{:016}", n * 0x100), false, "[]".to_string())).collect();
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(pages),
+        head_offsets: std::sync::Mutex::new(vec!["0000000000000000_0000000000000200".into(); 8]),
+        page_delay: Some(std::time::Duration::from_secs(1)),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store));
+    let ts = users();
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        // The sequencer starts far ahead of the parked cursor, so the replay's fence is the whole
+        // scripted span rather than the first page.
+        *engine.seq_start.lock().unwrap() =
+            LogPosition { segment: 0, offset: "0000000000000000_0000009999999999".into() };
+        engine.ensure_sequencer(&mut st);
+    }
+    engine
+        .park_dormant_shape_for_test(
+            "s1",
+            "users",
+            LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+        )
+        .await;
+
+    let joined = engine.ensure_active("s1").await;
+    joined.expect_err("the join must give up and retire the identity");
+    assert_eq!(engine.shape_lifecycle("s1").await, None, "the timed-out join purges the shape");
+
+    let started = tokio::time::Instant::now();
+    let permits = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        engine.reactivation_permits.clone().acquire_many_owned(2),
+    )
+    .await
+    .expect("a scan whose shape was purged must return its permit at the next page, not at the end of the span")
+    .expect("the reactivation semaphore is never closed");
+    drop(permits);
+    assert!(started.elapsed() <= std::time::Duration::from_secs(3), "waited {:?}", started.elapsed());
+}
+
+/// The other half of the pending-buffer bound: once the buffer is dropped, the shape must not be
+/// activated from what is left. Its stream would be missing exactly the changes the buffer was
+/// holding, and nothing downstream could tell. Activation refuses with a typed outcome instead, and
+/// the caller recreates from a fresh backfill.
+#[tokio::test(start_paused = true)]
+async fn an_overflowed_pending_buffer_refuses_activation() {
+    let envelope = |key: u64| {
+        format!(
+            "[{{\"type\":\"public.users\",\"key\":\"{key}\",\"value\":{{\"id\":{key},\"name\":\"{}\"}},\"headers\":{{\"operation\":\"insert\"}}}}]",
+            "x".repeat(4096)
+        )
+    };
+    let offset = |n: u64| format!("0000000000000000_{n:016}");
+    let mut pages = HashMap::new();
+    pages.insert("-1".to_string(), (offset(1), false, envelope(1)));
+    for n in 1..4 {
+        pages.insert(offset(n), (offset(n + 1), false, envelope(n + 1)));
+    }
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        pages_by_offset: std::sync::Mutex::new(pages),
+        // Slow enough that the `BeginShape` below is handled before the first page arrives, which
+        // is what puts the buffer in front of the whole scripted write burst.
+        page_delay: Some(std::time::Duration::from_secs(1)),
+        ..Default::default()
+    });
+    let mut engine =
+        Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+    engine.retention = std::sync::Arc::new(crate::retention::RetentionConfig {
+        pending_buffer_max_bytes: 8 * 1024,
+        ..crate::retention::RetentionConfig::default()
+    });
+    let ts = users();
+    engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+    let cmd_tx = {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        engine.ensure_sequencer(&mut st).cmd_tx.clone()
+    };
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(crate::engine::sequencer::SequencerCmd::BeginShape {
+            table: ts.table.clone(),
+            shape_id: "s1".into(),
+            num_id: 1,
+            stream_path: "shape/s1".into(),
+            pred: std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap()),
+            out_cols: None,
+            kind: crate::engine::sequencer::CreateKind::Plain,
+            ack: ack_tx,
+        })
+        .unwrap();
+    ack_rx.await.expect("the pending buffer is registered");
+
+    // Let the scripted write burst run past the cap.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while crate::metrics::metrics().pending_buffer_overflows.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the buffer never overflowed");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(crate::engine::sequencer::SequencerCmd::ActivateShape {
+            table: ts.table.clone(),
+            shape_id: "s1".into(),
+            gate: crate::pg::SnapshotGate::passthrough(),
+            agg_seed: None,
+            emitted_seed: 0,
+            ready: ready_tx,
+        })
+        .unwrap();
+    let outcome = ready_rx.await.expect("the sequencer answers the activation");
+    assert!(
+        matches!(outcome, Err(crate::engine::sequencer::ActivateFailure::PendingBufferOverflow)),
+        "a shape whose buffered deltas were dropped must not be activated: {outcome:?}"
+    );
+}
+
+/// Against a store that advertises no page, the client cap is a guess, not a contract: the store
+/// answers a read with the whole remainder of the stream, so a backlog over the cap is a normal
+/// operational state and not evidence of anything being wrong. Latching the engine degraded there
+/// is worse than the memory spike it avoids — the health check replaces the task, the restart reads
+/// from the same checkpoint, fails identically, and the task cycles forever, where the previous
+/// engine read the page whole and made progress. The cap is raised and the read retried instead.
+#[tokio::test]
+async fn an_uncapped_store_raises_the_read_ceiling_rather_than_latching_degraded() {
+    let _cap = crate::ds::read_cap_test_guard();
+    let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        // No `max_chunk_bytes`: the verdict is Unknown, which is every released store today.
+        readiness_body: std::sync::Mutex::new(Some(crate::ds::readiness_json(&identity))),
+        cap_breach_live_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    ds.refresh_readiness(&identity).await.expect("the boot attestation");
+    let boot_cap = crate::ds::ds_read_max_bytes();
+    assert_eq!(boot_cap, 64 * 1024 * 1024, "an uncapped store starts at the uncapped ceiling");
+
+    let engine = Engine::new_for_in_process_test(ds);
+    {
+        let mut st = engine.state.lock().await;
+        engine.ensure_sequencer(&mut st);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::ds::ds_read_max_bytes() == boot_cap {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an oversized read against an uncapped store must raise the ceiling and retry, not halt the engine"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(crate::ds::ds_read_max_bytes() > boot_cap);
+    assert_eq!(
+        engine.readiness_status(),
+        "active",
+        "a raised ceiling is a WARN, not a degraded engine the fleet will replace and replace again"
+    );
+}
+
+/// The other branch: a store that DID advertise a page and then answered with more than it
+/// promised is broken in a way a bigger buffer does not fix, so the latch stays.
+#[tokio::test]
+async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it() {
+    let _cap = crate::ds::read_cap_test_guard();
+    let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+    let paging =
+        crate::ds::readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{");
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        readiness_body: std::sync::Mutex::new(Some(paging)),
+        cap_breach_live_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    ds.refresh_readiness(&identity).await.expect("the boot attestation");
+    let engine = Engine::new_for_in_process_test(ds);
+    {
+        let mut st = engine.state.lock().await;
+        engine.ensure_sequencer(&mut st);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine.readiness_status() != "degraded" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a store that broke its own advertised page must still withdraw readiness"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }

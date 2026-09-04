@@ -24,6 +24,11 @@ pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
 /// not the value. The fold ignores an `eid` it has already applied, which is what makes the writer's
 /// retry-in-place (no event is ever dropped, ADR-0007) safe for a record whose effect is not
 /// naturally idempotent.
+// `Created` carries a whole `ShapeRecord` and is much larger than the other variants. Boxing it
+// would move the allocation onto every create rather than removing it: these events are built one at
+// a time, sent through the writer's channel and serialized immediately, so the enum's size is never
+// multiplied by anything.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "camelCase")]
 pub(crate) enum CatalogEvent {
@@ -74,6 +79,13 @@ pub(crate) enum CatalogEvent {
     /// A dormant shape was reactivated (replayed + re-registered).
     Reactivated {
         id: String,
+    },
+    /// Plain-shape backfill sizing, emitted after the streamed snapshot completes. Older records
+    /// simply omit this event and therefore have unknown sizing at reactivation time.
+    BackfillSized {
+        id: String,
+        rows: u64,
+        bytes: u64,
     },
     Dropped {
         id: String,
@@ -515,6 +527,7 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
         CatalogEvent::Left { .. } => "left",
         CatalogEvent::Dormant { .. } => "dormant",
         CatalogEvent::Reactivated { .. } => "reactivated",
+        CatalogEvent::BackfillSized { .. } => "backfillSized",
         CatalogEvent::Dropped { .. } => "dropped",
         CatalogEvent::Retired { .. } => "retired",
         CatalogEvent::Offset { .. } => "offset",
@@ -914,6 +927,12 @@ impl CatalogFold {
             CatalogEvent::Reactivated { id } => {
                 if let Some(e) = self.recs.get_mut(&id) {
                     e.3 = None;
+                }
+            }
+            CatalogEvent::BackfillSized { id, rows, bytes } => {
+                if let Some((rec, ..)) = self.recs.get_mut(&id) {
+                    rec.backfill_rows = Some(rows);
+                    rec.backfill_bytes = Some(bytes);
                 }
             }
             // The record goes; the obligation to retire its stream stays until a `Retired` says it
@@ -1506,6 +1525,7 @@ impl Engine {
             ack_rx,
         )
         .await
+        .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))
     }
 }
@@ -1885,6 +1905,33 @@ mod tests {
             fold.apply_once(&eid, ev);
         }
         fold
+    }
+
+    #[test]
+    fn backfill_sized_updates_created_records_and_old_records_remain_compatible() {
+        let rec = crate::engine::ShapeRecord {
+            id: "s1".into(),
+            table: "users".into(),
+            stream_path: "shape/s1".into(),
+            changes_only: false,
+            where_json: None,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: None,
+            fingerprint: None,
+            backfill_rows: None,
+            backfill_bytes: None,
+        };
+        let fold = fold_of(vec![
+            CatalogEvent::Created { rec: rec.clone(), sig: None, subscription: "sub".into(), at: 1 },
+            CatalogEvent::BackfillSized { id: "s1".into(), rows: 12, bytes: 3456 },
+        ]);
+        let restored = &fold.recs.get("s1").unwrap().0;
+        assert_eq!(restored.backfill_rows, Some(12));
+        assert_eq!(restored.backfill_bytes, Some(3456));
+        let old = serde_json::json!({"t":"created","id":"s-old","table":"users","streamPath":"shape/s-old","changesOnly":false});
+        assert!(serde_json::from_value::<CatalogEvent>(old).is_err() || rec.backfill_rows.is_none());
     }
 
     /// The three shape-lifecycle events, with the subscription and lease timestamp ADR-0008 gives

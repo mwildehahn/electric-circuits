@@ -418,6 +418,9 @@ impl From<anyhow::Error> for ApiError {
         if e.downcast_ref::<crate::engine::CreateRaced>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
+            // A deferred reactivation is retryable on this surface too: the shape still exists, so
+            // `must-refetch` would throw away a stream that is about to come back.
+            || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()
         {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -426,7 +429,10 @@ impl From<anyhow::Error> for ApiError {
                 must_refetch: false,
             };
         }
-        if crate::ds::is_stream_gone(&e) {
+        // A shape retired because its dormant replay exceeded the budget is gone in exactly the
+        // sense `must-refetch` describes: the client's stream no longer exists and the answer is a
+        // fresh subscription, not a server error.
+        if crate::ds::is_stream_gone(&e) || e.downcast_ref::<crate::engine::ReactivationRecreate>().is_some() {
             return ApiError::must_refetch();
         }
         ApiError {
@@ -1087,6 +1093,32 @@ mod tests {
     use crate::schema::{ColumnDef, TableDef};
     use crate::shutdown::ShutdownToken;
     use std::collections::BTreeMap;
+
+    /// An Electric client's recreate signal is the protocol's own `must-refetch` (409 + the control
+    /// message), not a 500. A shape retired because its dormant replay exceeded the budget is
+    /// exactly that: the stream the client holds is gone and the answer is a fresh subscription.
+    #[test]
+    fn an_over_budget_reactivation_tells_an_electric_client_to_refetch() {
+        let error: ApiError = anyhow::Error::new(crate::engine::ReactivationRecreate {
+            shape: "s1".into(),
+            reason: crate::engine::RecreateReason::OverBudget,
+        })
+        .into();
+        assert!(error.must_refetch, "an Electric client must be told to refetch, not handed a 500");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    /// A deferred reactivation is the one reactivation outcome that is NOT `must-refetch`: the
+    /// shape still exists and is about to come back, so telling the client to throw its stream away
+    /// would turn a retry into a full re-subscribe.
+    #[test]
+    fn a_deferred_reactivation_is_an_electric_retryable_response() {
+        let error: ApiError =
+            anyhow::Error::new(crate::engine::ReactivationDeferred::new("s1", "change-log HEAD unavailable")).into();
+        assert!(!error.must_refetch, "the shape is still there; refetching would discard a live stream");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(1));
+    }
 
     #[test]
     fn managed_deployment_not_ready_is_an_electric_retryable_response() {

@@ -684,6 +684,10 @@ fn health_json(status: &str) -> String {
     format!("{{\"status\":\"{status}\"}}")
 }
 
+fn page_should_continue(offset: &str, next: Option<&str>, up_to_date: bool, closed: bool) -> bool {
+    !up_to_date && !closed && next.is_some_and(|candidate| candidate != offset)
+}
+
 /// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200, `degraded` → 503 (the engine lost
 /// membership effects and only a restart fixes it; 503 keeps a load balancer from routing to it).
 /// Caches are disabled so the fleet's 500ms poll always sees the live phase.
@@ -1032,7 +1036,7 @@ struct ShapeResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     subscription: Option<String>,
     /// How long a subscription may go unrenewed before the engine releases it
-    /// (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse, because dormancy is off).
+    /// (`ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`; `0` = leases never lapse).
     /// The renewal cadence is the server's to set, so clients read it from here rather than guess.
     #[serde(skip_serializing_if = "Option::is_none")]
     lease_seconds: Option<u64>,
@@ -1262,7 +1266,6 @@ async fn get_shape_log(
     let mut offset = "-1".to_string();
     loop {
         let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
-        let empty = r.envelopes.is_empty();
         for env in r.envelopes {
             total += 1;
             let (op, old) = if env.headers.operation == "delete" {
@@ -1281,11 +1284,12 @@ async fn get_shape_log(
         // the page was empty, or the offset failed to advance (a defensive guard against a non-empty
         // page with a missing/unchanged next offset looping forever).
         let closed = r.closed;
-        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
+        let previous = offset.clone();
+        let next = r.next_offset.clone();
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || closed || empty || !advanced {
+        if !page_should_continue(&previous, next.as_deref(), r.up_to_date, closed) {
             break;
         }
     }
@@ -1320,7 +1324,6 @@ async fn get_shape_rows(
     let mut offset = "-1".to_string();
     loop {
         let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
-        let empty = r.envelopes.is_empty();
         for env in r.envelopes {
             if env.headers.operation == "delete" {
                 rows.remove(&env.key);
@@ -1330,11 +1333,12 @@ async fn get_shape_rows(
         }
         // Same breaks as get_shape_log: caught up, closed (retired), empty, or non-advancing.
         let closed = r.closed;
-        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
+        let previous = offset.clone();
+        let next = r.next_offset.clone();
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || closed || empty || !advanced {
+        if !page_should_continue(&previous, next.as_deref(), r.up_to_date, closed) {
             break;
         }
     }
@@ -1671,6 +1675,9 @@ impl From<anyhow::Error> for AppError {
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
         let retry_after = e.downcast_ref::<crate::engine::CreateRaced>().is_some()
+            // A deferred reactivation is the caller's to retry, not evidence of a broken engine:
+            // the shape is still there, parked back as dormant, and the next touch replays it.
+            || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
@@ -1689,6 +1696,14 @@ impl From<anyhow::Error> for AppError {
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Conflict))
         {
             StatusCode::CONFLICT
+        } else if e.downcast_ref::<crate::engine::ReactivationRecreate>().is_some() {
+            // GONE, not CONFLICT. The create/join path never reaches here in the ordinary case —
+            // `retry_create` redoes the attempt as a fresh create and the client receives a 2xx
+            // carrying a NEW shape id, which the iOS SDK already treats as a replacement and
+            // reseeds from. This status is what a *read* route (rows/log) and an exhausted
+            // fall-through return, and 410 is the code that SDK's stream reader already maps to
+            // "gone, get a fresh one"; 409 it classifies as a terminal failure with no reseed.
+            StatusCode::GONE
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
@@ -1713,7 +1728,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AppError, CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json,
+        AppError, CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json, page_should_continue,
         require_private_admin_with_secret, router_with_introspection,
     };
     use crate::predicate::PredicateJson;
@@ -1726,6 +1741,85 @@ mod tests {
         assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);
         assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
+    }
+
+    #[test]
+    fn empty_advanced_pages_continue_rows_and_log_folds() {
+        assert!(page_should_continue("offset-1", Some("offset-2"), false, false));
+        assert!(!page_should_continue("offset-2", Some("offset-2"), false, false));
+        assert!(!page_should_continue("offset-1", Some("offset-2"), true, false));
+    }
+
+    /// The iOS SDK's one "gone, get a fresh one" vocabulary is 404/410 (`StreamMaterialization`
+    /// turns those into `.notFound`/`.gone` and reseeds); 409 it classifies as a terminal
+    /// `ClientError.http` with no reseed. 410 also cannot be confused with an unknown shape id or
+    /// route, and it keeps 409 for the ElectricSQL protocol's own must-refetch code.
+    #[test]
+    fn over_budget_reactivation_is_gone_not_a_conflict() {
+        let err = AppError::from(anyhow::Error::new(crate::engine::ReactivationRecreate {
+            shape: "shape/s1".into(),
+            reason: crate::engine::RecreateReason::OverBudget,
+        }));
+        assert_eq!(err.status, StatusCode::GONE);
+    }
+
+    /// A reactivation that DEFERRED — a transient HEAD failure on the change log, a replay page
+    /// the store never finished — is not a bug in the engine and not a state the caller can act on
+    /// by recreating: the shape is parked back as dormant and the next touch retries it. Answering
+    /// it with a bare 500 tells a client that backs off on 5xx the same thing a panic would, and
+    /// tells an operator watching error rates nothing. It is a retryable refusal, with the
+    /// `Retry-After` every other retryable refusal on these routes carries.
+    #[tokio::test]
+    async fn a_deferred_reactivation_is_retryable_not_a_server_fault() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore { head_status: 503, ..Default::default() });
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://provider".into(), store.clone()));
+        engine
+            .park_dormant_shape_for_test(
+                "s1",
+                "users",
+                crate::changelog::LogPosition { segment: 0, offset: "0".into() },
+            )
+            .await;
+        let app = router_with_introspection(engine, false);
+        let response = app.oneshot(Request::get("/shapes/s1/rows").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a deferred reactivation is a retryable refusal, not a server fault"
+        );
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a caller told to retry must be told when"
+        );
+    }
+
+    /// The three answers a reactivation can produce, side by side, because the value of each one
+    /// is that it is not the other two: retry this exact shape, get a replacement, or resolve a
+    /// name you gave to two shapes. A 500 is none of them.
+    #[test]
+    fn reactivation_outcomes_map_to_distinct_actionable_statuses() {
+        let deferred = AppError::from(anyhow::Error::new(crate::engine::ReactivationDeferred::new(
+            "s1",
+            "change-log HEAD unavailable",
+        )));
+        assert_eq!(deferred.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(deferred.retry_after, "a retryable refusal carries Retry-After");
+
+        let recreate = AppError::from(anyhow::Error::new(crate::engine::ReactivationRecreate {
+            shape: "shape/s1".into(),
+            reason: crate::engine::RecreateReason::JoinTimedOut,
+        }));
+        assert_eq!(recreate.status, StatusCode::GONE);
+        assert!(!recreate.retry_after, "the same shape is not coming back; retrying it is not the action");
+
+        let conflict = AppError::from(anyhow::Error::new(crate::engine::SubscriptionConflict {
+            subscription: "sub-1".into(),
+            shape: "s2".into(),
+        }));
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        assert!(!conflict.retry_after);
     }
 
     #[test]

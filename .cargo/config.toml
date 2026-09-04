@@ -4,3 +4,6 @@
 # to gnu17 until dbsp moves off `mimalloc-rust`. Applies to `cc`-driven build scripts only.
 [env]
 CFLAGS = "-std=gnu17"
+# tikv-jemalloc-sys consumes this at build time and bakes it into jemalloc. The runtime
+# `MALLOC_CONF` name is not read by the prefixed `_rjem_` build after process startup.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true"

@@ -89,6 +89,10 @@ pub(crate) fn validate_in_process_test_url(base_url: &str) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreReadinessV1 {
     pub identity: StoreIdentityV1,
+    /// Maximum response page advertised by the server. `None`/zero means an uncapped server.
+    pub max_chunk_bytes: Option<u64>,
+    /// Maximum size of one value on the store. This is diagnostic only and never sizes reads.
+    pub max_value_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -97,6 +101,7 @@ pub enum StoreReadinessError {
     Malformed { detail: String },
     NotReady { status: String },
     IdentityMismatch { expected: StoreIdentityV1, observed: StoreIdentityV1 },
+    PageCapability { detail: String },
 }
 
 impl std::fmt::Display for StoreReadinessError {
@@ -108,6 +113,7 @@ impl std::fmt::Display for StoreReadinessError {
             Self::IdentityMismatch { expected, observed } => {
                 write!(f, "storage identity mismatch: expected {expected:?}, observed {observed:?}")
             }
+            Self::PageCapability { detail } => write!(f, "storage page capability is incompatible: {detail}"),
         }
     }
 }
@@ -163,6 +169,31 @@ pub struct EnvelopeHeaders {
     /// incomplete transaction, by definition — never a transaction that opted out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<bool>,
+}
+
+/// Envelope framing used by the replay reader. Row bodies stay as raw JSON until the envelope's
+/// `type` has been matched to the waking shape's table, avoiding allocation for unrelated tables
+/// in the global change log.
+#[derive(Debug, Deserialize)]
+struct LazyEnvelope {
+    #[serde(rename = "type")]
+    type_: String,
+    key: String,
+    #[serde(default)]
+    value: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default)]
+    old: Option<Box<serde_json::value::RawValue>>,
+    headers: EnvelopeHeaders,
+}
+
+impl LazyEnvelope {
+    fn into_envelope(self) -> Result<Envelope> {
+        let value =
+            self.value.map(|raw| serde_json::from_str(raw.get())).transpose().context("decoding envelope value")?;
+        let old =
+            self.old.map(|raw| serde_json::from_str(raw.get())).transpose().context("decoding envelope old value")?;
+        Ok(Envelope { type_: self.type_, key: self.key, value, old, headers: self.headers })
+    }
 }
 
 impl crate::heap_size::HeapSize for EnvelopeHeaders {
@@ -336,7 +367,7 @@ pub type GoneReconciler = std::sync::Arc<
 /// provider boundary is being extracted: DSP-003 will replace the status-oriented compatibility
 /// mapping with a closed outcome vocabulary.  Until then it lets the existing facade preserve its
 /// exact error/retry behavior while keeping HTTP mechanics below the port.
-struct StoreResponse {
+pub(crate) struct StoreResponse {
     status: u16,
     /// The response body is deliberately retained as an outcome rather than normalized to text.
     /// Successful stream reads must fail if their body cannot be acquired: accepting the advertised
@@ -361,11 +392,253 @@ impl StoreResponse {
 }
 
 #[derive(Clone, Copy)]
-enum BodyRead {
+pub(crate) enum BodyRead {
     Never,
     OnFailure,
     OnData,
     Always,
+}
+
+/// The cap against a store that advertises a page: four of the 4 MiB pages the server serves, so it
+/// is pure defense in depth and is never reached in normal operation.
+const DEFAULT_DS_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The cap against a store that advertises NO page. Such a store answers a read with the whole
+/// remainder of the stream, so the client cap is the only thing between a large backlog and a
+/// **permanently stalled live loop**: the read fails, the sequencer retries the identical read, and
+/// it fails identically forever — no data flows and nothing recovers it. A larger ceiling does not
+/// make that store safe; it makes progress the default and leaves the boot WARN (and
+/// `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1`) as the way to demand a store that pages.
+const UNCAPPED_STORE_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct ReadCapExceeded {
+    pub path: String,
+    pub observed: u64,
+    pub limit: u64,
+    pub max_value_bytes: Option<u64>,
+}
+
+impl std::fmt::Display for ReadCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GET {} response body exceeded {} bytes (observed at least {} bytes); store advertises single messages up to {}; this response was {} bytes against client cap {}",
+            self.path,
+            self.limit,
+            self.observed,
+            self.max_value_bytes.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+            self.observed,
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for ReadCapExceeded {}
+
+/// A single Durable Streams read the store accepted and never finished.
+///
+/// The pinned HTTP store carries reqwest's own connect/read/request deadlines, but those bind that
+/// one provider adapter, not the port: any [`DurableStreamStore`] whose `read` future never resolves
+/// would otherwise park the caller forever. That caller is the coalesced reactivation worker, which
+/// holds a reactivation permit for the whole scan — so an unbounded read leaves the shape
+/// `Reactivating`, pins the permit, and queues every later reactivation behind it. This is the
+/// engine's own bound on one replay page, and it is typed so callers can tell a dead transport from
+/// a missing stream or a malformed page.
+#[derive(Debug)]
+pub(crate) struct DsReadTimeout {
+    pub path: String,
+    pub after: std::time::Duration,
+}
+
+impl std::fmt::Display for DsReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GET {} did not complete within {}s (ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS); the store accepted the read and never finished it",
+            self.path,
+            self.after.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DsReadTimeout {}
+
+/// Transport deadlines for the pinned HTTP store. A long-poll gets its own read deadline because
+/// it is not a bounded request: the store holds it open for its whole long-poll window and answers
+/// empty, so a deadline shorter than that window turns every idle read into an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DsTimeouts {
+    pub connect: std::time::Duration,
+    pub read: std::time::Duration,
+    pub live_read: std::time::Duration,
+    pub request: std::time::Duration,
+}
+
+impl DsTimeouts {
+    fn from_env() -> Self {
+        let secs = |name: &str, default: u64| {
+            std::time::Duration::from_secs(
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(default),
+            )
+        };
+        Self {
+            connect: secs("ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS", 10),
+            read: secs("ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS", DEFAULT_DS_READ_TIMEOUT_SECS),
+            live_read: secs("ELECTRIC_CIRCUITS_DS_LIVE_READ_TIMEOUT_SECS", DEFAULT_DS_LIVE_READ_TIMEOUT_SECS),
+            request: secs("ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS", 60),
+        }
+    }
+
+    /// The whole-request deadline for a long-poll. reqwest's request timeout covers the same wait
+    /// the read timeout does, so leaving it at the ordinary value would just move the premature
+    /// cut-off one layer out; it is never shorter than the long-poll deadline plus room for the
+    /// response body.
+    fn live_request(&self) -> std::time::Duration {
+        self.request.max(self.live_read + std::time::Duration::from_secs(15))
+    }
+}
+
+/// How long one replay page read may take before it is abandoned. It shares
+/// `ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS` with the HTTP store's transport read deadline so an
+/// operator has one number to reason about: no single page read outlives it, whichever layer
+/// notices first.
+pub(crate) const DEFAULT_DS_READ_TIMEOUT_SECS: u64 = 30;
+
+/// How long a LONG-POLL read may take. It must exceed the store's own long-poll window or the
+/// client gives up first on every idle log: the deployed durable-streams holds an idle read for
+/// 35 s (`long_poll_timeout_ms`), so 30 s produced a read error, a WARN and a fresh connection
+/// every 30 s forever, and buried real transport faults in that noise. 45 s leaves 10 s of margin.
+pub(crate) const DEFAULT_DS_LIVE_READ_TIMEOUT_SECS: u64 = 45;
+
+fn ds_read_deadline() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_DS_READ_TIMEOUT_SECS),
+    )
+}
+
+/// The hard ceiling a raised cap may not pass. Above this a single read really is unserviceable and
+/// halting is the honest answer; below it, raising and retrying is what keeps an uncapped store's
+/// backlog moving.
+const DEFAULT_DS_READ_MAX_CEILING_BYTES: u64 = 512 * 1024 * 1024;
+
+fn ds_read_max_ceiling_bytes() -> u64 {
+    std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_CEILING_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DS_READ_MAX_CEILING_BYTES)
+}
+
+/// Whether the store this process attested advertises a page size. It decides what an oversized
+/// read MEANS: against a store that promised a page it is the store breaking its promise, and
+/// against one that promised nothing it is an ordinary backlog the client guessed too small for.
+static STORE_ADVERTISES_PAGE_CAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What to do about a read that exceeded the body cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapBreachOutcome {
+    /// Retry with this larger cap. Only an uncapped store, below the hard ceiling, with no operator-named cap.
+    Raise { limit: u64 },
+    /// Stop reading and withdraw readiness: nothing about a retry can make this read fit.
+    Latch,
+}
+
+/// The policy behind [`raise_read_cap_after_breach`], separated from the process statics so it can
+/// be exercised as the decision table it is.
+pub(crate) fn cap_after_breach(
+    advertises_page: bool,
+    configured: Option<u64>,
+    current: u64,
+    ceiling: u64,
+) -> CapBreachOutcome {
+    // A store that advertises a page and then answers with more than it advertised is broken in a
+    // way a bigger buffer does not fix, and hiding it behind a raised cap would lose the only
+    // signal that says so.
+    if advertises_page {
+        return CapBreachOutcome::Latch;
+    }
+    // An operator who named a cap has decided what this process may buffer. Raising it silently
+    // would be the engine overruling that decision on its own.
+    if configured.is_some() {
+        return CapBreachOutcome::Latch;
+    }
+    let raised = current.saturating_mul(2).min(ceiling);
+    if raised <= current { CapBreachOutcome::Latch } else { CapBreachOutcome::Raise { limit: raised } }
+}
+
+/// Decide what an oversized live read means for THIS process, and install the raised cap when the
+/// answer is to retry.
+pub(crate) fn raise_read_cap_after_breach() -> CapBreachOutcome {
+    let outcome = cap_after_breach(
+        STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed),
+        configured_ds_read_max_bytes(),
+        ds_read_max_bytes(),
+        ds_read_max_ceiling_bytes(),
+    );
+    if let CapBreachOutcome::Raise { limit } = outcome {
+        EFFECTIVE_READ_MAX_BYTES.store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+    outcome
+}
+
+/// The cap in force for this process, chosen at boot from the store's readiness. Zero means boot has
+/// not resolved it yet, in which case the configured or default value applies.
+static EFFECTIVE_READ_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADVERTISED_MAX_VALUE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn configured_ds_read_max_bytes() -> Option<u64> {
+    std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+pub(crate) fn ds_read_max_bytes() -> u64 {
+    match EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => configured_ds_read_max_bytes().unwrap_or(DEFAULT_DS_READ_MAX_BYTES),
+        installed => installed,
+    }
+}
+
+/// An explicit `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` is always obeyed: an operator who names a cap
+/// has decided what this process may buffer, including against an uncapped store.
+pub(crate) fn effective_read_max_bytes(verdict: PageCapVerdict, configured: Option<u64>) -> u64 {
+    match (configured, verdict) {
+        (Some(explicit), _) => explicit,
+        (None, PageCapVerdict::Compatible { .. }) => DEFAULT_DS_READ_MAX_BYTES,
+        (None, PageCapVerdict::Unknown | PageCapVerdict::Exceeds { .. }) => UNCAPPED_STORE_READ_MAX_BYTES,
+    }
+}
+
+async fn read_body_bounded(mut response: reqwest::Response, limit: u64, path: &str) -> Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(anyhow::Error::new)? {
+        let size = body.len() as u64 + chunk.len() as u64;
+        if size > limit {
+            tracing::error!(path, size, limit, "durable-streams response exceeded client body limit");
+            let max_value_bytes = match ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => None,
+                value => Some(value),
+            };
+            return Err(anyhow::Error::new(ReadCapExceeded {
+                path: path.to_string(),
+                observed: size,
+                limit,
+                max_value_bytes,
+            }));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("durable-streams response body was not UTF-8")
 }
 
 type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send + 'a>>;
@@ -376,7 +649,7 @@ type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send
 /// reconciliation, envelope codec, retirement, or byte-accounting policy: those are Circuits
 /// invariants and remain on [`DsClient`].  It is private because no external crate is entitled to
 /// rely on this first compatibility-shaped outcome representation.
-trait DurableStreamStore: Send + Sync {
+pub(crate) trait DurableStreamStore: Send + Sync {
     fn ready<'a>(&'a self) -> StoreFuture<'a>;
     fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a>;
     fn append<'a>(
@@ -397,6 +670,11 @@ trait DurableStreamStore: Send + Sync {
 struct HttpDurableStreamsStore {
     base: String,
     http: reqwest::Client,
+    /// The long-poll client. Identical to `http` except for its deadlines: reqwest's read timeout
+    /// is a client-wide setting (there is no per-request form in 0.12), and a long-poll needs one
+    /// longer than the store's own long-poll window while every other operation stays bounded by
+    /// the short one.
+    live_http: reqwest::Client,
 }
 
 impl HttpDurableStreamsStore {
@@ -416,26 +694,53 @@ impl HttpDurableStreamsStore {
         identity_pem.extend(key);
         let identity =
             reqwest::Identity::from_pem(&identity_pem).context("parsing Durable Streams client certificate/key")?;
-        let http = reqwest::Client::builder()
-            .https_only(true)
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(ca)
-            .identity(identity)
-            .build()
-            .context("building Durable Streams mTLS client")?;
-        Ok(Self { base: config.base_url.clone(), http })
+        let timeouts = DsTimeouts::from_env();
+        let mtls = |read: std::time::Duration, request: std::time::Duration| {
+            reqwest::Client::builder()
+                .https_only(true)
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(ca.clone())
+                .identity(identity.clone())
+                .connect_timeout(timeouts.connect)
+                .read_timeout(read)
+                .timeout(request)
+                .build()
+        };
+        let http = mtls(timeouts.read, timeouts.request).context("building Durable Streams mTLS client")?;
+        let live_http = mtls(timeouts.live_read, timeouts.live_request())
+            .context("building Durable Streams mTLS long-poll client")?;
+        Ok(Self { base: config.base_url.clone(), http, live_http })
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn new_in_process(base: String) -> Self {
-        Self { base, http: reqwest::Client::new() }
+        Self { base, http: reqwest::Client::new(), live_http: reqwest::Client::new() }
+    }
+
+    /// Test seam: the same client production builds, from explicit deadlines instead of the
+    /// environment and without mTLS material.
+    #[cfg(test)]
+    fn new_in_process_with_timeouts(base: String, timeouts: DsTimeouts) -> Self {
+        let client = |read: std::time::Duration, request: std::time::Duration| {
+            reqwest::Client::builder()
+                .connect_timeout(timeouts.connect)
+                .read_timeout(read)
+                .timeout(request)
+                .build()
+                .expect("in-process client")
+        };
+        Self {
+            base,
+            http: client(timeouts.read, timeouts.request),
+            live_http: client(timeouts.live_read, timeouts.live_request()),
+        }
     }
 
     fn stream_url(&self, path: &str) -> String {
         format!("{}/{}", self.base.trim_end_matches('/'), path.trim_start_matches('/'))
     }
 
-    async fn response(res: reqwest::Response, body_read: BodyRead) -> StoreResponse {
+    async fn response(&self, res: reqwest::Response, body_read: BodyRead, path: Option<&str>) -> StoreResponse {
         let status = res.status().as_u16();
         let next_offset = header(&res, "stream-next-offset");
         let up_to_date = res.headers().get("stream-up-to-date").is_some();
@@ -451,7 +756,11 @@ impl HttpDurableStreamsStore {
         // `read` and `read_json` used `res.text().await?` after a successful GET; turning an
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // The selected mode otherwise preserves the legacy per-operation best-effort behavior.
-        let body = if should_read { Some(res.text().await.map_err(anyhow::Error::new)) } else { None };
+        let body = if should_read {
+            Some(read_body_bounded(res, ds_read_max_bytes(), path.unwrap_or("<unknown>")).await)
+        } else {
+            None
+        };
         StoreResponse { status, body, next_offset, up_to_date, closed }
     }
 }
@@ -460,7 +769,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
     fn ready<'a>(&'a self) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.get(format!("{}/_admin/ready", self.base)).send().await.context("GET /_admin/ready")?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, None).await)
         })
     }
 
@@ -473,7 +782,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
                 .send()
                 .await
                 .with_context(|| format!("PUT {path}"))?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, Some(path)).await)
         })
     }
 
@@ -493,7 +802,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
                 .send()
                 .await
                 .with_context(|| format!("POST {path}"))?;
-            Ok(Self::response(res, response_body).await)
+            Ok(self.response(res, response_body, Some(path)).await)
         })
     }
 
@@ -503,15 +812,16 @@ impl DurableStreamStore for HttpDurableStreamsStore {
             if live {
                 url.push_str("&live=long-poll");
             }
-            let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
-            Ok(Self::response(res, BodyRead::OnData).await)
+            let client = if live { &self.live_http } else { &self.http };
+            let res = client.get(url).send().await.with_context(|| format!("GET {path}"))?;
+            Ok(self.response(res, BodyRead::OnData, Some(path)).await)
         })
     }
 
     fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.head(self.stream_url(path)).send().await.with_context(|| format!("HEAD {path}"))?;
-            Ok(Self::response(res, BodyRead::Never).await)
+            Ok(self.response(res, BodyRead::Never, Some(path)).await)
         })
     }
 
@@ -524,14 +834,14 @@ impl DurableStreamStore for HttpDurableStreamsStore {
                 .send()
                 .await
                 .with_context(|| format!("POST {path} (close)"))?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, Some(path)).await)
         })
     }
 
     fn delete<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.delete(self.stream_url(path)).send().await.with_context(|| format!("DELETE {path}"))?;
-            Ok(Self::response(res, BodyRead::Always).await)
+            Ok(self.response(res, BodyRead::Always, Some(path)).await)
         })
     }
 }
@@ -559,7 +869,7 @@ impl DsClient {
         let store = Arc::new(HttpDurableStreamsStore::new(&config)?);
         let client = Self::with_store(config.base_url, config.scope, store);
         // A production client is not constructible until the store has attested the exact identity.
-        client.preflight_readiness(&expected).await?;
+        client.refresh_readiness(&expected).await?;
         Ok(client)
     }
 
@@ -591,7 +901,7 @@ impl DsClient {
     }
 
     #[cfg(test)]
-    fn with_test_store(base: String, store: Arc<dyn DurableStreamStore>) -> Self {
+    pub(crate) fn with_test_store(base: String, store: Arc<dyn DurableStreamStore>) -> Self {
         Self::with_store(base, StreamScope::in_process_test_scope(), store)
     }
 
@@ -654,6 +964,32 @@ impl DsClient {
             }));
         }
         Ok(observed)
+    }
+
+    /// Re-attest the store after a transport reconnect. Readiness is deliberately not cached:
+    /// page capabilities are startup state that can change independently of store identity.
+    pub(crate) async fn refresh_readiness(&self, expected: &StoreIdentityV1) -> Result<PageCapVerdict> {
+        let readiness = self.preflight_readiness(expected).await?;
+        let configured = configured_ds_read_max_bytes();
+        let verdict = assess_page_cap(&readiness, configured.unwrap_or(DEFAULT_DS_READ_MAX_BYTES));
+        EFFECTIVE_READ_MAX_BYTES
+            .store(effective_read_max_bytes(verdict, configured), std::sync::atomic::Ordering::Relaxed);
+        ADVERTISED_MAX_VALUE_BYTES.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        STORE_ADVERTISES_PAGE_CAP
+            .store(matches!(verdict, PageCapVerdict::Compatible { .. }), std::sync::atomic::Ordering::Relaxed);
+        if let Some(advisory) = enforce_page_cap(verdict, ds_read_max_bytes(), require_ds_chunk_cap())? {
+            warn_page_cap_once(&advisory);
+        }
+        Ok(verdict)
+    }
+
+    /// Re-attest the store this client is bound to, after a transport failure and the reconnect
+    /// that follows it. The expected identity is the one this client was scoped with, so a caller
+    /// on the reconnect path does not have to carry it: a store that came back as a *different*
+    /// store is refused here exactly as it would be at boot.
+    pub(crate) async fn reattest_readiness(&self) -> Result<PageCapVerdict> {
+        let expected = self.scope.store.clone();
+        self.refresh_readiness(&expected).await
     }
 
     fn physical_path(&self, logical_path: &str) -> Result<String> {
@@ -1007,6 +1343,56 @@ impl DsClient {
         };
         Ok(ReadResult { envelopes, next_offset, up_to_date, closed })
     }
+
+    /// Read one page while decoding row bodies only for `table` and change-log control envelopes.
+    /// This is the replay path's cheap-page variant: framing and headers are still validated for
+    /// every item, but unrelated table rows remain borrowed raw bytes until discarded.
+    pub async fn read_for_table(&self, path: &str, offset: &str, live: bool, table: &str) -> Result<ReadResult> {
+        let physical_path = self.physical_path(path)?;
+        // A replay page is a bounded request, so it gets a deadline of its own; a long-poll is not
+        // and keeps the store's own idle semantics.
+        let res = if live {
+            self.store.read(&physical_path, offset, live).await?
+        } else {
+            let deadline = ds_read_deadline();
+            match tokio::time::timeout(deadline, self.store.read(&physical_path, offset, live)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    tracing::error!(path, deadline_secs = deadline.as_secs(), "durable-streams read never completed");
+                    return Err(anyhow::Error::new(DsReadTimeout { path: path.to_string(), after: deadline }));
+                }
+            }
+        };
+        if res.status == 204 {
+            return Ok(ReadResult {
+                envelopes: Vec::new(),
+                next_offset: res.next_offset,
+                up_to_date: res.up_to_date,
+                closed: res.closed,
+            });
+        }
+        if res.status == 404 || res.status == 410 {
+            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
+        }
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("GET", path, res.status, ""));
+        }
+        let next_offset = res.next_offset.clone();
+        let up_to_date = res.up_to_date;
+        let closed = res.closed;
+        let body = res.required_body()?;
+        let mut envelopes = Vec::new();
+        if !body.trim().is_empty() {
+            let raw: Vec<LazyEnvelope> =
+                serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?;
+            for item in raw {
+                if item.type_ == table || item.type_ == crate::changelog::CONTROL_TYPE {
+                    envelopes.push(item.into_envelope()?);
+                }
+            }
+        }
+        Ok(ReadResult { envelopes, next_offset, up_to_date, closed })
+    }
 }
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {
@@ -1021,6 +1407,10 @@ struct ReadinessWire {
     manifest: ManifestWire,
     recovery: RecoveryWire,
     reserve: ReserveWire,
+    #[serde(default)]
+    max_chunk_bytes: Option<u64>,
+    #[serde(default)]
+    max_value_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1141,7 +1531,72 @@ fn decode_readiness(body: &str) -> Result<StoreReadinessV1> {
         wire.reserve.minimum_free_bytes,
         wire.reserve.minimum_free_inodes,
     );
-    Ok(StoreReadinessV1 { identity })
+    Ok(StoreReadinessV1 { identity, max_chunk_bytes: wire.max_chunk_bytes, max_value_bytes: wire.max_value_bytes })
+}
+
+/// What the client concluded about the read page the store advertises in its readiness response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageCapVerdict {
+    /// The store advertises a page that fits inside the client body cap.
+    Compatible { observed: u64 },
+    /// Readiness carries no cap field, or advertises zero. Every durable-streams build shipped so
+    /// far omits the field, so this is the ordinary verdict, not an anomaly.
+    Unknown,
+    /// The store advertises a page larger than the client body cap; a full page would be refused
+    /// by [`read_body_bounded`].
+    Exceeds { observed: u64 },
+}
+
+pub(crate) fn assess_page_cap(readiness: &StoreReadinessV1, client_cap: u64) -> PageCapVerdict {
+    match readiness.max_chunk_bytes {
+        Some(0) => PageCapVerdict::Unknown,
+        Some(observed) if observed.saturating_add(2) <= client_cap => PageCapVerdict::Compatible { observed },
+        Some(observed) => PageCapVerdict::Exceeds { observed },
+        None => PageCapVerdict::Unknown,
+    }
+}
+
+/// `1` makes an unadvertised or oversized store page a boot refusal instead of a warning. Left
+/// unset (the default) because no released durable-streams build advertises a cap at all, so a
+/// refusal would reject every real store including the deployed one.
+fn require_ds_chunk_cap() -> bool {
+    std::env::var("ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP").is_ok_and(|value| value.trim() == "1")
+}
+
+/// Advisory by default: the read path already fails closed on an oversized page
+/// ([`read_body_bounded`] returns a typed error naming the path, the observed size and the cap), so
+/// an unverifiable server capability is a diagnosable warning rather than a reason to refuse the
+/// boot. `Ok(None)` means nothing to say; `Ok(Some(message))` is the warning to log once; `Err` is
+/// the strict-mode refusal.
+pub(crate) fn enforce_page_cap(verdict: PageCapVerdict, client_cap: u64, strict: bool) -> Result<Option<String>> {
+    let detail = match verdict {
+        PageCapVerdict::Compatible { .. } => return Ok(None),
+        PageCapVerdict::Unknown => format!(
+            "durable-streams readiness advertises no max_chunk_bytes (uncapped or older store); \
+             client body cap is {client_cap} bytes and a larger page will fail the read"
+        ),
+        PageCapVerdict::Exceeds { observed } => format!(
+            "durable-streams readiness advertises max_chunk_bytes={observed}, larger than the \
+             client body cap of {client_cap} bytes; a full page will fail the read"
+        ),
+    };
+    if strict {
+        return Err(anyhow::Error::new(StoreReadinessError::PageCapability { detail }));
+    }
+    Ok(Some(detail))
+}
+
+/// The advisory is a property of the store, not of the request, so it is logged once per process
+/// however many clients are constructed.
+fn warn_page_cap_once(message: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            advisory = message,
+            strict_env = "ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP",
+            "durable-streams read page capability could not be verified"
+        );
+    }
 }
 
 fn is_artifact_digest(value: &str) -> bool {
@@ -1268,16 +1723,97 @@ impl<'de> Deserialize<'de> for StrictJson {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{ScriptedStore, read_cap_test_guard, readiness_json};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The effective read cap is process-wide state that `refresh_readiness` installs, so any test
+    /// that attests a store moves it under every other test in the same binary. Tests that read or
+    /// write it hold this guard: it serialises them and restores the previous values on drop, which
+    /// is what makes their assertions independent of scheduling order.
+    static READ_CAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) struct ReadCapTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        cap: u64,
+        max_value: u64,
+        advertises_page: bool,
+    }
+
+    impl Drop for ReadCapTestGuard {
+        fn drop(&mut self) {
+            EFFECTIVE_READ_MAX_BYTES.store(self.cap, std::sync::atomic::Ordering::Relaxed);
+            ADVERTISED_MAX_VALUE_BYTES.store(self.max_value, std::sync::atomic::Ordering::Relaxed);
+            STORE_ADVERTISES_PAGE_CAP.store(self.advertises_page, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn read_cap_test_guard() -> ReadCapTestGuard {
+        // A panicking test must not make every later one fail on a poisoned lock; the guard's whole
+        // job is restoring the statics, which the drop below does either way.
+        let lock = READ_CAP_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ReadCapTestGuard {
+            _lock: lock,
+            cap: EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            max_value: ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            advertises_page: STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    #[test]
+    fn read_body_cap_defaults_to_16_mib() {
+        // The default is a property of the sizing rule, not of whatever another test last attested.
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None),
+            16 * 1024 * 1024
+        );
+        // And with nothing installed, that is what the read path uses.
+        let _guard = read_cap_test_guard();
+        EFFECTIVE_READ_MAX_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(ds_read_max_bytes(), 16 * 1024 * 1024);
+    }
+
     #[derive(Default)]
-    struct ScriptedStore {
-        appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
-        operations: std::sync::Mutex<Vec<String>>,
-        fail_read_body: bool,
-        readiness_status: u16,
-        readiness_body: Option<String>,
+    pub(crate) struct ScriptedStore {
+        pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+        pub(crate) operations: std::sync::Mutex<Vec<String>>,
+        pub(crate) fail_read_body: bool,
+        pub(crate) read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
+        /// Pages keyed by the offset the reader asked for. A single ordered log two readers share
+        /// (the sequencer's live tail and a replay scan) cannot be modelled by one pop-front queue:
+        /// whichever read arrives first consumes the other's page. When this map is non-empty it
+        /// takes over from `read_pages`: an offset it knows answers with that page, an offset it
+        /// does not know parks a live read (an idle long-poll) and answers a replay read with an
+        /// empty up-to-date page (the end of the log).
+        pub(crate) pages_by_offset: std::sync::Mutex<HashMap<String, (String, bool, String)>>,
+        pub(crate) read_count: std::sync::atomic::AtomicUsize,
+        /// Every offset a read was asked for, in order. A coalesced scan's routing is only correct
+        /// if the scan STARTS at the earliest parked cursor, which is invisible from the pages.
+        pub(crate) read_offsets: std::sync::Mutex<Vec<String>>,
+        pub(crate) head_count: std::sync::atomic::AtomicUsize,
+        pub(crate) head_offsets: std::sync::Mutex<Vec<String>>,
+        pub(crate) fail_append_path: Option<String>,
+        /// How many non-live reads the store accepts and then never finishes. It models a provider
+        /// that answers a replay `GET` and then stops yielding body bytes: the store call itself
+        /// never resolves, exactly as the HTTP store's response future would not.
+        pub(crate) stall_nonlive_reads: std::sync::atomic::AtomicUsize,
+        /// Park every long-poll forever, which is what an idle tail read does. Only scaffolding: a
+        /// spawned sequencer must not spin on a synthetic empty page while a stall is under test.
+        pub(crate) stall_live_reads: bool,
+        /// How many long-polls are answered with a transport failure before the rest are served
+        /// normally (or parked). It models the store going away and the client reconnecting.
+        pub(crate) fail_live_reads: std::sync::atomic::AtomicUsize,
+        /// How many long-polls come back as a body that breached the client cap, which is what an
+        /// uncapped store does when the backlog is bigger than the ceiling.
+        pub(crate) cap_breach_live_reads: std::sync::atomic::AtomicUsize,
+        /// How long each page takes to come back. Under `start_paused` this is virtual time, which
+        /// is how a test can say "the remaining span is ten minutes of pages" without spending any.
+        pub(crate) page_delay: Option<std::time::Duration>,
+        pub(crate) readiness_status: u16,
+        pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
+        pub(crate) head_status: u16,
     }
 
     fn response(status: u16) -> StoreResponse {
@@ -1295,7 +1831,7 @@ mod tests {
             Box::pin(async move {
                 self.operations.lock().unwrap().push("ready".to_string());
                 let mut response = response(if self.readiness_status == 0 { 200 } else { self.readiness_status });
-                response.body = Some(Ok(self.readiness_body.clone().unwrap_or_default()));
+                response.body = Some(Ok(self.readiness_body.lock().unwrap().clone().unwrap_or_default()));
                 Ok(response)
             })
         }
@@ -1312,25 +1848,109 @@ mod tests {
             _response_body: BodyRead,
         ) -> StoreFuture<'a> {
             Box::pin(async move {
+                if self.fail_append_path.as_deref().is_some_and(|p| path.ends_with(p)) {
+                    return Err(anyhow::anyhow!("scripted append failure"));
+                }
                 self.operations.lock().unwrap().push("append".to_string());
                 self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));
                 Ok(response(204))
             })
         }
 
-        fn read<'a>(&'a self, _path: &'a str, _offset: &'a str, _live: bool) -> StoreFuture<'a> {
+        fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a> {
             Box::pin(async move {
+                self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.read_offsets.lock().unwrap().push(offset.to_string());
+                if live
+                    && self
+                        .cap_breach_live_reads
+                        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                            (n > 0).then(|| n - 1)
+                        })
+                        .is_ok()
+                {
+                    let limit = ds_read_max_bytes();
+                    let mut res = response(200);
+                    res.body = Some(Err(anyhow::Error::new(ReadCapExceeded {
+                        path: path.to_string(),
+                        observed: limit + 1,
+                        limit,
+                        max_value_bytes: None,
+                    })));
+                    return Ok(res);
+                }
+                if live
+                    && self
+                        .fail_live_reads
+                        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                            (n > 0).then(|| n - 1)
+                        })
+                        .is_ok()
+                {
+                    return Ok(response(503));
+                }
+                let stalled = !live
+                    && self
+                        .stall_nonlive_reads
+                        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                            (n > 0).then(|| n - 1)
+                        })
+                        .is_ok();
+                if stalled || (live && self.stall_live_reads) {
+                    std::future::pending::<()>().await;
+                }
+                if let Some(delay) = self.page_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                let keyed = {
+                    let pages = self.pages_by_offset.lock().unwrap();
+                    (!pages.is_empty()).then(|| pages.get(offset).cloned())
+                };
+                if let Some(keyed) = keyed {
+                    let mut res = response(200);
+                    match keyed {
+                        Some((next, up_to_date, body)) => {
+                            res.next_offset = Some(next);
+                            res.up_to_date = up_to_date;
+                            res.body = Some(Ok(body));
+                        }
+                        None if live => std::future::pending::<()>().await,
+                        None => {
+                            res.next_offset = Some(offset.to_string());
+                            res.up_to_date = true;
+                            res.body = Some(Ok("[]".to_string()));
+                        }
+                    }
+                    return Ok(res);
+                }
                 let mut res = response(200);
                 res.next_offset = Some("tempting-next-offset".to_string());
                 if self.fail_read_body {
                     res.body = Some(Err(anyhow::anyhow!("scripted stream body failure")));
+                } else {
+                    let page = {
+                        let mut pages = self.read_pages.lock().unwrap();
+                        (!pages.is_empty()).then(|| pages.remove(0))
+                    };
+                    if let Some((next, up_to_date, body)) = page {
+                        res.next_offset = Some(next);
+                        res.up_to_date = up_to_date;
+                        res.body = Some(Ok(body));
+                    }
                 }
                 Ok(res)
             })
         }
 
         fn head<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
-            Box::pin(async { Ok(response(200)) })
+            Box::pin(async move {
+                self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
+                if let Some(offset) = self.head_offsets.lock().unwrap().pop() {
+                    res.next_offset = Some(offset);
+                }
+                Ok(res)
+            })
         }
 
         fn close<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
@@ -1404,7 +2024,87 @@ mod tests {
         );
     }
 
-    fn readiness_json(identity: &StoreIdentityV1) -> String {
+    #[tokio::test]
+    async fn scripted_reads_preserve_partial_page_metadata_for_callers_to_page() {
+        let store = Arc::new(ScriptedStore {
+            read_pages: std::sync::Mutex::new(vec![
+                (
+                    "page-2".to_string(),
+                    false,
+                    "[{\"type\":\"public.items\",\"key\":\"1\",\"headers\":{\"operation\":\"upsert\"}}]".to_string(),
+                ),
+                ("tail".to_string(), true, "[]".to_string()),
+            ]),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store);
+
+        let first = client.read("changes/0", "page-1", false).await.unwrap();
+        assert_eq!(first.next_offset.as_deref(), Some("page-2"));
+        assert!(!first.up_to_date, "partial pages must not be treated as drained");
+        assert_eq!(first.envelopes.len(), 1);
+
+        let second = client.read("changes/0", "page-2", false).await.unwrap();
+        assert_eq!(second.next_offset.as_deref(), Some("tail"));
+        assert!(second.up_to_date);
+        assert!(second.envelopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn table_read_discards_unmatched_rows_before_decoding_their_bodies() {
+        let store = Arc::new(ScriptedStore {
+            read_pages: std::sync::Mutex::new(vec![(
+                "tail".to_string(),
+                true,
+                "[{\"type\":\"public.other\",\"key\":\"x\",\"value\":{\"large\":true},\"headers\":{\"operation\":\"upsert\"}},{\"type\":\"public.items\",\"key\":\"1\",\"value\":{\"id\":1},\"headers\":{\"operation\":\"upsert\"}}]".to_string(),
+            )]),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store);
+
+        let page = client.read_for_table("changes/0", "-1", false, "public.items").await.unwrap();
+        assert_eq!(page.envelopes.len(), 1);
+        assert_eq!(page.envelopes[0].type_, "public.items");
+    }
+
+    /// A store that accepts a replay `GET` and then never finishes the response must not park the
+    /// caller. The caller here is the coalesced reactivation worker, which holds a reactivation
+    /// permit for the whole scan, so an unbounded read is what leaves a shape `Reactivating` and
+    /// queues every later reactivation behind a permit nothing will ever return. Virtual time keeps
+    /// the deadline the production default instead of a test-only value.
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_page_the_store_never_finishes_fails_with_a_typed_read_timeout() {
+        let store = Arc::new(ScriptedStore {
+            stall_nonlive_reads: std::sync::atomic::AtomicUsize::new(1),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
+
+        let started = tokio::time::Instant::now();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            client.read_for_table("changes/0", "-1", false, "public.items"),
+        )
+        .await
+        .expect("a replay page the store never finishes must be bounded by the engine, not read forever");
+
+        let Err(error) = read else { panic!("a page whose response never arrived is not a page") };
+        let timeout = error
+            .downcast_ref::<DsReadTimeout>()
+            .expect("a dead transport must be typed, not folded into a generic read failure");
+        assert_eq!(timeout.path, "changes/0");
+        assert_eq!(timeout.after, std::time::Duration::from_secs(DEFAULT_DS_READ_TIMEOUT_SECS));
+        let waited = started.elapsed();
+        assert!(waited >= timeout.after, "waited {waited:?}, short of the configured read deadline");
+        assert!(waited < std::time::Duration::from_secs(600), "waited {waited:?}, the outer guard, not the deadline");
+        assert_eq!(
+            store.read_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the abandoned read is not retried inside the port"
+        );
+    }
+
+    pub(crate) fn readiness_json(identity: &StoreIdentityV1) -> String {
         serde_json::json!({
             "contract_version": "durable-streams-store-ready-v1",
             "status": "ready",
@@ -1438,12 +2138,122 @@ mod tests {
         .to_string()
     }
 
+    /// A store that answers `delay` after the request arrives, on `connections` connections. It is
+    /// the shape of a durable-streams long-poll: the response head does not start until the store
+    /// has something to say, or its own long-poll window expires.
+    async fn slow_store(delay: std::time::Duration, connections: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            for _ in 0..connections {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        match socket.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => request.push(byte[0]),
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    let body = "[]";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nstream-next-offset: 0000000000000000_0000000000000000\r\nstream-up-to-date: true\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The deployed store holds an idle long-poll for 35 s before answering empty
+    /// (`long_poll_timeout_ms` in the indexed infra). A read deadline shorter than that window is
+    /// not a safety bound on a long-poll — it is a guaranteed error on every idle read — so the
+    /// long-poll carries its own, longer deadline while ordinary reads keep the short one.
+    #[tokio::test]
+    async fn a_long_poll_outlives_the_ordinary_read_deadline() {
+        let timeouts = DsTimeouts {
+            connect: std::time::Duration::from_secs(5),
+            read: std::time::Duration::from_millis(150),
+            live_read: std::time::Duration::from_secs(5),
+            request: std::time::Duration::from_secs(10),
+        };
+        // Longer than the ordinary read deadline, well inside the long-poll one: the store is
+        // holding the request open exactly as it holds an idle long-poll.
+        let base = slow_store(std::time::Duration::from_millis(400), 2).await;
+        let store = HttpDurableStreamsStore::new_in_process_with_timeouts(base, timeouts);
+
+        let live = store.read("changes/0", "-1", true).await;
+        assert!(
+            live.as_ref().is_ok_and(|res| res.status == 200),
+            "a long-poll must be bounded by the long-poll deadline, not the ordinary read deadline: {:?}",
+            live.err().map(|e| format!("{e:#}"))
+        );
+        let ordinary = store.read("changes/0", "-1", false).await;
+        assert!(ordinary.is_err(), "an ordinary read is a bounded request and keeps the short deadline");
+    }
+
+    /// The pair of defaults this depends on, in one place: the long-poll deadline has to clear the
+    /// store's window, and it is the ordinary read deadline that stays short.
+    #[test]
+    fn the_long_poll_deadline_clears_the_stores_long_poll_window() {
+        const DEPLOYED_STORE_LONG_POLL_SECS: u64 = 35;
+        let timeouts = DsTimeouts::from_env();
+        assert!(
+            timeouts.live_read.as_secs() > DEPLOYED_STORE_LONG_POLL_SECS,
+            "a long-poll deadline of {}s expires before the store's {DEPLOYED_STORE_LONG_POLL_SECS}s window",
+            timeouts.live_read.as_secs()
+        );
+        assert!(timeouts.read < timeouts.live_read, "an ordinary read must stay bounded more tightly than a long-poll");
+        assert_eq!(timeouts.read.as_secs(), DEFAULT_DS_READ_TIMEOUT_SECS);
+    }
+
+    /// The decision table behind a body-cap breach, in one place: raise only where a bigger buffer
+    /// is what the situation actually calls for.
+    #[test]
+    fn a_cap_breach_raises_only_against_an_uncapped_store_below_the_ceiling() {
+        let ceiling = 512 * 1024 * 1024;
+        assert_eq!(
+            cap_after_breach(false, None, 64 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Raise { limit: 128 * 1024 * 1024 },
+            "an uncapped store's backlog is not a fault; make progress on it"
+        );
+        assert_eq!(
+            cap_after_breach(true, None, 16 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Latch,
+            "a store that broke a page it advertised must stay visible, not be papered over"
+        );
+        assert_eq!(
+            cap_after_breach(false, Some(16 * 1024 * 1024), 16 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Latch,
+            "an operator who named a cap decided what this process may buffer"
+        );
+        assert_eq!(
+            cap_after_breach(false, None, ceiling, ceiling),
+            CapBreachOutcome::Latch,
+            "past the hard ceiling a single read really is unserviceable"
+        );
+        assert_eq!(
+            cap_after_breach(false, None, 400 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Raise { limit: ceiling },
+            "the last raise stops at the ceiling rather than overshooting it"
+        );
+    }
+
     #[tokio::test]
     async fn readiness_mismatch_stops_before_any_normal_store_operation() {
         let expected = StoreIdentityV1::in_process_test_identity();
         let mut observed = expected.clone();
         observed.store_generation = "aa8b5fa6-e786-4994-8da0-f14e9e79f318".to_string();
-        let store = Arc::new(ScriptedStore { readiness_body: Some(readiness_json(&observed)), ..Default::default() });
+        let store = Arc::new(ScriptedStore {
+            readiness_body: std::sync::Mutex::new(Some(readiness_json(&observed))),
+            ..Default::default()
+        });
         let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
 
         let error =
@@ -1451,6 +2261,24 @@ mod tests {
         assert!(error.downcast_ref::<StoreReadinessError>().is_some());
         assert_eq!(*store.operations.lock().unwrap(), vec!["ready".to_string()]);
         assert!(store.appended.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn readiness_is_reread_and_verdict_rederived_after_reconnect() {
+        let _guard = read_cap_test_guard();
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let store = Arc::new(ScriptedStore { readiness_body: std::sync::Mutex::new(None), ..Default::default() });
+        // Replace the helper's decoded value with a wire body for the first and second connections.
+        *store.readiness_body.lock().unwrap() =
+            Some(readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{"));
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store.clone());
+        assert_eq!(
+            client.refresh_readiness(&identity).await.unwrap(),
+            PageCapVerdict::Compatible { observed: 4194304 }
+        );
+        *store.readiness_body.lock().unwrap() =
+            Some(readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":33554432,\"reserve\":{"));
+        assert_eq!(client.refresh_readiness(&identity).await.unwrap(), PageCapVerdict::Exceeds { observed: 33554432 });
     }
 
     #[tokio::test]
@@ -1473,6 +2301,139 @@ mod tests {
         assert!(decode_readiness(&noncanonical).is_err());
         let fractional = readiness_json(&identity).replace("2026-08-27T19:00:00Z", "2026-08-27T19:00:00.001Z");
         assert!(decode_readiness(&fractional).is_err());
+    }
+
+    const TEST_CLIENT_CAP: u64 = 16 * 1024 * 1024;
+
+    fn readiness_with_cap(identity: &StoreIdentityV1, cap: u64) -> StoreReadinessV1 {
+        let body =
+            readiness_json(identity).replace("\"reserve\":{", &format!("\"max_chunk_bytes\":{cap},\"reserve\":{{"));
+        decode_readiness(&body).unwrap()
+    }
+
+    #[test]
+    fn readiness_preserves_max_value_bytes_separately_from_page_cap() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let body = readiness_json(&identity)
+            .replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"max_value_bytes\":1073741824,\"reserve\":{");
+        let readiness = decode_readiness(&body).unwrap();
+        assert!(format!("{readiness:?}").contains("max_value_bytes: Some(1073741824)"));
+        assert_eq!(assess_page_cap(&readiness, TEST_CLIENT_CAP), PageCapVerdict::Compatible { observed: 4194304 });
+        let message = ReadCapExceeded {
+            path: "changes/0".to_string(),
+            observed: TEST_CLIENT_CAP + 1,
+            limit: TEST_CLIENT_CAP,
+            max_value_bytes: readiness.max_value_bytes,
+        }
+        .to_string();
+        assert!(message.contains("single messages up to 1073741824"));
+    }
+
+    #[test]
+    fn a_store_that_advertises_no_page_cap_is_read_as_unknown() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let missing = decode_readiness(&readiness_json(&identity)).unwrap();
+        assert_eq!(assess_page_cap(&missing, TEST_CLIENT_CAP), PageCapVerdict::Unknown);
+        // A server that advertises zero means "unlimited", which is the same unknown page size.
+        let zero = readiness_with_cap(&identity, 0);
+        assert_eq!(assess_page_cap(&zero, TEST_CLIENT_CAP), PageCapVerdict::Unknown);
+        let fitting = readiness_with_cap(&identity, 4 * 1024 * 1024);
+        assert_eq!(
+            assess_page_cap(&fitting, TEST_CLIENT_CAP),
+            PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }
+        );
+        let oversized = readiness_with_cap(&identity, 32 * 1024 * 1024);
+        assert_eq!(
+            assess_page_cap(&oversized, TEST_CLIENT_CAP),
+            PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }
+        );
+    }
+
+    #[test]
+    fn json_page_cap_includes_two_bytes_of_array_framing() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let readiness = readiness_with_cap(&identity, TEST_CLIENT_CAP);
+        assert_eq!(assess_page_cap(&readiness, TEST_CLIENT_CAP), PageCapVerdict::Exceeds { observed: TEST_CLIENT_CAP });
+    }
+
+    #[test]
+    fn json_page_cap_fits_when_observed_plus_two_is_within_client_cap() {
+        let identity = StoreIdentityV1::in_process_test_identity();
+        let readiness = readiness_with_cap(&identity, TEST_CLIENT_CAP - 2);
+        assert_eq!(
+            assess_page_cap(&readiness, TEST_CLIENT_CAP),
+            PageCapVerdict::Compatible { observed: TEST_CLIENT_CAP - 2 }
+        );
+    }
+
+    /// No released durable-streams build advertises `max_chunk_bytes`, so refusing an unverifiable
+    /// page cap refuses every real store — including the deployed one and the conformance harness.
+    /// The default must boot and warn; the read path is what stays fail-closed.
+    #[test]
+    fn an_unverifiable_page_cap_is_advisory_by_default_and_refused_only_in_strict_mode() {
+        for verdict in [PageCapVerdict::Unknown, PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }] {
+            let advisory = enforce_page_cap(verdict, TEST_CLIENT_CAP, false)
+                .expect("an unverifiable page cap must not refuse the boot by default")
+                .expect("an unverifiable page cap must produce a warning");
+            assert!(advisory.contains("16777216"), "the advisory names the client body cap: {advisory}");
+
+            let refusal = enforce_page_cap(verdict, TEST_CLIENT_CAP, true)
+                .expect_err("strict mode must refuse an unverifiable page cap");
+            assert!(refusal.to_string().contains("storage page capability is incompatible"), "{refusal}");
+        }
+        assert!(
+            enforce_page_cap(PageCapVerdict::Unknown, TEST_CLIENT_CAP, false)
+                .unwrap()
+                .unwrap()
+                .contains("no max_chunk_bytes")
+        );
+        assert!(
+            enforce_page_cap(PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }, TEST_CLIENT_CAP, false)
+                .unwrap()
+                .unwrap()
+                .contains("max_chunk_bytes=33554432")
+        );
+    }
+
+    /// A store that does not page answers a read with the whole remainder of the stream. A cap
+    /// below that backlog does not bound memory — it stops the live loop entirely, because the
+    /// sequencer retries the identical read and it fails identically forever. Sized for the store,
+    /// not for a number.
+    #[test]
+    fn an_uncapped_store_raises_the_read_ceiling_unless_an_operator_named_one() {
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None),
+            16 * 1024 * 1024,
+            "a store that pages needs only defense in depth"
+        );
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Unknown, None),
+            64 * 1024 * 1024,
+            "a store that does not page must not be able to stall the live loop at 16 MiB"
+        );
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }, None),
+            64 * 1024 * 1024,
+            "a store whose page exceeds the client cap is the same hazard"
+        );
+        for verdict in [
+            PageCapVerdict::Unknown,
+            PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 },
+            PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 },
+        ] {
+            assert_eq!(
+                effective_read_max_bytes(verdict, Some(8 * 1024 * 1024)),
+                8 * 1024 * 1024,
+                "an operator who names a cap has decided what this process may buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compatible_page_cap_says_nothing_in_either_mode() {
+        let verdict = PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 };
+        assert!(enforce_page_cap(verdict, TEST_CLIENT_CAP, false).unwrap().is_none());
+        assert!(enforce_page_cap(verdict, TEST_CLIENT_CAP, true).unwrap().is_none());
     }
 
     /// The boot classification of a durable-streams failure. Getting this wrong is expensive in

@@ -11,7 +11,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "pnpm test:node && pnpm test:vitest",
-    "test:node": "echo 'Supported product Node test gate (PostgreSQL image + evidence helpers; planner audit excluded).' && node --import tsx --test scripts/postgres-image-version.test.ts scripts/readiness-evidence.test.ts",
+    "test:node": "echo 'Supported product Node test gate (PostgreSQL image + evidence helpers; planner audit excluded).' && node --import tsx --test scripts/postgres-image-version.test.ts scripts/readiness-evidence.test.ts scripts/allocator-build-config.test.ts",
     "test:vitest": "NODE_EXTRA_CA_CERTS=packages/conformance/test-pki/ca.pem vitest run",
     "test:readiness-plan": "echo 'Non-gating planner audit: known stale/red provenance-planning lane, not a product test gate.' && node --import tsx --test scripts/readiness-plan.test.ts",
     "test:conformance": "NODE_EXTRA_CA_CERTS=packages/conformance/test-pki/ca.pem vitest run packages/conformance",

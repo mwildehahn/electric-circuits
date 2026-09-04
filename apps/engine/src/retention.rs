@@ -1,5 +1,5 @@
 //! Shape retention: the three-tier lifecycle (active / dormant / evicted) and its layered,
-//! dormant-only eviction policy.
+//! dormant eviction policy plus active retirement for non-parkable feeds.
 //!
 //! Replaces delete-on-refcount-0 (extended API) and the "handle TTL drops the shape" behavior of
 //! the `/v1/shape` adapter as the primary lifecycle (a deliberate divergence from upstream
@@ -18,7 +18,8 @@
 //! - **Evicted** — stream and record deleted; a returning `/v1/shape` client gets `409
 //!   must-refetch` and re-snapshots, an extended-API client gets `404` and recreates.
 //!
-//! Eviction is **layered** and applies to dormant shapes only (active shapes are never evicted),
+//! Eviction is **layered**: ordinary shapes are evicted from dormant, while non-parkable active
+//! shapes (subqueries, aggregates, changes-only) retire after the full idle+dormancy grace,
 //! least-recently-read first:
 //! 1. **Dormancy TTL** (hygiene): dormant longer than [`RetentionConfig::dormant_ttl`] → evict.
 //!    Reaps dead shapes even with no resource pressure.
@@ -30,7 +31,7 @@
 //!    the durable-streams server exposes no per-stream sizes yet — so it undercounts streams
 //!    written before the current process started.
 //!
-//! If a cap/budget is exceeded but nothing dormant is left to evict, the sweep logs loudly and
+//! If a cap/budget is exceeded but nothing eligible is left to evict, the sweep logs loudly and
 //! bumps a metric instead of evicting active shapes.
 //!
 //! Subquery and aggregate shapes are exempt from dormancy (their engine state — inner-set
@@ -57,23 +58,45 @@ use crate::pg::SnapshotGate;
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` (30 min) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
+/// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
+/// | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Time since the last renewal before a native subscription lease lapses. `0` disables lease expiry. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
+/// | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum change-log span budget for dormant replay. |
+/// | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Replay budget multiplier applied to the shape's recorded backfill bytes. |
 /// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Total shape-count cap; over it, least-recently-read dormant shapes are evicted. `0` = unlimited. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Cap on tracked shape-stream bytes; over it, least-recently-read dormant shapes are evicted. |
 /// | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Sweep interval of the background retention task. |
+/// | `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` | `20` | How long a create/join/read may wait on a dormant shape's reactivation before it gives up with a typed recreate outcome. The reactivation itself continues. `0` = wait forever. |
 #[derive(Clone, Debug)]
 pub struct RetentionConfig {
-    /// Active → dormant idle threshold (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, default 30 min; 0 = never).
+    /// Active → dormant idle threshold (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, default 6 hours; 0 = never).
     pub idle_timeout: Duration,
+    /// Native subscription lease window (`ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`, default 30 min; 0 = never).
+    pub subscription_lease_timeout: Duration,
     /// Dormant → evicted hygiene TTL (`ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS`, default 7 days; 0 = never).
     pub dormant_ttl: Duration,
+    /// Minimum dormant replay span in bytes (`ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES`).
+    pub replay_min_bytes: u64,
+    /// Backfill-size multiplier for replay admission (`ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER`).
+    pub replay_multiplier: u64,
     /// Total shape-count cap (`ELECTRIC_CIRCUITS_MAX_SHAPES`, default 10000; 0 = unlimited).
     pub max_shapes: usize,
     /// Shape-stream disk budget in bytes (`ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB`, default 0 = disabled).
     pub disk_budget_bytes: u64,
     /// Background sweep interval (`ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS`, default 60s).
     pub sweep_interval: Duration,
+    /// How long a touch may wait on an in-flight reactivation before giving up with a typed
+    /// recreate outcome (`ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`, default 20s; 0 = wait
+    /// forever). The default sits under the API gateway's 30s read timeout: a large-span replay
+    /// takes longer than the gateway will wait, and a caller that is going to be cut off anyway is
+    /// better served by an answer it can act on than by the gateway's 503.
+    pub reactivation_join_timeout: Duration,
+    /// Per-shape ceiling for the buffer of live deltas a shape accumulates between `BeginShape` and
+    /// `ActivateShape` (`ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES`, default 64 MiB; 0 = no cap).
+    /// That window is a Postgres backfill for a create and a change-log replay for a wake — plus,
+    /// since replays are permit-gated, the wait for a permit, which makes the window "replay
+    /// duration x queue depth". Past the cap the buffer is dropped and the shape answers recreate.
+    pub pending_buffer_max_bytes: u64,
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -83,27 +106,54 @@ fn env_u64(name: &str, default: u64) -> u64 {
 impl Default for RetentionConfig {
     fn default() -> Self {
         RetentionConfig {
-            idle_timeout: Duration::from_secs(1800),
+            idle_timeout: Duration::from_secs(6 * 3600),
+            subscription_lease_timeout: Duration::from_secs(1800),
             dormant_ttl: Duration::from_secs(7 * 24 * 3600),
+            replay_min_bytes: 16 * 1024 * 1024,
+            replay_multiplier: 4,
             max_shapes: 10_000,
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
+            reactivation_join_timeout: Duration::from_secs(20),
+            pending_buffer_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
 
 impl RetentionConfig {
+    pub fn replay_budget(&self, backfill_bytes: Option<u64>) -> u64 {
+        self.replay_min_bytes.max(backfill_bytes.unwrap_or(0).saturating_mul(self.replay_multiplier))
+    }
+
     pub fn from_env() -> Self {
         let d = RetentionConfig::default();
+        // Backward compatibility: deployments and the conformance harness historically set the
+        // idle knob to accelerate both dormancy and lease expiry. An explicit lease knob wins;
+        // otherwise preserve that legacy coupling only when the old env var is actually supplied.
+        let legacy_idle =
+            std::env::var("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let lease_secs = std::env::var("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or(legacy_idle)
+            .unwrap_or(d.subscription_lease_timeout.as_secs());
         RetentionConfig {
-            idle_timeout: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
+            idle_timeout: Duration::from_secs(legacy_idle.unwrap_or(d.idle_timeout.as_secs())),
+            subscription_lease_timeout: Duration::from_secs(lease_secs),
             dormant_ttl: Duration::from_secs(env_u64(
                 "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS",
                 d.dormant_ttl.as_secs(),
             )),
+            replay_min_bytes: env_u64("ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES", d.replay_min_bytes),
+            replay_multiplier: env_u64("ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER", d.replay_multiplier),
             max_shapes: env_u64("ELECTRIC_CIRCUITS_MAX_SHAPES", d.max_shapes as u64) as usize,
             disk_budget_bytes: env_u64("ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
             sweep_interval: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", 60).max(1)),
+            reactivation_join_timeout: Duration::from_secs(env_u64(
+                "ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS",
+                d.reactivation_join_timeout.as_secs(),
+            )),
+            pending_buffer_max_bytes: env_u64("ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES", d.pending_buffer_max_bytes),
         }
     }
 }
@@ -180,6 +230,12 @@ pub struct SweepShape {
     pub dormancy_eligible: bool,
     /// Tracked bytes appended to the shape's stream (engine-side accounting).
     pub stream_bytes: u64,
+    /// Bytes from the dormant cursor to the current tail. `None` means the cursor's segment is gone.
+    pub replay_span_bytes: Option<u64>,
+    /// A transient HEAD failure prevented measuring the span this sweep; defer eviction.
+    pub replay_span_deferred: bool,
+    /// Last plain-shape backfill estimate. `None` is an old/unknown catalog record.
+    pub backfill_bytes: Option<u64>,
 }
 
 /// Did an eviction actually happen?
@@ -209,6 +265,7 @@ pub enum EvictReason {
     /// segment so it can be deleted — the change log must not be held hostage by a shape nobody has
     /// touched in a week.
     ChangeLogRetention,
+    ReplayBudget,
 }
 
 impl EvictReason {
@@ -218,6 +275,7 @@ impl EvictReason {
             EvictReason::MaxShapes => "max-shapes",
             EvictReason::DiskBudget => "disk-budget",
             EvictReason::ChangeLogRetention => "change-log-retention",
+            EvictReason::ReplayBudget => "replay-budget",
         }
     }
 }
@@ -254,6 +312,23 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
 
     let mut evicted: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
+    // A parked cursor that points into an expired segment, or whose replay span has grown beyond
+    // the shape's bounded replay budget, is no longer safely reactivatable. Retire it now so the
+    // next subscriber recreates from a fresh snapshot.
+    for s in shapes {
+        if s.dormant_for.is_some() {
+            if s.replay_span_deferred {
+                continue;
+            } else if s.replay_span_bytes.is_none() {
+                plan.evict.push((s.id.clone(), EvictReason::ChangeLogRetention));
+                evicted.insert(&s.id);
+            } else if s.replay_span_bytes.unwrap_or(0) > cfg.replay_budget(s.backfill_bytes) {
+                plan.evict.push((s.id.clone(), EvictReason::ReplayBudget));
+                evicted.insert(&s.id);
+            }
+        }
+    }
+
     // Tier 1 — dormancy TTL (hygiene, independent of pressure).
     if !cfg.dormant_ttl.is_zero() {
         for s in shapes {
@@ -262,20 +337,20 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
                 evicted.insert(&s.id);
             }
         }
-        // Shapes that cannot park (subquery / aggregate — their state is not rebuildable from a
-        // bounded replay) would otherwise be immortal once unsubscribed: evict them straight from
-        // active after the same total grace an eligible shape gets (idle timeout + dormancy TTL).
-        // They are recreatable — a returning client gets 404 / must-refetch and recreates.
-        if !cfg.idle_timeout.is_zero() {
-            for s in shapes {
-                if !s.dormancy_eligible
-                    && !s.in_transition
-                    && s.refcount == 0
-                    && s.idle >= cfg.idle_timeout + cfg.dormant_ttl
-                {
-                    plan.evict.push((s.id.clone(), EvictReason::DormantTtl));
-                    evicted.insert(&s.id);
-                }
+        // Shapes that cannot park (subquery / aggregate state is not rebuildable from a bounded
+        // replay; changes_only feeds would lose their dormant-period history) would otherwise be
+        // immortal once unsubscribed: evict them straight from active after the same total grace
+        // an eligible shape gets (idle timeout + dormancy TTL). They are recreatable — a returning
+        // client gets 404 / must-refetch and recreates; changes_only callers receive a fresh feed
+        // rather than a silently incomplete dormant replay.
+        for s in shapes {
+            if !s.dormancy_eligible
+                && !s.in_transition
+                && s.refcount == 0
+                && s.idle >= cfg.idle_timeout + cfg.dormant_ttl
+            {
+                plan.evict.push((s.id.clone(), EvictReason::DormantTtl));
+                evicted.insert(&s.id);
             }
         }
     }
@@ -332,10 +407,15 @@ mod tests {
     fn cfg() -> RetentionConfig {
         RetentionConfig {
             idle_timeout: Duration::from_secs(1800),
+            subscription_lease_timeout: Duration::from_secs(1800),
             dormant_ttl: Duration::from_secs(7 * 24 * 3600),
+            replay_min_bytes: 16 * 1024 * 1024,
+            replay_multiplier: 4,
             max_shapes: 0,
             disk_budget_bytes: 0,
             sweep_interval: Duration::from_secs(60),
+            reactivation_join_timeout: Duration::from_secs(20),
+            pending_buffer_max_bytes: 64 * 1024 * 1024,
         }
     }
 
@@ -348,6 +428,9 @@ mod tests {
             in_transition: false,
             dormancy_eligible: true,
             stream_bytes: 0,
+            replay_span_bytes: None,
+            replay_span_deferred: false,
+            backfill_bytes: None,
         }
     }
 
@@ -355,6 +438,7 @@ mod tests {
         SweepShape {
             idle: Duration::from_secs(idle_secs),
             dormant_for: Some(Duration::from_secs(dormant_secs)),
+            replay_span_bytes: Some(0),
             ..shape(id)
         }
     }
@@ -409,6 +493,17 @@ mod tests {
     }
 
     #[test]
+    fn non_parkable_retirement_still_runs_when_dormancy_is_disabled() {
+        let c = RetentionConfig {
+            idle_timeout: Duration::ZERO,
+            subscription_lease_timeout: Duration::from_secs(1800),
+            ..cfg()
+        };
+        let shapes = vec![SweepShape { idle: c.dormant_ttl, dormancy_eligible: false, ..shape("changes-only") }];
+        assert_eq!(plan_sweep(&c, &shapes).evict, vec![("changes-only".to_string(), EvictReason::DormantTtl)]);
+    }
+
+    #[test]
     fn max_shapes_evicts_least_recently_read_dormant_first() {
         let c = RetentionConfig { max_shapes: 2, ..cfg() };
         let shapes = vec![
@@ -457,6 +552,22 @@ mod tests {
     }
 
     #[test]
+    fn replay_budget_evicts_over_budget_and_unknown_uses_minimum() {
+        let c = RetentionConfig { replay_min_bytes: 100, replay_multiplier: 4, ..cfg() };
+        let over = SweepShape { replay_span_bytes: Some(401), backfill_bytes: Some(100), ..dormant("over", 1, 1) };
+        let unknown_ok = SweepShape { replay_span_bytes: Some(100), backfill_bytes: None, ..dormant("unknown", 1, 1) };
+        let plan = plan_sweep(&c, &[over, unknown_ok]);
+        assert_eq!(plan.evict, vec![("over".to_string(), EvictReason::ReplayBudget)]);
+    }
+
+    #[test]
+    fn missing_replay_segment_is_evicted_immediately() {
+        let shape = SweepShape { replay_span_bytes: None, ..dormant("gone", 1, 1) };
+        let plan = plan_sweep(&cfg(), &[shape]);
+        assert_eq!(plan.evict, vec![("gone".to_string(), EvictReason::ChangeLogRetention)]);
+    }
+
+    #[test]
     fn ttl_evictions_count_toward_the_cap_and_budget() {
         // s1 falls to the TTL; that alone brings the count under max_shapes, so no cap eviction.
         let c = RetentionConfig { max_shapes: 1, ..cfg() };
@@ -469,7 +580,8 @@ mod tests {
     #[test]
     fn config_defaults_are_sensible() {
         let d = RetentionConfig::default();
-        assert_eq!(d.idle_timeout, Duration::from_secs(1800));
+        assert_eq!(d.idle_timeout, Duration::from_secs(6 * 3600));
+        assert_eq!(d.subscription_lease_timeout, Duration::from_secs(1800));
         assert_eq!(d.dormant_ttl, Duration::from_secs(604800));
         assert_eq!(d.max_shapes, 10_000);
         assert_eq!(d.disk_budget_bytes, 0);

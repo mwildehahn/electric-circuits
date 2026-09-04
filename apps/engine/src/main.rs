@@ -33,6 +33,10 @@ use anyhow::{Context, Result};
 use electric_circuits_engine::config::{self, Config};
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::Engine;
+
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use electric_circuits_engine::shutdown::{self, ShutdownToken};
 use electric_circuits_engine::store_identity::StoreBound;
 #[cfg(feature = "test-support")]
@@ -60,6 +64,17 @@ async fn main() -> Result<()> {
         tracing::info!("accepted (no-op) ELECTRIC_* vars: {}", config.noop_vars.join(", "));
     }
     tracing::info!("resolved config: {}", config.redacted());
+    #[cfg(unix)]
+    {
+        let allocator = electric_circuits_engine::mem::allocator_config();
+        tracing::info!(
+            event = "jemalloc_config",
+            background_thread = ?allocator.background_thread,
+            dirty_decay_ms = ?allocator.dirty_decay_ms,
+            muzzy_decay_ms = ?allocator.muzzy_decay_ms,
+            "effective jemalloc decay configuration"
+        );
+    }
 
     // Publish request-path globals. Metrics transport is initialized only after storage admission,
     // so readiness stays the first network operation.

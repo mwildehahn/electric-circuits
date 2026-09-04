@@ -3,6 +3,10 @@
 
 use super::*;
 
+pub(crate) struct ReplayBatch {
+    targets: Vec<(crate::engine::sequencer::ReplayTarget, tokio::sync::oneshot::Sender<Result<u64>>)>,
+}
+
 /// How many times a create/join is redone after losing a race during its catalog durability wait
 /// (see [`Engine::recheck_after_durability`]). Three: the race needs an *external* retirement to
 /// land inside the wait, so a second loss is already unusual and a third means something is
@@ -41,11 +45,127 @@ fn retry_create(
             );
             Err(())
         }
+        // Only an OVER-BUDGET recreate is redone here. The shape has been retired, so the redo
+        // finds nothing to join and takes a fresh backfill. A JOIN-TIMED-OUT recreate must not be
+        // redone: the shape is still reactivating, so the redo would rejoin the same replay and
+        // spend another full timeout — exactly the overrun this bounds.
+        Err(e)
+            if e.downcast_ref::<ReactivationRecreate>()
+                .is_some_and(|r| matches!(r.reason, RecreateReason::OverBudget | RecreateReason::JoinTimedOut))
+                && attempt < CREATE_RACE_ATTEMPTS =>
+        {
+            tracing::info!("{what} create found an over-budget dormant shape; retrying as a fresh create");
+            Err(())
+        }
         _ => Ok(res),
     }
 }
 
 impl Engine {
+    /// Decide whether a parked plain shape may replay. A missing segment is terminal; callers
+    /// retire the stream so a subscriber receives the ADR-0007 closed-stream signal and recreates.
+    async fn reactivation_admission(&self, id: &str, resume: &LogPosition) -> Result<bool> {
+        let span = self
+            .dormant_replay_span_result(resume)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("dormant replay cursor points into an expired segment"))?;
+        let backfill = self.state.lock().await.shapes.get(id).and_then(|r| r.backfill_bytes);
+        let budget = self.retention.replay_budget(backfill);
+        tracing::debug!(shape_id = id, span_bytes = span, budget_bytes = budget, backfill_bytes = ?backfill, "reactivation admission");
+        Ok(span <= budget)
+    }
+
+    /// Compute the byte span a dormant replay would scan. For the parked segment, subtract the
+    /// cursor's byte offset from that segment's HEAD; for every later retained segment use its
+    /// complete HEAD size; for the current segment stop at the engine's processed tail. A missing
+    /// HEAD means rotation/retention already removed the cursor and is an immediate eviction.
+    async fn dormant_replay_span(&self, resume: &LogPosition) -> Option<u64> {
+        let mut cache = std::collections::HashMap::new();
+        self.dormant_replay_span_cached(resume, &mut cache).await
+    }
+
+    async fn dormant_replay_span_result(&self, resume: &LogPosition) -> Result<Option<u64>> {
+        let mut cache = std::collections::HashMap::new();
+        self.dormant_replay_span_result_cached(resume, &mut cache).await
+    }
+
+    async fn dormant_replay_span_result_cached(
+        &self,
+        resume: &LogPosition,
+        heads: &mut std::collections::HashMap<u32, std::result::Result<Option<u64>, String>>,
+    ) -> Result<Option<u64>> {
+        let tail = self.changes_position();
+        if resume.segment > tail.segment {
+            return Ok(Some(0));
+        }
+        let mut total = 0u64;
+        for segment in resume.segment..=tail.segment {
+            let head = match heads.get(&segment) {
+                Some(cached) => cached.clone().map_err(anyhow::Error::msg),
+                None => {
+                    let result = self
+                        .ds
+                        .head(&crate::changelog::segment_path(segment))
+                        .await
+                        .map(|head| {
+                            head.and_then(|head| head.next_offset.as_deref().and_then(crate::changelog::offset_bytes))
+                        })
+                        .map_err(|e| format!("{e:#}"));
+                    heads.insert(segment, result.clone());
+                    result.map_err(|e| anyhow::Error::new(crate::engine::ReplayHeadUnavailable).context(e))
+                }
+            }?;
+            let Some(segment_head) = head else { return Ok(None) };
+            let end = if segment == tail.segment {
+                crate::changelog::offset_bytes(&tail.offset).unwrap_or(segment_head)
+            } else {
+                segment_head
+            };
+            let start =
+                if segment == resume.segment { crate::changelog::offset_bytes(&resume.offset).unwrap_or(0) } else { 0 };
+            total = total.saturating_add(end.saturating_sub(start));
+        }
+        Ok(Some(total))
+    }
+
+    pub(crate) async fn dormant_replay_span_cached(
+        &self,
+        resume: &LogPosition,
+        heads: &mut std::collections::HashMap<u32, Option<u64>>,
+    ) -> Option<u64> {
+        let tail = self.changes_position();
+        if resume.segment > tail.segment {
+            return Some(0);
+        }
+        let mut total = 0u64;
+        for segment in resume.segment..=tail.segment {
+            let head = match heads.get(&segment).copied() {
+                Some(cached) => cached,
+                None => {
+                    let value = self
+                        .ds
+                        .head(&crate::changelog::segment_path(segment))
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|head| head.next_offset.as_deref().and_then(crate::changelog::offset_bytes));
+                    heads.insert(segment, value);
+                    value
+                }
+            };
+            let segment_head = head?;
+            let end = if segment == tail.segment {
+                crate::changelog::offset_bytes(&tail.offset).unwrap_or(segment_head)
+            } else {
+                segment_head
+            };
+            let start =
+                if segment == resume.segment { crate::changelog::offset_bytes(&resume.offset).unwrap_or(0) } else { 0 };
+            total = total.saturating_add(end.saturating_sub(start));
+        }
+        Some(total)
+    }
+
     /// `share`: when true, an identical existing shape (same table, canonical predicate, and columns) is
     /// joined by ref-count instead of creating a second stream — so N app clients subscribing to the same
     /// reference shape (e.g. `project_members WHERE user_id = me`) share one maintained output. Both
@@ -306,6 +426,8 @@ impl Engine {
                 is_subquery: true,
                 aggregate: None,
                 fingerprint: ts.fingerprint.clone(),
+                backfill_rows: None,
+                backfill_bytes: None,
             };
             // The load-bearing degrade check: taken under the state lock, in the same critical
             // section as the registration below. The degradation reaper snapshots every registered
@@ -444,6 +566,8 @@ impl Engine {
             is_subquery: false,
             aggregate: None,
             fingerprint: ts.fingerprint.clone(),
+            backfill_rows: None,
+            backfill_bytes: None,
         };
         // Under the state lock, immediately before registering — see `ensure_create_not_degraded`
         // for why this check and the one after the create's work are together sufficient.
@@ -493,7 +617,7 @@ impl Engine {
             }
         };
         match outcome {
-            Ok(()) => {
+            Ok(backfill_stats) => {
                 // The create's work is done, but it may have overlapped a degradation — its stream is
                 // then already reaped and the handle would be dead on arrival. Refuse instead of
                 // answering success (see `ensure_create_not_degraded`).
@@ -513,6 +637,16 @@ impl Engine {
                     let _ = share_tx.send(ShareOutcome::Failed);
                     creating.rollback().await;
                     return Err(error.into());
+                }
+                if !changes_only {
+                    self.catalog_tx
+                        .send_durable(CatalogEvent::BackfillSized {
+                            id: rec.id.clone(),
+                            rows: backfill_stats.rows,
+                            bytes: backfill_stats.estimated_bytes,
+                        })
+                        .await
+                        .map_err(anyhow::Error::from)?;
                 }
                 // The wait is an interval of its own: re-check before acknowledging.
                 if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
@@ -698,6 +832,8 @@ impl Engine {
                             is_subquery: false,
                             aggregate: Some(AggInfo { func, col }),
                             fingerprint: ts.fingerprint.clone(),
+                            backfill_rows: None,
+                            backfill_bytes: None,
                         };
                         // Under the state lock, immediately before registering — see
                         // `ensure_create_not_degraded` for why this check and the one after the
@@ -809,6 +945,8 @@ impl Engine {
             is_subquery: false,
             aggregate: Some(AggInfo { func, col }),
             fingerprint: ts.fingerprint.clone(),
+            backfill_rows: None,
+            backfill_bytes: None,
         };
         // Under the state lock, immediately before registering — see `ensure_create_not_degraded`
         // for why this check and the one after the create's work are together sufficient.
@@ -847,7 +985,7 @@ impl Engine {
         )
         .await;
         match outcome {
-            Ok(()) => {
+            Ok(_backfill_stats) => {
                 // The create's work is done, but it may have overlapped a degradation — its stream is
                 // then already reaped and the handle would be dead on arrival. Refuse instead of
                 // answering success (see `ensure_create_not_degraded`).
@@ -986,6 +1124,7 @@ impl Engine {
 
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
+        self.cancel_reactivation_scan(id);
         self.lives.lock().unwrap().remove(id);
         st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
@@ -1189,7 +1328,11 @@ impl Engine {
                         match &life.state {
                             LifeState::Active => Step::Done,
                             LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
-                            LifeState::Reactivating { done, .. } => Step::WaitReactivate(done.clone()),
+                            LifeState::Reactivating { done, .. } => {
+                                metrics().reactivations_coalesced.fetch_add(1, Ordering::Relaxed);
+                                metrics().reactivation_scans_coalesced.fetch_add(1, Ordering::Relaxed);
+                                Step::WaitReactivate(done.clone())
+                            }
                             LifeState::Dormant { resume, gate, .. } => {
                                 let control = self.admit_control()?;
                                 // Kick off the replay in a DETACHED task: `ensure_active` futures
@@ -1204,8 +1347,47 @@ impl Engine {
                                 life.state = LifeState::Reactivating { done: rx.clone(), resume: resume.clone() };
                                 let engine = self.clone();
                                 let id = id.to_string();
+                                metrics().reactivations_started.fetch_add(1, Ordering::Relaxed);
                                 tokio::spawn(async move {
                                     let _control = control;
+                                    let admission = engine.reactivation_admission(&id, &resume).await;
+                                    if let Err(error) = &admission {
+                                        if error.downcast_ref::<crate::engine::ReplayHeadUnavailable>().is_some() {
+                                            tracing::warn!("reactivation admission for {id} deferred: {error:#}");
+                                            if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                                life.state = LifeState::Dormant {
+                                                    since: std::time::Instant::now(),
+                                                    resume: resume.clone(),
+                                                    gate: gate.clone(),
+                                                };
+                                            }
+                                            metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
+                                            let _ = tx.send(Some(false));
+                                            return;
+                                        }
+                                    }
+                                    if admission.is_err() || !admission.as_ref().copied().unwrap_or(false) {
+                                        let reason = if admission.is_err() {
+                                            EvictReason::ChangeLogRetention
+                                        } else {
+                                            EvictReason::ReplayBudget
+                                        };
+                                        if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                            life.state = LifeState::Dormant {
+                                                since: std::time::Instant::now(),
+                                                resume: resume.clone(),
+                                                gate: gate.clone(),
+                                            };
+                                        }
+                                        let _ = engine.evict_shape(&id, reason).await;
+                                        metrics().reactivations_recreated.fetch_add(1, Ordering::Relaxed);
+                                        if admission.is_err() {
+                                            metrics().reactivations_evicted_unresumable.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        let _ = tx.send(Some(false));
+                                        return;
+                                    }
+                                    metrics().reactivations_replayed.fetch_add(1, Ordering::Relaxed);
                                     let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
                                     let err = match res {
                                         Ok(()) => {
@@ -1215,6 +1397,7 @@ impl Engine {
                                                 life.last_read = std::time::Instant::now();
                                             }
                                             drop(lives);
+                                            metrics().reactivations_completed.fetch_add(1, Ordering::Relaxed);
                                             let _ = tx.send(Some(true));
                                             return;
                                         }
@@ -1226,6 +1409,27 @@ impl Engine {
                                     // back as dormant with a resume position that will 404 on every
                                     // future touch. Subscribers get 404 / `stream-closed` and
                                     // recreate, which backfills them from Postgres.
+                                    // The buffer of live deltas this wake accumulated passed its
+                                    // cap and was dropped, so the shape can never be activated from
+                                    // it: retire the identity and answer recreate, the same
+                                    // outcome an over-budget replay produces and one every client
+                                    // surface already handles.
+                                    if err.downcast_ref::<crate::engine::PendingBufferOverflow>().is_some() {
+                                        tracing::error!("reactivating shape {id}: {err:#}");
+                                        if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                            life.state = LifeState::Dormant {
+                                                since: std::time::Instant::now(),
+                                                resume: resume.clone(),
+                                                gate: gate.clone(),
+                                            };
+                                        }
+                                        if let Err(e) = engine.evict_shape(&id, EvictReason::ReplayBudget).await {
+                                            tracing::warn!("retiring overflowed shape {id} failed: {e:#}");
+                                        }
+                                        metrics().reactivations_recreated.fetch_add(1, Ordering::Relaxed);
+                                        let _ = tx.send(Some(false));
+                                        return;
+                                    }
                                     if crate::ds::is_stream_gone(&err) {
                                         tracing::error!(
                                             "reactivating shape {id}: its change-log resume segment {} is gone \
@@ -1245,6 +1449,7 @@ impl Engine {
                                             tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
                                         }
                                         let _ = tx.send(Some(false));
+                                        metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
                                         return;
                                     }
                                     tracing::warn!("reactivating shape {id} failed: {err:#}");
@@ -1253,6 +1458,7 @@ impl Engine {
                                         life.state =
                                             LifeState::Dormant { since: std::time::Instant::now(), resume, gate };
                                     }
+                                    metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
                                     let _ = tx.send(Some(false));
                                 });
                                 Step::WaitReactivate(rx)
@@ -1271,18 +1477,62 @@ impl Engine {
                         }
                     }
                 }
-                Step::WaitReactivate(mut rx) => loop {
-                    let outcome = *rx.borrow_and_update();
-                    match outcome {
-                        Some(true) => return Ok(()),
-                        Some(false) => bail!("shape '{id}' reactivation failed; retry the read"),
-                        None => {
-                            if rx.changed().await.is_err() {
-                                bail!("shape '{id}' reactivator died; retry the read");
+                Step::WaitReactivate(mut rx) => {
+                    // The reactivation is DETACHED and unbounded — a large-span replay can run for
+                    // tens of seconds. This request is not: past the join timeout it gives up with
+                    // a typed recreate outcome and lets the replay finish on its own, rather than
+                    // being cut off by the API gateway's read timeout with nothing to act on.
+                    let deadline = (!self.retention.reactivation_join_timeout.is_zero())
+                        .then(|| tokio::time::Instant::now() + self.retention.reactivation_join_timeout);
+                    loop {
+                        let outcome = *rx.borrow_and_update();
+                        match outcome {
+                            Some(true) => return Ok(()),
+                            Some(false) => {
+                                if !self.lives.lock().unwrap().contains_key(id) {
+                                    return Err(anyhow::Error::new(ReactivationRecreate::over_budget(id)));
+                                }
+                                return Err(anyhow::Error::new(ReactivationDeferred::new(
+                                    id,
+                                    "the attempt failed and the shape was parked back as dormant",
+                                )));
+                            }
+                            None => {
+                                let changed = match deadline {
+                                    None => rx.changed().await.map(Some),
+                                    Some(deadline) => match tokio::time::timeout_at(deadline, rx.changed()).await {
+                                        Ok(changed) => changed.map(Some),
+                                        Err(_) => Ok(None),
+                                    },
+                                };
+                                match changed {
+                                    Ok(Some(())) => {}
+                                    Ok(None) => {
+                                        metrics().reactivation_joins_timed_out.fetch_add(1, Ordering::Relaxed);
+                                        tracing::warn!(
+                                            shape_id = id,
+                                            timeout_secs = self.retention.reactivation_join_timeout.as_secs(),
+                                            "gave up waiting on an in-flight reactivation; the replay continues \
+                                             and the caller is told to recreate"
+                                        );
+                                        // A timed-out create/join must have the same actionable
+                                        // recreate semantics as an over-budget replay. Retire the
+                                        // old identity now; the detached task will observe the
+                                        // missing lifecycle entry and settle harmlessly.
+                                        let _ = self.purge_shape(id).await;
+                                        return Err(anyhow::Error::new(ReactivationRecreate::join_timed_out(id)));
+                                    }
+                                    Err(_) => {
+                                        return Err(anyhow::Error::new(ReactivationDeferred::new(
+                                            id,
+                                            "the reactivator went away before publishing an outcome",
+                                        )));
+                                    }
+                                }
                             }
                         }
                     }
-                },
+                }
             }
         }
     }
@@ -1325,21 +1575,27 @@ impl Engine {
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-        ack_rx.await.map_err(|_| anyhow::anyhow!("sequencer dropped the begin-shape ack"))?;
+        // The fence for the replay comes back WITH the ack: it is the sequencer's published
+        // position at the instant this shape's pending buffer started collecting. Taking it any
+        // earlier (the ingestor's tail when the touch was accepted, before the admission HEADs and
+        // the state lock) leaves every envelope processed in between to neither the replay — which
+        // stops at the fence, and on a chunked store cuts its last page short of the tail — nor the
+        // buffer, which did not exist yet.
+        let buffer_start = ack_rx.await.map_err(|_| anyhow::anyhow!("sequencer dropped the begin-shape ack"))?;
         // Replay everything the retained stream is missing (buffering live deltas meanwhile).
-        let emitted = match replay_changes_for_shape(
-            &self.ds,
-            &ts,
-            &rec.table,
-            &pred,
-            out_cols.as_ref(),
-            &gate,
-            &rec.stream_path,
-            &resume,
-            self.pg_url.is_none(),
-            &self.shutdown_token(),
-        )
-        .await
+        let emitted = match self
+            .replay_coalesced(
+                id,
+                ts.clone(),
+                rec.table.clone(),
+                pred.clone(),
+                out_cols.clone(),
+                gate.clone(),
+                rec.stream_path.clone(),
+                resume.clone(),
+                Some(buffer_start),
+            )
+            .await
         {
             Ok(n) => n,
             Err(e) => {
@@ -1360,10 +1616,18 @@ impl Engine {
                 ready: ready_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-        ready_rx
-            .await
-            .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
-            .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e}"))?;
+        // An overflowed pending buffer is not a retryable failure: the deltas the shape needed are
+        // gone, so it is retired and recreated from a fresh backfill exactly as an over-budget
+        // replay is. Every other activation failure keeps its message.
+        match ready_rx.await.unwrap_or_else(|_| {
+            Err(crate::engine::sequencer::ActivateFailure::Failed("sequencer dropped the ready channel".to_string()))
+        }) {
+            Ok(()) => {}
+            Err(crate::engine::sequencer::ActivateFailure::PendingBufferOverflow) => {
+                return Err(anyhow::Error::new(PendingBufferOverflow { shape: id.to_string() }));
+            }
+            Err(other) => return Err(anyhow::anyhow!("shape '{id}' reactivation failed: {other}")),
+        }
         // The replay read the change log through the schema captured above; if the table drifted
         // meanwhile the shape has been retired underneath us and must not be reported live.
         if let Err(e) = self.ensure_schema_unchanged(&gens).await {
@@ -1380,6 +1644,90 @@ impl Engine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_coalesced(
+        &self,
+        shape_id: &str,
+        ts: TableSchema,
+        table: TableRef,
+        pred: Arc<CompiledPredicate>,
+        out_cols: Option<Arc<Vec<usize>>>,
+        gate: crate::pg::SnapshotGate,
+        stream_path: String,
+        from: LogPosition,
+        until: Option<LogPosition>,
+    ) -> Result<u64> {
+        // Requests on the same segment are admitted to one scan window. The worker scans from the
+        // earliest cursor in the batch and routes each page by its byte range, so targets parked at
+        // different cursors each receive exactly the envelopes after their own cursor.
+        let key = format!("{}:{}", table, from.segment);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = {
+            let mut batches = self.reactivation_batches.lock().unwrap();
+            if let Some(existing) = batches.get(&key) {
+                metrics().reactivation_scans_coalesced.fetch_add(1, Ordering::Relaxed);
+                existing.clone()
+            } else {
+                let batch = Arc::new(std::sync::Mutex::new(ReplayBatch { targets: Vec::new() }));
+                batches.insert(key.clone(), batch.clone());
+                let engine = self.clone();
+                let batch_for_task = batch.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    engine.reactivation_batches.lock().unwrap().remove(&key);
+                    let targets = std::mem::take(&mut batch_for_task.lock().unwrap().targets);
+                    let (targets, waiters): (Vec<_>, Vec<_>) = targets.into_iter().unzip();
+                    let permit = engine.reactivation_permits.clone().acquire_owned().await;
+                    let results = if permit.is_ok() {
+                        crate::engine::sequencer::replay_changes_for_targets(
+                            &engine.ds,
+                            targets,
+                            &engine.shutdown_token(),
+                        )
+                        .await
+                    } else {
+                        (0..waiters.len()).map(|_| Err(anyhow::anyhow!("reactivation scheduler closed"))).collect()
+                    };
+                    for (waiter, result) in waiters.into_iter().zip(results) {
+                        let _ = waiter.send(result);
+                    }
+                });
+                batch
+            }
+        };
+        // Registered before the target is queued, so a retirement that lands while the batch is
+        // still coalescing (or waiting for a permit) is seen by the scan when it starts.
+        let purged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.reactivation_cancels.lock().unwrap().insert(shape_id.to_string(), purged.clone());
+        batch.lock().unwrap().targets.push((
+            crate::engine::sequencer::ReplayTarget {
+                shape_id: shape_id.to_string(),
+                purged,
+                ts,
+                table,
+                pred,
+                out_cols,
+                gate,
+                stream_path,
+                from,
+                library_mode: self.pg_url.is_none(),
+                until,
+            },
+            tx,
+        ));
+        let outcome = rx.await;
+        self.reactivation_cancels.lock().unwrap().remove(shape_id);
+        outcome.map_err(|_| anyhow::anyhow!("coalesced replay worker stopped"))?
+    }
+
+    /// Tell an in-flight replay scan that the shape it is scanning for is gone, so it can stop at
+    /// its next page instead of holding a reactivation permit for the rest of the span.
+    pub(crate) fn cancel_reactivation_scan(&self, id: &str) {
+        if let Some(purged) = self.reactivation_cancels.lock().unwrap().get(id) {
+            purged.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Move an idle refcount-0 shape from active to dormant: the sequencer unregisters its
     /// routing and hands back the resume state (fully-processed change-log position + the shape's
     /// snapshot gate); the stream and record are retained. Rechecks eligibility under the locks —
@@ -1390,7 +1738,7 @@ impl Engine {
     pub(crate) async fn deactivate_shape(&self, id: &str) -> Result<()> {
         let st = self.state.lock().await;
         let Some(rec) = st.shapes.get(id).cloned() else { return Ok(()) }; // already gone
-        if rec.is_subquery || rec.aggregate.is_some() {
+        if rec.is_subquery || rec.aggregate.is_some() || rec.changes_only {
             return Ok(()); // never dormant (state not rebuildable from a bounded replay)
         }
         if st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
@@ -1450,7 +1798,11 @@ impl Engine {
         // No record: the shape is already gone, so whatever it held (a change-log segment pin
         // included) is released — that IS the outcome the caller asked for.
         let Some(rec) = st.shapes.get(id).cloned() else { return Ok(Evicted::Yes) };
-        let parkable = !rec.is_subquery && rec.aggregate.is_none();
+        // `changes_only` feeds are intentionally never parked: recreating one from a snapshot
+        // would lose the dormant-period change history promised by the client contract. They are
+        // therefore treated like other non-parkable feeds and retired directly after the full
+        // idle+dormancy grace once their last lease lapses.
+        let parkable = !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only;
         {
             let mut lives = self.lives.lock().unwrap();
             let evictable = match lives.get(id) {
@@ -1465,11 +1817,20 @@ impl Engine {
             if !evictable {
                 return Ok(Evicted::Skipped);
             }
-            if st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
+            // A dormant replay retirement is terminal: the retained cursor can no longer be
+            // served, so any claim taken by a joiner while admission was in flight must not pin
+            // the shape and turn the typed recreate outcome into a generic 500. Dormant shapes
+            // normally have no claims; if one appears here it is precisely that provisional join
+            // race. Active/non-parkable retirement still respects real subscribers.
+            let provisional_replay_retirement =
+                matches!(lives.get(id).map(|l| &l.state), Some(LifeState::Dormant { .. }))
+                    && matches!(reason, EvictReason::ReplayBudget | EvictReason::ChangeLogRetention);
+            if !provisional_replay_retirement && st.feed_shares.get(id).is_some_and(|s| s.refcount() > 0) {
                 return Ok(Evicted::Skipped);
             }
             lives.remove(id);
         }
+        self.cancel_reactivation_scan(id);
         st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
             st.feed_by_sig.remove(&share.sig);
@@ -1533,12 +1894,35 @@ impl Engine {
                         idle,
                         dormant_for,
                         in_transition,
-                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none(),
+                        // `changes_only` feeds cannot be recreated from a snapshot without
+                        // losing the dormant-period change history promised by the client API;
+                        // keep them active until a correct replay/reconcile path exists.
+                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
                         stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
+                        replay_span_bytes: None,
+                        replay_span_deferred: false,
+                        backfill_bytes: rec.backfill_bytes,
                     }
                 })
                 .collect()
         };
+        let mut snapshot = snapshot;
+        let mut result_cache = std::collections::HashMap::new();
+        for s in &mut snapshot {
+            let resume = self.lives.lock().unwrap().get(&s.id).and_then(|life| match &life.state {
+                LifeState::Dormant { resume, .. } => Some(resume.clone()),
+                _ => None,
+            });
+            if let Some(resume) = resume {
+                match self.dormant_replay_span_result_cached(&resume, &mut result_cache).await {
+                    Ok(span) => s.replay_span_bytes = span,
+                    Err(error) => {
+                        tracing::warn!(shape_id = %s.id, "retention: changelog HEAD unavailable; deferring replay eviction: {error:#}");
+                        s.replay_span_deferred = true;
+                    }
+                }
+            }
+        }
         let plan = crate::retention::plan_sweep(&cfg, &snapshot);
         if plan.over_capacity {
             metrics().retention_pressure.fetch_add(1, Ordering::Relaxed);
@@ -1572,7 +1956,7 @@ impl Engine {
     }
 
     /// The lease half of a sweep (ADR-0008): release every subscription that has not been renewed
-    /// within [`RetentionConfig::idle_timeout`], exactly as an explicit `DELETE` would.
+    /// within [`RetentionConfig::subscription_lease_timeout`], exactly as an explicit `DELETE` would.
     ///
     /// This is the only liveness signal the engine has for a native subscriber. Its reads go
     /// straight to durable-streams, so an un-renewed subscription is indistinguishable from a
@@ -1581,13 +1965,13 @@ impl Engine {
     /// ordinary lifecycle: idle → dormant → evicted, with the same grace as any other.
     ///
     /// A lapse is a `Left` like any other, marked `lapsed` so the durable record says who released
-    /// it. `idle_timeout == 0` disables dormancy, and with it leases: an engine that never parks a
-    /// shape has no use for the signal.
+    /// it. `subscription_lease_timeout == 0` disables lease expiry; dormancy is controlled
+    /// independently by `idle_timeout`.
     async fn sweep_leases(&self, cfg: &crate::retention::RetentionConfig) {
         let lapsed = {
             let mut st = self.state.lock().await;
             let now = crate::changelog::now_secs();
-            let expired = st.lapsed_subscriptions(cfg.idle_timeout, now);
+            let expired = st.lapsed_subscriptions(cfg.subscription_lease_timeout, now);
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);
             }
@@ -1597,7 +1981,7 @@ impl Engine {
         for (shape, subscription) in lapsed {
             tracing::debug!(
                 "retention: subscription {subscription} on shape {shape} was not renewed within {:?}; released",
-                cfg.idle_timeout
+                cfg.subscription_lease_timeout
             );
             self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription, lapsed: true });
             metrics().subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
@@ -1819,6 +2203,14 @@ impl Engine {
                 }
             }
         };
+        tracing::info!(
+            target: "electric_circuits_engine::shape_create",
+            shape_id = id,
+            table = %table,
+            changes_only,
+            subquery_nodes = begin.seeds.len() as u64,
+            "subquery shape create started"
+        );
         // Phase B (no registry lock): seed fresh nodes + backfill the shape, all from pooled PG.
         let phase_b = async {
             let mut node_seeds = Vec::with_capacity(begin.seeds.len());
@@ -1836,7 +2228,25 @@ impl Engine {
                 // `collect`: an inner-set node's seed IS engine state — the set it will maintain
                 // — so there is nothing to stream it to. It is read through the same streamed
                 // reader as every other backfill, so the transport (and the fences) are identical.
+                let seed_started = std::time::Instant::now();
+                tracing::info!(
+                    target: "electric_circuits_engine::shape_create",
+                    shape_id = id,
+                    table = %table,
+                    inner_table = %inner_table,
+                    inner_where_present = inner_where.is_some(),
+                    "subquery inner seed started"
+                );
                 let (rows, fences) = crate::pg::backfill_where_reader(&client, &ts, wsql).await?.collect().await?;
+                tracing::info!(
+                    target: "electric_circuits_engine::shape_create",
+                    shape_id = id,
+                    table = %table,
+                    inner_table = %inner_table,
+                    rows = rows.len() as u64,
+                    duration_ms = seed_started.elapsed().as_millis() as u64,
+                    "subquery inner seed finished"
+                );
                 node_seeds.push((sig.clone(), rows, fences.gate));
             }
             let outer_ts =
@@ -1888,6 +2298,14 @@ impl Engine {
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
         let finished =
             self.subqueries.lock().await.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
+        tracing::info!(
+            target: "electric_circuits_engine::shape_create",
+            shape_id = id,
+            table = %table,
+            changes_only,
+            seeded,
+            "subquery shape create finished"
+        );
         enqueue_finished_create_work(&self.flip_tx, &self.pending_flips, id, finished)?;
         Ok(())
     }
@@ -2485,6 +2903,8 @@ mod cancellation_tests {
                 is_subquery: true,
                 aggregate: None,
                 fingerprint: None,
+                backfill_rows: None,
+                backfill_bytes: None,
             },
         );
         let (_ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Pending);
@@ -2674,6 +3094,8 @@ mod cancellation_tests {
                 is_subquery: true,
                 aggregate: None,
                 fingerprint: None,
+                backfill_rows: None,
+                backfill_bytes: None,
             },
         );
         st.feed_by_sig.insert(sig.clone(), id.to_string());
@@ -2801,6 +3223,8 @@ mod subscription_tests {
                 is_subquery: false,
                 aggregate: None,
                 fingerprint: None,
+                backfill_rows: None,
+                backfill_bytes: None,
             },
         );
         let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
@@ -2892,6 +3316,7 @@ mod subscription_tests {
         let engine = engine_with_share("s1", &[("stale", now - 60), ("renewed", now)]).await;
         let cfg = crate::retention::RetentionConfig {
             idle_timeout: std::time::Duration::from_secs(5),
+            subscription_lease_timeout: std::time::Duration::from_secs(5),
             ..crate::retention::RetentionConfig::default()
         };
 
@@ -2957,14 +3382,13 @@ mod subscription_tests {
         );
     }
 
-    /// `idle_timeout == 0` turns dormancy off, and with it leases: an engine that never parks a
-    /// shape has no use for the signal, and expiring subscriptions under it would only break
-    /// sharing for long-lived subscribers.
+    /// `subscription_lease_timeout == 0` disables lease expiry independently of dormancy.
     #[tokio::test(flavor = "multi_thread")]
     async fn leases_never_lapse_when_dormancy_is_disabled() {
         let engine = engine_with_share("s1", &[("ancient", 1)]).await;
         let cfg = crate::retention::RetentionConfig {
             idle_timeout: std::time::Duration::ZERO,
+            subscription_lease_timeout: std::time::Duration::ZERO,
             ..crate::retention::RetentionConfig::default()
         };
         engine.sweep_leases(&cfg).await;
@@ -3034,6 +3458,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }
@@ -3074,6 +3500,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }
@@ -3125,6 +3553,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }
@@ -3170,6 +3600,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }
@@ -3210,6 +3642,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }
@@ -3255,6 +3689,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }
@@ -3310,6 +3746,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }
@@ -3349,6 +3787,8 @@ mod subscription_tests {
                     is_subquery: false,
                     aggregate: None,
                     fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
                 },
             );
         }

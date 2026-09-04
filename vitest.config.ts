@@ -12,6 +12,7 @@ export default defineConfig({
     exclude: [
       '**/node_modules/**',
       '**/.claude/worktrees/**',
+      'scripts/allocator-build-config.test.ts',
       'scripts/postgres-image-version.test.ts',
       'scripts/readiness-evidence.test.ts',
       'scripts/readiness-plan.test.ts',

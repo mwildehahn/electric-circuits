@@ -157,6 +157,115 @@ pub struct SubscriptionConflict {
     pub shape: String,
 }
 
+/// Why a touch cannot hand back the shape it was asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecreateReason {
+    /// The dormant replay span exceeded its budget, so the shape was deliberately retired. The
+    /// shape is gone from the lifecycle map, so a create can fall through to a fresh one.
+    OverBudget,
+    /// The reactivation is admitted and still running, but the joining request reached
+    /// `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`. The old identity is retired so a create
+    /// in the same request falls through to a fresh shape; the detached replay continues until it
+    /// notices its shape is gone.
+    JoinTimedOut,
+}
+
+/// The touch could not complete and the shape is still there: a transient change-log HEAD failure,
+/// a replay page the store never finished, a reactivator that went away. The shape has been parked
+/// back as dormant and the next touch retries it, so this is a RETRYABLE refusal — distinct from
+/// [`ReactivationRecreate`], where the identity is gone and only a replacement will do, and from a
+/// 500, which says the engine is broken.
+#[derive(Debug)]
+pub struct ReactivationDeferred {
+    pub shape: String,
+    /// What the failed attempt reported, kept for the response body and the log line.
+    pub detail: String,
+}
+
+impl ReactivationDeferred {
+    pub(crate) fn new(shape: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { shape: shape.into(), detail: detail.into() }
+    }
+}
+
+impl std::fmt::Display for ReactivationDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shape '{}' reactivation was deferred ({}); retry the read", self.shape, self.detail)
+    }
+}
+
+impl std::error::Error for ReactivationDeferred {}
+
+/// The touch cannot return the retained shape; the caller should obtain a replacement rather than
+/// receive a generic 500. See [`RecreateReason`] for which of the two situations produced it.
+#[derive(Debug)]
+pub struct ReactivationRecreate {
+    pub shape: String,
+    pub reason: RecreateReason,
+}
+
+/// A pending shape's buffer of live deltas passed its cap and was dropped. The shape cannot be
+/// activated from it — its stream would be missing exactly those changes — so this is a recreate
+/// outcome, not a retry.
+#[derive(Debug)]
+pub(crate) struct PendingBufferOverflow {
+    pub shape: String,
+}
+
+impl std::fmt::Display for PendingBufferOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shape '{}' buffered more live change than ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES allows while it \
+             was being replayed; recreate it from a fresh backfill",
+            self.shape
+        )
+    }
+}
+
+impl std::error::Error for PendingBufferOverflow {}
+
+/// A transient changelog HEAD failure. Unlike a missing segment, it is not evidence that a
+/// dormant cursor is unrecoverable and must never trigger eviction.
+#[derive(Debug)]
+pub(crate) struct ReplayHeadUnavailable;
+
+impl std::fmt::Display for ReplayHeadUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("change-log HEAD unavailable; retaining dormant shape for a later retry")
+    }
+}
+
+impl std::error::Error for ReplayHeadUnavailable {}
+
+impl ReactivationRecreate {
+    pub(crate) fn over_budget(shape: impl Into<String>) -> Self {
+        Self { shape: shape.into(), reason: RecreateReason::OverBudget }
+    }
+
+    pub(crate) fn join_timed_out(shape: impl Into<String>) -> Self {
+        Self { shape: shape.into(), reason: RecreateReason::JoinTimedOut }
+    }
+}
+
+impl std::fmt::Display for ReactivationRecreate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            RecreateReason::OverBudget => {
+                write!(f, "shape '{}' was retired; recreate from a fresh backfill", self.shape)
+            }
+            RecreateReason::JoinTimedOut => write!(
+                f,
+                "shape '{}' is still replaying its change log; the join gave up before the gateway would. \
+                 Recreate from a fresh backfill or retry later",
+                self.shape
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReactivationRecreate {}
+
 impl std::fmt::Display for SubscriptionConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -366,6 +475,8 @@ pub struct Engine {
     pending_flips: Arc<std::sync::atomic::AtomicI64>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
+    /// Latched when the live sequencer encounters an unrecoverable body-cap breach.
+    pub(crate) read_cap_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Table schemas shared with the sequencer task and the replication ingestor — the set of
     /// tables the engine can **currently decode and route**, and the single place a drift swaps a
     /// schema (ADR-0005).
@@ -407,6 +518,18 @@ pub struct Engine {
     lives: Arc<std::sync::Mutex<HashMap<String, ShapeLife>>>,
     /// Retention policy knobs (see `crate::retention`).
     retention: Arc<RetentionConfig>,
+    /// Bounds concurrent dormant replays; each permit covers one replay scan and its page-sized
+    /// transient allocations. Shapes joining an in-flight replay wait on its lifecycle channel.
+    pub(crate) reactivation_permits: Arc<tokio::sync::Semaphore>,
+    /// Cancellation flags for in-flight replay scans, keyed by shape id. A scan that is still
+    /// paging for a shape nothing is waiting for any more (a join timeout purged it, the sweeper
+    /// evicted it) holds a reactivation permit until it happens to append — which a predicate that
+    /// matches nothing in the remaining span never does. Retiring a shape sets its flag; the scan
+    /// drops that target at the next page boundary and gives the permit back.
+    pub(crate) reactivation_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Pending same-table/cursor replay requests coalesced into one page scan.
+    pub(crate) reactivation_batches:
+        Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<crate::engine::lifecycle::ReplayBatch>>>>>,
     /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
     /// Set once the background schema reconciler has been spawned (see `engine::drift`).
@@ -1154,6 +1277,7 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
+            read_cap_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
             retirements,
@@ -1167,6 +1291,15 @@ impl Engine {
             restore_reads_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
+            reactivation_permits: Arc::new(tokio::sync::Semaphore::new(
+                std::env::var("ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(2)
+                    .max(1),
+            )),
+            reactivation_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reactivation_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconciler_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resolving: Arc::new(drift::Resolving::default()),
@@ -1476,6 +1609,43 @@ impl Engine {
         self.source_receipt_progress.lock().unwrap().record(source_commit_id);
     }
 
+    /// Park a shape as dormant from outside the engine module, for tests that drive a wake through
+    /// a public surface (an HTTP route) rather than through `Engine`'s private state.
+    #[cfg(test)]
+    pub(crate) async fn park_dormant_shape_for_test(&self, id: &str, table: &str, resume: LogPosition) {
+        {
+            let mut st = self.state.lock().await;
+            st.shapes.insert(
+                id.to_string(),
+                ShapeRecord {
+                    id: id.to_string(),
+                    table: table.into(),
+                    stream_path: format!("shape/{id}"),
+                    changes_only: false,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                    backfill_rows: Some(1),
+                    backfill_bytes: Some(1),
+                },
+            );
+        }
+        self.lives.lock().unwrap().insert(
+            id.to_string(),
+            crate::retention::ShapeLife {
+                last_read: std::time::Instant::now(),
+                state: crate::retention::LifeState::Dormant {
+                    since: std::time::Instant::now(),
+                    resume,
+                    gate: crate::pg::SnapshotGate::passthrough(),
+                },
+            },
+        );
+    }
+
     fn restore_failed_promotion_role(&self) {
         if let Some(state) = self.managed_deployment.lock().unwrap().as_mut()
             && state.role == ManagedRole::Promoting
@@ -1705,6 +1875,8 @@ impl Engine {
                 self.pg_url.is_none(),
                 self.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire),
                 self.restore_reads_paused.clone(),
+                self.read_cap_failed.clone(),
+                self.retention.pending_buffer_max_bytes,
                 self.shutdown.clone(),
             ));
         }
@@ -1738,7 +1910,10 @@ impl Engine {
                 ManagedRole::Active => {}
             }
         }
-        if self.degraded() || self.epoch_broken().is_some() {
+        if self.degraded()
+            || self.epoch_broken().is_some()
+            || self.read_cap_failed.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return "degraded";
         }
         match self.health.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2471,11 +2646,11 @@ impl Engine {
         self.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
     }
 
-    /// The lease window a subscription must renew within (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`),
-    /// handed to clients in every create response so the renewal cadence is the server's to set.
-    /// `0` = dormancy is off, so leases never lapse.
+    /// The lease window a subscription must renew within
+    /// (`ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`), handed to clients in every create response.
+    /// This is independent from the dormancy idle timeout.
     pub fn lease_seconds(&self) -> u64 {
-        self.retention.idle_timeout.as_secs()
+        self.retention.subscription_lease_timeout.as_secs()
     }
 
     /// The change-log position up to which the sequencer has processed (global — all tables share

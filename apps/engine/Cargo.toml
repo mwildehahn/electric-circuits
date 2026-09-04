@@ -42,7 +42,7 @@ constant_time_eq = "0.3"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # OpenAPI is generated from the native Axum contract's Rust documentation types.
 utoipa = { version = "4.2.3", features = ["axum_extras"] }
 tokio = { version = "1", features = ["full"] }
@@ -76,6 +76,8 @@ prometheus = "0.13"
 pgwire-replication = { version = "0.3.2", default-features = false, features = ["scram", "tls-rustls"] }
 url = "2"
 libc = "0.2.186"
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): `FeedSet` holds each shape's feed
 # membership as a `HashMap<feed_id, RoaringBitmap>` keyed by `u32` pk-id — the delete gate is a
 # synchronous `remove()`-returns-`true` check, no longer an in-circuit relation. Already in the

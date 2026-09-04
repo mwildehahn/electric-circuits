@@ -35,7 +35,13 @@ pub(crate) enum SequencerCmd {
         /// Output projection (column indices to emit), or `None` for the full row.
         out_cols: Option<Arc<Vec<usize>>>,
         kind: CreateKind,
-        ack: tokio::sync::oneshot::Sender<()>,
+        /// Acknowledges the buffer registration, carrying the sequencer's PUBLISHED change-log
+        /// position at that instant — the exact point the pending buffer starts from. A
+        /// reactivation replay fences its scan there: earlier envelopes are the replay's to
+        /// deliver, later ones are the buffer's, and the two meet with no gap. Any fence captured
+        /// before this ack (the ingestor's tail when the touch was accepted, say) leaves the
+        /// envelopes processed in between to neither.
+        ack: tokio::sync::oneshot::Sender<LogPosition>,
     },
     /// Phase 2: the creator's backfill snapshot has been appended chunk by chunk (plain) or folded
     /// into `agg_seed` (aggregates); drain the buffered deltas through the shape's snapshot gate
@@ -52,7 +58,7 @@ pub(crate) enum SequencerCmd {
         agg_seed: Option<AggSeed>,
         /// Snapshot envelopes the creator appended (seeds the shape's emit counter).
         emitted_seed: u64,
-        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<(), ActivateFailure>>,
     },
     /// Creation failed after `BeginShape`: drop the pending buffer.
     AbortShape {
@@ -146,6 +152,9 @@ pub(crate) fn spawn_sequencer(
     library_mode: bool,
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
+    read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
+    // Per-shape ceiling for the pending-creation buffer (see `buffer_pending`).
+    pending_buffer_max_bytes: u64,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -175,6 +184,8 @@ pub(crate) fn spawn_sequencer(
         library_mode,
         start_paused,
         pause_gate,
+        read_cap_latch,
+        pending_buffer_max_bytes,
         shutdown,
         party,
     ));
@@ -256,7 +267,7 @@ pub(crate) struct TableExec {
     /// mode has no catalog checkpoint to resume from (`apply_catalog` runs only on the Postgres
     /// boot), so a starting process replays the log from `LogPosition::start()` and rebuilds the
     /// whole view before it serves anything. The one reader this cannot serve is
-    /// `replay_changes_for_shape`, which reads the log at a DORMANT SHAPE's resume position while
+    /// the coalesced replay scanner, which reads the log at DORMANT SHAPE resume positions while
     /// the view is at the head; that path decides membership absolutely instead
     /// (`output::absolute_envelope`).
     pub(crate) library_rows: HashMap<String, serde_json::Value>,
@@ -306,6 +317,31 @@ impl TableExec {
     }
 }
 
+/// Why `ActivateShape` refused. Typed because one of the two answers is actionable in a way a
+/// message is not: an overflowed pending buffer means this identity can never be brought up, and
+/// the caller must recreate from a fresh backfill instead of retrying.
+#[derive(Debug)]
+pub(crate) enum ActivateFailure {
+    /// The shape's pending buffer passed `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` and was
+    /// dropped, so the deltas it was holding are not anywhere any more.
+    PendingBufferOverflow,
+    Failed(String),
+}
+
+impl std::fmt::Display for ActivateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActivateFailure::PendingBufferOverflow => f.write_str(
+                "the pending-shape buffer exceeded ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES and was dropped; \
+                 this shape must be recreated from a fresh backfill",
+            ),
+            ActivateFailure::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ActivateFailure {}
+
 /// A shape between `BeginShape` and `ActivateShape`: buffers every processed delta of its table so
 /// activation can replay exactly what the backfill snapshot did not see (through the gate).
 pub(crate) struct PendingShape {
@@ -315,6 +351,46 @@ pub(crate) struct PendingShape {
     pub(crate) out_cols: Option<Arc<Vec<usize>>>,
     pub(crate) kind: CreateKind,
     pub(crate) buffered: Vec<Envelope>,
+    /// What `buffered` costs to hold, in the same unit `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` uses.
+    pub(crate) buffered_bytes: u64,
+    /// The buffer passed its cap and was dropped. The shape can no longer be activated from it —
+    /// its stream would be missing exactly the changes the buffer was holding — so activation
+    /// refuses and the caller recreates from a fresh backfill.
+    pub(crate) overflowed: bool,
+}
+
+impl crate::heap_size::HeapSize for PendingShape {
+    fn heap_bytes(&self) -> usize {
+        self.stream_path.heap_bytes() + self.buffered.heap_bytes()
+    }
+}
+
+/// Buffer one processed envelope for a pending shape, or refuse it because the shape's buffer is
+/// over its cap.
+///
+/// The buffer holds every delta of the table between `BeginShape` and `ActivateShape`. That window
+/// is a Postgres backfill for a create, and for a wake it is the replay — which now also includes
+/// the wait for a reactivation permit, so a burst of wakes behind two long scans lengthens it to
+/// "replay duration x queue depth". Unbounded, it is a write-rate-driven allocation with no ceiling
+/// and no owner. Bounded, the shape is retired and recreated from a fresh backfill, which is the
+/// same outcome an over-budget replay produces and one every client surface already handles.
+///
+/// The whole buffer is dropped on overflow rather than truncated: a prefix of the deltas is not a
+/// cheaper answer, it is a silently wrong stream.
+pub(crate) fn buffer_pending(pending: &mut PendingShape, env: &Envelope, cap: u64) -> bool {
+    if pending.overflowed {
+        return false;
+    }
+    let cost = crate::ds::envelope_memory_bytes(env);
+    if cap > 0 && pending.buffered_bytes.saturating_add(cost) > cap {
+        pending.overflowed = true;
+        pending.buffered = Vec::new();
+        pending.buffered_bytes = 0;
+        return false;
+    }
+    pending.buffered_bytes = pending.buffered_bytes.saturating_add(cost);
+    pending.buffered.push(env.clone());
+    true
 }
 
 /// Get (or lazily create) the executor for `table`; `None` if `table` is not a known table's
@@ -326,7 +402,7 @@ pub(crate) struct PendingShape {
 ///
 /// **Strict, deliberately.** A non-canonical spelling (a bare `users`) is refused rather than
 /// resolved, because resolving it here would be resolved in only HALF the engine: the live fan-out
-/// would route it while `replay_changes_for_shape` — the dormant-reactivation / retained-stream
+/// would route it while the dormant-reactivation / retained-stream
 /// catch-up — compares `env.type_ != table.as_str()` and would skip the very same envelopes, so a
 /// shape's live stream and its replayed stream would disagree. No legitimate writer produces a
 /// non-canonical `type`: the replication ingestor stamps `TableRef::to_string()`, and library-mode
@@ -374,12 +450,24 @@ pub(crate) async fn sequencer_loop(
     library_mode: bool,
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
+    read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
+    pending_buffer_max_bytes: u64,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut paused = start_paused;
+    // A bounded body breach is terminal for this live loop: retrying the same uncapped page can
+    // never make progress. Commands and shutdown remain serviced, but reads stay halted until a
+    // restart with a compatible store/cap.
+    let mut read_cap_failed = false;
+    // Whether the store has been re-attested since the last successful read. A read failure is the
+    // only reconnect signal this client gets (reqwest owns the connection pool and reports no
+    // reconnect event), so the first failure of a streak re-reads readiness; the rest of the streak
+    // does not, or a store that is down would be HEADed at the backoff frequency for as long as it
+    // stays down.
+    let mut reattested_since_read = false;
     let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
     // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
@@ -435,12 +523,21 @@ pub(crate) async fn sequencer_loop(
                         Some(exec) => {
                             exec.pending.insert(
                                 shape_id,
-                                PendingShape { num_id, stream_path, pred, out_cols, kind, buffered: Vec::new() },
+                                PendingShape {
+                                    num_id,
+                                    stream_path,
+                                    pred,
+                                    out_cols,
+                                    kind,
+                                    buffered: Vec::new(),
+                                    buffered_bytes: 0,
+                                    overflowed: false,
+                                },
                             );
                         }
                         None => tracing::error!("begin_shape: unknown table '{table}'"),
                     }
-                    let _ = ack.send(());
+                    let _ = ack.send(published(&pos, &held_from));
                 }
                 Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, ready }) => {
                     let res = activate_shape(
@@ -450,7 +547,7 @@ pub(crate) async fn sequencer_loop(
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
                     }
-                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
+                    let _ = ready.send(res);
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::AbortShape { table, shape_id }) => {
@@ -578,7 +675,7 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true), if !paused => match res {
+            res = ds.read(&read_path, &read_off, true), if !paused && !read_cap_failed => match res {
                 Ok(rr) => {
                     // A PauseReads command may win immediately after an in-flight HTTP read returns.
                     // Discard that page before touching the cursor or checkpoint so an existing
@@ -586,6 +683,7 @@ pub(crate) async fn sequencer_loop(
                     if pause_gate.load(std::sync::atomic::Ordering::Acquire) {
                         continue;
                     }
+                    reattested_since_read = false;
                     let next = rr.next_offset.clone();
                     // How much this read delivered, BEFORE control envelopes are filtered out: a
                     // closed segment is only left once a read comes back empty, which is the proof
@@ -792,8 +890,18 @@ pub(crate) async fn sequencer_loop(
                             // Buffer for in-flight creations on this table: their `BeginShape` was
                             // acknowledged before the creator's snapshot, so everything the
                             // snapshot cannot contain lands in the buffer.
-                            for pending in exec.pending.values_mut() {
-                                pending.buffered.push(envs[k].clone());
+                            for (pending_id, pending) in exec.pending.iter_mut() {
+                                let was_overflowed = pending.overflowed;
+                                if !buffer_pending(pending, &envs[k], pending_buffer_max_bytes) && !was_overflowed {
+                                    metrics().pending_buffer_overflows.fetch_add(1, Ordering::Relaxed);
+                                    tracing::error!(
+                                        shape_id = pending_id,
+                                        cap_bytes = pending_buffer_max_bytes,
+                                        "pending shape buffer exceeded ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES \
+                                         while the shape was still being created or replayed; dropping the buffer \
+                                         and refusing activation, so the caller recreates from a fresh backfill"
+                                    );
+                                }
                             }
                             if let Err(e) = process_envelope(
                                 &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
@@ -977,8 +1085,52 @@ pub(crate) async fn sequencer_loop(
                     back_off(&shutdown, std::time::Duration::from_secs(5)).await;
                 }
                 Err(e) => {
-                    tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
-                    back_off(&shutdown, std::time::Duration::from_millis(200)).await;
+                    if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
+                        metrics().sequencer_read_cap_failures.fetch_add(1, Ordering::Relaxed);
+                        // Against a store that advertises no page — every released durable-streams
+                        // build — a read bigger than the cap is an ordinary backlog, not a broken
+                        // store: the whole remainder of the stream comes back in one response.
+                        // Halting there costs more than the memory it saves. The health check
+                        // replaces the task, the restart re-reads from the same checkpoint, and the
+                        // task cycles until an operator intervenes, where the previous engine read
+                        // the page whole and made progress. So the ceiling is raised, the read
+                        // retried, and the latch kept for a store that broke a page it advertised
+                        // or a backlog past the hard ceiling.
+                        match crate::ds::raise_read_cap_after_breach() {
+                            crate::ds::CapBreachOutcome::Raise { limit } => {
+                                metrics().sequencer_read_cap_raised.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(path = %cap.path, observed = cap.observed, was = cap.limit, now = limit,
+                                    "a Durable Streams read exceeded the client body cap against a store that                                      advertises no page; raising the cap and retrying. Deploy a store that pages,                                      or name a cap this process should not exceed");
+                                back_off(&shutdown, std::time::Duration::from_millis(200)).await;
+                            }
+                            crate::ds::CapBreachOutcome::Latch => {
+                                read_cap_failed = true;
+                                read_cap_latch.store(true, Ordering::SeqCst);
+                                tracing::error!(path = %cap.path, observed = cap.observed, limit = cap.limit,
+                                    "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
+                            }
+                        }
+                    } else {
+                        tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
+                        // The next read reconnects, and a store's page capability is boot state
+                        // that can change under a running client (an upgrade that starts paging, a
+                        // rollback that stops). Re-derive the verdict here so the cap in force is
+                        // the one this store actually advertises now, rather than the one attested
+                        // at a connection that no longer exists.
+                        if !reattested_since_read {
+                            reattested_since_read = true;
+                            match ds.reattest_readiness().await {
+                                Ok(verdict) => tracing::info!(
+                                    ?verdict,
+                                    "re-attested Durable Streams readiness after a read failure"
+                                ),
+                                Err(error) => tracing::error!(
+                                    "re-attesting Durable Streams readiness after a read failure failed: {error:#}"
+                                ),
+                            }
+                        }
+                        back_off(&shutdown, std::time::Duration::from_millis(200)).await;
+                    }
                 }
             },
         }
@@ -1099,9 +1251,17 @@ pub(crate) async fn activate_shape(
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
     shutdown: &crate::shutdown::ShutdownToken,
-) -> Result<()> {
-    let exec = execs.get_mut(table.as_str()).with_context(|| format!("no executor for table '{table}'"))?;
-    let p = exec.pending.remove(shape_id).with_context(|| format!("no pending shape '{shape_id}' (aborted?)"))?;
+) -> std::result::Result<(), ActivateFailure> {
+    let exec = execs
+        .get_mut(table.as_str())
+        .ok_or_else(|| ActivateFailure::Failed(format!("no executor for table '{table}'")))?;
+    let p = exec
+        .pending
+        .remove(shape_id)
+        .ok_or_else(|| ActivateFailure::Failed(format!("no pending shape '{shape_id}' (aborted?)")))?;
+    if p.overflowed {
+        return Err(ActivateFailure::PendingBufferOverflow);
+    }
     if emitted_seed > 0 {
         emitted.insert(shape_id.to_string(), emitted_seed);
     }
@@ -1203,7 +1363,9 @@ pub(crate) async fn activate_shape(
             // Retried, not propagated on the first failure: at RESTORE this append's error is what
             // makes `apply_catalog` drop and retire an acknowledged aggregate, so one transient 503
             // during a boot used to delete a live subscription permanently.
-            ds.append_retrying(&p.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await?;
+            ds.append_retrying(&p.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown)
+                .await
+                .map_err(|e| ActivateFailure::Failed(format!("{e:#}")))?;
             exec.agg_index.insert(shape_id, &agg.pred);
             exec.aggregates.insert(shape_id.to_string(), agg);
         }
@@ -1230,98 +1392,185 @@ pub(crate) async fn activate_shape(
 /// the rest — no delta is counted twice and no intermediate state is wrong, only briefly
 /// incomplete, on a stream the shape is not live on yet. The live loop's rule is what governs from
 /// the moment the shape is registered.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn replay_changes_for_shape(
+/// Replay one exact cursor page for several shapes of the same table. The caller groups requests
+/// with the same `(table, segment, offset)`; each target still applies its own predicate/gate and
+/// appends to its own stream. A target append failure is isolated so other waiters can complete.
+pub(crate) struct ReplayTarget {
+    pub shape_id: String,
+    /// Set when the shape is retired underneath the scan (see `Engine::reactivation_cancels`).
+    pub purged: Arc<std::sync::atomic::AtomicBool>,
+    pub ts: TableSchema,
+    pub table: TableRef,
+    pub pred: Arc<CompiledPredicate>,
+    pub out_cols: Option<Arc<Vec<usize>>>,
+    pub gate: crate::pg::SnapshotGate,
+    pub stream_path: String,
+    pub from: LogPosition,
+    pub library_mode: bool,
+    pub until: Option<LogPosition>,
+}
+
+pub(crate) async fn replay_changes_for_targets(
     ds: &DsClient,
-    ts: &TableSchema,
-    table: &TableRef,
-    pred: &CompiledPredicate,
-    out_cols: Option<&Arc<Vec<usize>>>,
-    gate: &crate::pg::SnapshotGate,
-    stream_path: &str,
-    from: &LogPosition,
-    library_mode: bool,
+    mut targets: Vec<ReplayTarget>,
     shutdown: &crate::shutdown::ShutdownToken,
-) -> Result<u64> {
-    let mut pos = from.clone();
-    let mut rotate_to: Option<u32> = None;
-    let mut emitted = 0u64;
+) -> Vec<Result<u64>> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let table = targets[0].table.clone();
+    // Start at the EARLIEST parked cursor in the batch. Targets arrive in touch order, not cursor
+    // order, and each one is routed below by comparing its cursor to the page range — so a scan
+    // that began at `targets[0]` would silently drop `[earliest, targets[0].from)` for every target
+    // parked before it.
+    let mut pos = targets
+        .iter()
+        .map(|target| target.from.clone())
+        .min_by(|a, b| {
+            a.segment
+                .cmp(&b.segment)
+                .then_with(|| crate::changelog::offset_bytes(&a.offset).cmp(&crate::changelog::offset_bytes(&b.offset)))
+        })
+        .expect("targets is non-empty");
+    let mut emitted = vec![0u64; targets.len()];
+    let mut errors: Vec<Option<anyhow::Error>> = (0..targets.len()).map(|_| None).collect();
+    let mut rotate_to = None;
     loop {
-        let rr = ds
-            .read(&pos.path(), &pos.offset, false)
-            .await
-            .with_context(|| format!("replaying the change log from {pos}"))?;
+        // A target whose shape has been retired is dropped HERE, at a page boundary, rather than at
+        // its next append: a selective predicate can match nothing for the whole remaining span, and
+        // until this scan ends it holds one of the engine's two reactivation permits.
+        for (idx, target) in targets.iter().enumerate() {
+            if errors[idx].is_none() && target.purged.load(Ordering::Relaxed) {
+                errors[idx] = Some(anyhow::anyhow!(
+                    "shape '{}' was retired while its change-log replay was still scanning",
+                    target.shape_id
+                ));
+            }
+        }
+        if errors.iter().all(Option::is_some) {
+            break;
+        }
+        let page_start = crate::changelog::offset_bytes(&pos.offset);
+        let rr = match ds.read_for_table(&pos.path(), &pos.offset, false, table.as_str()).await {
+            Ok(rr) => rr,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                for err in &mut errors {
+                    if err.is_none() {
+                        *err = Some(anyhow::anyhow!("coalesced replay read: {msg}"));
+                    }
+                }
+                break;
+            }
+        };
         if let Some(n) = crate::changelog::rotation_target_in(&rr.envelopes) {
             rotate_to = Some(n);
         }
-        let delivered = rr.envelopes.len();
-        let mut outs: Vec<Envelope> = Vec::new();
-        for env in &rr.envelopes {
-            // The change log's `type` is the canonical `schema.name`; a control envelope's never
-            // is, so it is skipped by TYPE here as everywhere else.
-            if env.type_ != table.as_str() {
+        for (idx, target) in targets.iter_mut().enumerate() {
+            if errors[idx].is_some() {
                 continue;
             }
-            let Ok((delta, txid, lsn)) = apply_envelope(ts, env) else { continue };
-            // Library mode replays RAW change-log envelopes: nothing stamped a before-image on
-            // them (the sequencer's per-key view is the state at the log's HEAD, not at this
-            // replay position), so membership is decided ABSOLUTELY per pk — matches now ⇒
-            // `upsert`, otherwise ⇒ `delete <key>`. Without this a shape coming back from
-            // dormancy would never learn about the deletes it slept through.
-            let absolute = library_mode && needs_absolute_emission(env);
-            if delta.is_empty() && !absolute {
+            // Durable Streams offsets identify the byte cut *between pages*; individual change
+            // envelopes do not carry offsets. A target whose parked cursor is after this page's
+            // start must wait for a later page. Cursors before this page (including an earlier
+            // segment) receive the whole page. This deliberately uses the page range rather than
+            // the absent per-envelope `headers.offset` field, which would otherwise duplicate or
+            // silently drop rows when coalescing different cursors.
+            let target_is_after_page_start = target.from.segment > pos.segment
+                || (target.from.segment == pos.segment
+                    && match (crate::changelog::offset_bytes(&target.from.offset), page_start) {
+                        (Some(target_offset), Some(page_offset)) => target_offset > page_offset,
+                        _ => target.from.offset != pos.offset,
+                    });
+            if target_is_after_page_start {
                 continue;
             }
-            let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
-            let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
-            if gate.should_skip(lsn_u64, xid) {
-                continue;
-            }
-            if absolute {
-                let held = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| pred.matches(r));
-                if let Some(e) = absolute_envelope(ts, &env.key, held, txid, lsn, out_cols.map(|c| c.as_slice())) {
-                    outs.push(e);
+            let mut outs = Vec::new();
+            for env in &rr.envelopes {
+                if env.type_ != target.table.as_str() {
+                    continue;
                 }
-                continue;
+                let Ok((delta, txid, lsn)) = apply_envelope(&target.ts, env) else { continue };
+                let absolute = target.library_mode && needs_absolute_emission(env);
+                if delta.is_empty() && !absolute {
+                    continue;
+                }
+                let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+                let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+                if target.gate.should_skip(lsn_u64, xid) {
+                    continue;
+                }
+                if absolute {
+                    let held =
+                        delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| target.pred.matches(r));
+                    if let Some(e) = absolute_envelope(
+                        &target.ts,
+                        &env.key,
+                        held,
+                        txid,
+                        lsn,
+                        target.out_cols.as_deref().map(Vec::as_slice),
+                    ) {
+                        outs.push(e);
+                    }
+                } else {
+                    let matched = eval_standalone(&target.pred, &delta);
+                    if !matched.is_empty() {
+                        outs.extend(translate_output(
+                            &target.ts,
+                            matched,
+                            txid,
+                            lsn,
+                            target.out_cols.as_deref().map(Vec::as_slice),
+                        ));
+                    }
+                }
             }
-            let matched = eval_standalone(pred, &delta);
-            if matched.is_empty() {
-                continue;
+            if !outs.is_empty() {
+                emitted[idx] += outs.len() as u64;
+                if let Err(e) =
+                    ds.append_retrying(&target.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await
+                {
+                    errors[idx] = Some(e.context("append coalesced replay"));
+                }
             }
-            outs.extend(translate_output(ts, matched, txid, lsn, out_cols.map(|c| c.as_slice())));
-        }
-        if !outs.is_empty() {
-            emitted += outs.len() as u64;
-            // A reactivation that fails is EVICTED (its subscribers lose the shape), so a transient
-            // storage failure is retried rather than propagated — same rule as the aggregate re-seed.
-            ds.append_retrying(stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown)
-                .await
-                .context("append replay to retained stream")?;
         }
         let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
+        if let (Some(start), Some(end)) =
+            (page_start, rr.next_offset.as_deref().and_then(crate::changelog::offset_bytes))
+        {
+            metrics().reactivation_bytes_scanned.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+        }
         if let Some(n) = rr.next_offset {
             pos.offset = n;
         }
-        if rr.closed && (delivered == 0 || !advanced) {
-            // The segment is drained AND closed: follow the pointer, exactly as the live loop does.
+        if targets.iter().all(|target| target.until.as_ref().is_some_and(|until| pos >= *until)) {
+            break;
+        }
+        if rr.closed && (rr.envelopes.is_empty() || !advanced) {
             let next = match rotate_to.take() {
                 Some(n) => n,
-                // No pointer seen on this page: step to EXACTLY the next segment (verified to
-                // exist). A walk to the first open segment would skip the closed ones in between,
-                // and this replay is precisely what has to read them.
-                None => crate::changelog::next_segment_for_reader(ds, pos.segment).await?,
+                None => match crate::changelog::next_segment_for_reader(ds, pos.segment).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        for err in &mut errors {
+                            if err.is_none() {
+                                *err = Some(anyhow::anyhow!("{msg}"));
+                            }
+                        }
+                        break;
+                    }
+                },
             };
             pos = LogPosition::start_of(next);
             continue;
         }
-        if !advanced {
-            break; // the segment stopped advancing and is still open: nothing more to replay
-        }
-        if rr.up_to_date && !rr.closed {
+        if !advanced || (rr.up_to_date && !rr.closed) {
             break;
         }
     }
-    Ok(emitted)
+    errors.into_iter().zip(emitted).map(|(err, n)| err.map_or(Ok(n), Err)).collect()
 }
 
 /// Creator-side half of the two-phase shape creation: await the pending-buffer ack, **stream** the
@@ -1352,8 +1601,8 @@ pub(crate) async fn backfill_and_activate(
     // than appended as snapshot envelopes.
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
-    ack_rx: tokio::sync::oneshot::Receiver<()>,
-) -> std::result::Result<(), String> {
+    ack_rx: tokio::sync::oneshot::Receiver<LogPosition>,
+) -> std::result::Result<BackfillStats, String> {
     let abort = || {
         let _ = cmd_tx.send(SequencerCmd::AbortShape { table: table.clone(), shape_id: shape_id.to_string() });
     };
@@ -1364,8 +1613,8 @@ pub(crate) async fn backfill_and_activate(
     // SELECT; `matches()` is the final authority (a safety net if the SQL is ever a looser
     // superset). A `changes_only` feed skips the backfill and forwards only future matches
     // (passthrough gate) — the non-materialized live tail a subset query follows.
-    let (gate, agg_seed, emitted_seed) = if changes_only {
-        (crate::pg::SnapshotGate::passthrough(), None, 0u64)
+    let (gate, agg_seed, emitted_seed, stats) = if changes_only {
+        (crate::pg::SnapshotGate::passthrough(), None, 0u64, BackfillStats::default())
     } else {
         let t0 = std::time::Instant::now();
         match stream_backfill(ds, pg_url, ts, pred, out_cols, stream_path, aggregate, shutdown, t0).await {
@@ -1390,7 +1639,17 @@ pub(crate) async fn backfill_and_activate(
     {
         return Err("sequencer is gone".to_string());
     }
-    ready_rx.await.unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+    ready_rx
+        .await
+        .unwrap_or_else(|_| Err(ActivateFailure::Failed("sequencer dropped the ready channel".to_string())))
+        .map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BackfillStats {
+    pub rows: u64,
+    pub estimated_bytes: u64,
 }
 
 /// What a create is refused with when a shutdown interrupts it. The client's move is to retry
@@ -1414,11 +1673,16 @@ async fn stream_backfill(
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
     t0: std::time::Instant,
-) -> std::result::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64), String> {
+) -> std::result::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64, BackfillStats), String> {
     // Library/no-source mode: the shape simply starts empty (and an aggregate starts at its
     // empty-set value), exactly as the materialising version did.
     let Some(url) = pg_url.as_deref() else {
-        return Ok((crate::pg::SnapshotGate::passthrough(), aggregate.map(|_| AggSeed::default()), 0));
+        return Ok((
+            crate::pg::SnapshotGate::passthrough(),
+            aggregate.map(|_| AggSeed::default()),
+            0,
+            BackfillStats::default(),
+        ));
     };
     let client = crate::pg::pool_for(url).get().await.map_err(|e| format!("{e:#}"))?;
     let mut reader =
@@ -1475,11 +1739,12 @@ async fn stream_backfill(
             "large backfill appended in chunks"
         );
     }
+    let estimated_bytes = reader.estimated_bytes_read();
     let fences = reader.finish().await;
     if agg_seed.is_none() {
         crate::statsd::snapshot_stored(rows_total, snapshot_bytes, t0.elapsed().as_secs_f64() * 1000.0);
     }
-    Ok((fences.gate, agg_seed, emitted_seed))
+    Ok((fences.gate, agg_seed, emitted_seed, BackfillStats { rows: rows_total, estimated_bytes }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1965,5 +2230,102 @@ mod source_fence_tests {
         let subquery = handle(0);
         subquery.degrade.mark();
         assert!(!wait_for_source_effects(&subquery, &crate::shutdown::ShutdownToken::new()).await);
+    }
+}
+
+#[cfg(test)]
+mod pending_buffer_tests {
+    use super::*;
+    use crate::schema::TableDef;
+
+    fn users() -> TableSchema {
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "name": {"type":"text"} },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        TableSchema::from_def(&"users".into(), &def).unwrap()
+    }
+
+    fn envelope(key: u64, filler: usize) -> Envelope {
+        Envelope {
+            type_: "public.users".to_string(),
+            key: key.to_string(),
+            value: Some(serde_json::json!({ "id": key, "name": "x".repeat(filler) })),
+            old: None,
+            headers: crate::ds::EnvelopeHeaders {
+                operation: "insert".to_string(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        }
+    }
+
+    fn pending(ts: &TableSchema, buffered: Vec<Envelope>) -> PendingShape {
+        PendingShape {
+            num_id: 1,
+            stream_path: "shape/s1".to_string(),
+            pred: Arc::new(CompiledPredicate::compile_opt(None, ts).unwrap()),
+            out_cols: None,
+            kind: CreateKind::Plain,
+            buffered_bytes: buffered.iter().map(crate::ds::envelope_memory_bytes).sum(),
+            buffered,
+            overflowed: false,
+        }
+    }
+
+    /// The buffer is a ceiling, not a ration: past the cap the whole thing goes, because a prefix
+    /// of a shape's missing deltas is not a cheaper answer — it is a stream that is silently wrong.
+    /// The shape is retired and recreated from a fresh backfill instead.
+    #[test]
+    fn a_pending_buffer_stops_at_its_cap_and_drops_what_it_held() {
+        let ts = users();
+        let mut pending_shape = pending(&ts, Vec::new());
+        let cap = 8 * 1024;
+        let accepted = (0..100).filter(|key| buffer_pending(&mut pending_shape, &envelope(*key, 1024), cap)).count();
+        assert!(accepted > 0, "a buffer under its cap still buffers");
+        assert!(accepted < 100, "a buffer over its cap stops");
+        assert!(pending_shape.overflowed);
+        assert!(pending_shape.buffered.is_empty(), "the deltas it was holding are dropped, not truncated");
+        assert_eq!(pending_shape.buffered_bytes, 0);
+        assert!(
+            !buffer_pending(&mut pending_shape, &envelope(101, 1), cap),
+            "an overflowed buffer stays overflowed; it cannot half-recover"
+        );
+    }
+
+    /// `0` is the documented escape hatch, and it has to mean "no ceiling" rather than "zero bytes".
+    #[test]
+    fn a_zero_cap_means_no_cap() {
+        let ts = users();
+        let mut pending_shape = pending(&ts, Vec::new());
+        for key in 0..100 {
+            assert!(buffer_pending(&mut pending_shape, &envelope(key, 1024), 0));
+        }
+        assert!(!pending_shape.overflowed);
+        assert_eq!(pending_shape.buffered.len(), 100);
+    }
+
+    /// Everything the sequencer processes for a table while a shape of that table is between
+    /// `BeginShape` and `ActivateShape` is cloned into that shape's buffer. That is the term that
+    /// grows with the write rate times the replay duration times the permit queue depth, so it is
+    /// exactly the term `/memory` has to show.
+    #[test]
+    fn a_pending_shapes_buffer_is_reported_as_engine_memory() {
+        let ts = users();
+        let mut exec = TableExec::new(ts.clone());
+        let empty = crate::engine::introspection::exec_heap_bytes(&exec);
+        let buffered: Vec<Envelope> = (0..100).map(|key| envelope(key, 1024)).collect();
+        exec.pending.insert("s1".to_string(), pending(&ts, buffered));
+        let with_buffer = crate::engine::introspection::exec_heap_bytes(&exec);
+        assert!(
+            with_buffer - empty >= 100 * 1024,
+            "a pending shape's buffered deltas must be visible as engine memory, not invisible until OOM \
+             (reported growth: {} bytes)",
+            with_buffer - empty
+        );
     }
 }

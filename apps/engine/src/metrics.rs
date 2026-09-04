@@ -102,6 +102,25 @@ pub struct Metrics {
     pub family_steps: AtomicU64,       // family circuit transactions (write path)
     pub shapes_dormanted: AtomicU64,   // retention: active -> dormant transitions
     pub shapes_reactivated: AtomicU64, // retention: dormant -> active (table-stream replay)
+    pub reactivations_started: AtomicU64,
+    pub reactivations_coalesced: AtomicU64,
+    pub reactivation_scans_coalesced: AtomicU64,
+    pub reactivations_replayed: AtomicU64,
+    pub reactivations_recreated: AtomicU64,
+    pub reactivations_evicted_unresumable: AtomicU64,
+    pub reactivations_completed: AtomicU64,
+    pub reactivations_failed: AtomicU64,
+    /// Touches that gave up waiting on an in-flight reactivation (`ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS`).
+    pub reactivation_joins_timed_out: AtomicU64,
+    pub reactivation_bytes_scanned: AtomicU64,
+    /// Pending-shape buffers dropped for exceeding `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES`.
+    /// Each one is a create or wake that answers "recreate" instead of activating a shape whose
+    /// stream would be missing the deltas the buffer was holding.
+    pub pending_buffer_overflows: AtomicU64,
+    /// Body-cap breaches answered by raising the ceiling and retrying (an uncapped store) rather
+    /// than by halting. Every one of these is a WARN and a bigger buffer than the last.
+    pub sequencer_read_cap_raised: AtomicU64,
+    pub reactivation_spans: AtomicU64,
     pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
     /// ADR-0008 COUNTER: subscriptions released by the sweeper because their lease was not renewed
@@ -148,6 +167,7 @@ pub struct Metrics {
     /// segment-deletion floor — so a hold that does not end must be visible as a level, not only as
     /// a once-a-minute log line.
     pub sequencer_held_run: AtomicU64,
+    pub sequencer_read_cap_failures: AtomicU64,
     /// GAUGE: 1 once a `SIGTERM`/`SIGINT` graceful shutdown has begun (see [`crate::shutdown`]).
     pub shutdown_in_progress: AtomicU64,
     /// ADR-0008 GAUGE: live subscriptions across every shape — the claims pinning shapes against
@@ -182,6 +202,19 @@ pub fn metrics() -> &'static Metrics {
         family_steps: AtomicU64::new(0),
         shapes_dormanted: AtomicU64::new(0),
         shapes_reactivated: AtomicU64::new(0),
+        reactivations_started: AtomicU64::new(0),
+        reactivations_coalesced: AtomicU64::new(0),
+        reactivation_scans_coalesced: AtomicU64::new(0),
+        reactivations_replayed: AtomicU64::new(0),
+        reactivations_recreated: AtomicU64::new(0),
+        pending_buffer_overflows: AtomicU64::new(0),
+        sequencer_read_cap_raised: AtomicU64::new(0),
+        reactivations_evicted_unresumable: AtomicU64::new(0),
+        reactivations_completed: AtomicU64::new(0),
+        reactivations_failed: AtomicU64::new(0),
+        reactivation_joins_timed_out: AtomicU64::new(0),
+        reactivation_bytes_scanned: AtomicU64::new(0),
+        reactivation_spans: AtomicU64::new(0),
         shapes_evicted: AtomicU64::new(0),
         retention_pressure: AtomicU64::new(0),
         subscriptions_lapsed: AtomicU64::new(0),
@@ -200,6 +233,7 @@ pub fn metrics() -> &'static Metrics {
         backfill_chunked_appends: AtomicU64::new(0),
         sequencer_orphan_fragments: AtomicU64::new(0),
         sequencer_held_run: AtomicU64::new(0),
+        sequencer_read_cap_failures: AtomicU64::new(0),
         shutdown_in_progress: AtomicU64::new(0),
         replication_slot_retained_wal_bytes: AtomicU64::new(0),
         replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
@@ -222,6 +256,19 @@ impl Metrics {
                 "family_steps": self.family_steps.load(Ordering::Relaxed),
                 "shapes_dormanted": self.shapes_dormanted.load(Ordering::Relaxed),
                 "shapes_reactivated": self.shapes_reactivated.load(Ordering::Relaxed),
+                "reactivations_started": self.reactivations_started.load(Ordering::Relaxed),
+                "reactivations_coalesced": self.reactivations_coalesced.load(Ordering::Relaxed),
+                "reactivation_scans_coalesced": self.reactivation_scans_coalesced.load(Ordering::Relaxed),
+                "reactivations_replayed": self.reactivations_replayed.load(Ordering::Relaxed),
+                "reactivations_recreated": self.reactivations_recreated.load(Ordering::Relaxed),
+                "reactivations_evicted_unresumable": self.reactivations_evicted_unresumable.load(Ordering::Relaxed),
+                "reactivations_completed": self.reactivations_completed.load(Ordering::Relaxed),
+                "reactivations_failed": self.reactivations_failed.load(Ordering::Relaxed),
+                "reactivation_joins_timed_out": self.reactivation_joins_timed_out.load(Ordering::Relaxed),
+                "reactivation_bytes_scanned": self.reactivation_bytes_scanned.load(Ordering::Relaxed),
+                "pending_buffer_overflows": self.pending_buffer_overflows.load(Ordering::Relaxed),
+                "sequencer_read_cap_raised": self.sequencer_read_cap_raised.load(Ordering::Relaxed),
+                "reactivation_spans": self.reactivation_spans.load(Ordering::Relaxed),
                 "shapes_evicted": self.shapes_evicted.load(Ordering::Relaxed),
                 "retention_pressure": self.retention_pressure.load(Ordering::Relaxed),
                 "subscriptions_lapsed_total": self.subscriptions_lapsed.load(Ordering::Relaxed),
@@ -243,6 +290,7 @@ impl Metrics {
             "gauges": {
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
                 "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
+                "sequencer_read_cap_failures_total": self.sequencer_read_cap_failures.load(Ordering::Relaxed),
                 "shutdown_in_progress": self.shutdown_in_progress.load(Ordering::Relaxed),
                 "subscriptions_live": self.subscriptions_live.load(Ordering::Relaxed),
                 "retirements_pending": self.retirements_pending.load(Ordering::Relaxed),
@@ -264,6 +312,19 @@ impl Metrics {
         self.family_steps.store(0, Ordering::Relaxed);
         self.shapes_dormanted.store(0, Ordering::Relaxed);
         self.shapes_reactivated.store(0, Ordering::Relaxed);
+        self.reactivations_started.store(0, Ordering::Relaxed);
+        self.reactivations_coalesced.store(0, Ordering::Relaxed);
+        self.reactivation_scans_coalesced.store(0, Ordering::Relaxed);
+        self.reactivations_replayed.store(0, Ordering::Relaxed);
+        self.reactivations_recreated.store(0, Ordering::Relaxed);
+        self.pending_buffer_overflows.store(0, Ordering::Relaxed);
+        self.sequencer_read_cap_raised.store(0, Ordering::Relaxed);
+        self.reactivations_evicted_unresumable.store(0, Ordering::Relaxed);
+        self.reactivations_completed.store(0, Ordering::Relaxed);
+        self.reactivations_failed.store(0, Ordering::Relaxed);
+        self.reactivation_joins_timed_out.store(0, Ordering::Relaxed);
+        self.reactivation_bytes_scanned.store(0, Ordering::Relaxed);
+        self.reactivation_spans.store(0, Ordering::Relaxed);
         self.shapes_evicted.store(0, Ordering::Relaxed);
         self.retention_pressure.store(0, Ordering::Relaxed);
         self.subscriptions_lapsed.store(0, Ordering::Relaxed);

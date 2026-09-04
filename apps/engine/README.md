@@ -66,7 +66,8 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_REVISION` | *(unset; disabled)* | Canonical immutable UUID for opt-in managed writer ownership. Requires `ELECTRIC_CIRCUITS_CONTROL_SECRET`; only the persisted active revision can restore, claim the slot, or serve data. |
 | `ELECTRIC_CIRCUITS_MANAGED_DEPLOYMENT_INITIAL_ACTIVE` | *(unset)* | Exact `1` permits the one managed-capable incumbent to bootstrap an absent ownership row at generation 1. It never overwrites an existing owner. |
 | `ELECTRIC_CIRCUITS_TRACE` | `1` (on) | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc) |
-| `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). It is also the **subscription lease window** — a claim not renewed within it is released (see "Subscriptions"). `0` disables both |
+| `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). `0` disables dormancy |
+| `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Subscription lease window: a native claim not renewed within it is released. `0` disables lease expiry |
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
 | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
@@ -74,6 +75,18 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Change log: rotate once the current segment is this old. `0` disables the age criterion (both `0` = never rotate, i.e. an unbounded log) |
 | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | Change log: how long a rotated-out segment may stay pinned by a **dormant** shape before that shape is evicted and the segment deleted. `0` = a dormant shape pins its segment forever |
+| `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | `16777216` (16 MiB) against a store that advertises a page, `67108864` (64 MiB) against one that does not | Durable Streams: client-side hard cap for any response body; exceeding it fails the read with the stream path and observed size. Setting it explicitly always wins. An uncapped store answers a read with the whole remainder of the stream, so too small a cap there stalls the live loop permanently rather than bounding it |
+| `ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS` | `10` | Durable Streams: TCP+TLS connect deadline |
+| `ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS` | `30` | Durable Streams: deadline for an ORDINARY (bounded) request — a replay page, a HEAD, an append. Also the engine-side deadline the replay path wraps `read_for_table` in, so no single page read outlives it whichever layer notices first |
+| `ELECTRIC_CIRCUITS_DS_LIVE_READ_TIMEOUT_SECS` | `45` | Durable Streams: deadline for a LONG-POLL read. It must exceed the store's own long-poll window (35 s in the deployed configuration) — a shorter one turns every idle read into a client-side error, a WARN and a reconnect once per window, and hides real transport faults in that noise |
+| `ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS` | `60` | Durable Streams: whole-request deadline for ordinary requests. A long-poll uses this or its own read deadline plus 15 s, whichever is longer |
+| `ELECTRIC_CIRCUITS_DS_READ_MAX_CEILING_BYTES` | `536870912` (512 MiB) | Hard ceiling for the cap above. Against a store that advertises NO page, a read over the cap doubles it (WARN, `sequencer_read_cap_raised`) and retries, up to this ceiling — such a store answers with the whole remainder of the stream, so an oversized read is a backlog, not a fault, and halting would cycle the task instead of making progress. Past the ceiling, or against a store that broke a page it advertised, or with an explicit `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES`, the engine latches degraded instead |
+| `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP` | unset | Postgres-mode boot refuses a store whose readiness does not advertise a `max_chunk_bytes` at or below `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES`. Unset (the default) logs one WARN naming the observed/absent server page and the client cap, and boots — no released durable-streams build advertises the field yet |
+| `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` | `2` | Maximum concurrent dormant replay scans |
+| `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` | `20` | How long a create/join/read waits on an in-flight reactivation before giving up with the typed recreate outcome. The detached replay continues. `0` = wait forever |
+| `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum replay span budget; combined with the recorded backfill size when replay-vs-recreate admission is enabled |
+| `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Multiplier applied to recorded backfill bytes for replay admission |
+| `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | `67108864` (64 MiB) | Per-shape ceiling for the live deltas a shape buffers between `BeginShape` and `ActivateShape` (its Postgres backfill, or its change-log replay plus the wait for a reactivation permit). Past it the buffer is dropped, activation refuses with a typed outcome and the caller recreates from a fresh backfill — the same answer an over-budget replay gives. `0` = no ceiling |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM) |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
 | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for the largest transaction the database can produce, must be writable at boot, and must not be shared between engines |
@@ -403,11 +416,11 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   achieves is making its own claim the expendable one).
 - **A subscription is a lease.** Native reads go straight to durable-streams, so the engine never
   sees them: a claim counts as live only while it is created or renewed within
-  `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
+  `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
   The retention sweeper releases an unrenewed one exactly as an explicit `DELETE` would, and the
   shape then follows the ordinary lifecycle (idle → dormant → evicted). A client that renews late
-  simply re-subscribes and may find a fresh shape. `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` disables
-  dormancy and, with it, leases. Watch `subscriptions_live` (gauge) and
+  simply re-subscribes and may find a fresh shape. `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS=0`
+  disables lease expiry; `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` independently disables dormancy. Watch `subscriptions_live` (gauge) and
   `subscriptions_lapsed_total` (counter); `GET /shapes/{id}` reports the per-shape count.
 - **Every catalog event carries an `eid`**, assigned when it is queued, and the boot fold ignores an
   `eid` it has already applied — so the writer's retry-in-place (a response lost after the append
@@ -759,12 +772,14 @@ maintained:
   clients **must** treat `stream-closed`, `404` and `410` alike: re-subscribe. (A **dormant**
   shape's stream is never closed — reactivation appends to it.)
 
-Eviction is layered, least-recently-read first, and **dormant-only** (active shapes are never
-evicted): the dormancy TTL (hygiene), the `ELECTRIC_CIRCUITS_MAX_SHAPES` count cap (engine cost bound),
+Eviction is layered, least-recently-read first: ordinary shapes retire from dormant (dormancy TTL,
+count cap, and disk budget), while active non-parkable shapes retire after the full idle+dormancy
+grace. Active ordinary shapes are never evicted: the `ELECTRIC_CIRCUITS_MAX_SHAPES` count cap (engine cost bound),
 and the disk budget (hard backstop). When a cap/budget is exceeded with nothing dormant to evict,
 the engine logs loudly and bumps the `retention_pressure` metric instead of evicting.
 
 Subquery and aggregate shapes never go dormant (their state is not rebuildable from a bounded
 replay); once unsubscribed, the TTL layer instead evicts them straight from active after the same
 total grace an ordinary shape gets (idle timeout + dormancy TTL). Lifecycle state is in-memory
-today — restart recovery (persistent catalog, GH #8) will persist it.
+today — restart recovery (persistent catalog, GH #8) will persist it. A restored dormant shape's
+dormancy age starts at process boot, so repeated restarts conservatively extend wall-clock retention.
