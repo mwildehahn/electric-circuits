@@ -58,7 +58,10 @@ number: a store that advertises a page gets 16 MiB (four of its pages, so the ca
 and a store that advertises none gets 64 MiB, because it answers a read with the whole remainder of
 the stream and a cap below the backlog does not bound memory — the sequencer retries the identical
 read and it fails identically forever, so no data flows at all. A deployment that wants the tighter
-bound guaranteed sets `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1` and runs a store that pages. If a
+bound guaranteed sets `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1` and runs a store that pages. The
+verdict is not boot-only state: the sequencer re-attests readiness on the first failed read of a
+streak — the only reconnect signal the HTTP client offers — so a store upgraded to page, or rolled
+back to one that does not, changes the cap in force without a restart. If a
 live read nevertheless exceeds its cap, the sequencer records a typed cap failure, increments
 `sequencer_read_cap_failures_total`, logs an error, latches the engine `degraded`/not-ready status,
 and halts further reads until restart rather than retrying the same page forever. Reactivation latency can queue behind the semaphore. `changes_only` shapes

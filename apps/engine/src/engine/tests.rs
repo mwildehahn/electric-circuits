@@ -2462,3 +2462,49 @@ async fn a_wake_replays_up_to_where_the_pending_buffer_starts() {
         "every envelope the sequencer processed before the pending buffer existed must be replayed, exactly once"
     );
 }
+
+/// Readiness is boot state that can change while the engine runs: a store can be upgraded to
+/// advertise a page, or downgraded to advertise none, under a running client. The engine attested
+/// it once, at `DsClient::connect`, and never again — so a store that stopped paging kept the
+/// 16 MiB verdict's cap until the next restart, and the live loop halted on the first backlog over
+/// it. Every reconnect must re-attest, and the re-derived verdict must be the one in force.
+#[tokio::test]
+async fn a_reconnect_re_attests_readiness_and_rederives_the_read_cap() {
+    let _cap = crate::ds::read_cap_test_guard();
+    let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+    let paging =
+        crate::ds::readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{");
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        readiness_body: std::sync::Mutex::new(Some(paging)),
+        // One long-poll fails; the reconnect that follows is what must re-attest. Later reads park
+        // so the loop cannot spin through the assertions below.
+        fail_live_reads: std::sync::atomic::AtomicUsize::new(1),
+        stall_live_reads: true,
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    ds.refresh_readiness(&identity).await.expect("the boot attestation");
+    assert_eq!(crate::ds::ds_read_max_bytes(), 16 * 1024 * 1024, "a store that pages caps reads at four pages");
+
+    // The store is replaced by one that advertises no page while the engine is running.
+    *store.readiness_body.lock().unwrap() = Some(crate::ds::readiness_json(&identity));
+
+    let engine = Engine::new_for_in_process_test(ds);
+    {
+        let mut st = engine.state.lock().await;
+        engine.ensure_sequencer(&mut st);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while store.operations.lock().unwrap().iter().filter(|op| *op == "ready").count() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a store reconnect must re-attest readiness; the store saw only the boot attestation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        crate::ds::ds_read_max_bytes(),
+        64 * 1024 * 1024,
+        "the verdict re-derived on reconnect must be the one the read path uses"
+    );
+}

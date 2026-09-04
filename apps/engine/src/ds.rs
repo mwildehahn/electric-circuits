@@ -492,7 +492,7 @@ fn configured_ds_read_max_bytes() -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
-fn ds_read_max_bytes() -> u64 {
+pub(crate) fn ds_read_max_bytes() -> u64 {
     match EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
         0 => configured_ds_read_max_bytes().unwrap_or(DEFAULT_DS_READ_MAX_BYTES),
         installed => installed,
@@ -845,6 +845,15 @@ impl DsClient {
             warn_page_cap_once(&advisory);
         }
         Ok(verdict)
+    }
+
+    /// Re-attest the store this client is bound to, after a transport failure and the reconnect
+    /// that follows it. The expected identity is the one this client was scoped with, so a caller
+    /// on the reconnect path does not have to carry it: a store that came back as a *different*
+    /// store is refused here exactly as it would be at boot.
+    pub(crate) async fn reattest_readiness(&self) -> Result<PageCapVerdict> {
+        let expected = self.scope.store.clone();
+        self.refresh_readiness(&expected).await
     }
 
     fn physical_path(&self, logical_path: &str) -> Result<String> {
@@ -1578,7 +1587,7 @@ impl<'de> Deserialize<'de> for StrictJson {
 }
 
 #[cfg(test)]
-pub(crate) use tests::ScriptedStore;
+pub(crate) use tests::{ScriptedStore, read_cap_test_guard, readiness_json};
 
 #[cfg(test)]
 mod tests {
@@ -1654,6 +1663,9 @@ mod tests {
         /// Park every long-poll forever, which is what an idle tail read does. Only scaffolding: a
         /// spawned sequencer must not spin on a synthetic empty page while a stall is under test.
         pub(crate) stall_live_reads: bool,
+        /// How many long-polls are answered with a transport failure before the rest are served
+        /// normally (or parked). It models the store going away and the client reconnecting.
+        pub(crate) fail_live_reads: std::sync::atomic::AtomicUsize,
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
         pub(crate) head_status: u16,
@@ -1704,6 +1716,16 @@ mod tests {
             Box::pin(async move {
                 self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.read_offsets.lock().unwrap().push(offset.to_string());
+                if live
+                    && self
+                        .fail_live_reads
+                        .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                            (n > 0).then(|| n - 1)
+                        })
+                        .is_ok()
+                {
+                    return Ok(response(503));
+                }
                 let stalled = !live
                     && self
                         .stall_nonlive_reads
@@ -1916,7 +1938,7 @@ mod tests {
         );
     }
 
-    fn readiness_json(identity: &StoreIdentityV1) -> String {
+    pub(crate) fn readiness_json(identity: &StoreIdentityV1) -> String {
         serde_json::json!({
             "contract_version": "durable-streams-store-ready-v1",
             "status": "ready",

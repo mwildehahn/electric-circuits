@@ -393,6 +393,12 @@ pub(crate) async fn sequencer_loop(
     // never make progress. Commands and shutdown remain serviced, but reads stay halted until a
     // restart with a compatible store/cap.
     let mut read_cap_failed = false;
+    // Whether the store has been re-attested since the last successful read. A read failure is the
+    // only reconnect signal this client gets (reqwest owns the connection pool and reports no
+    // reconnect event), so the first failure of a streak re-reads readiness; the rest of the streak
+    // does not, or a store that is down would be HEADed at the backoff frequency for as long as it
+    // stays down.
+    let mut reattested_since_read = false;
     let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
     // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
@@ -599,6 +605,7 @@ pub(crate) async fn sequencer_loop(
                     if pause_gate.load(std::sync::atomic::Ordering::Acquire) {
                         continue;
                     }
+                    reattested_since_read = false;
                     let next = rr.next_offset.clone();
                     // How much this read delivered, BEFORE control envelopes are filtered out: a
                     // closed segment is only left once a read comes back empty, which is the proof
@@ -998,6 +1005,23 @@ pub(crate) async fn sequencer_loop(
                             "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
                     } else {
                         tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
+                        // The next read reconnects, and a store's page capability is boot state
+                        // that can change under a running client (an upgrade that starts paging, a
+                        // rollback that stops). Re-derive the verdict here so the cap in force is
+                        // the one this store actually advertises now, rather than the one attested
+                        // at a connection that no longer exists.
+                        if !reattested_since_read {
+                            reattested_since_read = true;
+                            match ds.reattest_readiness().await {
+                                Ok(verdict) => tracing::info!(
+                                    ?verdict,
+                                    "re-attested Durable Streams readiness after a read failure"
+                                ),
+                                Err(error) => tracing::error!(
+                                    "re-attesting Durable Streams readiness after a read failure failed: {error:#}"
+                                ),
+                            }
+                        }
                         back_off(&shutdown, std::time::Duration::from_millis(200)).await;
                     }
                 }
