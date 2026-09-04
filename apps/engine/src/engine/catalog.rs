@@ -12,7 +12,8 @@ use super::*;
 /// fresh-seeded node cannot detect downtime flips, which would leave stale move-outs forever) —
 /// they are dropped loudly at restore for clients to recreate. A restorable shape whose stream
 /// storage is definitively missing or closed is likewise dropped and retired at boot; a transport
-/// error while checking the stream remains fatal.
+/// error while checking the stream still aborts the restore, and the boot backs off and retries it
+/// (`pg::boot_disposition`) rather than exiting.
 pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
 
 /// One catalog event. `Offset` checkpoints the sequencer's processed change-log position (the
@@ -1062,8 +1063,9 @@ impl Engine {
     }
 
     /// Vouch for every stream that Resume would install before changing the registry, routing or
-    /// sequencer. Definitive missing/closed answers are returned for retirement; transport errors
-    /// remain fatal. Schema-drift and subquery records are intentionally dropped by the existing
+    /// sequencer. Definitive missing/closed answers are returned for retirement; a transport error
+    /// still aborts the restore (the boot boundary classifies it as retryable and backs off).
+    /// Schema-drift and subquery records are intentionally dropped by the existing
     /// restore path, so their streams are retired below rather than treated as resumable state.
     async fn preflight_catalog_streams(
         &self,
@@ -1195,8 +1197,11 @@ impl Engine {
             st.next_shape_id = st.next_shape_id.max(max + 1);
         }
         // A definitive missing/closed HEAD is a durable shape record whose storage disappeared
-        // while the engine was down. Remove it from the install set, write the durable drop intent,
-        // and send its stream through the normal close-then-delete retirement path.
+        // while the engine was down. Remove it from the install set, enqueue the `Dropped` intent
+        // (ordered ahead of the retirement's `Retired` on the same writer, not awaited — the same
+        // stance as the drift and subquery drops below; retry-safety comes from the next boot's
+        // HEAD, which re-retires anything whose pair never landed), and send its stream through the
+        // normal close-then-delete retirement path.
         let mut dead_streams: Vec<(String, String)> = Vec::new();
         for (id, reason) in boot_retire {
             if let Some((rec, _, _, _)) = fold.recs.remove(&id) {
@@ -1647,33 +1652,41 @@ pub(crate) mod testing {
                                 axum::http::StatusCode::NO_CONTENT
                             },
                         )
-                        .delete(|State(st): State<Arc<FakeDsState>>| async move {
-                            let release_generation = st.delete_release_generation.load(Ordering::SeqCst);
-                            st.deletes.fetch_add(1, Ordering::SeqCst);
-                            st.delete_started.notify_one();
-                            if st.pause_delete_after_start.load(Ordering::SeqCst) {
-                                st.delete_after_start_paused.notify_one();
-                                st.continue_delete_after_start.notified().await;
-                            }
-                            if st.block_deletes.load(Ordering::SeqCst) {
-                                st.delete_blocked.notify_one();
-                                wait_while_blocked(
-                                    &st.block_deletes,
-                                    &st.delete_release_generation,
-                                    release_generation,
-                                    &st.release_delete,
-                                )
-                                .await;
-                            }
-                            if st
-                                .fail_deletes
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                                .is_ok()
-                            {
-                                return axum::http::StatusCode::SERVICE_UNAVAILABLE;
-                            }
-                            axum::http::StatusCode::NO_CONTENT
-                        }),
+                        .delete(
+                            |State(st): State<Arc<FakeDsState>>,
+                             axum::extract::Path(path): axum::extract::Path<String>| async move {
+                                let release_generation = st.delete_release_generation.load(Ordering::SeqCst);
+                                st.deletes.fetch_add(1, Ordering::SeqCst);
+                                // The real server answers 404 for a stream it does not have; the client's
+                                // delete tolerance (`ds::delete_stream`) is what makes that a retirement.
+                                if st.missing_heads.lock().unwrap().contains(logical_path(&path)) {
+                                    return axum::http::StatusCode::NOT_FOUND;
+                                }
+                                st.delete_started.notify_one();
+                                if st.pause_delete_after_start.load(Ordering::SeqCst) {
+                                    st.delete_after_start_paused.notify_one();
+                                    st.continue_delete_after_start.notified().await;
+                                }
+                                if st.block_deletes.load(Ordering::SeqCst) {
+                                    st.delete_blocked.notify_one();
+                                    wait_while_blocked(
+                                        &st.block_deletes,
+                                        &st.delete_release_generation,
+                                        release_generation,
+                                        &st.release_delete,
+                                    )
+                                    .await;
+                                }
+                                if st
+                                    .fail_deletes
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .is_ok()
+                                {
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                }
+                                axum::http::StatusCode::NO_CONTENT
+                            },
+                        ),
                 )
                 .with_state(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2589,9 +2602,9 @@ mod tests {
         assert_eq!(st.subscription_owner("sub-b"), Some(&"s1".to_string()), "the id index is restored too");
     }
 
-    /// A transport failure while checking a retained stream is a restore failure, not an
-    /// empty-catalog success. The Postgres boot boundary must see this error before it starts
-    /// serving, so it can apply the ordinary retry/fatal boot classification.
+    /// A shape that cannot be re-registered is a restore failure, not an empty-catalog success.
+    /// The Postgres boot boundary must see this error before it starts serving, so it can apply
+    /// the ordinary retry/fatal boot classification instead of resuming from missing state.
     #[tokio::test(flavor = "multi_thread")]
     async fn restore_failure_is_returned_to_the_boot_boundary() {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
@@ -2651,7 +2664,7 @@ mod tests {
         let events = missing_server.catalog_events();
         assert!(events.iter().any(|event| event["t"] == "dropped" && event["id"] == "s2"), "{events:?}");
         assert!(events.iter().any(|event| event["t"] == "retired" && event["id"] == "s2"), "{events:?}");
-        assert!(missing_server.deletes() >= 1, "the absent stream still takes the idempotent delete path");
+        assert_eq!(missing_server.deletes(), 1, "exactly the absent stream takes the (404-tolerant) delete path");
     }
 
     /// A closed retained stream is the same definitive storage answer as a missing one: retire
@@ -2700,7 +2713,7 @@ mod tests {
         let events = closed_server.catalog_events();
         assert!(events.iter().any(|event| event["t"] == "dropped" && event["id"] == "s2"), "{events:?}");
         assert!(events.iter().any(|event| event["t"] == "retired" && event["id"] == "s2"), "{events:?}");
-        assert!(closed_server.deletes() >= 1);
+        assert_eq!(closed_server.deletes(), 1, "exactly the closed stream is deleted");
     }
 
     /// A connection error while preflighting a stream is not a definitive missing/closed answer

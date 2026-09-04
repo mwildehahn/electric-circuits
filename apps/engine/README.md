@@ -516,9 +516,10 @@ in use) and `57` (operator intervention, incl. `57P03` "the database system is s
 `GET /ready` reports `503 waiting` throughout and each attempt is logged. **Durable-streams** is
 treated the same way: a refused connection, a timeout or a 5xx while folding the catalog or opening
 the change log backs off with `durable-streams is unreachable` rather than exiting — storage that
-comes up after its engine is as ordinary as a database that does. (A *malformed* catalog, a stream
-that is gone and an unusable `ELECTRIC_CIRCUITS_DS_URL` stay fatal: none of them is a transport
-problem.) There is no restart in any of these cases: an orchestrator gates traffic on readiness, and
+comes up after its engine is as ordinary as a database that does. (A *malformed* catalog, a
+change-log segment that is gone and an unusable `ELECTRIC_CIRCUITS_DS_URL` stay fatal: none of them
+is a transport problem. A *shape* stream that is gone is not a boot failure at all: restore retires
+that shape and continues, ADR-0011.) There is no restart in any of these cases: an orchestrator gates traffic on readiness, and
 a dependency that comes up after its engine is the normal case, not a failure. A `SIGTERM` while
 still waiting exits `0` — the whole boot is raced against the shutdown token, so it stops in
 milliseconds even mid-connect.
@@ -541,6 +542,7 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
 | `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
 | `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
+| `catalog_restore_retired_total` | counter | shape records retired at boot because storage answered their stream `HEAD` with 404/410 or `closed` (ADR-0011). StatsD emits the same as `electric.catalog.restore.retired.count` tagged `reason:missing` / `reason:closed`. Non-zero after a boot means a shape was orphaned by a crash (or storage lost a stream); a burst is worth a look |
 
 The three replication-slot gauges are sampled every ~10 s by an **engine-owned** sampler on a
 **pooled** connection (never a dedicated one), and the same sample feeds StatsD — so the numbers are
