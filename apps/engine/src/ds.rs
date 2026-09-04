@@ -464,11 +464,56 @@ impl std::fmt::Display for DsReadTimeout {
 
 impl std::error::Error for DsReadTimeout {}
 
+/// Transport deadlines for the pinned HTTP store. A long-poll gets its own read deadline because
+/// it is not a bounded request: the store holds it open for its whole long-poll window and answers
+/// empty, so a deadline shorter than that window turns every idle read into an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DsTimeouts {
+    pub connect: std::time::Duration,
+    pub read: std::time::Duration,
+    pub live_read: std::time::Duration,
+    pub request: std::time::Duration,
+}
+
+impl DsTimeouts {
+    fn from_env() -> Self {
+        let secs = |name: &str, default: u64| {
+            std::time::Duration::from_secs(
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(default),
+            )
+        };
+        Self {
+            connect: secs("ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS", 10),
+            read: secs("ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS", DEFAULT_DS_READ_TIMEOUT_SECS),
+            live_read: secs("ELECTRIC_CIRCUITS_DS_LIVE_READ_TIMEOUT_SECS", DEFAULT_DS_LIVE_READ_TIMEOUT_SECS),
+            request: secs("ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS", 60),
+        }
+    }
+
+    /// The whole-request deadline for a long-poll. reqwest's request timeout covers the same wait
+    /// the read timeout does, so leaving it at the ordinary value would just move the premature
+    /// cut-off one layer out; it is never shorter than the long-poll deadline plus room for the
+    /// response body.
+    fn live_request(&self) -> std::time::Duration {
+        self.request.max(self.live_read + std::time::Duration::from_secs(15))
+    }
+}
+
 /// How long one replay page read may take before it is abandoned. It shares
 /// `ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS` with the HTTP store's transport read deadline so an
 /// operator has one number to reason about: no single page read outlives it, whichever layer
 /// notices first.
 pub(crate) const DEFAULT_DS_READ_TIMEOUT_SECS: u64 = 30;
+
+/// How long a LONG-POLL read may take. It must exceed the store's own long-poll window or the
+/// client gives up first on every idle log: the deployed durable-streams holds an idle read for
+/// 35 s (`long_poll_timeout_ms`), so 30 s produced a read error, a WARN and a fresh connection
+/// every 30 s forever, and buried real transport faults in that noise. 45 s leaves 10 s of margin.
+pub(crate) const DEFAULT_DS_LIVE_READ_TIMEOUT_SECS: u64 = 45;
 
 fn ds_read_deadline() -> std::time::Duration {
     std::time::Duration::from_secs(
@@ -560,6 +605,11 @@ pub(crate) trait DurableStreamStore: Send + Sync {
 struct HttpDurableStreamsStore {
     base: String,
     http: reqwest::Client,
+    /// The long-poll client. Identical to `http` except for its deadlines: reqwest's read timeout
+    /// is a client-wide setting (there is no per-request form in 0.12), and a long-poll needs one
+    /// longer than the store's own long-poll window while every other operation stays bounded by
+    /// the short one.
+    live_http: reqwest::Client,
 }
 
 impl HttpDurableStreamsStore {
@@ -579,28 +629,46 @@ impl HttpDurableStreamsStore {
         identity_pem.extend(key);
         let identity =
             reqwest::Identity::from_pem(&identity_pem).context("parsing Durable Streams client certificate/key")?;
-        let timeout = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v > 0).unwrap_or(default)
+        let timeouts = DsTimeouts::from_env();
+        let mtls = |read: std::time::Duration, request: std::time::Duration| {
+            reqwest::Client::builder()
+                .https_only(true)
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(ca.clone())
+                .identity(identity.clone())
+                .connect_timeout(timeouts.connect)
+                .read_timeout(read)
+                .timeout(request)
+                .build()
         };
-        let http = reqwest::Client::builder()
-            .https_only(true)
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(ca)
-            .identity(identity)
-            .connect_timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS", 10)))
-            .read_timeout(std::time::Duration::from_secs(timeout(
-                "ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS",
-                DEFAULT_DS_READ_TIMEOUT_SECS,
-            )))
-            .timeout(std::time::Duration::from_secs(timeout("ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS", 60)))
-            .build()
-            .context("building Durable Streams mTLS client")?;
-        Ok(Self { base: config.base_url.clone(), http })
+        let http = mtls(timeouts.read, timeouts.request).context("building Durable Streams mTLS client")?;
+        let live_http = mtls(timeouts.live_read, timeouts.live_request())
+            .context("building Durable Streams mTLS long-poll client")?;
+        Ok(Self { base: config.base_url.clone(), http, live_http })
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn new_in_process(base: String) -> Self {
-        Self { base, http: reqwest::Client::new() }
+        Self { base, http: reqwest::Client::new(), live_http: reqwest::Client::new() }
+    }
+
+    /// Test seam: the same client production builds, from explicit deadlines instead of the
+    /// environment and without mTLS material.
+    #[cfg(test)]
+    fn new_in_process_with_timeouts(base: String, timeouts: DsTimeouts) -> Self {
+        let client = |read: std::time::Duration, request: std::time::Duration| {
+            reqwest::Client::builder()
+                .connect_timeout(timeouts.connect)
+                .read_timeout(read)
+                .timeout(request)
+                .build()
+                .expect("in-process client")
+        };
+        Self {
+            base,
+            http: client(timeouts.read, timeouts.request),
+            live_http: client(timeouts.live_read, timeouts.live_request()),
+        }
     }
 
     fn stream_url(&self, path: &str) -> String {
@@ -679,7 +747,8 @@ impl DurableStreamStore for HttpDurableStreamsStore {
             if live {
                 url.push_str("&live=long-poll");
             }
-            let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
+            let client = if live { &self.live_http } else { &self.http };
+            let res = client.get(url).send().await.with_context(|| format!("GET {path}"))?;
             Ok(self.response(res, BodyRead::OnData, Some(path)).await)
         })
     }
@@ -1970,6 +2039,81 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// A store that answers `delay` after the request arrives, on `connections` connections. It is
+    /// the shape of a durable-streams long-poll: the response head does not start until the store
+    /// has something to say, or its own long-poll window expires.
+    async fn slow_store(delay: std::time::Duration, connections: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            for _ in 0..connections {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        match socket.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => request.push(byte[0]),
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    let body = "[]";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nstream-next-offset: 0000000000000000_0000000000000000\r\nstream-up-to-date: true\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The deployed store holds an idle long-poll for 35 s before answering empty
+    /// (`long_poll_timeout_ms` in the indexed infra). A read deadline shorter than that window is
+    /// not a safety bound on a long-poll — it is a guaranteed error on every idle read — so the
+    /// long-poll carries its own, longer deadline while ordinary reads keep the short one.
+    #[tokio::test]
+    async fn a_long_poll_outlives_the_ordinary_read_deadline() {
+        let timeouts = DsTimeouts {
+            connect: std::time::Duration::from_secs(5),
+            read: std::time::Duration::from_millis(150),
+            live_read: std::time::Duration::from_secs(5),
+            request: std::time::Duration::from_secs(10),
+        };
+        // Longer than the ordinary read deadline, well inside the long-poll one: the store is
+        // holding the request open exactly as it holds an idle long-poll.
+        let base = slow_store(std::time::Duration::from_millis(400), 2).await;
+        let store = HttpDurableStreamsStore::new_in_process_with_timeouts(base, timeouts);
+
+        let live = store.read("changes/0", "-1", true).await;
+        assert!(
+            live.as_ref().is_ok_and(|res| res.status == 200),
+            "a long-poll must be bounded by the long-poll deadline, not the ordinary read deadline: {:?}",
+            live.err().map(|e| format!("{e:#}"))
+        );
+        let ordinary = store.read("changes/0", "-1", false).await;
+        assert!(ordinary.is_err(), "an ordinary read is a bounded request and keeps the short deadline");
+    }
+
+    /// The pair of defaults this depends on, in one place: the long-poll deadline has to clear the
+    /// store's window, and it is the ordinary read deadline that stays short.
+    #[test]
+    fn the_long_poll_deadline_clears_the_stores_long_poll_window() {
+        const DEPLOYED_STORE_LONG_POLL_SECS: u64 = 35;
+        let timeouts = DsTimeouts::from_env();
+        assert!(
+            timeouts.live_read.as_secs() > DEPLOYED_STORE_LONG_POLL_SECS,
+            "a long-poll deadline of {}s expires before the store's {DEPLOYED_STORE_LONG_POLL_SECS}s window",
+            timeouts.live_read.as_secs()
+        );
+        assert!(timeouts.read < timeouts.live_read, "an ordinary read must stay bounded more tightly than a long-poll");
+        assert_eq!(timeouts.read.as_secs(), DEFAULT_DS_READ_TIMEOUT_SECS);
     }
 
     #[tokio::test]

@@ -95,6 +95,10 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | no | `21600` | Dormancy idle threshold (6 hours; `0` disables dormancy). |
 | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | no | `1800` | Native subscription lease window (30 minutes; `0` disables lease expiry). |
 | `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | no | `16777216` / `67108864` | Client-side Durable Streams response cap. 16 MiB (four times the 4 MiB server page) when readiness advertises a page within it; 64 MiB when it advertises none, because such a store returns the whole remainder in one response and a smaller cap stalls the live loop instead of bounding it. An explicit value always wins. A page above the cap fails the read with a typed error; it is never truncated. |
+| `ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS` | no | `10` | Durable Streams connect deadline. |
+| `ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS` | no | `30` | Deadline for a bounded Durable Streams request (replay page, HEAD, append), applied both at the transport and around the replay read. |
+| `ELECTRIC_CIRCUITS_DS_LIVE_READ_TIMEOUT_SECS` | no | `45` | Deadline for a long-poll read. Keep it above the store's `long_poll_timeout_ms` (35 s deployed) or every idle read errors before the store's own empty answer. |
+| `ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS` | no | `60` | Whole-request deadline for bounded requests; a long-poll gets `max(this, live read + 15s)`. |
 | `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP` | no | unset | `1` refuses the boot when readiness does not advertise a `max_chunk_bytes` within the client cap. Unset warns once and boots, because the store advertises no such field today. |
 | `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` | no | `2` | Maximum concurrent dormant replay scans. |
 | `ELECTRIC_CIRCUITS_REACTIVATION_JOIN_TIMEOUT_SECS` | no | `20` | Bound on how long one request waits for an in-flight reactivation. Keep it under the gateway's read timeout (30s today); past it the request returns the typed recreate outcome while the replay continues. `0` = wait forever. |
