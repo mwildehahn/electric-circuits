@@ -291,6 +291,14 @@ pub fn shape_gauges(total: u64, indexed: u64, unindexed: u64) {
     s.gauge("electric.shapes.total_shapes.count_unindexed", unindexed as f64, &[]);
 }
 
+/// A shape retired during catalog restore because durable-streams definitively reported its
+/// stream missing or closed. The reason is a bounded value from the HEAD response and is retained
+/// as a StatsD tag for operators distinguishing orphan cleanup from terminal-stream cleanup.
+pub fn catalog_restore_retired(reason: &str) {
+    let Some(s) = statsd() else { return };
+    s.incr("electric.catalog.restore.retired.count", &[("reason", reason)]);
+}
+
 /// Compute the replication-slot WAL gauges from raw LSN strings (pure, unit-tested). `restart` and
 /// `confirmed` are `Option` because a freshly-created slot can report NULL for them — a missing value
 /// omits its delta metric rather than emitting a fake/stale one. `pg_wal_offset` is always present.

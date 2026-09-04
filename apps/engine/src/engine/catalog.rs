@@ -10,7 +10,9 @@ use super::*;
 /// aggregates re-seed their fold from a fresh Postgres snapshot (their fresh gate then skips the
 /// replayed history). Subquery shapes are NOT restorable without persisted inner-node state (a
 /// fresh-seeded node cannot detect downtime flips, which would leave stale move-outs forever) —
-/// they are dropped loudly at restore for clients to recreate.
+/// they are dropped loudly at restore for clients to recreate. A restorable shape whose stream
+/// storage is definitively missing or closed is likewise dropped and retired at boot; a transport
+/// error while checking the stream remains fatal.
 pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
 
 /// One catalog event. `Offset` checkpoints the sequencer's processed change-log position (the
@@ -691,24 +693,6 @@ impl std::fmt::Display for CatalogPredatesSubscriptions {
 
 impl std::error::Error for CatalogPredatesSubscriptions {}
 
-/// A catalog record cannot be resumed when its durable shape stream is absent or terminal.
-/// Restore checks every restorable record before installing any one of them, so a partial catalog
-/// cannot become visible after storage lost a stream during downtime.
-#[derive(Debug)]
-pub struct CatalogRestoreStreamInvalid {
-    pub shape_id: String,
-    pub path: String,
-    pub reason: &'static str,
-}
-
-impl std::fmt::Display for CatalogRestoreStreamInvalid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "shape {} stream {} is {}", self.shape_id, self.path, self.reason)
-    }
-}
-
-impl std::error::Error for CatalogRestoreStreamInvalid {}
-
 /// Is this raw catalog event missing what ADR-0008 requires of it? `Some(detail)` names it.
 ///
 /// Positive-checking the raw JSON rather than trusting the deserializer, exactly like
@@ -999,6 +983,7 @@ impl CatalogFold {
     ///
     /// Deliberately does NOT consider `pending_retire`: this asks "is there anything to INSTALL",
     /// and the boot enqueues outstanding retirements before it consults this at all.
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.recs.is_empty() && self.start_pos == LogPosition::start()
     }
@@ -1078,13 +1063,15 @@ impl Engine {
     }
 
     /// Vouch for every stream that Resume would install before changing the registry, routing or
-    /// sequencer. Schema-drift and subquery records are intentionally dropped by the existing
+    /// sequencer. Definitive missing/closed answers are returned for retirement; transport errors
+    /// remain fatal. Schema-drift and subquery records are intentionally dropped by the existing
     /// restore path, so their streams are retired below rather than treated as resumable state.
     async fn preflight_catalog_streams(
         &self,
         recs: &HashMap<String, Restored>,
         compiled: &HashMap<TableRef, TableSchema>,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, &'static str)>> {
+        let mut retire = Vec::new();
         for (id, (rec, _, _, _)) in recs {
             if rec.is_subquery || schema_moved_while_down(rec, compiled).is_some() {
                 continue;
@@ -1095,24 +1082,13 @@ impl Engine {
                 .await
                 .with_context(|| format!("catalog restore: checking shape {id} stream {}", rec.stream_path))?;
             match head {
-                None => {
-                    return Err(anyhow::Error::new(CatalogRestoreStreamInvalid {
-                        shape_id: id.clone(),
-                        path: rec.stream_path.clone(),
-                        reason: "missing",
-                    }));
-                }
-                Some(head) if head.closed => {
-                    return Err(anyhow::Error::new(CatalogRestoreStreamInvalid {
-                        shape_id: id.clone(),
-                        path: rec.stream_path.clone(),
-                        reason: "closed",
-                    }));
-                }
+                None => retire.push((id.clone(), "missing")),
+                Some(head) if head.closed => retire.push((id.clone(), "closed")),
                 Some(_) => {}
             }
         }
-        Ok(())
+        retire.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(retire)
     }
 
     /// Read the durable shape catalog and fold it. No engine state is touched — see
@@ -1196,9 +1172,11 @@ impl Engine {
         // Resume must prove every retained stream is still appendable before any record, share or
         // sequencer state is installed. Park intentionally skips this: it records old-epoch shapes
         // for the reset's close-then-delete path and must preserve that existing semantics.
-        if mode == RestoreMode::Resume {
-            self.preflight_catalog_streams(&fold.recs, compiled).await?;
-        }
+        let boot_retire = if mode == RestoreMode::Resume {
+            self.preflight_catalog_streams(&fold.recs, compiled).await?
+        } else {
+            Vec::new()
+        };
         // BEFORE anything else, and in both modes: a `Dropped` with no `Retired` is a shape stream a
         // previous process promised to remove and did not (its retirement was refused by storage,
         // or the process died between the two). The engine has already forgotten the shape, so
@@ -1217,11 +1195,32 @@ impl Engine {
             let mut st = self.state.lock().await;
             st.next_shape_id = st.next_shape_id.max(max + 1);
         }
-        if fold.is_empty() {
+        let CatalogFold { mut recs, start_pos, start_highwater, max_shape_id: _, .. } = fold;
+        // A definitive missing/closed HEAD is a durable shape record whose storage disappeared
+        // while the engine was down. Remove it from the install set, write the durable drop intent,
+        // and send its stream through the normal close-then-delete retirement path.
+        let mut dead_streams: Vec<(String, String)> = Vec::new();
+        for (id, reason) in boot_retire {
+            if let Some((rec, _, _, _)) = recs.remove(&id) {
+                tracing::warn!(
+                    shape_id = %id,
+                    stream_path = %rec.stream_path,
+                    reason,
+                    "catalog restore: retiring shape whose stream storage is gone"
+                );
+                self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                crate::metrics::metrics().catalog_restore_retired.fetch_add(1, Ordering::Relaxed);
+                crate::statsd::catalog_restore_retired(reason);
+                dead_streams.push((id, rec.stream_path));
+            }
+        }
+        if recs.is_empty() && start_pos == LogPosition::start() {
+            for (id, path) in dead_streams {
+                self.retire_shape_stream(&id, &path).await;
+            }
             self.release_restore_reads().await?;
             return Ok(());
         }
-        let CatalogFold { recs, start_pos, start_highwater, .. } = fold;
         let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The restored checkpoint IS durable (it was read back out of the log), so it is the
@@ -1269,9 +1268,6 @@ impl Engine {
 
         // 2. Restore records + shares; subquery shapes are dropped (see CATALOG_STREAM docs).
         let mut resume: Vec<ShapeRecord> = Vec::new();
-        // `(shape id, stream path)`: the id travels with the path because completing a retirement
-        // writes `Retired { id }`.
-        let mut dead_streams: Vec<(String, String)> = Vec::new();
         {
             let mut st = self.state.lock().await;
             for (id, (rec, sig, subs, dormant)) in recs {

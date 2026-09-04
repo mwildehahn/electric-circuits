@@ -118,6 +118,9 @@ pub struct Metrics {
     /// (the writer retries in place, forever) — this is the visible cost of that promise, and a
     /// climbing value with a flat `shapes_*` means creates are waiting on storage.
     pub catalog_append_retries: AtomicU64,
+    /// Shape records retired during catalog restore because their durable stream was missing or
+    /// already closed. The reason-tagged StatsD event is emitted alongside this process counter.
+    pub catalog_restore_retired: AtomicU64,
     /// ADR-0007: retirement attempts that failed and were re-queued.
     pub retirement_retries: AtomicU64,
     pub txn_spills: AtomicU64, // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
@@ -191,6 +194,7 @@ pub fn metrics() -> &'static Metrics {
         changes_segments_deleted: AtomicU64::new(0),
         changes_segments_retained: AtomicU64::new(0),
         catalog_append_retries: AtomicU64::new(0),
+        catalog_restore_retired: AtomicU64::new(0),
         retirement_retries: AtomicU64::new(0),
         retirements_pending: AtomicU64::new(0),
         backfill_chunked_appends: AtomicU64::new(0),
@@ -228,6 +232,7 @@ impl Metrics {
                 "changes_rotations_total": self.changes_rotations.load(Ordering::Relaxed),
                 "changes_segments_deleted_total": self.changes_segments_deleted.load(Ordering::Relaxed),
                 "catalog_append_retries_total": self.catalog_append_retries.load(Ordering::Relaxed),
+                "catalog_restore_retired_total": self.catalog_restore_retired.load(Ordering::Relaxed),
                 "retirement_retries_total": self.retirement_retries.load(Ordering::Relaxed),
                 "txn_spills_total": self.txn_spills.load(Ordering::Relaxed),
                 "txn_spill_bytes": self.txn_spill_bytes.load(Ordering::Relaxed),
@@ -269,6 +274,7 @@ impl Metrics {
         self.changes_rotations.store(0, Ordering::Relaxed);
         self.changes_segments_deleted.store(0, Ordering::Relaxed);
         self.catalog_append_retries.store(0, Ordering::Relaxed);
+        self.catalog_restore_retired.store(0, Ordering::Relaxed);
         self.retirement_retries.store(0, Ordering::Relaxed);
         self.txn_spills.store(0, Ordering::Relaxed);
         self.txn_spill_bytes.store(0, Ordering::Relaxed);

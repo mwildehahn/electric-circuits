@@ -572,6 +572,12 @@ pub fn init_otel() -> SdkMeterProvider {
         ""
     );
     engine_counter!("engine_changes_segments_deleted", "Rotated-out segments retired", changes_segments_deleted, "");
+    engine_counter!(
+        "engine_catalog_restore_retired",
+        "Shape records retired during catalog restore because their streams were missing or closed",
+        catalog_restore_retired,
+        ""
+    );
     engine_counter!("engine_txn_spills", "Transactions whose buffer outgrew the memory cap (ADR-0003)", txn_spills, "");
     engine_counter!("engine_txn_spill", "Bytes ever written to transaction spill files", txn_spill_bytes, "By");
     engine_counter!(
