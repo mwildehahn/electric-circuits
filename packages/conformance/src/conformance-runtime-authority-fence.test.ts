@@ -105,13 +105,24 @@ describe('conformance: runtime authority receipts are separate from deployment h
     }
     expect(await receipt(h, MARKER)).toEqual({ sourceCommitId: MARKER, drained: false, receipt: null })
     expect((await request(h, `/_admin/drained-through/${MARKER}`, GATEWAY_SECRET)).status).toBe(401)
-    const tables = await (await fetch(`${h.engineUrl}/tables`)).text()
+    const tableResponse = await request(h, '/tables', GATEWAY_SECRET)
+    expect(tableResponse.status).toBe(200)
+    const tables = await tableResponse.text()
+    expect(tables).toContain('public.items')
     expect(tables).not.toContain('native_sync_authority_fence')
+    const shapeHeaders = { 'content-type': 'application/json', authorization: `Bearer ${GATEWAY_SECRET}` }
+    const ordinaryShape = await fetch(`${h.engineUrl}/v1/shapes`, {
+      method: 'POST', headers: shapeHeaders,
+      body: JSON.stringify({ table: 'public.items' }),
+    })
+    expect(ordinaryShape.status).toBe(200)
+    expect((await ordinaryShape.json() as { shapeId: string }).shapeId).toMatch(/^s[0-9]+$/)
     const shape = await fetch(`${h.engineUrl}/v1/shapes`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: shapeHeaders,
       body: JSON.stringify({ table: 'public.native_sync_authority_fence' }),
     })
-    expect(shape.ok).toBe(false)
+    expect(shape.status).toBe(400)
+    expect(await shape.text()).toContain("unknown table 'public.native_sync_authority_fence'")
   })
 
   it('waits for commit and binds the receipt to the exact user, generation and marker', async () => {
@@ -177,6 +188,8 @@ describe('conformance: runtime authority receipts are separate from deployment h
     await writeMarker(h, RESTART_MARKER, NEXT_GENERATION)
     await awaitReceipt(h, RESTART_MARKER, NEXT_GENERATION)
     h.signalEngine('SIGTERM')
+    // Exit0 requires the sequencer's final checkpoint and catalog drain (main::finish_shutdown).
+    // A crash may replay an uncheckpointed marker and legitimately regenerate its receipt.
     expect(await h.waitForEngineExit()).toEqual({ code: 0, signal: null })
     await h.startEngine()
     expect((await receipt(h, RESTART_MARKER, USER, NEXT_GENERATION)).drained).toBe(false)
