@@ -160,6 +160,9 @@ pub trait EpochEvents: Send + Sync {
     /// (the loop backs off and asks again).
     fn before_connect(&self) -> BoxFuture<'_, std::result::Result<uuid::Uuid, Refused>>;
 
+    /// A connection may attach after a reset finished. Its admission must still be current.
+    fn runtime_ingress_is_current(&self, incarnation: uuid::Uuid) -> bool;
+
     /// Resolves when the engine (re)binds an epoch — an operator reset, so the answer to
     /// [`Self::before_connect`] has just changed and the backoff should be cut short.
     fn epoch_rebound(&self) -> BoxFuture<'_, ()>;
@@ -342,6 +345,7 @@ pub async fn run(
         match stream_loop(
             cfg,
             runtime_incarnation,
+            epoch.as_ref(),
             &log,
             &tables,
             events.as_ref(),
@@ -384,6 +388,10 @@ fn keepalive_ack_lsn(transaction_open: bool, wal_end: pgwire_replication::Lsn) -
     (!transaction_open).then_some(wal_end)
 }
 
+fn ingress_must_reconnect(epoch: &dyn EpochEvents, incarnation: uuid::Uuid, transaction_open: bool) -> bool {
+    !transaction_open && !epoch.runtime_ingress_is_current(incarnation)
+}
+
 /// Build the walsender connection from the same validated TLS policy used by query connections.
 fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<ReplicationConfig> {
     crate::pg::PgConnectionConfig::from_process_env(pg_url)?.replication_config(slot, publication)
@@ -396,6 +404,7 @@ fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<Rep
 async fn stream_loop(
     cfg: ReplicationConfig,
     runtime_incarnation: uuid::Uuid,
+    epoch: &dyn EpochEvents,
     log: &ChangeLogWriter,
     tables: &SharedTables,
     events: &dyn SchemaEvents,
@@ -442,6 +451,13 @@ async fn stream_loop(
     let mut txn: Option<TxnBuffer> = None;
     let mut initial = Some(initial);
     loop {
+        // Reconnect at a transaction boundary, including the first frame after socket setup.
+        // An old admission must not leave a live replacement-slot connection unable to issue
+        // runtime receipts forever. Never interrupt a complete transaction's append here.
+        if ingress_must_reconnect(epoch, runtime_incarnation, txn.is_some()) {
+            client.abort();
+            return Ok(StreamEnd::Ended);
+        }
         // The ONE safe point for a graceful stop: between messages, never inside the `Commit` arm.
         //
         // A commit that is being APPENDED runs to completion — the arm below is not a select branch,
@@ -467,6 +483,10 @@ async fn stream_loop(
         };
         *connected = true;
         let Some(ev) = ev else { return Ok(StreamEnd::Ended) };
+        if ingress_must_reconnect(epoch, runtime_incarnation, txn.is_some()) {
+            client.abort();
+            return Ok(StreamEnd::Ended);
+        }
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
                 txn = Some(TxnBuffer::new(xid, txn_cfg.clone()));
@@ -1245,6 +1265,24 @@ mod tests {
         assert_eq!(envelope.type_, SOURCE_FENCE_ENVELOPE);
         assert_eq!(envelope.key, "018f5f4d-70c2-7d70-a4d5-5f7355078f85");
         assert!(envelope.value.is_none(), "the fence is control metadata, never an application row");
+    }
+
+    #[tokio::test]
+    async fn reset_after_admission_before_first_frame_reconnects_without_cutting_a_transaction() {
+        let engine = crate::engine::Engine::new_for_in_process_test(crate::ds::DsClient::new_for_in_process_test(
+            "http://127.0.0.1:1",
+        ));
+        let admitted = engine.before_connect().await.unwrap();
+        // Admission has returned, but socket setup has not delivered its initial frame yet.
+        drop(engine.force_epoch_reset_window().await);
+        assert!(ingress_must_reconnect(&engine, admitted, false), "first-frame admission is stale");
+        assert!(!ingress_must_reconnect(&engine, admitted, true), "finish the open transaction before reconnecting");
+        let current = engine.before_connect().await.unwrap();
+        assert_ne!(current, admitted);
+        assert!(
+            !ingress_must_reconnect(&engine, current, false),
+            "a current connection can consume new runtime markers"
+        );
     }
 
     #[tokio::test]

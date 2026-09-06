@@ -651,6 +651,10 @@ impl crate::replication::EpochEvents for Engine {
         Box::pin(self.admit_runtime_ingress(self.verify_ingress_epoch()))
     }
 
+    fn runtime_ingress_is_current(&self, incarnation: uuid::Uuid) -> bool {
+        self.runtime_receipts.lock().unwrap().incarnation() == incarnation
+    }
+
     fn epoch_rebound(&self) -> crate::replication::BoxFuture<'_, ()> {
         Box::pin(async move { self.epoch.wake.notified().await })
     }

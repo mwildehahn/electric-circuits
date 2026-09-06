@@ -2289,6 +2289,50 @@ mod source_fence_tests {
     }
 
     #[tokio::test]
+    async fn newly_admitted_ingress_after_reset_publishes_only_after_full_drain() {
+        use crate::replication::EpochEvents;
+        use crate::runtime_authority::{AuthorityMarker, RuntimeFence};
+        use std::future::Future;
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let old = engine.before_connect().await.unwrap();
+        drop(engine.force_epoch_reset_window().await);
+        let current = engine.before_connect().await.unwrap();
+        let marker = AuthorityMarker::parse(
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f85",
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f81",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let subquery = handle(1);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let drain = wait_for_source_effects(&subquery, &shutdown);
+        tokio::pin!(drain);
+        std::future::poll_fn(|cx| {
+            assert!(drain.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(engine.runtime_drain_receipt(&marker).unwrap().is_none());
+        subquery.pending_flips.store(0, Ordering::Release);
+        assert!(drain.await);
+        let mut receipts = engine.runtime_receipts.lock().unwrap();
+        receipts.publish(
+            current,
+            vec![RuntimeFence { marker: marker.clone(), incarnation: old }],
+            "0/10",
+            std::time::Instant::now(),
+        );
+        assert!(receipts.get(&marker, std::time::Instant::now()).is_none());
+        receipts.publish(
+            current,
+            vec![RuntimeFence { marker: marker.clone(), incarnation: current }],
+            "0/20",
+            std::time::Instant::now(),
+        );
+        assert_eq!(receipts.get(&marker, std::time::Instant::now()).unwrap().commit_lsn, "0/20");
+    }
+
+    #[tokio::test]
     async fn degraded_effects_cannot_manufacture_a_source_receipt() {
         let subquery = handle(0);
         subquery.degrade.mark();

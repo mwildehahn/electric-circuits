@@ -197,7 +197,9 @@ compare-and-swap a fresh source marker.
 
 Each runtime envelope carries the process/reset incarnation admitted for its replication connection.
 An epoch break invalidates the cache and incarnation; queued old envelopes and publication racing
-reset cannot become current receipts. Restart does not restore receipts from the catalog, and old
+reset cannot become current receipts. A connection whose admission became stale reconnects after
+its first frame or at the next completed-transaction boundary; it never acquires a new incarnation
+by relabeling its old envelopes. Restart does not restore receipts from the catalog, and old
 durable-log envelopes retain the prior incarnation. PostgreSQL WAL replay through a newly admitted
 connection may regenerate a receipt only through an actual full drain. After a checkpointed graceful
 restart the prior receipt is unknown; a fresh marker recovers it.
