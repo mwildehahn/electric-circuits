@@ -313,6 +313,7 @@ impl Engine {
             return false;
         }
         *broken = Some(reason);
+        self.runtime_receipts.lock().unwrap().invalidate();
         drop(broken);
         crate::metrics::metrics().epoch_breaks.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
@@ -569,6 +570,7 @@ impl Engine {
     #[doc(hidden)]
     pub async fn force_epoch_reset_window(&self) -> EpochResetWindow {
         let mut st = self.state.lock().await;
+        self.runtime_receipts.lock().unwrap().invalidate();
         self.epoch.resetting.store(true, Ordering::SeqCst);
         st.epoch_gen += 1;
         drop(st);
@@ -581,50 +583,72 @@ impl Engine {
 pub struct EpochResetWindow(#[allow(dead_code)] ResettingGuard);
 
 /// The ingestor's gate on the connection itself (see [`crate::replication::EpochEvents`]).
+impl Engine {
+    async fn admit_runtime_ingress(
+        &self,
+        verification: impl std::future::Future<Output = std::result::Result<(), Refused>>,
+    ) -> std::result::Result<uuid::Uuid, Refused> {
+        let seen = self.runtime_receipts.lock().unwrap().incarnation();
+        verification.await?;
+        if self.epoch_resetting() || self.epoch_broken().is_some() {
+            return Err(Refused::CheckFailed);
+        }
+        // Reset during verification cannot lend the replacement incarnation to old admission.
+        // Reset after this lock invalidates every runtime envelope on the admitted connection.
+        let receipts = self.runtime_receipts.lock().unwrap();
+        if receipts.incarnation() != seen {
+            return Err(Refused::CheckFailed);
+        }
+        Ok(seen)
+    }
+
+    async fn verify_ingress_epoch(&self) -> std::result::Result<(), Refused> {
+        let (Some(url), Some(slot)) = (self.pg_url.clone(), self.epoch_slot()) else {
+            return Ok(()); // library mode has no slot to verify
+        };
+        // Already latched broken. Under the refuse policy only an operator clears it, and the
+        // check below would just re-derive what we know. Under auto-reset it means a reset was
+        // owed and did not finish — resume it rather than re-observing a slot whose verdict may
+        // now look `Ok` (the new slot exists) while the catalog still names the old epoch.
+        if let Some(reason) = self.epoch_broken() {
+            return self.on_epoch_break(reason, &slot).await;
+        }
+        // A dedicated connection, not the shared pool: the pool is where shape backfills queue,
+        // and the one check that decides whether ingest may resume must never wait behind them.
+        let client = match crate::pg::connect(&url).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("epoch check: postgres unreachable ({e:#})");
+                return Err(Refused::CheckFailed);
+            }
+        };
+        let obs = match crate::pg::observe_slot(&client, &slot).await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("epoch check: could not read the slot ({e:#})");
+                return Err(Refused::CheckFailed);
+            }
+        };
+        drop(client);
+        match verdict(&obs, self.epoch_binding().as_ref()) {
+            // Boot binds the epoch before the ingestor is spawned, so this is only reachable if
+            // the catalog write is still in flight; connecting is correct either way.
+            Verdict::FirstBoot => Ok(()),
+            Verdict::Ok { timeline_changed } => {
+                if timeline_changed {
+                    self.warn_timeline_changed(&obs);
+                }
+                Ok(())
+            }
+            Verdict::Busy { active_pid } => Err(Refused::SlotBusy(active_pid)),
+            Verdict::Break(reason) => self.on_epoch_break(reason, &slot).await,
+        }
+    }
+}
+
 impl crate::replication::EpochEvents for Engine {
-    fn before_connect(&self) -> crate::replication::BoxFuture<'_, std::result::Result<(), Refused>> {
-        Box::pin(async move {
-            let (Some(url), Some(slot)) = (self.pg_url.clone(), self.epoch_slot()) else {
-                return Ok(()); // library mode has no slot to verify
-            };
-            // Already latched broken. Under the refuse policy only an operator clears it, and the
-            // check below would just re-derive what we know. Under auto-reset it means a reset was
-            // owed and did not finish — resume it rather than re-observing a slot whose verdict may
-            // now look `Ok` (the new slot exists) while the catalog still names the old epoch.
-            if let Some(reason) = self.epoch_broken() {
-                return self.on_epoch_break(reason, &slot).await;
-            }
-            // A dedicated connection, not the shared pool: the pool is where shape backfills queue,
-            // and the one check that decides whether ingest may resume must never wait behind them.
-            let client = match crate::pg::connect(&url).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("epoch check: postgres unreachable ({e:#})");
-                    return Err(Refused::CheckFailed);
-                }
-            };
-            let obs = match crate::pg::observe_slot(&client, &slot).await {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!("epoch check: could not read the slot ({e:#})");
-                    return Err(Refused::CheckFailed);
-                }
-            };
-            drop(client);
-            match verdict(&obs, self.epoch_binding().as_ref()) {
-                // Boot binds the epoch before the ingestor is spawned, so this is only reachable if
-                // the catalog write is still in flight; connecting is correct either way.
-                Verdict::FirstBoot => Ok(()),
-                Verdict::Ok { timeline_changed } => {
-                    if timeline_changed {
-                        self.warn_timeline_changed(&obs);
-                    }
-                    Ok(())
-                }
-                Verdict::Busy { active_pid } => Err(Refused::SlotBusy(active_pid)),
-                Verdict::Break(reason) => self.on_epoch_break(reason, &slot).await,
-            }
-        })
+    fn before_connect(&self) -> crate::replication::BoxFuture<'_, std::result::Result<uuid::Uuid, Refused>> {
+        Box::pin(self.admit_runtime_ingress(self.verify_ingress_epoch()))
     }
 
     fn epoch_rebound(&self) -> crate::replication::BoxFuture<'_, ()> {
@@ -636,6 +660,35 @@ impl crate::replication::EpochEvents for Engine {
 mod tests {
     use super::*;
     use crate::pg::SlotRow;
+
+    #[tokio::test]
+    async fn reset_during_connection_admission_cannot_restamp_old_ingress() {
+        use crate::replication::EpochEvents;
+        let engine =
+            Engine::new_for_in_process_test(crate::ds::DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let old = engine.before_connect().await.unwrap();
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let admitting = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .admit_runtime_ingress(async move {
+                        arrived_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        arrived_rx.await.unwrap();
+        let reset = engine.force_epoch_reset_window().await;
+        assert!(engine.before_connect().await.is_err(), "reset in progress refuses new admission");
+        drop(reset);
+        release_tx.send(()).unwrap();
+        assert_eq!(admitting.await.unwrap(), Err(Refused::CheckFailed));
+        assert_ne!(engine.before_connect().await.unwrap(), old, "fresh valid admission uses the new incarnation");
+    }
 
     fn binding() -> SlotBinding {
         SlotBinding {

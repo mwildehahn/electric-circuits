@@ -142,6 +142,7 @@ pub(crate) fn spawn_sequencer(
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
     source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
+    runtime_receipts: Arc<std::sync::Mutex<crate::runtime_authority::RuntimeReceipts>>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
@@ -173,6 +174,7 @@ pub(crate) fn spawn_sequencer(
         source_receipts,
         last_source_receipt,
         source_receipt_progress,
+        runtime_receipts,
         cmd_rx,
         processed.clone(),
         stats.clone(),
@@ -439,6 +441,7 @@ pub(crate) async fn sequencer_loop(
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
     source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
+    runtime_receipts: Arc<std::sync::Mutex<crate::runtime_authority::RuntimeReceipts>>,
     mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<LogPosition>>,
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
@@ -822,6 +825,8 @@ pub(crate) async fn sequencer_loop(
                         let txid = envs[i].headers.txid.clone();
                         let lsn = envs[i].headers.lsn.clone();
                         let mut source_fence: Option<String> = None;
+                        let runtime_incarnation = runtime_receipts.lock().unwrap().incarnation();
+                        let mut runtime_fences = crate::runtime_authority::PendingRuntimeFences::default();
                         let mut j = i + 1;
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
@@ -851,6 +856,12 @@ pub(crate) async fn sequencer_loop(
                                     tracing::debug!("sequencer: skipping duplicate change at {p:?}");
                                     continue;
                                 }
+                            }
+                            if envs[k].type_ == crate::runtime_authority::ENVELOPE_TYPE {
+                                runtime_fences.stage(&envs[k], runtime_incarnation);
+                                touched = true;
+                                if let Some(position) = pos { highwater = Some(position); }
+                                continue;
                             }
                             if envs[k].type_ == crate::replication::SOURCE_FENCE_ENVELOPE {
                                 if source_fence.replace(envs[k].key.clone()).is_some() {
@@ -947,16 +958,31 @@ pub(crate) async fn sequencer_loop(
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
-                        if let Some(source_commit_id) = source_fence {
+                        if source_fence.is_some() || !runtime_fences.is_empty() {
                             if !wait_for_source_effects(&subq, &shutdown).await {
                                 tracing::error!(
-                                    source_commit_id,
-                                    "sequencer: source fence could not reach a durable receipt before shutdown/degradation"
+                                    "sequencer: drain fence could not reach a receipt before shutdown/degradation"
                                 );
                                 highwater = txn_highwater;
                                 processing_failed = true;
                                 break;
                             }
+                        }
+                        if runtime_fences.overflowed() {
+                            tracing::warn!(commit_lsn = ?lsn, capacity = crate::runtime_authority::RECEIPT_CAPACITY,
+                                "runtime marker staging full; excess receipts stay unknown; application transaction processed");
+                        }
+                        // Only the runtime cache consumes these markers. In particular, runtime
+                        // traffic never advances deployment closure progress or catalog receipts.
+                        if !runtime_fences.is_empty() {
+                            if let Some(commit_lsn) = lsn.as_deref() {
+                                runtime_receipts.lock().unwrap().publish(
+                                    runtime_incarnation, runtime_fences.into_fences(), commit_lsn,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                        }
+                        if let Some(source_commit_id) = source_fence {
                             let receipt = SourceDrainReceipt {
                                 source_commit_id: source_commit_id.clone(),
                                 commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
@@ -1152,7 +1178,8 @@ pub(crate) async fn sequencer_loop(
 
 /// A source receipt is stronger than "the sequencer task exited" or "the slot was released": it
 /// waits for every deferred propagation/emission batch to land and refuses to publish after the
-/// engine has degraded. The wait is rare (one handoff fence), so a short poll keeps the hot paths
+/// engine has degraded. Runtime and deployment markers share this effect barrier, while their
+/// receipts and admission remain separate. A short poll keeps the hot paths
 /// and emission lanes unchanged.
 async fn wait_for_source_effects(subq: &SubqueryHandle, shutdown: &crate::shutdown::ShutdownToken) -> bool {
     loop {
@@ -2223,6 +2250,42 @@ mod source_fence_tests {
         assert!(!wait.is_finished(), "a pending deferred write must hold the receipt barrier");
         pending.store(0, Ordering::Release);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(1), wait).await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn reset_while_runtime_drain_waits_rejects_its_completed_effects() {
+        use crate::runtime_authority::{AuthorityMarker, RuntimeFence, RuntimeReceipts};
+        use std::future::Future;
+        let mut receipts = RuntimeReceipts::default();
+        let incarnation = receipts.incarnation();
+        let marker = AuthorityMarker::parse(
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f85",
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f81",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let subquery = handle(1);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let drain = wait_for_source_effects(&subquery, &shutdown);
+        tokio::pin!(drain);
+        std::future::poll_fn(|cx| {
+            assert!(drain.as_mut().poll(cx).is_pending(), "the deferred effect has not landed");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        receipts.invalidate();
+        subquery.pending_flips.store(0, Ordering::Release);
+        assert!(drain.await);
+        receipts.publish(
+            incarnation,
+            vec![RuntimeFence { marker: marker.clone(), incarnation }],
+            "0/10",
+            std::time::Instant::now(),
+        );
+        assert!(
+            receipts.get(&marker, std::time::Instant::now()).is_none(),
+            "finishing old work cannot mint current authority"
+        );
     }
 
     #[tokio::test]

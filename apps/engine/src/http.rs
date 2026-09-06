@@ -378,6 +378,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/_admin/control-admission/close", post(close_control_admission))
         .route("/_admin/control-admission/open", post(open_control_admission))
         .route("/_admin/drained-through/{source_commit_id}", get(drained_through))
+        .route("/_runtime/drained-through/{source_commit_id}", get(runtime_drained_through))
         .route("/_admin/deployment/status", get(deployment_status))
         .route("/_admin/deployment/quiesce", post(deployment_quiesce))
         .route("/_admin/deployment/promote", post(deployment_promote))
@@ -799,6 +800,69 @@ async fn drained_through(
         "receipt": receipt,
         "lastReceipt": last_receipt,
     })))
+}
+
+fn require_runtime_gateway(
+    headers: &HeaderMap,
+    gateway: Option<&str>,
+    controller: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(secret) = gateway.filter(|secret| !secret.is_empty() && Some(*secret) != controller) else {
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: "runtime gateway authentication is not configured with a distinct secret".into(),
+            retry_after: false,
+        });
+    };
+    let authorized = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|provided| crate::config::secret_matches(secret, provided));
+    if !authorized {
+        return Err(AppError {
+            status: StatusCode::UNAUTHORIZED,
+            msg: "runtime gateway authentication failed".into(),
+            retry_after: false,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RuntimeDrainQuery {
+    user_id: String,
+    generation: String,
+}
+
+async fn runtime_drained_through(
+    State(engine): State<Engine>,
+    headers: HeaderMap,
+    Path(source_commit_id): Path<String>,
+    Query(query): Query<RuntimeDrainQuery>,
+) -> Result<Response, AppError> {
+    require_runtime_gateway(&headers, crate::config::secret(), crate::config::control_secret())?;
+    let marker = crate::runtime_authority::AuthorityMarker::parse(&source_commit_id, &query.user_id, &query.generation)
+        .ok_or_else(|| AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "runtime marker requires canonical lowercase UUIDs and a 64-character lowercase hex generation".into(),
+            retry_after: false,
+        })?;
+    if engine.readiness_status() != "active" {
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: "runtime drain receipt unavailable while engine is not ready".into(),
+            retry_after: false,
+        });
+    }
+    let receipt = engine.runtime_drain_receipt(&marker)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "sourceCommitId": source_commit_id, "drained": receipt.is_some(), "receipt": receipt,
+        })),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1729,7 +1793,7 @@ mod tests {
 
     use super::{
         AppError, CreateShapeReq, Predicate, ShapeRequest, SubsetFeedRequest, health_json, page_should_continue,
-        require_private_admin_with_secret, router_with_introspection,
+        require_private_admin_with_secret, require_runtime_gateway, router_with_introspection,
     };
     use crate::predicate::PredicateJson;
     use crate::{ds::DsClient, engine::Engine};
@@ -1835,6 +1899,34 @@ mod tests {
         assert!(require_private_admin_with_secret(&headers, Some("controller-secret")).is_ok());
         assert_eq!(
             require_private_admin_with_secret(&headers, None).unwrap_err().status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn runtime_gateway_requires_a_configured_distinct_bearer() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            require_runtime_gateway(&headers, Some("gateway"), Some("controller")).unwrap_err().status,
+            StatusCode::UNAUTHORIZED
+        );
+        for invalid in ["Bearer controller", "Bearer wrong", "gateway"] {
+            headers.insert(header::AUTHORIZATION, HeaderValue::from_static(invalid));
+            assert_eq!(
+                require_runtime_gateway(&headers, Some("gateway"), Some("controller")).unwrap_err().status,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer gateway"));
+        assert!(require_runtime_gateway(&headers, Some("gateway"), Some("controller")).is_ok());
+        for gateway in [None, Some("")] {
+            assert_eq!(
+                require_runtime_gateway(&headers, gateway, Some("controller")).unwrap_err().status,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            require_runtime_gateway(&headers, Some("gateway"), Some("gateway")).unwrap_err().status,
             StatusCode::SERVICE_UNAVAILABLE
         );
     }

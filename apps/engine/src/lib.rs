@@ -35,6 +35,7 @@ pub mod pk_dict;
 pub mod predicate;
 pub mod replication;
 pub mod retention;
+mod runtime_authority;
 pub mod schema;
 pub mod shutdown;
 pub mod sql;

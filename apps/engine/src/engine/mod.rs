@@ -18,6 +18,7 @@ use crate::heap_size::HeapSize;
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::retention::{EvictReason, Evicted, LifeState, RetentionConfig, ShapeLife, SweepShape};
+use crate::runtime_authority::{AuthorityMarker, RuntimeDrainReceipt, RuntimeReceipts};
 use crate::schema::{Schema, SharedTables, TableSchema, compile_schema};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::table_ref::{TableRef, TableSelector};
@@ -457,6 +458,7 @@ pub struct Engine {
     source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
     last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
     source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
+    runtime_receipts: Arc<std::sync::Mutex<RuntimeReceipts>>,
     /// Cross-table subquery registry: maintained inner-set nodes (shared by canonical signature) + the
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
@@ -1272,6 +1274,7 @@ impl Engine {
             source_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             last_source_receipt: Arc::new(std::sync::Mutex::new(None)),
             source_receipt_progress: Arc::new(std::sync::Mutex::new(SourceReceiptProgress::default())),
+            runtime_receipts: Arc::new(std::sync::Mutex::new(RuntimeReceipts::default())),
             subqueries,
             trace_tx,
             flip_tx,
@@ -1597,6 +1600,13 @@ impl Engine {
         }
     }
 
+    pub(crate) fn runtime_drain_receipt(&self, marker: &AuthorityMarker) -> Result<Option<RuntimeDrainReceipt>> {
+        self.ensure_not_degraded()?;
+        let receipt = self.runtime_receipts.lock().unwrap().get(marker, std::time::Instant::now());
+        self.ensure_not_degraded()?;
+        Ok(receipt)
+    }
+
     pub fn source_drain_receipt(&self, source_commit_id: &str) -> Option<SourceDrainReceipt> {
         self.source_receipts.lock().unwrap().get(source_commit_id).cloned()
     }
@@ -1868,6 +1878,7 @@ impl Engine {
                 self.source_receipts.clone(),
                 self.last_source_receipt.clone(),
                 self.source_receipt_progress.clone(),
+                self.runtime_receipts.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
@@ -1997,6 +2008,7 @@ impl Engine {
                     tracing::info!("introspect-all '{schema}.*': {} table(s)", discovered.len());
                     tables.extend(discovered);
                 }
+                TableSelector::One(t) if t == crate::runtime_authority::marker_table() => {}
                 TableSelector::One(t) => tables.push(t.clone()),
             }
         }
@@ -2245,6 +2257,9 @@ impl Engine {
 
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
         let compiled = compile_schema(schema)?;
+        if compiled.contains_key(crate::runtime_authority::marker_table()) {
+            bail!("runtime authority marker is private and cannot be an application table");
+        }
         // Library mode has no durable catalog to fold, so the current segment is whatever this
         // process already resolved (0 on a fresh engine) and nothing rotates it — there is no
         // ingestor. The CURRENT segment stream is what gets created, never a bare `changes`.
