@@ -99,7 +99,9 @@ jobs:
           manifest = {
               "source_commit": (root / "source-commit").read_text().strip(),
               "source_tree": (root / "source-tree").read_text().strip(),
-              "source_parents": subprocess.check_output(["git", "show", "-s", "--format=%P", "HEAD"], text=True).split(),
+              "source_parents": [line[7:] for line in subprocess.check_output(
+                  ["git", "cat-file", "-p", "HEAD"], text=True
+              ).split("\n\n", 1)[0].splitlines() if line.startswith("parent ")],
               "pull_request_head": os.environ["PR_HEAD_SHA"],
               "image_digest": os.environ["BUILD_IMAGE_DIGEST"],
               "image_id": os.environ["BUILD_IMAGE_ID"],
