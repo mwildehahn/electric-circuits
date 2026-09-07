@@ -156,6 +156,50 @@ async fn source_scoped_admin_routes_are_not_found() {
 }
 
 #[tokio::test]
+async fn source_scoped_epoch_reset_is_not_found() {
+    let file = std::env::temp_dir().join(format!("circuits-sources-epoch-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&file, serde_json::to_vec(&vec![row(7)]).unwrap()).unwrap();
+    electric_circuits_engine::config::set_globals(
+        "sources-http-epoch",
+        "sources-http-epoch",
+        None,
+        Some("control-secret"),
+    );
+
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let supervisor = SourcesSupervisor::with_test_source(config(file.to_str().unwrap()), row(7), engine).await.unwrap();
+    let app = supervisor.router();
+
+    let before = app.clone().oneshot(Request::get("/sources/alpha/status").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(before.status(), StatusCode::OK);
+    let before = body(before).await;
+
+    for (method, uri) in [("POST", "/sources/alpha/epoch/reset"), ("GET", "/sources/alpha/epoch/reset")] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", "Bearer control-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri} must not be a source-scoped admin route");
+    }
+
+    let after = app.clone().oneshot(Request::get("/sources/alpha/status").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    assert_eq!(body(after).await, before, "source-scoped epoch reset must change nothing");
+
+    supervisor.shutdown_token().begin();
+    supervisor.shutdown_all().await;
+    std::fs::remove_file(file).unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_refreshes_serialize_and_return_the_same_revision() {
     let file = std::env::temp_dir().join(format!("circuits-sources-refresh-{}.json", uuid::Uuid::new_v4()));
     std::fs::write(&file, serde_json::to_vec(&vec![row(7)]).unwrap()).unwrap();
