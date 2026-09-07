@@ -245,6 +245,15 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
         .await?;
         let (_, status) = json(&app, Method::GET, "/sources/alpha/status", Body::empty()).await?;
         assert_eq!(status["revision"], 1);
+        let shape = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/sources/alpha/v1/shape?table=public.{source_table}&offset=-1"))
+                    .body(Body::empty())?,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert_eq!(shape.status(), StatusCode::OK, "a ready source must serve an Electric shape");
         let (_, health) = json(&app, Method::GET, "/sources/alpha/v1/health", Body::empty()).await?;
         assert_eq!(health["status"], "active");
 
