@@ -182,10 +182,13 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
              INSERT INTO public.{version_table_sql} VALUES (1);
              CREATE TABLE public.{source_table_sql} (id bigint PRIMARY KEY, body text NOT NULL);
              ALTER TABLE public.{source_table_sql} REPLICA IDENTITY FULL;
-             CREATE PUBLICATION {publication_sql} FOR TABLE public.{source_table_sql};
-             SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput');",
+             CREATE PUBLICATION {publication_sql} FOR TABLE public.{source_table_sql};",
         ))
         .await?;
+    client
+        .query_one("SELECT pg_create_logical_replication_slot($1, 'pgoutput')", &[&slot])
+        .await
+        .context("create source logical replication slot")?;
 
     let secret_file = std::env::temp_dir().join(format!("circuits-source-url-{suffix}"));
     std::fs::write(&secret_file, &control_url)?;
