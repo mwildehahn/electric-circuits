@@ -321,7 +321,19 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
                 &[&row.slot, &row.publication, &row.tables],
             )
             .await?;
-        let (refresh_status, refresh) = json(&app, Method::POST, "/admin/refresh", Body::empty()).await?;
+        let refresh_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/admin/refresh")
+                    .header("authorization", "Bearer sources-table-test-admin")
+                    .body(Body::empty())?,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let refresh_status = refresh_response.status();
+        let refresh: serde_json::Value = serde_json::from_slice(
+            &to_bytes(refresh_response.into_body(), 64 * 1024).await?,
+        )?;
         assert_eq!(refresh_status, StatusCode::OK);
         assert_eq!(refresh["revision"], 4);
         let (_, sources) = json(&app, Method::GET, "/sources", Body::empty()).await?;
