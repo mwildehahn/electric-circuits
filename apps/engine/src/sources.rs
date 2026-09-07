@@ -75,6 +75,20 @@ pub fn reconcile(running: &BTreeMap<String, RunningSourceState>, rows: &[SourceR
     Plan { actions }
 }
 
+/// Refresh plan: failed desired rows are started again even when their revision is unchanged.
+/// Healthy running rows with the same revision remain no-ops.
+pub fn reconcile_refresh(
+    running: &BTreeMap<String, RunningSourceState>,
+    failed: &BTreeMap<String, RunningSourceState>,
+    rows: &[SourceRow],
+) -> Plan {
+    let mut effective_running = running.clone();
+    for source_id in failed.keys() {
+        effective_running.remove(source_id);
+    }
+    reconcile(&effective_running, rows)
+}
+
 #[derive(Clone)]
 pub struct SourcesSupervisor {
     inner: Arc<SupervisorInner>,
@@ -86,6 +100,7 @@ struct SupervisorInner {
     state: Mutex<SupervisorState>,
     reconcile: Mutex<()>,
     shutdown: ShutdownToken,
+    poll_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct SupervisorState {
@@ -139,6 +154,7 @@ impl SourcesSupervisor {
                 }),
                 reconcile: Mutex::new(()),
                 shutdown: ShutdownToken::new(),
+                poll_task: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -176,6 +192,19 @@ impl SourcesSupervisor {
         Ok(supervisor)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn with_test_failed_source(config: Config, row: SourceRow, error: impl Into<String>) -> Result<Self> {
+        let supervisor = Self::new(config)?;
+        {
+            let mut state = supervisor.inner.state.lock().await;
+            state.last_revision = Some(row.revision);
+            state.failed.insert(row.source_id.clone(), FailedSource { row, error: error.into() });
+            state.fetched = true;
+        }
+        Ok(supervisor)
+    }
+
     pub async fn initial_fetch_until_ready(&self) -> Result<()> {
         let mut attempt = 0u32;
         loop {
@@ -200,30 +229,52 @@ impl SourcesSupervisor {
     /// Fetch and reconcile unconditionally. The lock covers the fetch and all lifecycle changes,
     /// so concurrent refreshes cannot interleave plans.
     pub async fn refresh(&self) -> Result<i64> {
+        if self.inner.shutdown.is_shutting_down() {
+            bail!("sources refresh interrupted by shutdown");
+        }
         let _guard = self.inner.reconcile.lock().await;
+        if self.inner.shutdown.is_shutting_down() {
+            bail!("sources refresh interrupted by shutdown");
+        }
         let snapshot = self.fetch_snapshot().await?;
         self.apply_snapshot(snapshot).await
     }
 
     pub fn spawn_poll(&self) {
         let supervisor = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(supervisor.inner.sources.poll);
             interval.tick().await;
             loop {
                 tokio::select! {
+                    biased;
                     _ = supervisor.inner.shutdown.wait() => break,
                     _ = interval.tick() => {
+                        if supervisor.inner.shutdown.is_shutting_down() {
+                            break;
+                        }
                         if let Err(error) = supervisor.poll_once().await {
+                            if supervisor.inner.shutdown.is_shutting_down() {
+                                break;
+                            }
                             tracing::warn!(error = %error, "sources poll failed");
                         }
                     }
                 }
             }
         });
+        let previous = self.inner.poll_task.lock().unwrap().replace(handle);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
     }
 
     pub async fn shutdown_all(&self) {
+        self.inner.shutdown.begin();
+        let poll_task = self.inner.poll_task.lock().unwrap().take();
+        if let Some(handle) = poll_task {
+            let _ = handle.await;
+        }
         let _guard = self.inner.reconcile.lock().await;
         let runtimes = {
             let mut state = self.inner.state.lock().await;
@@ -240,12 +291,18 @@ impl SourcesSupervisor {
     }
 
     async fn poll_once(&self) -> Result<()> {
+        if self.inner.shutdown.is_shutting_down() {
+            return Ok(());
+        }
         match self.inner.sources.mode {
             SourcesMode::File => {
                 self.refresh().await?;
             }
             SourcesMode::Table => {
                 let revision = self.read_control_revision().await?;
+                if self.inner.shutdown.is_shutting_down() {
+                    return Ok(());
+                }
                 let unchanged = self.inner.state.lock().await.last_revision == Some(revision);
                 if !unchanged {
                     self.refresh().await?;
@@ -255,11 +312,26 @@ impl SourcesSupervisor {
         Ok(())
     }
 
+    async fn run_unless_shutdown<T, E, F>(&self, fut: F) -> Result<T>
+    where
+        F: std::future::Future<Output = std::result::Result<T, E>>,
+        E: Into<anyhow::Error>,
+    {
+        tokio::select! {
+            biased;
+            _ = self.inner.shutdown.wait() => bail!("sources operation interrupted by shutdown"),
+            result = fut => result.map_err(Into::into),
+        }
+    }
+
     async fn fetch_snapshot(&self) -> Result<SourceSnapshot> {
         match self.inner.sources.mode {
             SourcesMode::File => {
                 let path = self.inner.sources.file.as_deref().context("file mode has no sources file")?;
-                let body = tokio::fs::read_to_string(path).await.with_context(|| format!("read {}", path.display()))?;
+                let body = self
+                    .run_unless_shutdown(tokio::fs::read_to_string(path))
+                    .await
+                    .with_context(|| format!("read {}", path.display()))?;
                 let rows: Vec<SourceRow> = serde_json::from_str(&body).context("parse sources JSON")?;
                 validate_rows(&rows)?;
                 let revision = rows.iter().map(|row| row.revision).max().unwrap_or(0);
@@ -268,13 +340,16 @@ impl SourcesSupervisor {
             SourcesMode::Table => {
                 let revision = self.read_control_revision().await?;
                 let url = self.inner.sources.pg_url.as_deref().context("table mode has no control URL")?;
-                let client = crate::pg::connect(url).await.context("connect sources control database")?;
+                let client = self
+                    .run_unless_shutdown(crate::pg::connect(url))
+                    .await
+                    .context("connect sources control database")?;
                 let query = format!(
                     "SELECT source_id, plugin, database_secret, slot, publication, tables, revision, updated_at::text \
                      FROM {} ORDER BY source_id",
                     quote_table_name(&self.inner.sources.table)
                 );
-                let rows = client.query(&query, &[]).await.context("read sources table")?;
+                let rows = self.run_unless_shutdown(client.query(&query, &[])).await.context("read sources table")?;
                 let rows = rows.into_iter().map(source_row_from_pg).collect::<Result<Vec<_>>>()?;
                 validate_rows(&rows)?;
                 Ok(SourceSnapshot { revision, rows })
@@ -284,23 +359,36 @@ impl SourcesSupervisor {
 
     async fn read_control_revision(&self) -> Result<i64> {
         let url = self.inner.sources.pg_url.as_deref().context("table mode has no control URL")?;
-        let client = crate::pg::connect(url).await.context("connect sources version database")?;
+        let client =
+            self.run_unless_shutdown(crate::pg::connect(url)).await.context("connect sources version database")?;
         let query = format!("SELECT revision FROM {} LIMIT 1", quote_table_name(&self.inner.sources.version_table));
-        let row = client.query_opt(&query, &[]).await.context("read sources version")?;
+        let row = self.run_unless_shutdown(client.query_opt(&query, &[])).await.context("read sources version")?;
         row.map(|row| row.get(0)).context("sources version table has no revision row")
     }
 
     async fn apply_snapshot(&self, snapshot: SourceSnapshot) -> Result<i64> {
-        let running = {
+        if self.inner.shutdown.is_shutting_down() {
+            bail!("sources reconcile interrupted by shutdown");
+        }
+        let (running, failed) = {
             let state = self.inner.state.lock().await;
-            state
+            let running = state
                 .running
                 .iter()
                 .map(|(source_id, runtime)| (source_id.clone(), RunningSourceState { revision: runtime.row.revision }))
-                .collect::<BTreeMap<_, _>>()
+                .collect::<BTreeMap<_, _>>();
+            let failed = state
+                .failed
+                .iter()
+                .map(|(source_id, failed)| (source_id.clone(), RunningSourceState { revision: failed.row.revision }))
+                .collect::<BTreeMap<_, _>>();
+            (running, failed)
         };
-        let plan = reconcile(&running, &snapshot.rows);
+        let plan = reconcile_refresh(&running, &failed, &snapshot.rows);
         for action in plan.actions {
+            if self.inner.shutdown.is_shutting_down() {
+                bail!("sources reconcile interrupted by shutdown");
+            }
             match action {
                 PlanAction::Stop(source_id) => {
                     if let Some(mut runtime) = self.inner.state.lock().await.running.remove(&source_id) {
@@ -341,33 +429,41 @@ impl SourcesSupervisor {
     }
 
     async fn start_or_record(&self, row: SourceRow) {
+        if self.inner.shutdown.is_shutting_down() {
+            return;
+        }
         match self.start_source(row.clone()).await {
             Ok(runtime) => {
+                if self.inner.shutdown.is_shutting_down() {
+                    let mut runtime = runtime;
+                    if let Err(error) = stop_runtime(&mut runtime).await {
+                        tracing::warn!(source_id = %row.source_id, error = %error, "source stop during shutdown failed");
+                    }
+                    return;
+                }
                 let mut state = self.inner.state.lock().await;
                 state.failed.remove(&row.source_id);
                 state.running.insert(row.source_id.clone(), runtime);
             }
             Err(error) => {
-                tracing::warn!(
-                    source_id = %row.source_id,
-                    revision = row.revision,
-                    error = %error,
-                    "source is not ready"
-                );
-                self.inner
-                    .state
-                    .lock()
-                    .await
-                    .failed
-                    .insert(row.source_id.clone(), FailedSource { row, error: format!("{error:#}") });
+                if self.inner.shutdown.is_shutting_down() {
+                    return;
+                }
+                let error = public_source_error(&error);
+                tracing::warn!(source_id = %row.source_id, revision = row.revision, error = %error, "source is not ready");
+                self.inner.state.lock().await.failed.insert(row.source_id.clone(), FailedSource { row, error });
             }
         }
     }
 
     async fn start_source(&self, row: SourceRow) -> Result<SourceRuntime> {
+        if self.inner.shutdown.is_shutting_down() {
+            bail!("source start interrupted by shutdown");
+        }
         validate_source_row(&row)?;
         let config = self.inner.config.clone();
         let grace = config.shutdown_grace;
+        let host_shutdown = self.inner.shutdown.clone();
         let source_id = row.source_id.clone();
         let row_for_thread = row.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -382,7 +478,13 @@ impl SourcesSupervisor {
                         return;
                     }
                 };
-                let booted = runtime.block_on(boot_source(config, row_for_thread));
+                let booted = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = host_shutdown.wait() => Err(anyhow::anyhow!("source start interrupted by shutdown")),
+                        result = boot_source(config, row_for_thread) => result,
+                    }
+                });
                 match booted {
                     Ok((engine, router)) => {
                         let shutdown = engine.shutdown_token();
@@ -557,17 +659,70 @@ fn source_scope(base: &StreamScope, source_id: &str) -> Result<StreamScope> {
     StreamScope::new(format!("source-{}", &digest[..40]), base.store.clone(), format!("query-{}", &digest[..40]))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretResolveError {
+    UrlShaped,
+    MissingPrefix,
+    UnknownPrefix,
+    EmptyName,
+    EnvMissing,
+    EnvEmpty,
+    FileRead,
+    AwsLookup,
+    InvalidUrl,
+}
+
+impl std::fmt::Display for SecretResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UrlShaped => "resolve failed: url-shaped secret",
+            Self::MissingPrefix => "resolve failed: missing prefix",
+            Self::UnknownPrefix => "resolve failed: unknown prefix",
+            Self::EmptyName => "resolve failed: empty name",
+            Self::EnvMissing => "resolve failed: env variable missing",
+            Self::EnvEmpty => "resolve failed: env variable empty",
+            Self::FileRead => "resolve failed: file read error",
+            Self::AwsLookup => "resolve failed: aws-sm lookup error",
+            Self::InvalidUrl => "resolve failed: invalid postgres url",
+        })
+    }
+}
+
+impl std::error::Error for SecretResolveError {}
+
+fn is_url_shaped_secret(reference: &str) -> bool {
+    let trimmed = reference.trim();
+    if trimmed.starts_with("env:") || trimmed.starts_with("file:") || trimmed.starts_with("aws-sm:") {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("://") || lower.starts_with("postgres:") || lower.starts_with("postgresql:")
+}
+
+fn public_source_error(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if let Some(classified) = cause.downcast_ref::<SecretResolveError>() {
+            return classified.to_string();
+        }
+    }
+    error.to_string()
+}
+
 async fn resolve_database_secret(reference: &str) -> Result<String> {
-    let (kind, name) =
-        reference.split_once(':').with_context(|| format!("database_secret has no resolver prefix: {reference}"))?;
+    if is_url_shaped_secret(reference) {
+        bail!(SecretResolveError::UrlShaped);
+    }
+    let Some((kind, name)) = reference.split_once(':') else {
+        bail!(SecretResolveError::MissingPrefix);
+    };
     if name.trim().is_empty() {
-        bail!("database_secret resolver name is empty");
+        bail!(SecretResolveError::EmptyName);
     }
     let value = match kind {
         "env" => return resolve_env_secret(reference, |key| std::env::var(key).ok()),
-        "file" => tokio::fs::read_to_string(name).await.with_context(|| format!("read database secret file {name}"))?,
+        "file" => tokio::fs::read_to_string(name).await.map_err(|_| SecretResolveError::FileRead)?,
         "aws-sm" => return resolve_aws_secret(name).await,
-        other => bail!("unknown database_secret resolver '{other}'"),
+        _ => bail!(SecretResolveError::UnknownPrefix),
     };
     validate_database_secret_value(&value)
 }
@@ -595,29 +750,38 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    let value = fetch(name.to_string()).await?;
+    let value = fetch(name.to_string()).await.map_err(|_| SecretResolveError::AwsLookup)?;
     validate_database_secret_value(&value)
 }
 
 fn validate_database_secret_value(value: &str) -> Result<String> {
     let value = value.trim().to_string();
     if value.is_empty() {
-        bail!("database secret resolved to an empty value");
+        bail!(SecretResolveError::InvalidUrl);
     }
     validate_database_url(&value)?;
     Ok(value)
 }
 
 fn resolve_env_secret(reference: &str, get: impl Fn(&str) -> Option<String>) -> Result<String> {
-    let (kind, name) =
-        reference.split_once(':').with_context(|| format!("database_secret has no resolver prefix: {reference}"))?;
-    if kind != "env" || name.trim().is_empty() {
-        bail!("database_secret must use env:NAME for an environment lookup");
+    if is_url_shaped_secret(reference) {
+        bail!(SecretResolveError::UrlShaped);
     }
-    let value = get(name).with_context(|| format!("environment secret {name} is missing"))?;
+    let Some((kind, name)) = reference.split_once(':') else {
+        bail!(SecretResolveError::MissingPrefix);
+    };
+    if kind != "env" {
+        bail!(SecretResolveError::UnknownPrefix);
+    }
+    if name.trim().is_empty() {
+        bail!(SecretResolveError::EmptyName);
+    }
+    let Some(value) = get(name) else {
+        bail!(SecretResolveError::EnvMissing);
+    };
     let value = value.trim().to_string();
     if value.is_empty() {
-        bail!("environment secret {name} is empty");
+        bail!(SecretResolveError::EnvEmpty);
     }
     validate_database_url(&value)?;
     Ok(value)
@@ -626,8 +790,9 @@ fn resolve_env_secret(reference: &str, get: impl Fn(&str) -> Option<String>) -> 
 fn validate_database_url(value: &str) -> Result<()> {
     let ca_bundle = std::env::var("ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE").ok();
     let server_name = std::env::var("ELECTRIC_CIRCUITS_PG_TLS_SERVER_NAME").ok();
-    crate::pg::PgConnectionConfig::resolve(value, ca_bundle.as_deref(), server_name.as_deref())
-        .context("resolved database secret is not a valid Postgres URL")?;
+    if crate::pg::PgConnectionConfig::resolve(value, ca_bundle.as_deref(), server_name.as_deref()).is_err() {
+        bail!(SecretResolveError::InvalidUrl);
+    }
     Ok(())
 }
 
@@ -641,14 +806,18 @@ fn validate_rows(rows: &[SourceRow]) -> Result<()> {
     Ok(())
 }
 
+fn is_safe_source_id(source_id: &str) -> bool {
+    if source_id.is_empty() || source_id == "." || source_id == ".." {
+        return false;
+    }
+    !source_id
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\' | '?' | '#' | '%' | ':' | '*' | '"' | '<' | '>' | '|'))
+}
+
 fn validate_source_row(row: &SourceRow) -> Result<()> {
-    if row.source_id.trim().is_empty()
-        || row.source_id.contains('/')
-        || row.source_id.contains('?')
-        || row.source_id.contains('#')
-        || row.source_id.contains('%')
-    {
-        bail!("source_id '{}' cannot be represented safely in a source route", row.source_id);
+    if !is_safe_source_id(&row.source_id) {
+        bail!("source_id is not a single safe path component");
     }
     if row.plugin != crate::pg::PGOUTPUT {
         bail!("source '{}' uses unsupported logical-replication plugin '{}'", row.source_id, row.plugin);
@@ -752,7 +921,15 @@ async fn proxy_path(
     proxy(supervisor, source_id, path, request).await
 }
 
+fn is_source_admin_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+    path == "_admin" || path.starts_with("_admin/")
+}
+
 async fn proxy(supervisor: SourcesSupervisor, source_id: String, path: String, request: Request) -> Response {
+    if is_source_admin_path(&path) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
     let router = {
         let state = supervisor.inner.state.lock().await;
         state.running.get(&source_id).map(|runtime| runtime.router.clone())
@@ -915,18 +1092,50 @@ mod tests {
     }
 
     #[test]
+    fn refresh_retries_failed_desired_rows_without_restarting_healthy_ones() {
+        let rows = vec![row("alpha", 1), row("broken", 3)];
+        let plan = reconcile_refresh(&running(&[("alpha", 1)]), &running(&[("broken", 3)]), &rows);
+        assert_eq!(plan.actions, vec![PlanAction::Start(row("broken", 3))]);
+    }
+
+    #[test]
+    fn source_id_must_be_a_single_safe_path_component() {
+        assert!(is_safe_source_id("alpha-1_src"));
+        for source_id in [".", "..", "a/b", r"a\b", "a\nb", "a\0b", "a:b", ""] {
+            assert!(!is_safe_source_id(source_id), "source_id {source_id:?} must be rejected");
+            let mut invalid = row("alpha", 1);
+            invalid.source_id = source_id.to_string();
+            assert!(validate_source_row(&invalid).is_err(), "source_id {source_id:?} must be rejected");
+        }
+    }
+
+    #[test]
     fn environment_secret_resolves_and_missing_or_malformed_values_fail() {
         let url = resolve_env_secret("env:SOURCE_URL", |name| {
             (name == "SOURCE_URL").then(|| " postgres://postgres@127.0.0.1:5432/source ".to_string())
         })
         .expect("environment secret");
         assert_eq!(url, "postgres://postgres@127.0.0.1:5432/source");
-        assert!(resolve_env_secret("env:MISSING", |_| None).is_err());
-        assert!(resolve_env_secret("env:BROKEN", |_| Some("not a postgres URL".into())).is_err());
-        assert!(
-            resolve_env_secret("vault:SOURCE_URL", |_| { Some("postgres://postgres@127.0.0.1:5432/source".into()) })
-                .is_err()
-        );
+        let missing = resolve_env_secret("env:MISSING_WITH_PASSWORD_LIKE_VALUE", |_| None).unwrap_err();
+        assert_classified_secret_error(&missing, "resolve failed: env variable missing");
+        let broken = resolve_env_secret("env:BROKEN", |_| Some("not a postgres URL".into())).unwrap_err();
+        assert_classified_secret_error(&broken, "resolve failed: invalid postgres url");
+        let unknown =
+            resolve_env_secret("vault:SOURCE_URL", |_| Some("postgres://postgres@127.0.0.1:5432/source".into()))
+                .unwrap_err();
+        assert_classified_secret_error(&unknown, "resolve failed: unknown prefix");
+        let embedded_url = resolve_env_secret("env:postgres://user:s3cret@127.0.0.1:5432/db", |_| None).unwrap_err();
+        assert_classified_secret_error(&embedded_url, "resolve failed: env variable missing");
+    }
+
+    fn assert_classified_secret_error(error: &anyhow::Error, expected: &str) {
+        let message = format!("{error:#}");
+        assert!(message.contains(expected), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+        assert!(!message.contains("MISSING_WITH_PASSWORD_LIKE_VALUE"), "{message}");
+        assert!(!message.contains("SOURCE_URL"), "{message}");
+        assert!(!message.contains("postgres://"), "{message}");
+        assert!(!message.contains("user:"), "{message}");
     }
 
     #[tokio::test]
@@ -936,9 +1145,18 @@ mod tests {
         let resolved = resolve_database_secret(&format!("file:{}", path.display())).await.unwrap();
         assert_eq!(resolved, "postgres://postgres@127.0.0.1:5432/source");
         std::fs::write(&path, "not a postgres URL").unwrap();
-        assert!(resolve_database_secret(&format!("file:{}", path.display())).await.is_err());
+        let invalid = resolve_database_secret(&format!("file:{}", path.display())).await.unwrap_err();
+        assert_classified_secret_error(&invalid, "resolve failed: invalid postgres url");
         std::fs::remove_file(&path).unwrap();
-        assert!(resolve_database_secret(&format!("file:{}", path.display())).await.is_err());
+        let missing = resolve_database_secret(&format!("file:{}", path.display())).await.unwrap_err();
+        assert_classified_secret_error(&missing, "resolve failed: file read error");
+        assert!(!format!("{missing:#}").contains(&path.display().to_string()), "{missing:#}");
+    }
+
+    #[tokio::test]
+    async fn url_shaped_database_secret_is_rejected_before_resolution() {
+        let error = resolve_database_secret("postgres://user:s3cret@127.0.0.1:5432/source").await.unwrap_err();
+        assert_classified_secret_error(&error, "resolve failed: url-shaped secret");
     }
 
     #[tokio::test]
@@ -950,11 +1168,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(value, "postgres://postgres@127.0.0.1:5432/source");
-        assert!(resolve_aws_secret_with("bad", |_| async { Ok("not-a-url".into()) }).await.is_err());
-        assert!(
-            resolve_aws_secret_with("missing", |_| async { Err(anyhow::anyhow!("stubbed lookup failed")) })
-                .await
-                .is_err()
-        );
+        let invalid = resolve_aws_secret_with("bad", |_| async { Ok("not-a-url".into()) }).await.unwrap_err();
+        assert_classified_secret_error(&invalid, "resolve failed: invalid postgres url");
+        let missing = resolve_aws_secret_with("missing", |_| async {
+            Err(anyhow::anyhow!("stubbed lookup failed postgres://user:s3cret@host/db"))
+        })
+        .await
+        .unwrap_err();
+        assert_classified_secret_error(&missing, "resolve failed: aws-sm lookup error");
+    }
+
+    fn file_mode_config(file: &str) -> Config {
+        Config::resolve(|name| match name {
+            "ELECTRIC_CIRCUITS_SOURCES_MODE" => Some("file".into()),
+            "ELECTRIC_CIRCUITS_SOURCES_FILE" => Some(file.into()),
+            "ELECTRIC_CIRCUITS_SOURCES_POLL_SECS" => Some("1".into()),
+            _ => None,
+        })
+        .expect("valid sources test config")
+    }
+
+    fn valid_row(source_id: &str, revision: i64, secret: &str) -> SourceRow {
+        SourceRow {
+            source_id: source_id.into(),
+            plugin: "pgoutput".into(),
+            database_secret: secret.into(),
+            slot: format!("{source_id}_slot"),
+            publication: format!("{source_id}_slot_pub"),
+            tables: vec!["public.thread_messages".into()],
+            revision,
+            updated_at: "2026-09-07T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_short_circuits_refresh_before_starting_sources() {
+        let file = std::env::temp_dir().join(format!("circuits-sources-shutdown-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"[]").unwrap();
+        let supervisor = SourcesSupervisor::new(file_mode_config(file.to_str().unwrap())).unwrap();
+        supervisor.refresh().await.unwrap();
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&vec![valid_row("alpha", 1, "env:MISSING_WITH_PASSWORD_LIKE_VALUE")]).unwrap(),
+        )
+        .unwrap();
+        supervisor.shutdown_token().begin();
+        let error = supervisor.refresh().await.expect_err("refresh must stop at the shutdown cut");
+        assert!(format!("{error:#}").contains("shutdown"), "{error:#}");
+        assert!(supervisor.summaries().await.is_empty(), "shutdown must not start a source");
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_the_poll_task() {
+        let file = std::env::temp_dir().join(format!("circuits-sources-poll-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"[]").unwrap();
+        let supervisor = SourcesSupervisor::new(file_mode_config(file.to_str().unwrap())).unwrap();
+        supervisor.refresh().await.unwrap();
+        supervisor.spawn_poll();
+        tokio::time::timeout(std::time::Duration::from_secs(2), supervisor.shutdown_all())
+            .await
+            .expect("shutdown must join the poll task");
+        let _ = std::fs::remove_file(file);
     }
 }

@@ -111,3 +111,129 @@ async fn sources_admin_and_proxy_routes_have_the_declared_contract() {
     supervisor.shutdown_all().await;
     std::fs::remove_file(file).unwrap();
 }
+
+#[tokio::test]
+async fn source_scoped_admin_routes_are_not_found() {
+    let file = std::env::temp_dir().join(format!("circuits-sources-admin-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&file, serde_json::to_vec(&vec![row(7)]).unwrap()).unwrap();
+    electric_circuits_engine::config::set_globals(
+        "sources-http-admin",
+        "sources-http-admin",
+        None,
+        Some("control-secret"),
+    );
+
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let supervisor = SourcesSupervisor::with_test_source(config(file.to_str().unwrap()), row(7), engine).await.unwrap();
+    let app = supervisor.router();
+
+    for uri in [
+        "/sources/alpha/_admin/control-admission/close",
+        "/sources/alpha/_admin/control-admission/open",
+        "/sources/alpha/_admin/deployment/promote",
+        "/sources/alpha/_admin/deployment/quiesce",
+        "/sources/alpha/_admin/deployment/status",
+        "/sources/alpha/_admin",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", "Bearer control-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri} must not be a source-scoped admin route");
+    }
+
+    supervisor.shutdown_token().begin();
+    supervisor.shutdown_all().await;
+    std::fs::remove_file(file).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_refreshes_serialize_and_return_the_same_revision() {
+    let file = std::env::temp_dir().join(format!("circuits-sources-refresh-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&file, serde_json::to_vec(&vec![row(7)]).unwrap()).unwrap();
+    electric_circuits_engine::config::set_globals(
+        "sources-http-refresh",
+        "sources-http-refresh",
+        None,
+        Some("control-secret"),
+    );
+
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let supervisor = SourcesSupervisor::with_test_source(config(file.to_str().unwrap()), row(7), engine).await.unwrap();
+    let app = supervisor.router();
+
+    let refresh = || {
+        app.clone().oneshot(
+            Request::post("/admin/refresh")
+                .header("authorization", "Bearer control-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let (first, second) = tokio::join!(refresh(), refresh());
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(body(first).await["revision"], 7);
+    assert_eq!(body(second).await["revision"], 7);
+
+    supervisor.shutdown_token().begin();
+    supervisor.shutdown_all().await;
+    std::fs::remove_file(file).unwrap();
+}
+
+#[tokio::test]
+async fn refresh_retries_an_unchanged_failed_source() {
+    let file = std::env::temp_dir().join(format!("circuits-sources-retry-{}.json", uuid::Uuid::new_v4()));
+    let failed = row(7);
+    std::fs::write(&file, serde_json::to_vec(&vec![failed.clone()]).unwrap()).unwrap();
+    electric_circuits_engine::config::set_globals(
+        "sources-http-retry",
+        "sources-http-retry",
+        None,
+        Some("control-secret"),
+    );
+
+    let supervisor =
+        SourcesSupervisor::with_test_failed_source(config(file.to_str().unwrap()), failed, "injected-not-retried")
+            .await
+            .unwrap();
+    let app = supervisor.router();
+
+    let before = app.clone().oneshot(Request::get("/sources").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(body(before).await[0]["error"], "injected-not-retried");
+
+    let refreshed = app
+        .clone()
+        .oneshot(
+            Request::post("/admin/refresh")
+                .header("authorization", "Bearer control-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+
+    let after = app.oneshot(Request::get("/sources").body(Body::empty()).unwrap()).await.unwrap();
+    let after = body(after).await;
+    assert_eq!(after[0]["source_id"], "alpha");
+    assert_eq!(after[0]["ready"], false);
+    assert_ne!(after[0]["error"], "injected-not-retried", "an explicit refresh must retry the failed start");
+    let error = after[0]["error"].as_str().unwrap_or_default();
+    assert!(!error.contains("ALPHA_DATABASE_URL"), "{error}");
+    assert!(!error.contains("postgres://"), "{error}");
+
+    supervisor.shutdown_token().begin();
+    supervisor.shutdown_all().await;
+    std::fs::remove_file(file).unwrap();
+}

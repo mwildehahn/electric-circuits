@@ -160,10 +160,9 @@ async fn set_revision(client: &tokio_postgres::Client, version_table: &str, revi
 #[tokio::test]
 #[ignore = "requires an isolated real PostgreSQL instance via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Result<()> {
-    let control_url = match std::env::var("ELECTRIC_CIRCUITS_TEST_PG_URL") {
-        Ok(url) => url,
-        Err(_) => return Ok(()),
-    };
+    let control_url = std::env::var("ELECTRIC_CIRCUITS_TEST_PG_URL").context(
+        "ELECTRIC_CIRCUITS_TEST_PG_URL is required for this ignored lifecycle test; a missing value must fail, not skip",
+    )?;
     let client = pg::connect(&control_url).await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let source_table = format!("circuits_thread_messages_{suffix}");

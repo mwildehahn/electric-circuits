@@ -6,29 +6,29 @@ source has its own engine, replication slot, worker thread, and storage director
 
 ## Configuration
 
-\`ELECTRIC_CIRCUITS_SOURCES_MODE\` is opt-in. Without it, the existing single-source boot path and
-its \`ELECTRIC_CIRCUITS_PG_*\` settings are unchanged. Set it to \`table\` for PostgreSQL control
-tables or \`file\` for local development.
+`ELECTRIC_CIRCUITS_SOURCES_MODE` is opt-in. Without it, the existing single-source boot path and
+its `ELECTRIC_CIRCUITS_PG_*` settings are unchanged. Set it to `table` for PostgreSQL control
+tables or `file` for local development.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| \`ELECTRIC_CIRCUITS_SOURCES_MODE\` | — | \`table\` or \`file\`. |
-| \`ELECTRIC_CIRCUITS_SOURCES_PG_URL\` | — | Required in \`table\` mode; the control database URL. |
-| \`ELECTRIC_CIRCUITS_SOURCES_TABLE\` | \`circuits_sources\` | Control row table; a simple or schema-qualified identifier. |
-| \`ELECTRIC_CIRCUITS_SOURCES_VERSION_TABLE\` | \`circuits_sources_version\` | Single-row revision table. |
-| \`ELECTRIC_CIRCUITS_SOURCES_POLL_SECS\` | \`30\` | Version-row poll interval. Must be positive. |
-| \`ELECTRIC_CIRCUITS_SOURCES_FILE\` | — | Required in \`file\` mode; a JSON array containing source rows. |
-| \`ELECTRIC_CIRCUITS_SOURCES_STORAGE_DIR\` | \`./data/sources\` | Root for \`<source_id>/\` storage, DBSP state, and transaction spill. |
+| `ELECTRIC_CIRCUITS_SOURCES_MODE` | — | `table` or `file`. |
+| `ELECTRIC_CIRCUITS_SOURCES_PG_URL` | — | Required in `table` mode; the control database URL. |
+| `ELECTRIC_CIRCUITS_SOURCES_TABLE` | `circuits_sources` | Control row table; a simple or schema-qualified identifier. |
+| `ELECTRIC_CIRCUITS_SOURCES_VERSION_TABLE` | `circuits_sources_version` | Single-row revision table. |
+| `ELECTRIC_CIRCUITS_SOURCES_POLL_SECS` | `30` | Version-row poll interval. Must be positive. |
+| `ELECTRIC_CIRCUITS_SOURCES_FILE` | — | Required in `file` mode; a JSON array containing source rows. |
+| `ELECTRIC_CIRCUITS_SOURCES_STORAGE_DIR` | `./data/sources` | Root for `<source_id>/` storage, DBSP state, and transaction spill. |
 
-In \`table\` mode, \`ELECTRIC_CIRCUITS_PG_URL\`, \`ELECTRIC_CIRCUITS_PG_SLOT\`, and
-\`ELECTRIC_CIRCUITS_PG_TABLES\` are rejected. \`ELECTRIC_CIRCUITS_BIND\`, secrets, Durable Streams, DBSP, transaction,
+In `table` mode, `ELECTRIC_CIRCUITS_PG_URL`, `ELECTRIC_CIRCUITS_PG_SLOT`, and
+`ELECTRIC_CIRCUITS_PG_TABLES` are rejected. `ELECTRIC_CIRCUITS_BIND`, secrets, Durable Streams, DBSP, transaction,
 backfill, and shutdown settings apply to every source.
 
 ## Control rows
 
 The engine reads, but never creates or alters, these relations:
 
-\`\`\`sql
+```sql
 CREATE TABLE circuits_sources (
   source_id       TEXT PRIMARY KEY,
   plugin          TEXT NOT NULL,
@@ -41,42 +41,49 @@ CREATE TABLE circuits_sources (
 );
 
 CREATE TABLE circuits_sources_version (revision BIGINT NOT NULL);
-\`\`\`
+```
 
-\`tables\` entries are schema-qualified, for example \`public.thread_messages\`. A file-mode row uses
-the same field names and JSON types. \`plugin\` must be \`pgoutput\`; \`publication\` must be the
-slot's \`<slot>_pub\` publication. A row contains a secret reference, never a connection URL or
-password.
+`tables` entries are schema-qualified, for example `public.thread_messages`. A file-mode row uses
+the same field names and JSON types. `plugin` must be `pgoutput`; `publication` must be the
+slot's `<slot>_pub` publication. A row contains a secret reference, never a connection URL or
+password. `source_id` must be a single safe filesystem path component: not empty, not `.` or `..`,
+and without `/`, `\`, control characters, or other path separators. An unsafe id makes only that
+source not ready.
 
 ## Database-secret resolution
 
-The \`database_secret\` prefix selects the resolver:
+The `database_secret` prefix selects the resolver:
 
-- \`env:NAME\` reads and validates environment variable \`NAME\`.
-- \`file:/absolute/path\` reads, trims, and validates the file contents.
-- \`aws-sm:NAME\` reads the current \`SecretString\` from AWS Secrets Manager using the ambient
+- `env:NAME` reads and validates environment variable `NAME`.
+- `file:/absolute/path` reads, trims, and validates the file contents.
+- `aws-sm:NAME` reads the current `SecretString` from AWS Secrets Manager using the ambient
   credential chain and environment-selected region.
 
 Every source start and restart resolves its secret again. Unknown prefixes, missing values,
-malformed URLs, and failed AWS lookups make only that source not ready.
+malformed URLs, URL-shaped secret fields, and failed AWS lookups make only that source not ready.
+The public `error` field is a fixed classification plus the resolver prefix only, for example
+`resolve failed: env variable missing` or `resolve failed: aws-sm lookup error`. It never includes
+the secret name, the resolved value, or an underlying error string.
 
 ## HTTP routes
 
 The host exposes:
 
-- \`GET /health\` for liveness.
-- \`GET /ready\`, which becomes \`200\` after the first successful discovery fetch, even if one or
+- `GET /health` for liveness.
+- `GET /ready`, which becomes `200` after the first successful discovery fetch, even if one or
   more source rows are not ready.
-- \`GET /sources\`, returning \`{source_id, revision, ready, error}\` summaries.
-- \`GET /sources/{source_id}/status\`, returning the summary plus the source's changes route,
+- `GET /sources`, returning `{source_id, revision, ready, error}` summaries.
+- `GET /sources/{source_id}/status`, returning the summary plus the source's changes route,
   epoch, position, segments, consumers, and readiness fields.
-- Every engine route at \`/sources/{source_id}/...\`, forwarded to that source after rewriting the
-  URI back to the engine root. The engine router is intentionally not nested.
-- \`POST /admin/refresh\`, protected by the private control secret. It accepts no body, fetches rows
-  unconditionally, reconciles them, and returns \`{ "revision": ... }\`.
+- Every engine route at `/sources/{source_id}/...`, forwarded to that source after rewriting the
+  URI back to the engine root. The engine router is intentionally not nested. Any
+  `/sources/{source_id}/_admin/...` path returns 404; there is no source-scoped admin surface.
+- `POST /admin/refresh`, protected by the private control secret. It accepts no body, fetches rows
+  unconditionally, reconciles them, and returns `{ "revision": ... }`.
 
-There is no write API for sources and no source-specific admin route. The existing \`/_admin/*\`
-deployment routes remain single-source-only.
+There is no write API for sources and no source-specific admin route. Host-level `/admin/refresh`
+is the only admin route in this mode. The existing `/_admin/*` deployment routes remain
+single-source-only and return 404 here.
 
 ## Discovery and reconciliation
 
@@ -90,20 +97,23 @@ Reconciliation is idempotent:
 - a new row starts one source;
 - a missing row stops it;
 - a changed row revision stops and restarts it;
-- an unchanged row does nothing.
+- an unchanged healthy row does nothing.
 
-A failed start is retained as a not-ready source with its error and is retried when a later
-revision or refresh touches it. One source's failure does not stop other sources. Stopping leaves
-that source's storage directory in place, so a restart can restore its shape catalog.
+A failed start is retained as a not-ready source with its classified error and is retried when a
+later revision or an explicit refresh touches it, including when the row revision is unchanged.
+Unchanged healthy rows remain no-ops. Polling does not retry a failed source while the version row
+is unchanged, so failure is not a tight loop. One source's failure does not stop other sources.
+Stopping leaves that source's storage directory in place, so a restart can restore its shape catalog.
 
 Each source runs on its own operating-system thread with a current-thread Tokio runtime. The
 control plane uses one serialized reconcile lock, so concurrent refresh calls cannot interleave
-plans.
+plans. The poll task is owned and joined on shutdown. Once the host shutdown token is set, control
+I/O and reconciliation short-circuit and no new source is started.
 
 ## Process-global caveats
 
-The existing DB pool, backfill, shutdown, and related \`OnceLock\` settings remain process-global.
+The existing DB pool, backfill, shutdown, and related `OnceLock` settings remain process-global.
 They therefore apply uniformly to every source in a host. Source-specific Postgres URLs, slots,
 tables, storage roots, DBSP directories, and transaction-spill directories are per-source. The
-engine uses \`PostgresSetup::ExternallyManaged\`: the consumer's migration/bootstrap step owns
+engine uses `PostgresSetup::ExternallyManaged`: the consumer's migration/bootstrap step owns
 publications, slots, replica identity, and grants; the engine only verifies them.

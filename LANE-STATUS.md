@@ -4,25 +4,22 @@ Lane: `circuits-engine-sources-run1`
 
 Branch: `feat/sources-table-mode`
 
-Status: implementation complete; PR checks are green and the PR is ready for review.
+Status: addressing independent xhigh review of PR #20 (FIX FIRST). Implementation of the review findings is complete locally; pushing and polling CI.
 
 Done:
 
-- Added opt-in table/file sources discovery, secret resolution, idempotent reconciliation, per-source workers/storage, source-scoped HTTP forwarding, status routes, refresh, and polling.
-- Added configuration, reconciliation, resolver, HTTP, and real-PostgreSQL lifecycle tests.
-- Added sources-table documentation and the ignored CI lifecycle gate.
+- Source-scoped `/_admin/*` now 404s; host `/admin/refresh` remains the only admin route.
+- Explicit refresh retries failed desired rows at the same revision; healthy unchanged rows stay no-ops.
+- `source_id` must be a single safe path component before storage dirs are built.
+- Poll task is owned and joined; shutdown short-circuits control I/O, reconcile, and new starts.
+- Resolver errors are classified (`resolve failed: <prefix> <class>`) with no name tail, URL, or underlying string.
+- Focused tests cover those paths, concurrent refresh serialization, and the ignored lifecycle test now fails closed if `ELECTRIC_CIRCUITS_TEST_PG_URL` is missing.
 
 Verification:
 
 - `cargo fmt --all -- --check`
 - `cargo test -p electric-circuits-engine --features test-support -j 2 -- --test-threads=2`
-- `pnpm typecheck`
-- `pnpm test` (69 files, 311 tests)
-- `sources_table` ignored lifecycle test is configured for CI but was not run locally because `ELECTRIC_CIRCUITS_TEST_PG_URL` is not set in this environment.
-- PR CI is green, including the real PostgreSQL 18 sources-table lifecycle test.
-
-Final implementation commit: `ee3499f`
 
 PR: https://github.com/mwildehahn/electric-circuits/pull/20
 
-In progress: none.
+In progress: push, PR comment per finding, poll CI until green.
