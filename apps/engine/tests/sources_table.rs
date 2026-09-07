@@ -135,7 +135,7 @@ async fn json(app: &Router, method: Method, uri: &str, body: Body) -> anyhow::Re
     Ok((status, value))
 }
 
-async fn wait_for<F, Fut>(mut check: F) -> anyhow::Result<()>
+async fn wait_for<F, Fut>(label: &str, mut check: F) -> anyhow::Result<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<bool>>,
@@ -149,7 +149,7 @@ where
         }
     })
     .await
-    .context("waiting for sources-table lifecycle state")?
+    .with_context(|| format!("waiting for {label}"))?
 }
 
 async fn set_revision(client: &tokio_postgres::Client, version_table: &str, revision: i64) -> anyhow::Result<()> {
@@ -245,7 +245,7 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
         let supervisor = SourcesSupervisor::new(config.clone())?;
         supervisor.refresh().await?;
         let app = supervisor.router();
-        wait_for(|| async {
+        wait_for("initial source readiness", || async {
             let (_, status) = json(&app, Method::GET, "/sources/alpha/status", Body::empty()).await?;
             Ok(status["ready"] == true)
         })
@@ -272,7 +272,7 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
             .await?;
         set_revision(&client, &version_table, 2).await?;
         supervisor.spawn_poll();
-        wait_for(|| async {
+        wait_for("source revision restart", || async {
             let (_, status) = json(&app, Method::GET, "/sources/alpha/status", Body::empty()).await?;
             Ok(status["revision"] == 2 && status["ready"] == true)
         })
@@ -282,7 +282,7 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
             .execute(&format!("DELETE FROM public.{sources_table_sql} WHERE source_id = 'alpha'"), &[])
             .await?;
         set_revision(&client, &version_table, 3).await?;
-        wait_for(|| async {
+        wait_for("source removal", || async {
             let (_, sources) = json(&app, Method::GET, "/sources", Body::empty()).await?;
             Ok(sources.as_array().is_some_and(Vec::is_empty))
         })
@@ -306,7 +306,7 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
             )
             .await?;
         set_revision(&client, &version_table, 4).await?;
-        wait_for(|| async {
+        wait_for("healthy and degraded sources", || async {
             let (_, sources) = json(&app, Method::GET, "/sources", Body::empty()).await?;
             Ok(sources.as_array().is_some_and(|sources| {
                 sources.iter().any(|source| source["source_id"] == "alpha" && source["ready"] == true)
