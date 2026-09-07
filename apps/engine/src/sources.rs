@@ -312,6 +312,10 @@ impl SourcesSupervisor {
                 }
                 PlanAction::Restart(row) => {
                     if let Some(mut runtime) = self.inner.state.lock().await.running.remove(&row.source_id) {
+                        self.inner.state.lock().await.failed.insert(
+                            row.source_id.clone(),
+                            FailedSource { row: row.clone(), error: "source restarting".to_string() },
+                        );
                         if let Err(error) = stop_runtime(&mut runtime).await {
                             tracing::warn!(source_id = %row.source_id, error = %error, "source restart stop failed");
                         }
