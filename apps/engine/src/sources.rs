@@ -311,7 +311,11 @@ impl SourcesSupervisor {
                     self.inner.state.lock().await.failed.remove(&source_id);
                 }
                 PlanAction::Restart(row) => {
-                    if let Some(mut runtime) = self.inner.state.lock().await.running.remove(&row.source_id) {
+                    let runtime = {
+                        let mut state = self.inner.state.lock().await;
+                        state.running.remove(&row.source_id)
+                    };
+                    if let Some(mut runtime) = runtime {
                         self.inner.state.lock().await.failed.insert(
                             row.source_id.clone(),
                             FailedSource { row: row.clone(), error: "source restarting".to_string() },
