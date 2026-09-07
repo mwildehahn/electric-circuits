@@ -91,6 +91,10 @@ async fn main() -> Result<()> {
         );
     }
 
+    if config.sources.is_some() {
+        return electric_circuits_engine::sources::run(config).await;
+    }
+
     let (ds, store_bound) = if let Some(base_url) = config.ds_in_process_test_url.clone() {
         #[cfg(feature = "test-support")]
         {

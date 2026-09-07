@@ -39,6 +39,8 @@ feldera-macros = "0.318"
 ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
 anyhow = "1"
 constant_time_eq = "0.3"
+aws-config = "1"
+aws-sdk-secretsmanager = "1"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +51,7 @@ tokio = { version = "1", features = ["full"] }
 # BroadcastStream adapter for the /trace SSE endpoint.
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
 # Production Durable Streams traffic is authenticated HTTPS; in-process test stores are the only
 # HTTP exception and never use this transport configuration.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -88,6 +91,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the /v1/health + endpoint tests.
-tower = { version = "0.5", features = ["util"] }
 # start_paused tests for the live long-poll deadline (deterministic virtual time).
 tokio = { version = "1", features = ["full", "test-util"] }

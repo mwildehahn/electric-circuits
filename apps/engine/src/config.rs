@@ -28,6 +28,25 @@ pub struct StatsdTarget {
     pub port: u16,
 }
 
+/// How the multi-source supervisor discovers its desired source rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourcesMode {
+    Table,
+    File,
+}
+
+/// Configuration for the optional multi-source supervisor.
+#[derive(Clone, Debug)]
+pub struct SourcesConfig {
+    pub mode: SourcesMode,
+    pub pg_url: Option<String>,
+    pub table: String,
+    pub version_table: String,
+    pub poll: Duration,
+    pub file: Option<std::path::PathBuf>,
+    pub storage_dir: std::path::PathBuf,
+}
+
 impl StatsdTarget {
     pub fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
@@ -110,6 +129,8 @@ pub struct Config {
     /// a load balancer's probe sees the drain (`ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS`). Comes out
     /// of `shutdown_grace`, not on top of it.
     pub shutdown_ready_drain: Duration,
+    /// Optional sources-table/file supervisor. `None` preserves the single-source boot path.
+    pub sources: Option<SourcesConfig>,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
@@ -224,12 +245,30 @@ impl Config {
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
         let g = |k: &str| nonempty(get(k));
 
+        let sources_mode = match g("ELECTRIC_CIRCUITS_SOURCES_MODE").as_deref() {
+            None => None,
+            Some("table") => Some(SourcesMode::Table),
+            Some("file") => Some(SourcesMode::File),
+            Some(value) => bail!("ELECTRIC_CIRCUITS_SOURCES_MODE must be 'table' or 'file', got '{value}'"),
+        };
+
+        if sources_mode.is_some() {
+            for key in ["ELECTRIC_CIRCUITS_PG_URL", "ELECTRIC_CIRCUITS_PG_SLOT", "ELECTRIC_CIRCUITS_PG_TABLES"] {
+                if g(key).is_some() {
+                    bail!(
+                        "{key} cannot be set when ELECTRIC_CIRCUITS_SOURCES_MODE is enabled; configure each source row instead"
+                    );
+                }
+            }
+        }
+
         // Postgres URL: our internal var wins, then the fleet's DATABASE_URL. Parsed here (parsing
         // is pure — no I/O) so an unusable one is a NAMED boot refusal rather than a connect that
         // fails identically forever: to the boot classifier a `Config::from_str` failure looks
         // exactly like "the database is not up yet" (no SQLSTATE, no server answer), so without
         // this a typo would back off and re-parse the same broken string every 30 s for ever.
-        let pg_url = g("ELECTRIC_CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL"));
+        let pg_url =
+            if sources_mode.is_some() { None } else { g("ELECTRIC_CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL")) };
         if let Some(url) = pg_url.as_deref() {
             let ca_bundle = g("ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE");
             let server_name = g("ELECTRIC_CIRCUITS_PG_TLS_SERVER_NAME");
@@ -310,7 +349,7 @@ impl Config {
             b
         } else if let Some(port) = g("ELECTRIC_PORT") {
             format!("0.0.0.0:{}", port.trim())
-        } else if pg_url.is_some() {
+        } else if pg_url.is_some() || sources_mode.is_some() {
             "0.0.0.0:3000".to_string()
         } else {
             "127.0.0.1:0".to_string()
@@ -526,6 +565,46 @@ impl Config {
             );
         }
 
+        let sources = match sources_mode {
+            None => None,
+            Some(mode) => {
+                let table = g("ELECTRIC_CIRCUITS_SOURCES_TABLE").unwrap_or_else(|| "circuits_sources".to_string());
+                validate_control_table_name("ELECTRIC_CIRCUITS_SOURCES_TABLE", &table)?;
+                let version_table = g("ELECTRIC_CIRCUITS_SOURCES_VERSION_TABLE")
+                    .unwrap_or_else(|| "circuits_sources_version".to_string());
+                validate_control_table_name("ELECTRIC_CIRCUITS_SOURCES_VERSION_TABLE", &version_table)?;
+                let poll = seconds_setting(&g, "ELECTRIC_CIRCUITS_SOURCES_POLL_SECS", 30)?;
+                if poll.is_zero() {
+                    bail!("ELECTRIC_CIRCUITS_SOURCES_POLL_SECS must be greater than zero");
+                }
+                let file = match mode {
+                    SourcesMode::Table => None,
+                    SourcesMode::File => {
+                        Some(std::path::PathBuf::from(g("ELECTRIC_CIRCUITS_SOURCES_FILE").ok_or_else(|| {
+                            anyhow::anyhow!("ELECTRIC_CIRCUITS_SOURCES_FILE is required in file mode")
+                        })?))
+                    }
+                };
+                let pg_url = match mode {
+                    SourcesMode::Table => {
+                        let url = g("ELECTRIC_CIRCUITS_SOURCES_PG_URL").ok_or_else(|| {
+                            anyhow::anyhow!("ELECTRIC_CIRCUITS_SOURCES_PG_URL is required in table mode")
+                        })?;
+                        let ca_bundle = g("ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE");
+                        let server_name = g("ELECTRIC_CIRCUITS_PG_TLS_SERVER_NAME");
+                        crate::pg::PgConnectionConfig::resolve(&url, ca_bundle.as_deref(), server_name.as_deref())
+                            .context("ELECTRIC_CIRCUITS_SOURCES_PG_URL")?;
+                        Some(url)
+                    }
+                    SourcesMode::File => None,
+                };
+                let storage_dir = g("ELECTRIC_CIRCUITS_SOURCES_STORAGE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("./data/sources"));
+                Some(SourcesConfig { mode, pg_url, table, version_table, poll, file, storage_dir })
+            }
+        };
+
         Ok(Config {
             pg_url,
             ds_url,
@@ -556,6 +635,7 @@ impl Config {
             backfill,
             shutdown_grace,
             shutdown_ready_drain,
+            sources,
             noop_vars: Vec::new(),
         })
     }
@@ -570,7 +650,7 @@ impl Config {
 
     /// The bind host:port with URL and bearer credentials redacted — safe to log.
     pub fn redacted(&self) -> String {
-        format!(
+        let base = format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
              secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} json_logs={} memory_log_period={:?} memory_bytes_log_period={:?} initialize_namespace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
@@ -601,8 +681,35 @@ impl Config {
             self.backfill.statement_timeout_ms,
             self.shutdown_grace,
             self.shutdown_ready_drain,
-        )
+        );
+        match &self.sources {
+            None => base,
+            Some(sources) => format!(
+                "{base} sources_mode={:?} sources_pg_url={} sources_table={} sources_version_table={} sources_poll={:?} sources_file={} sources_storage_dir={}",
+                sources.mode,
+                sources.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
+                sources.table,
+                sources.version_table,
+                sources.poll,
+                sources.file.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
+                sources.storage_dir.display(),
+            ),
+        }
     }
+}
+
+fn validate_control_table_name(name: &str, value: &str) -> Result<()> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if !(parts.len() == 1 || parts.len() == 2)
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    {
+        bail!(
+            "{name} must be a table name or schema-qualified table name using ASCII letters, digits, and '_', got '{value}'"
+        );
+    }
+    Ok(())
 }
 
 /// Is `k` an `ELECTRIC_*` var the engine does not act on (so it should be accepted as a no-op)?
@@ -791,6 +898,73 @@ mod tests {
         assert_eq!(c.pg_url.as_deref(), Some("postgres://fleet"));
         let c = cfg(&[]);
         assert_eq!(c.pg_url, None);
+    }
+
+    #[test]
+    fn sources_mode_is_opt_in_and_has_table_defaults() {
+        assert!(cfg(&[]).sources.is_none(), "the legacy single-source mode remains the default");
+        let c = cfg(&[
+            ("ELECTRIC_CIRCUITS_SOURCES_MODE", "table"),
+            ("ELECTRIC_CIRCUITS_SOURCES_PG_URL", "postgres://postgres@127.0.0.1:5432/postgres"),
+        ]);
+        let sources = c.sources.expect("table mode config");
+        assert_eq!(sources.mode, SourcesMode::Table);
+        assert_eq!(sources.table, "circuits_sources");
+        assert_eq!(sources.version_table, "circuits_sources_version");
+        assert_eq!(sources.poll, Duration::from_secs(30));
+        assert_eq!(sources.file, None);
+        assert_eq!(c.pg_url, None, "the control URL is not a source URL");
+    }
+
+    #[test]
+    fn sources_file_mode_requires_a_file_and_refuses_legacy_source_keys() {
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_SOURCES_MODE", "file")]).is_err());
+        let c = cfg(&[
+            ("ELECTRIC_CIRCUITS_SOURCES_MODE", "file"),
+            ("ELECTRIC_CIRCUITS_SOURCES_FILE", "/tmp/sources.json"),
+            ("ELECTRIC_CIRCUITS_SOURCES_POLL_SECS", "1"),
+        ]);
+        assert_eq!(c.sources.as_ref().unwrap().mode, SourcesMode::File);
+        assert_eq!(c.sources.as_ref().unwrap().poll, Duration::from_secs(1));
+        for key in ["ELECTRIC_CIRCUITS_PG_URL", "ELECTRIC_CIRCUITS_PG_SLOT", "ELECTRIC_CIRCUITS_PG_TABLES"] {
+            let mut pairs = vec![
+                ("ELECTRIC_CIRCUITS_SOURCES_MODE", "file"),
+                ("ELECTRIC_CIRCUITS_SOURCES_FILE", "/tmp/sources.json"),
+            ];
+            pairs.push((key, "set"));
+            let error = try_cfg(&pairs).expect_err("legacy source setting must be refused");
+            assert!(format!("{error:#}").contains(key));
+        }
+    }
+
+    #[test]
+    fn sources_control_url_is_redacted_and_source_settings_validate_eagerly() {
+        let c = cfg(&[
+            ("ELECTRIC_CIRCUITS_SOURCES_MODE", "table"),
+            ("ELECTRIC_CIRCUITS_SOURCES_PG_URL", "postgres://user:password@127.0.0.1:5432/control"),
+            ("ELECTRIC_CIRCUITS_SOURCES_POLL_SECS", "2"),
+            ("ELECTRIC_CIRCUITS_SOURCES_STORAGE_DIR", "/var/lib/circuits/sources"),
+        ]);
+        let redacted = c.redacted();
+        assert!(redacted.contains("sources_pg_url=postgres://***@127.0.0.1:5432/control"), "{redacted}");
+        assert!(!redacted.contains("password"), "{redacted}");
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_SOURCES_MODE", "table")]).is_err());
+        assert!(
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_SOURCES_MODE", "table"),
+                ("ELECTRIC_CIRCUITS_SOURCES_PG_URL", "postgres://postgres@127.0.0.1:5432/postgres"),
+                ("ELECTRIC_CIRCUITS_SOURCES_POLL_SECS", "0"),
+            ])
+            .is_err()
+        );
+        assert!(
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_SOURCES_MODE", "table"),
+                ("ELECTRIC_CIRCUITS_SOURCES_PG_URL", "postgres://postgres@127.0.0.1:5432/postgres"),
+                ("ELECTRIC_CIRCUITS_SOURCES_TABLE", "sources;drop table"),
+            ])
+            .is_err()
+        );
     }
 
     /// A connection string the driver cannot parse refuses the boot HERE, where every other
