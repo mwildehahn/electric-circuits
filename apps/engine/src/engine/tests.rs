@@ -2723,3 +2723,15 @@ async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it(
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
+
+#[tokio::test]
+async fn private_runtime_marker_is_rejected_before_library_schema_work() {
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let schema: Schema = serde_json::from_value(serde_json::json!({"tables": {
+        "public.native_sync_authority_fence": {"columns": {"user_id": {"type": "text"}}, "primaryKey": "user_id"}
+    }}))
+    .unwrap();
+    assert!(engine.define_schema(&schema).await.unwrap_err().to_string().contains("private"));
+    assert!(engine.tracked_tables().await.is_empty());
+    assert!(engine.state.lock().await.sequencer.is_none());
+}

@@ -72,6 +72,7 @@ use serde_json::{Map, Value as Json};
 use crate::changelog::ChangeLogWriter;
 use crate::ds::{Envelope, EnvelopeHeaders};
 use crate::pgoutput::{self, Cell, Message, OldTuple, RelColumn, Tuple};
+use crate::runtime_authority::{AuthorityMarker, RuntimeFence, marker_table};
 use crate::schema::{ColumnType, SchemaFingerprint, SharedTables, TableSchema};
 use crate::table_ref::TableRef;
 use crate::txn_buffer::{Stamp, TxnBuffer, TxnBufferConfig};
@@ -155,8 +156,12 @@ impl std::error::Error for Refused {}
 /// fresh slot at the current WAL head and every shape would miss the gap.
 pub trait EpochEvents: Send + Sync {
     /// Verify the slot before connecting, and apply the configured slot-loss policy. `Ok` = connect
-    /// now; `Err` = keep waiting (the loop backs off and asks again).
-    fn before_connect(&self) -> BoxFuture<'_, std::result::Result<(), Refused>>;
+    /// now with the runtime-marker incarnation bound to that admission; `Err` = keep waiting
+    /// (the loop backs off and asks again).
+    fn before_connect(&self) -> BoxFuture<'_, std::result::Result<uuid::Uuid, Refused>>;
+
+    /// A connection may attach after a reset finished. Its admission must still be current.
+    fn runtime_ingress_is_current(&self, incarnation: uuid::Uuid) -> bool;
 
     /// Resolves when the engine (re)binds an epoch — an operator reset, so the answer to
     /// [`Self::before_connect`] has just changed and the backoff should be cut short.
@@ -316,13 +321,16 @@ pub async fn run(
         }
         // The epoch gate. A refusal is never fatal — it is "not yet", and what could change the
         // answer differs per reason (see `Refused`).
-        if let Err(refused) = epoch.before_connect().await {
-            tracing::warn!("replicator: not connecting — {refused}");
-            let (base, next) = next_backoff(attempt, false);
-            backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
-            attempt = next;
-            continue;
-        }
+        let runtime_incarnation = match epoch.before_connect().await {
+            Ok(incarnation) => incarnation,
+            Err(refused) => {
+                tracing::warn!("replicator: not connecting — {refused}");
+                let (base, next) = next_backoff(attempt, false);
+                backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
+                attempt = next;
+                continue;
+            }
+        };
         let cfg = match replication_config(&pg_url, &slot, &publication) {
             Ok(c) => c,
             Err(e) => {
@@ -336,6 +344,8 @@ pub async fn run(
         let mut connected = false;
         match stream_loop(
             cfg,
+            runtime_incarnation,
+            epoch.as_ref(),
             &log,
             &tables,
             events.as_ref(),
@@ -378,6 +388,10 @@ fn keepalive_ack_lsn(transaction_open: bool, wal_end: pgwire_replication::Lsn) -
     (!transaction_open).then_some(wal_end)
 }
 
+fn ingress_must_reconnect(epoch: &dyn EpochEvents, incarnation: uuid::Uuid, transaction_open: bool) -> bool {
+    !transaction_open && !epoch.runtime_ingress_is_current(incarnation)
+}
+
 /// Build the walsender connection from the same validated TLS policy used by query connections.
 fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<ReplicationConfig> {
     crate::pg::PgConnectionConfig::from_process_env(pg_url)?.replication_config(slot, publication)
@@ -389,6 +403,8 @@ fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<Rep
 #[allow(clippy::too_many_arguments)]
 async fn stream_loop(
     cfg: ReplicationConfig,
+    runtime_incarnation: uuid::Uuid,
+    epoch: &dyn EpochEvents,
     log: &ChangeLogWriter,
     tables: &SharedTables,
     events: &dyn SchemaEvents,
@@ -429,11 +445,19 @@ async fn stream_loop(
         }
     };
     let mut dec = Decoder::new(tables.clone());
+    dec.runtime_incarnation = Some(runtime_incarnation);
     // Dropped on every exit path (a replaced `Begin`, an error return, the stream ending), which is
     // what removes a spilled transaction's temporary file (ADR-0003).
     let mut txn: Option<TxnBuffer> = None;
     let mut initial = Some(initial);
     loop {
+        // Reconnect at a transaction boundary, including the first frame after socket setup.
+        // An old admission must not leave a live replacement-slot connection unable to issue
+        // runtime receipts forever. Never interrupt a complete transaction's append here.
+        if ingress_must_reconnect(epoch, runtime_incarnation, txn.is_some()) {
+            client.abort();
+            return Ok(StreamEnd::Ended);
+        }
         // The ONE safe point for a graceful stop: between messages, never inside the `Commit` arm.
         //
         // A commit that is being APPENDED runs to completion — the arm below is not a select branch,
@@ -459,6 +483,10 @@ async fn stream_loop(
         };
         *connected = true;
         let Some(ev) = ev else { return Ok(StreamEnd::Ended) };
+        if ingress_must_reconnect(epoch, runtime_incarnation, txn.is_some()) {
+            client.abort();
+            return Ok(StreamEnd::Ended);
+        }
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
                 txn = Some(TxnBuffer::new(xid, txn_cfg.clone()));
@@ -629,13 +657,14 @@ fn observed_fingerprint(replident: u8, columns: &[RelColumn]) -> SchemaFingerpri
 /// `tables` is the engine's live, swappable schema view — never a private copy — so a schema the
 /// drift handler swapped is in effect for the very next change decoded (ADR-0005).
 struct Decoder {
+    runtime_incarnation: Option<uuid::Uuid>,
     tables: SharedTables,
     rels: HashMap<u32, RelMeta>,
 }
 
 impl Decoder {
     fn new(tables: SharedTables) -> Self {
-        Decoder { tables, rels: HashMap::new() }
+        Decoder { tables, rels: HashMap::new(), runtime_incarnation: None }
     }
 
     /// Record a relation and, if what Postgres now reports differs from the compiled schema, report
@@ -679,7 +708,9 @@ impl Decoder {
                 .iter()
                 .filter_map(|id| self.rels.get(id))
                 .filter_map(|r| r.table.clone())
-                .filter(|t| t != sync_table() && t != source_fence_table() && tracked.contains_key(t))
+                .filter(|t| {
+                    t != sync_table() && t != source_fence_table() && t != marker_table() && tracked.contains_key(t)
+                })
                 .collect()
         };
         if !tables.is_empty() {
@@ -705,6 +736,13 @@ impl Decoder {
             }
             return Decoded::None;
         }
+        if table == marker_table() {
+            return self
+                .runtime_incarnation
+                .and_then(|incarnation| runtime_fence_envelope(rel, &msg, incarnation))
+                .map(Decoded::Env)
+                .unwrap_or(Decoded::None);
+        }
         if table == source_fence_table() {
             return source_fence_envelope(rel, &msg).map(Decoded::Env).unwrap_or(Decoded::None);
         }
@@ -715,6 +753,22 @@ impl Decoder {
             None => Decoded::None,
         }
     }
+}
+
+fn runtime_fence_envelope(rel: &RelMeta, message: &Message, incarnation: uuid::Uuid) -> Option<Envelope> {
+    let tuple = match message {
+        Message::Insert { new, .. } | Message::Update { new, .. } => new,
+        _ => return None,
+    };
+    let text = |name: &str| -> Option<&str> {
+        let index = rel.columns.iter().position(|column| column == name)?;
+        match tuple.get(index)? {
+            Cell::Text(value) => Some(value.as_str()),
+            _ => None,
+        }
+    };
+    let marker = AuthorityMarker::parse(text("source_commit_id")?, text("user_id")?, text("generation")?)?;
+    Some(RuntimeFence { marker, incarnation }.into_envelope())
 }
 
 fn source_fence_envelope(rel: &RelMeta, message: &Message) -> Option<Envelope> {
@@ -1211,6 +1265,64 @@ mod tests {
         assert_eq!(envelope.type_, SOURCE_FENCE_ENVELOPE);
         assert_eq!(envelope.key, "018f5f4d-70c2-7d70-a4d5-5f7355078f85");
         assert!(envelope.value.is_none(), "the fence is control metadata, never an application row");
+    }
+
+    #[tokio::test]
+    async fn reset_after_admission_before_first_frame_reconnects_without_cutting_a_transaction() {
+        let engine = crate::engine::Engine::new_for_in_process_test(crate::ds::DsClient::new_for_in_process_test(
+            "http://127.0.0.1:1",
+        ));
+        let admitted = engine.before_connect().await.unwrap();
+        // Admission has returned, but socket setup has not delivered its initial frame yet.
+        drop(engine.force_epoch_reset_window().await);
+        assert!(ingress_must_reconnect(&engine, admitted, false), "first-frame admission is stale");
+        assert!(!ingress_must_reconnect(&engine, admitted, true), "finish the open transaction before reconnecting");
+        let current = engine.before_connect().await.unwrap();
+        assert_ne!(current, admitted);
+        assert!(
+            !ingress_must_reconnect(&engine, current, false),
+            "a current connection can consume new runtime markers"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_marker_decodes_only_valid_private_insert_or_update_with_admitted_incarnation() {
+        let tables = shared(users());
+        let (mut decoder, events) = decoder(&tables).await;
+        let incarnation = uuid::Uuid::new_v4();
+        let columns = [("user_id", 2950), ("generation", 1043), ("source_commit_id", 2950)];
+        decoder.on_relation(rel_msg(4, "public", "native_sync_authority_fence", &columns), events.as_ref(), None).await;
+        let valid = vec![
+            t("018f5f4d-70c2-7d70-a4d5-5f7355078f81"),
+            t(&"a".repeat(64)),
+            t("018f5f4d-70c2-7d70-a4d5-5f7355078f85"),
+        ];
+        assert!(matches!(decoder.on_change(Message::Insert { rel_id: 4, new: valid.clone() }), Decoded::None));
+        decoder.runtime_incarnation = Some(incarnation);
+        for message in [
+            Message::Insert { rel_id: 4, new: valid.clone() },
+            Message::Update { rel_id: 4, old: None, new: valid.clone() },
+        ] {
+            let envelope = env_of(decoder.on_change(message));
+            let decoded = RuntimeFence::from_envelope(&envelope).unwrap();
+            assert_eq!(decoded.incarnation, incarnation);
+            assert_eq!(decoded.marker.user_id, "018f5f4d-70c2-7d70-a4d5-5f7355078f81");
+            assert_ne!(envelope.type_, SOURCE_FENCE_ENVELOPE);
+            assert!(envelope.headers.last.is_none(), "only the transaction writer stamps its terminal boundary");
+        }
+        for column in 0..3 {
+            for invalid in [Cell::Null, t("invalid")] {
+                let mut tuple = valid.clone();
+                tuple[column] = invalid;
+                assert!(matches!(decoder.on_change(Message::Insert { rel_id: 4, new: tuple }), Decoded::None));
+            }
+        }
+        assert!(matches!(
+            decoder.on_change(Message::Delete { rel_id: 4, old: OldTuple::Full(valid.clone()) }),
+            Decoded::None
+        ));
+        decoder.on_relation(rel_msg(5, "other", "native_sync_authority_fence", &columns), events.as_ref(), None).await;
+        assert!(matches!(decoder.on_change(Message::Insert { rel_id: 5, new: valid }), Decoded::None));
     }
 
     /// Changes for relations that are not tracked (and not the sentinel) are ignored.

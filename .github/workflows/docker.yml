@@ -6,7 +6,7 @@
 #                                           container; drop-in for electricsql/electric)
 #
 # Pushes to main publish `main` + `sha-…` tags; version tags (v*) publish semver tags; pull
-# requests build without pushing.
+# requests build without pushing; the engine archive is retained briefly for local integration.
 name: docker
 
 on:
@@ -56,13 +56,75 @@ jobs:
             type=semver,pattern={{version}}
             type=sha
 
+      - name: Record engine artifact source
+        if: github.event_name == 'pull_request' && matrix.name == 'engine'
+        run: |
+          mkdir -p "$RUNNER_TEMP/engine-artifact"
+          git rev-parse HEAD > "$RUNNER_TEMP/engine-artifact/source-commit"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/engine-artifact/source-tree"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
       - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
+          platforms: ${{ github.event_name == 'pull_request' && matrix.name == 'engine' && 'linux/amd64' || '' }}
+          outputs: ${{ github.event_name == 'pull_request' && matrix.name == 'engine' && format('type=docker,dest={0}/engine-artifact/engine-image.tar', runner.temp) || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Record engine artifact identity
+        if: github.event_name == 'pull_request' && matrix.name == 'engine'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BUILD_IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_IMAGE_ID: ${{ steps.build.outputs.imageid }}
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/engine-artifact/source-commit")"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$(cat "$RUNNER_TEMP/engine-artifact/source-tree")"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "engine-artifact"
+          digest = hashlib.sha256()
+          with (root / "engine-image.tar").open("rb") as archive:
+              for chunk in iter(lambda: archive.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          manifest = {
+              "source_commit": (root / "source-commit").read_text().strip(),
+              "source_tree": (root / "source-tree").read_text().strip(),
+              "source_parents": [line[7:] for line in subprocess.check_output(
+                  ["git", "cat-file", "-p", "HEAD"], text=True
+              ).split("\n\n", 1)[0].splitlines() if line.startswith("parent ")],
+              "pull_request_head": os.environ["PR_HEAD_SHA"],
+              "image_digest": os.environ["BUILD_IMAGE_DIGEST"],
+              "image_id": os.environ["BUILD_IMAGE_ID"],
+              "build_metadata": json.loads(os.environ["BUILD_METADATA"]),
+              "archive_sha256": digest.hexdigest(),
+              "platform": "linux/amd64",
+              "profile": "release",
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source_unchanged": True,
+              "registry_published": False,
+          }
+          (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PYTHON
+
+      - name: Upload engine image for local integration
+        if: github.event_name == 'pull_request' && matrix.name == 'engine'
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-image-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/engine-artifact/engine-image.tar
+            ${{ runner.temp }}/engine-artifact/manifest.json
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error

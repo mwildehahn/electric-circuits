@@ -152,6 +152,58 @@ is emitted only after that complete PostgreSQL transaction and all derived strea
 are durable. The controller owns the poll timeout; task exit, slot release, and an attempted
 checkpoint are not receipts.
 
+### Runtime authority drain
+
+An internal application gateway can fence prior permission changes without deployment-controller
+credentials. Provision this separate private relation in the same source database/publication:
+
+```sql
+CREATE TABLE public.native_sync_authority_fence (
+  user_id uuid PRIMARY KEY,
+  generation varchar(64) NOT NULL,
+  source_commit_id uuid NOT NULL
+);
+ALTER TABLE public.native_sync_authority_fence REPLICA IDENTITY FULL;
+```
+
+The source application owns its INSERT/UPDATE and writes canonical UUIDs plus a 64-character
+lowercase hexadecimal authority generation. The marker must follow the permission changes it
+fences. The engine-created `FOR ALL TABLES` publication includes it; an externally managed explicit
+publication must include it separately. A configured table selector does not provision or verify
+that private publication membership or replica identity. An unpublished, invalid, or deleted marker
+produces no receipt. This relation is excluded from ordinary wildcard/explicit table admission and
+library schemas; it is never a public native template.
+
+Poll `GET /_runtime/drained-through/{source_commit_id}?user_id=<uuid>&generation=<generation>`
+with `Authorization: Bearer <ELECTRIC_SECRET>`. Missing/wrong/controller credentials return 401;
+an absent/empty gateway secret or equal gateway/controller secrets fails closed (503, or startup
+configuration rejection). Valid receipts use `Cache-Control: no-store` and this exact tuple:
+
+```json
+{"sourceCommitId":"<uuid>","drained":true,"receipt":{"sourceCommitId":"<uuid>","userId":"<uuid>","generation":"<64 lowercase hex>","commitLsn":"0/1234"}}
+```
+
+Unknown tuples return `drained:false, receipt:null`. Receipt publication follows the full source
+transaction boundary, its stream appends, and all preceding deferred membership/emission work.
+Runtime markers do not write `SourceDrained` catalog events or advance deployment closure progress;
+the controller's separate source fence and receipt protocol above remain unchanged. A server
+receipt does not prove that a client has applied the subsequent stream tail.
+
+Runtime receipts are memory-only: at most 65,536 entries, FIFO eviction, and a 600-second monotonic
+TTL from first insertion; duplicates retained in the cache do not refresh age. Per-transaction
+marker staging is also capped at 65,536. Excess markers stay unknown while the full application
+transaction still processes. Callers must fail closed on unknown and can use a bounded wait then
+compare-and-swap a fresh source marker.
+
+Each runtime envelope carries the process/reset incarnation admitted for its replication connection.
+An epoch break invalidates the cache and incarnation; queued old envelopes and publication racing
+reset cannot become current receipts. A connection whose admission became stale reconnects after
+its first frame or at the next completed-transaction boundary; it never acquires a new incarnation
+by relabeling its old envelopes. Restart does not restore receipts from the catalog, and old
+durable-log envelopes retain the prior incarnation. PostgreSQL WAL replay through a newly admitted
+connection may regenerate a receipt only through an actual full drain. After a checkpointed graceful
+restart the prior receipt is unknown; a fresh marker recovers it.
+
 ### Benchmarking-fleet surface (`ELECTRIC_*`)
 
 The engine also accepts Electric's own env surface so the `electric-circuits` image is a drop-in for

@@ -665,7 +665,7 @@ pub async fn list_tables(client: &Client, schema: &str) -> Result<Vec<TableRef>>
         .query(
             "select t.table_name from information_schema.tables t \
              where t.table_schema = $1 and t.table_type = 'BASE TABLE' \
-               and not (t.table_schema = 'public' and t.table_name in ('__el_sync', 'circuits_source_fence')) \
+               and not (t.table_schema = 'public' and t.table_name in ('__el_sync', 'circuits_source_fence', 'native_sync_authority_fence')) \
                and exists (select 1 from pg_index i \
                            where i.indrelid = to_regclass(quote_ident(t.table_schema)||'.'||quote_ident(t.table_name)) \
                              and i.indisprimary) \

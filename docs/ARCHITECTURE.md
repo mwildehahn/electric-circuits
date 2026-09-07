@@ -80,6 +80,14 @@ Three ideas carry the whole design:
   The native OpenAPI document intentionally omits the destructive `purge=true` delete query; it
   remains a legacy visualizer/operator escape hatch on the shared handler pending a separately
   authorizable admin route.
+- **runtime authority drain** (`runtime_authority.rs`) — a private gateway receipt family, separate
+  from deployment handoff. The source's `public.native_sync_authority_fence` INSERT/UPDATE becomes
+  an ordered runtime envelope carrying its admitted ingress incarnation. The sequencer waits for
+  the complete transaction and deferred effects before publishing an exact user/generation/marker
+  receipt into a bounded, expiring memory cache. Reset invalidates queued and in-flight old
+  incarnations; runtime traffic never advances deployment catalog/closure provenance. See the
+  [runtime integration contract](../apps/engine/README.md#runtime-authority-drain) for publication,
+  authentication, bounds and restart behavior.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
   windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
 - **oracle + conformance** (`packages/oracle`, `packages/conformance`) — a Postgres/pglite reference
