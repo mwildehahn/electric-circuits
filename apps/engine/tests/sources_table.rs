@@ -121,13 +121,17 @@ fn source_config(
 }
 
 async fn json(app: &Router, method: Method, uri: &str, body: Body) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+    let method_name = method.to_string();
     let response = app
         .clone()
         .oneshot(axum::http::Request::builder().method(method).uri(uri).body(body)?)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let status = response.status();
-    let value = serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await?)?;
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let value = serde_json::from_slice(&body).with_context(|| {
+        format!("parse {method_name} {uri} response ({status}): {}", String::from_utf8_lossy(&body))
+    })?;
     Ok((status, value))
 }
 
