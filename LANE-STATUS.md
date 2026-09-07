@@ -4,7 +4,7 @@ Lane: `circuits-engine-sources-run1`
 
 Branch: `feat/sources-table-mode`
 
-Status: implementation complete; PR checks are green and the PR is ready to mark ready-for-review.
+Status: implementation complete; PR checks are green and the PR is ready for review.
 
 Done:
 
@@ -25,4 +25,4 @@ Final implementation commit: `ee3499f`
 
 PR: https://github.com/mwildehahn/electric-circuits/pull/20
 
-In progress: push this final lane-status record, mark the PR ready, and confirm the resulting checks.
+In progress: none.
