@@ -76,14 +76,15 @@ The host exposes:
 - `GET /sources/{source_id}/status`, returning the summary plus the source's changes route,
   epoch, position, segments, consumers, and readiness fields.
 - Every engine route at `/sources/{source_id}/...`, forwarded to that source after rewriting the
-  URI back to the engine root. The engine router is intentionally not nested. Any
-  `/sources/{source_id}/_admin/...` path returns 404; there is no source-scoped admin surface.
+  URI back to the engine root. The engine router is intentionally not nested. Operator/admin
+  paths are not forwarded: `/sources/{source_id}/_admin/...` and
+  `/sources/{source_id}/epoch/reset` return 404. There is no source-scoped admin surface.
 - `POST /admin/refresh`, protected by the private control secret. It accepts no body, fetches rows
   unconditionally, reconciles them, and returns `{ "revision": ... }`.
 
 There is no write API for sources and no source-specific admin route. Host-level `/admin/refresh`
-is the only admin route in this mode. The existing `/_admin/*` deployment routes remain
-single-source-only and return 404 here.
+is the only admin route in this mode. The existing `/_admin/*` deployment routes and
+`POST /epoch/reset` remain single-source-only and return 404 under a source prefix.
 
 ## Discovery and reconciliation
 

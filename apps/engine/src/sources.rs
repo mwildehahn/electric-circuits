@@ -921,13 +921,15 @@ async fn proxy_path(
     proxy(supervisor, source_id, path, request).await
 }
 
-fn is_source_admin_path(path: &str) -> bool {
+/// Paths the source-scoped proxy must not forward. There is no source-specific admin surface;
+/// host `POST /admin/refresh` is the only admin route in sources-table mode.
+fn source_proxy_denies(path: &str) -> bool {
     let path = path.trim_start_matches('/');
-    path == "_admin" || path.starts_with("_admin/")
+    ["_admin", "epoch/reset"].iter().any(|denied| path == *denied || path.starts_with(&format!("{denied}/")))
 }
 
 async fn proxy(supervisor: SourcesSupervisor, source_id: String, path: String, request: Request) -> Response {
-    if is_source_admin_path(&path) {
+    if source_proxy_denies(&path) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     let router = {
@@ -1051,6 +1053,16 @@ mod tests {
             .iter()
             .map(|(source_id, revision)| (source_id.to_string(), RunningSourceState { revision: *revision }))
             .collect()
+    }
+
+    #[test]
+    fn source_proxy_denies_admin_and_epoch_reset_only() {
+        for path in ["_admin", "/_admin", "_admin/deployment/promote", "epoch/reset", "/epoch/reset", "epoch/reset/"] {
+            assert!(source_proxy_denies(path), "{path} must be denied");
+        }
+        for path in ["v1/shape", "shapes", "health", "ready", "status", "replication/lsn", "epoch"] {
+            assert!(!source_proxy_denies(path), "{path} must still be forwarded");
+        }
     }
 
     #[test]
