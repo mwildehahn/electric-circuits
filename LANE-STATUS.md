@@ -4,7 +4,7 @@ Lane: `circuits-engine-sources-run1`
 
 Branch: `feat/sources-table-mode`
 
-Status: implementation complete locally; draft PR is next.
+Status: implementation complete; draft PR is open and CI/review polling is in progress.
 
 Done:
 
@@ -20,6 +20,6 @@ Verification:
 - `pnpm test` (69 files, 311 tests)
 - `sources_table` ignored lifecycle test is configured for CI but was not run locally because `ELECTRIC_CIRCUITS_TEST_PG_URL` is not set in this environment.
 
-PR: pending
+PR: https://github.com/mwildehahn/electric-circuits/pull/20
 
-In progress: commit, push, open the draft PR, and monitor CI/reviewer feedback.
+In progress: monitor CI and reviewer feedback.
