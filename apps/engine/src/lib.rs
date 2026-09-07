@@ -37,6 +37,7 @@ pub mod replication;
 pub mod retention;
 pub mod schema;
 pub mod shutdown;
+pub mod sources;
 pub mod sql;
 pub mod statsd;
 pub mod store_identity;

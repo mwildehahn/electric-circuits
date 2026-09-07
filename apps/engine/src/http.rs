@@ -727,7 +727,7 @@ fn require_private_admin(headers: &HeaderMap) -> Result<(), AppError> {
     require_private_admin_with_secret(headers, crate::config::control_secret())
 }
 
-fn require_private_admin_with_secret(headers: &HeaderMap, secret: Option<&str>) -> Result<(), AppError> {
+pub(crate) fn require_private_admin_with_secret(headers: &HeaderMap, secret: Option<&str>) -> Result<(), AppError> {
     let Some(secret) = secret else {
         return Err(AppError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1662,10 +1662,10 @@ async fn get_prometheus() -> Response {
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], crate::mem::prometheus_text()).into_response()
 }
 
-struct AppError {
-    status: StatusCode,
-    msg: String,
-    retry_after: bool,
+pub(crate) struct AppError {
+    pub(crate) status: StatusCode,
+    pub(crate) msg: String,
+    pub(crate) retry_after: bool,
 }
 
 impl From<anyhow::Error> for AppError {

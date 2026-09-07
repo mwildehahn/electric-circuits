@@ -892,12 +892,14 @@ impl DsClient {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new_for_in_process_test(base: impl Into<String>) -> Self {
+        Self::new_for_in_process_test_with_scope(base, StreamScope::in_process_test_scope())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new_for_in_process_test_with_scope(base: impl Into<String>, scope: StreamScope) -> Self {
         let base = base.into();
-        Self::with_store(
-            base.clone(),
-            StreamScope::in_process_test_scope(),
-            Arc::new(HttpDurableStreamsStore::new_in_process(base)),
-        )
+        Self::with_store(base.clone(), scope, Arc::new(HttpDurableStreamsStore::new_in_process(base)))
     }
 
     #[cfg(test)]
