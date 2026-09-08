@@ -118,3 +118,11 @@ They therefore apply uniformly to every source in a host. Source-specific Postgr
 tables, storage roots, DBSP directories, and transaction-spill directories are per-source. The
 engine uses `PostgresSetup::ExternallyManaged`: the consumer's migration/bootstrap step owns
 publications, slots, replica identity, and grants; the engine only verifies them.
+
+## Shape gateway authentication
+
+The gateway sends `ELECTRIC_SECRET` as `Authorization: Bearer <gateway-secret>`
+on `/sources/{source_id}/v1/shape`. The Electric-compatible `secret` and
+`api_secret` query parameters remain supported. Missing or incorrect credentials
+return 401 before table lookup. The distinct controller secret cannot authorize
+shape reads; browser session credentials stay at the gateway.
