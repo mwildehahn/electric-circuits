@@ -44,7 +44,7 @@ CREATE TABLE circuits_sources_version (revision BIGINT NOT NULL);
 ```
 
 `tables` entries are schema-qualified, for example `public.thread_messages`. A file-mode row uses
-the same field names and JSON types. `plugin` must be `pgoutput`; `publication` must be the
+the same field names and JSON types. `plugin` names the consumer's package that owns the source (recorded in status; decoding always uses `pgoutput`); `publication` must be the
 slot's `<slot>_pub` publication. A row contains a secret reference, never a connection URL or
 password. `source_id` must be a single safe filesystem path component: not empty, not `.` or `..`,
 and without `/`, `\`, control characters, or other path separators. An unsafe id makes only that
@@ -118,3 +118,11 @@ They therefore apply uniformly to every source in a host. Source-specific Postgr
 tables, storage roots, DBSP directories, and transaction-spill directories are per-source. The
 engine uses `PostgresSetup::ExternallyManaged`: the consumer's migration/bootstrap step owns
 publications, slots, replica identity, and grants; the engine only verifies them.
+
+## Shape gateway authentication
+
+The gateway sends `ELECTRIC_SECRET` as `Authorization: Bearer <gateway-secret>`
+on `/sources/{source_id}/v1/shape`. The Electric-compatible `secret` and
+`api_secret` query parameters remain supported. Missing or incorrect credentials
+return 401 before table lookup. The distinct controller secret cannot authorize
+shape reads; browser session credentials stay at the gateway.

@@ -877,6 +877,7 @@ fn degraded(why: &anyhow::Error) -> Response {
 
 pub async fn shape(
     State(engine): State<Engine>,
+    headers: HeaderMap,
     Query(p): Query<ShapeParams>,
     // Raw query pairs (decoded) for `params` — bracket form `params[1]=…` isn't a single serde field.
     Query(raw_pairs): Query<Vec<(String, String)>>,
@@ -889,7 +890,18 @@ pub async fn shape(
     // series, not one.
     let root_table = p.table.to_string();
 
-    let resp = if !crate::config::secret_ok(crate::config::secret(), p.secret.as_deref(), p.api_secret.as_deref()) {
+    // Mighty forwards its server-held gateway credential as a bearer, keeping it out of URLs.
+    // The controller credential has separate authority and must never authorize this surface.
+    let gateway_bearer = crate::config::secret().is_some_and(|expected| {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|provided| crate::config::secret_matches(expected, provided))
+    });
+    let resp = if !gateway_bearer
+        && !crate::config::secret_ok(crate::config::secret(), p.secret.as_deref(), p.api_secret.as_deref())
+    {
         unauthorized()
     } else if let Err(e) = engine.ensure_not_degraded() {
         degraded(&e)
