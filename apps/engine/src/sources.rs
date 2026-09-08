@@ -819,8 +819,10 @@ fn validate_source_row(row: &SourceRow) -> Result<()> {
     if !is_safe_source_id(&row.source_id) {
         bail!("source_id is not a single safe path component");
     }
-    if row.plugin != crate::pg::PGOUTPUT {
-        bail!("source '{}' uses unsupported logical-replication plugin '{}'", row.source_id, row.plugin);
+    // `plugin` names the consumer's package that owns the source; the engine records it and
+    // always decodes with pgoutput. It is never the logical-decoding plugin.
+    if row.plugin.trim().is_empty() {
+        bail!("source '{}' has an empty plugin", row.source_id);
     }
     if row.slot.trim().is_empty() {
         bail!("source '{}' has an empty slot", row.source_id);
@@ -1108,6 +1110,16 @@ mod tests {
         let rows = vec![row("alpha", 1), row("broken", 3)];
         let plan = reconcile_refresh(&running(&[("alpha", 1)]), &running(&[("broken", 3)]), &rows);
         assert_eq!(plan.actions, vec![PlanAction::Start(row("broken", 3))]);
+    }
+
+    #[test]
+    fn plugin_names_the_owning_package_not_the_decoder() {
+        let mut owned = valid_row("alpha", 1, "env:ALPHA_URL");
+        owned.plugin = "mighty.agents".into();
+        validate_source_row(&owned).expect("a package name is a valid plugin value");
+        let mut empty = valid_row("alpha", 1, "env:ALPHA_URL");
+        empty.plugin = " ".into();
+        assert!(validate_source_row(&empty).is_err());
     }
 
     #[test]

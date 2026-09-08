@@ -44,7 +44,7 @@ CREATE TABLE circuits_sources_version (revision BIGINT NOT NULL);
 ```
 
 `tables` entries are schema-qualified, for example `public.thread_messages`. A file-mode row uses
-the same field names and JSON types. `plugin` must be `pgoutput`; `publication` must be the
+the same field names and JSON types. `plugin` names the consumer's package that owns the source (recorded in status; decoding always uses `pgoutput`); `publication` must be the
 slot's `<slot>_pub` publication. A row contains a secret reference, never a connection URL or
 password. `source_id` must be a single safe filesystem path component: not empty, not `.` or `..`,
 and without `/`, `\`, control characters, or other path separators. An unsafe id makes only that
